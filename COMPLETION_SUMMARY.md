@@ -11,10 +11,6 @@
 ### 2. Extensions Development
 - ✅ **background-tasks**: Background task management with 5 tools
 - ✅ **pwsh-adapter**: PowerShell 7 adapter for Windows
-- ✅ **permission-gate**: Security extension for blocking dangerous commands
-- ✅ **status-line**: Status information display in footer
-- ✅ **session-name**: Automatic session naming
-- ✅ **weather**: Weather information tool (example)
 
 ### 3. Documentation
 - ✅ **README.md**: Comprehensive project documentation
@@ -50,13 +46,9 @@
 pi-extensions/
 ├── .github/workflows/          # CI/CD configuration
 ├── .vscode/                    # VS Code settings
-├── extensions/                 # TypeScript extensions (6)
+├── extensions/                 # TypeScript extensions (2)
 │   ├── background-tasks/
-│   ├── permission-gate/
-│   ├── pwsh-adapter/
-│   ├── session-name/
-│   ├── status-line/
-│   └── weather/
+│   └── pwsh-adapter/
 ├── themes/                     # Color themes (1)
 ├── skills/                     # Markdown skills (1)
 ├── prompts/                    # Prompt templates (1)
@@ -114,8 +106,8 @@ pi-extensions/
 
 ## 📊 Statistics
 
-- **Total files**: 30
-- **Extensions**: 6
+- **Total files**: 26
+- **Extensions**: 2
 - **Themes**: 1
 - **Skills**: 1
 - **Prompts**: 1
@@ -128,10 +120,6 @@ pi-extensions/
 ### Extensions
 1. **background-tasks**: Run long commands in background with real-time monitoring
 2. **pwsh-adapter**: PowerShell 7 support for Windows environments
-3. **permission-gate**: Block dangerous commands with user confirmation
-4. **status-line**: Display useful status information in footer
-5. **session-name**: Automatically name sessions based on first message
-6. **weather**: Example weather information tool
 
 ### Development Tools
 - **Cross-platform scripts**: Windows and Linux/macOS support

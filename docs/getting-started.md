@@ -63,55 +63,14 @@ bg_send id="abcd" text="y"
 bg_stop id="abcd" force=true
 ```
 
-### Permission Gate
+### PWSh Adapter
 
-Automatically blocks dangerous commands:
+PowerShell 7 adapter for Windows:
 
-```bash
-# This will be blocked and require confirmation
-rm -rf /tmp/test
-
-# View blocked commands
-/blocked
-
-# Clear history
-/blocked-clear
-```
-
-### Status Line
-
-Displays useful information in the footer:
-
-- Current directory
-- Git branch and status
-- Model information
-- Session duration
-- Context usage
-
-### Session Name
-
-Automatically names sessions:
-
-```bash
-# Sessions are automatically named based on first message
-# You can also manually set a name
-/name My Project Session
-
-# Clear name
-/name-clear
-```
-
-### Weather
-
-Get weather information:
-
-```bash
-# Ask for weather
-What's the weather in New York?
-
-# Use the command
-/weather London
-```
+- Replaces default bash tool with PowerShell 7
+- Adapts background-tasks to use pwsh
+- UTF-8 encoding support
+- Process tree cleanup on Windows
 
 ## Creating Your Own Extension
 
@@ -179,6 +138,7 @@ pi -e ./extensions/my-extension/index.ts
   "pi": {
     "extensions": [
       "./extensions/background-tasks/index.ts",
+      "./extensions/pwsh-adapter/index.ts",
       "./extensions/my-extension/index.ts"
     ]
   }

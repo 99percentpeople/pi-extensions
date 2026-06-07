@@ -11,9 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial project structure
 - background-tasks extension for running long commands in the background
 - pwsh-adapter extension for PowerShell 7 support on Windows
-- permission-gate extension for blocking dangerous commands
-- status-line extension for displaying status information
-- session-name extension for automatic session naming
 - midnight theme
 - git-workflow skill
 - code-review prompt template

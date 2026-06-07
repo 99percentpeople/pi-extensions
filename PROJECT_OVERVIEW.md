@@ -21,15 +21,7 @@ pi-extensions/
 ├── extensions/                 # TypeScript extensions (main content)
 │   ├── background-tasks/       # Background task management
 │   │   └── index.ts
-│   ├── permission-gate/        # Command safety guard
-│   │   └── index.ts
-│   ├── pwsh-adapter/           # PowerShell 7 adapter
-│   │   └── index.ts
-│   ├── session-name/           # Auto session naming
-│   │   └── index.ts
-│   ├── status-line/            # Status information display
-│   │   └── index.ts
-│   └── weather/                # Weather information
+│   └── pwsh-adapter/           # PowerShell 7 adapter
 │       └── index.ts
 ├── themes/                     # Color themes
 │   └── midnight.json
@@ -64,11 +56,7 @@ pi-extensions/
 Each extension is a TypeScript module that extends Pi's behavior:
 
 - **background-tasks**: Run long commands in the background
-- **permission-gate**: Block dangerous commands
 - **pwsh-adapter**: PowerShell 7 support for Windows
-- **session-name**: Auto-name sessions
-- **status-line**: Display status information
-- **weather**: Weather information tool
 
 ### 2. Themes
 

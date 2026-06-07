@@ -8,10 +8,6 @@ A collection of custom extensions for the [Pi coding agent](https://github.com/b
 |-----------|------|-------------|
 | **background-tasks** | Tool | Run long commands in the background with real-time monitoring |
 | **pwsh-adapter** | Tool | PowerShell 7 adapter for Windows environments |
-| **permission-gate** | Tool | Block dangerous commands and require user confirmation |
-| **status-line** | UI | Display useful status information in the footer |
-| **session-name** | Command | Automatically name sessions based on first message |
-| **weather** | Tool | Get weather information for any city |
 
 ## Installation
 
@@ -93,71 +89,6 @@ PowerShell 7 adapter for Windows environments.
 - UTF-8 encoding support
 - Process tree cleanup on Windows
 
-### permission-gate
-
-Blocks dangerous commands and requires user confirmation.
-
-**Features:**
-- Blocks dangerous bash commands (rm -rf, sudo, git push --force, etc.)
-- Configurable blocked patterns
-- User confirmation dialog with 30-second timeout
-- Command history tracking
-
-**Commands:**
-- `/blocked` - Show history of blocked commands
-- `/blocked-clear` - Clear blocked commands history
-
-### status-line
-
-Displays useful status information in the footer.
-
-**Features:**
-- Current working directory (truncated)
-- Git branch and status (dirty, ahead/behind)
-- Model information
-- Session duration
-- Context token usage
-
-**Commands:**
-- `/status` - Refresh status line
-
-### session-name
-
-Automatically names sessions based on the first user message.
-
-**Features:**
-- Auto-generate session names from first message
-- Manual session naming via /name command
-- Configurable name length
-- Smart prefix removal
-
-**Commands:**
-- `/name` - Set or change session name
-- `/name-clear` - Clear session name
-
-### weather
-
-Get weather information for any city.
-
-**Features:**
-- Get current weather for any city
-- Temperature in Celsius/Fahrenheit
-- Weather conditions and humidity
-- Wind speed and direction
-- Custom rendering with weather icons
-
-**Tools:**
-- `weather` - Get weather information for a location
-
-**Commands:**
-- `/weather` - Quick weather lookup
-
-**Available Locations:**
-- New York
-- London
-- Tokyo
-- Paris
-
 ## Creating Your Own Extensions Repository
 
 Use this repository as a template to create your own Pi extensions collection:
@@ -189,15 +120,7 @@ pi-extensions/
 ├── extensions/           # TypeScript extensions
 │   ├── background-tasks/
 │   │   └── index.ts
-│   ├── pwsh-adapter/
-│   │   └── index.ts
-│   ├── permission-gate/
-│   │   └── index.ts
-│   ├── status-line/
-│   │   └── index.ts
-│   ├── session-name/
-│   │   └── index.ts
-│   └── weather/
+│   └── pwsh-adapter/
 │       └── index.ts
 ├── themes/               # Color themes
 │   └── midnight.json
