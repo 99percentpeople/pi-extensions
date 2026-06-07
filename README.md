@@ -14,14 +14,14 @@ A collection of custom extensions for the [Pi coding agent](https://github.com/b
 ### From npm (Recommended)
 
 ```bash
-pi install npm:pi-extensions
+pi install npm:@99percentpeople/pi-extensions
 ```
 
 ### From Source (For Development)
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/pi-extensions.git
+git clone https://github.com/99percentpeople/pi-extensions.git
 cd pi-extensions
 
 # Install globally (Windows)
@@ -195,7 +195,7 @@ pi remove pi-extensions
 4. Publish to npm:
 
 ```bash
-npm publish
+npm publish --access public
 ```
 
 ### To GitHub
@@ -204,7 +204,7 @@ npm publish
 2. Users can install with:
 
 ```bash
-pi install git:github.com/YOUR_USERNAME/pi-extensions
+pi install git:github.com/99percentpeople/pi-extensions
 ```
 
 ## Contributing

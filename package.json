@@ -1,9 +1,18 @@
 {
-  "name": "pi-extensions",
+  "name": "@99percentpeople/pi-extensions",
   "version": "1.0.0",
-  "description": "Custom extensions for Pi coding agent",
+  "description": "Custom extensions for Pi coding agent - background tasks and PowerShell adapter",
   "type": "module",
   "main": "index.js",
+  "files": [
+    "extensions/",
+    "themes/",
+    "skills/",
+    "prompts/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "lint": "tsc --noEmit",
@@ -28,10 +37,21 @@
     "pi",
     "extensions",
     "coding-agent",
-    "ai"
+    "ai",
+    "background-tasks",
+    "powershell",
+    "pwsh"
   ],
-  "author": "",
+  "author": "99percentpeople",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/99percentpeople/pi-extensions.git"
+  },
+  "bugs": {
+    "url": "https://github.com/99percentpeople/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/99percentpeople/pi-extensions#readme",
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "latest",
     "typescript": "^5.0.0"
