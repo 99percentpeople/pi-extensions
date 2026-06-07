@@ -1,0 +1,21 @@
+{
+  "packages": [
+    "npm:pi-extensions"
+  ],
+  "extensions": [
+    "./extensions/background-tasks/index.ts",
+    "./extensions/pwsh-adapter/index.ts",
+    "./extensions/permission-gate/index.ts",
+    "./extensions/status-line/index.ts",
+    "./extensions/session-name/index.ts"
+  ],
+  "themes": [
+    "./themes/midnight.json"
+  ],
+  "skills": [
+    "./skills/git-workflow/SKILL.md"
+  ],
+  "prompts": [
+    "./prompts/code-review.md"
+  ]
+}
