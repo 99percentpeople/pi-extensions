@@ -11,7 +11,7 @@
  *
  * Features:
  *   - Optional PTY sessions for interactive commands and full-screen TUIs
- *   - Detachable terminal attachment via /bg-attach (Ctrl+] to detach)
+ *   - Detachable PTY interaction or live pipe output via /bg-attach (Ctrl+] to detach)
  *   - Explicit completion waits with timeout (no polling required)
  *   - Auto-throttle via AbortController
  *   - Widget with real-time refresh (100ms)
@@ -60,8 +60,15 @@ interface PtyState {
   terminal: XtermTerminal;
   serializer: XtermSerializeAddon;
   parsed: Promise<void>;
-  attachedWriter?: (data: string) => void;
-  detach?: (reason: "detached" | "exited" | "shutdown") => void;
+}
+
+type AttachmentReason = "detached" | "exited" | "shutdown";
+
+interface AttachmentState {
+  terminalWriter?: (data: string) => void;
+  stdoutWriter?: (data: Buffer) => void;
+  stderrWriter?: (data: Buffer) => void;
+  detach?: (reason: AttachmentReason) => void;
 }
 
 interface ShellLaunch {
@@ -79,6 +86,7 @@ interface BgTask {
   mode: "pipe" | "pty";
   process: BackgroundProcess | null;
   ptyState: PtyState | null;
+  attachment: AttachmentState;
   status: "running" | "completed" | "failed" | "stopped";
   exitCode: number | null;
   signal: string | null;
@@ -255,7 +263,7 @@ function recordPtyData(task: BgTask, data: string): void {
       resolve();
     });
   });
-  state.attachedWriter?.(data);
+  task.attachment.terminalWriter?.(data);
 }
 
 async function flushPty(task: BgTask): Promise<void> {
@@ -405,11 +413,11 @@ function finishTask(task: BgTask, code: number | null, signal: string | null, fa
         ? "stopped"
         : code === 0 ? "completed" : "failed";
   task.done.abort();
-  task.ptyState?.detach?.("exited");
+  task.attachment.detach?.("exited");
   updateWidget();
 }
 
-const PTY_DETACH_KEY = "\x1d";
+const ATTACH_DETACH_KEY = "\x1d";
 const TERMINAL_RESET = [
   "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l",
   "\x1b[?2004l", "\x1b[?1049l", "\x1b[0m", "\x1b[?25h", "\x1b[2J", "\x1b[H",
@@ -430,13 +438,13 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
     ctx.ui.notify("PTY attachment requires Pi TUI mode.", "warning");
     return;
   }
-  if (state.detach) {
+  if (task.attachment.detach) {
     ctx.ui.notify(`Task "${task.name}" is already attached.`, "warning");
     return;
   }
 
   let attachError: string | undefined;
-  const reason = await ctx.ui.custom<"detached" | "exited" | "shutdown">((tui, _theme, _keybindings, done) => {
+  const reason = await ctx.ui.custom<AttachmentReason>((tui, _theme, _keybindings, done) => {
     let cleaned = false;
     let terminalStarted = false;
     let rawBeforeAttach = false;
@@ -444,11 +452,11 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
     let inputHandler: ((data: string | Buffer) => void) | undefined;
     let resizeHandler: (() => void) | undefined;
 
-    const cleanup = (result: "detached" | "exited" | "shutdown") => {
+    const cleanup = (result: AttachmentReason) => {
       if (cleaned) return;
       cleaned = true;
-      state.attachedWriter = undefined;
-      state.detach = undefined;
+      task.attachment.terminalWriter = undefined;
+      task.attachment.detach = undefined;
       if (inputHandler) process.stdin.removeListener("data", inputHandler);
       if (resizeHandler) process.stdout.removeListener("resize", resizeHandler);
       if (ptyPaused) {
@@ -465,7 +473,7 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
       done(result);
     };
 
-    state.detach = cleanup;
+    task.attachment.detach = cleanup;
 
     queueMicrotask(async () => {
       try {
@@ -479,7 +487,7 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
 
         inputHandler = (chunk) => {
           const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
-          const detachAt = data.indexOf(PTY_DETACH_KEY);
+          const detachAt = data.indexOf(ATTACH_DETACH_KEY);
           if (detachAt >= 0) {
             if (detachAt > 0) taskProcess.pty.write(data.slice(0, detachAt));
             cleanup("detached");
@@ -503,7 +511,7 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
         resizeHandler();
         process.stdout.write("\x1b[2J\x1b[H");
         process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
-        state.attachedWriter = (data) => process.stdout.write(data);
+        task.attachment.terminalWriter = (data) => process.stdout.write(data);
         taskProcess.pty.resume();
         ptyPaused = false;
       } catch (error) {
@@ -526,6 +534,99 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
   } else if (reason === "detached") {
     ctx.ui.notify(`Detached from "${task.name}"; the task is still running.`, "info");
   }
+}
+
+async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
+  const taskProcess = task.process;
+  if (task.mode !== "pipe") {
+    ctx.ui.notify(`Task "${task.name}" is not a pipe task.`, "warning");
+    return;
+  }
+  if (task.status !== "running" || !taskProcess || taskProcess.kind !== "pipe") {
+    ctx.ui.notify(`Task "${task.name}" is not running.`, "warning");
+    return;
+  }
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("Pipe attachment requires Pi TUI mode.", "warning");
+    return;
+  }
+  if (task.attachment.detach) {
+    ctx.ui.notify(`Task "${task.name}" is already attached.`, "warning");
+    return;
+  }
+
+  let attachError: string | undefined;
+  const reason = await ctx.ui.custom<AttachmentReason>((tui, _theme, _keybindings, done) => {
+    let cleaned = false;
+    let terminalStarted = false;
+    let rawBeforeAttach = false;
+    let inputHandler: ((data: string | Buffer) => void) | undefined;
+
+    const cleanup = (result: AttachmentReason) => {
+      if (cleaned) return;
+      cleaned = true;
+      task.attachment.stdoutWriter = undefined;
+      task.attachment.stderrWriter = undefined;
+      task.attachment.detach = undefined;
+      if (inputHandler) process.stdin.removeListener("data", inputHandler);
+      if (terminalStarted) {
+        process.stdin.pause();
+        process.stdin.setRawMode?.(rawBeforeAttach);
+        process.stdout.write(TERMINAL_RESET);
+        tui.start();
+        tui.requestRender(true);
+      }
+      done(result);
+    };
+
+    task.attachment.detach = cleanup;
+
+    queueMicrotask(() => {
+      try {
+        if (cleaned) return;
+        tui.stop();
+        terminalStarted = true;
+        rawBeforeAttach = process.stdin.isRaw || false;
+        process.stdin.setRawMode?.(true);
+        process.stdin.setEncoding("utf8");
+        process.stdin.resume();
+
+        inputHandler = (chunk) => {
+          const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+          if (data.includes(ATTACH_DETACH_KEY)) cleanup("detached");
+        };
+
+        process.stdin.on("data", inputHandler);
+        process.stdout.write("\x1b[2J\x1b[H");
+        const displayName = truncateText(sanitizeLogOutput(task.name).replace(/\n/g, " "), 80);
+        process.stdout.write(`Attached to pipe task "${displayName}". Streaming new output; press Ctrl+] to detach.\r\n\r\n`);
+        task.attachment.stdoutWriter = (data) => process.stdout.write(data);
+        task.attachment.stderrWriter = (data) => process.stderr.write(data);
+      } catch (error) {
+        attachError = error instanceof Error ? error.message : String(error);
+        cleanup("detached");
+      }
+    });
+
+    return {
+      render: () => [],
+      invalidate: () => {},
+      dispose: () => cleanup("detached"),
+    } satisfies Component & { dispose(): void };
+  });
+
+  if (attachError) {
+    ctx.ui.notify(`Pipe attachment failed: ${attachError}`, "error");
+  } else if (reason === "exited") {
+    ctx.ui.notify(`Pipe task "${task.name}" exited.`, "info");
+  } else if (reason === "detached") {
+    ctx.ui.notify(`Detached from "${task.name}"; the task is still running.`, "info");
+  }
+}
+
+async function attachTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
+  if (task.mode === "pty") await attachPtyTask(task, ctx);
+  else await attachPipeTask(task, ctx);
 }
 
 // ── Widget ─────────────────────────────────────────────────────────────
@@ -562,12 +663,13 @@ function updateWidget() {
     WIDGET_KEY,
     (_tui, theme) => {
       const now = Date.now();
-      const lines = running.map((t) => {
+      const lines = running.map((t, index) => {
         const dur = formatDuration(now - t.startedAt);
         const output = t.mode === "pty"
           ? `pty:${t.ptyState?.terminal.cols ?? "?"}x${t.ptyState?.terminal.rows ?? "?"}`
           : `stdout:${t.stdoutLines} stderr:${t.stderrLines}`;
-        return `  ${theme.bold(theme.fg("accent", t.name))} ${theme.fg("dim", `(${t.id})`)} ${theme.fg("muted", dur)} ${theme.fg("dim", output)}`;
+        const branch = index === running.length - 1 ? "└─" : "├─";
+        return `${theme.fg("dim", branch)} ${theme.bold(theme.fg("accent", t.name))} ${theme.fg("dim", `(${t.id})`)} ${theme.fg("muted", dur)} ${theme.fg("dim", output)}`;
       });
       const header = theme.fg("warning", `${running.length} background task${running.length > 1 ? "s" : ""}`);
       return new Text([header, ...lines].join("\n"), 0, 0);
@@ -603,7 +705,7 @@ export default function (pi: ExtensionAPI) {
     stopRefreshTimer();
     if (ctx?.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
     uiCtx = null;
-    for (const task of tasks.values()) task.ptyState?.detach?.("shutdown");
+    for (const task of tasks.values()) task.attachment.detach?.("shutdown");
     await Promise.all(Array.from(tasks.values()).map(async (task) => {
       if (!task.process || task.status !== "running") return;
       try {
@@ -691,7 +793,7 @@ export default function (pi: ExtensionAPI) {
 
       const task: BgTask = {
         id, name: params.name, command: params.command, mode,
-        process: taskProcess, ptyState, status: "running",
+        process: taskProcess, ptyState, attachment: {}, status: "running",
         exitCode: null, signal: null,
         startedAt: Date.now(), endedAt: null,
         stdoutFile, stderrFile, stdoutLines: 0, stderrLines: 0,
@@ -713,11 +815,13 @@ export default function (pi: ExtensionAPI) {
           task.stdoutLines += d.toString().split("\n").length - 1;
           updateLatestLog(task, "stdout", d);
           appendToFile(stdoutFile, d).catch(() => {});
+          task.attachment.stdoutWriter?.(d);
         });
         child.stderr?.on("data", (d: Buffer) => {
           task.stderrLines += d.toString().split("\n").length - 1;
           updateLatestLog(task, "stderr", d);
           appendToFile(stderrFile, d).catch(() => {});
+          task.attachment.stderrWriter?.(d);
         });
         let spawnError: Error | null = null;
         child.on("error", (err) => {
@@ -735,7 +839,7 @@ export default function (pi: ExtensionAPI) {
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ""}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to stream live output)`}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
         details: { id, name: params.name, command: params.command, pid: taskProcess.pid, wait: task.wait, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
       };
     },
@@ -773,6 +877,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use bg_wait once when the final result of a finite background task is required before responding.",
       "Prefer doing other useful work first, then use bg_wait instead of polling bg_status/bg_logs or running a shell sleep command.",
+      "When results from multiple finite tasks are required, call bg_wait for them together; independent waits execute in parallel.",
       "For a PTY task, set terminal_snapshot=true when the final terminal screen is needed; it is omitted by default.",
       "Do not use bg_wait for persistent servers or watchers. A timeout leaves the task running; do not immediately call bg_wait again unless the user asks you to keep waiting.",
     ],
@@ -782,7 +887,7 @@ export default function (pi: ExtensionAPI) {
       terminal_snapshot: Type.Optional(Type.Boolean({ description: "For PTY tasks, include the current terminal screen in the result (default: false)" })),
     }),
 
-    executionMode: "sequential",
+    executionMode: "parallel",
 
     async execute(_toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
       const task = tasks.get(params.id);
@@ -1476,24 +1581,24 @@ export default function (pi: ExtensionAPI) {
   // ── /bg-attach command ─────────────────────────────────────────────
 
   pi.registerCommand("bg-attach", {
-    description: "Attach the terminal to a running PTY background task (Ctrl+] to detach)",
+    description: "Attach to a running task (interactive PTY or live pipe output; Ctrl+] to detach)",
     getArgumentCompletions: (prefix: string) => {
       const items = Array.from(tasks.values())
-        .filter((task) => task.mode === "pty" && task.status === "running")
-        .map((task) => ({ value: task.id, label: `${task.id} ${task.name}` }));
+        .filter((task) => task.status === "running")
+        .map((task) => ({ value: task.id, label: `${task.id} [${task.mode}] ${task.name}` }));
       return items.filter((item) => item.value.startsWith(prefix));
     },
     handler: async (args, ctx) => {
       let id = args.trim().split(/\s+/, 1)[0];
       if (!id) {
-        const running = Array.from(tasks.values()).filter((task) => task.mode === "pty" && task.status === "running");
+        const running = Array.from(tasks.values()).filter((task) => task.status === "running");
         if (running.length === 0) {
-          ctx.ui.notify("No running PTY tasks.", "info");
+          ctx.ui.notify("No running tasks.", "info");
           return;
         }
         const choice = await ctx.ui.select(
-          "Attach to which PTY task? (Ctrl+] to detach)",
-          running.map((task) => `${task.id} ${task.name}`),
+          "Attach to which task? (Ctrl+] to detach)",
+          running.map((task) => `${task.id} [${task.mode}] ${task.name}`),
         );
         if (!choice) return;
         id = choice.split(" ", 1)[0];
@@ -1504,13 +1609,13 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Task not found: ${id}`, "error");
         return;
       }
-      await attachPtyTask(task, ctx);
+      await attachTask(task, ctx);
     },
   });
 
-  // ── /kill command ──────────────────────────────────────────────────
+  // ── /bg-kill command ───────────────────────────────────────────────
 
-  pi.registerCommand("kill", {
+  pi.registerCommand("bg-kill", {
     description: "Kill a background task by ID",
     getArgumentCompletions: (prefix: string) => {
       const items = Array.from(tasks.values())

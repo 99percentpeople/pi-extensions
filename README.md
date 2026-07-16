@@ -85,12 +85,13 @@ Run long-running commands in the background with real-time monitoring.
 - `bg_kill` - Terminate unresponsive processes
 
 **Commands:**
-- `/bg-attach <id>` - Attach to a running PTY task; press `Ctrl+]` to detach
-- `/kill` - Kill a background task by ID
+- `/bg-attach <id>` - Attach to an interactive PTY or stream new pipe output; press `Ctrl+]` to detach
+- `/bg-kill` - Kill a background task by ID
 
 **Features:**
 - Optional pseudoterminals for interactive commands and full-screen TUIs
 - Detachable, resizable terminal sessions backed by `node-pty` and xterm headless
+- Live stdout/stderr attachment for pipe tasks without replaying historical logs
 - Single-string PTY input DSL with Ctrl chords, navigation keys, F1-F12, repetition, and atomic validation
 - Explicit completion waits with timeout via `bg_wait` (no polling or AI follow-up notifications)
 - Auto-throttle via AbortController for explicit status checks

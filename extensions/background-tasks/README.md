@@ -16,8 +16,8 @@ pi install npm:@99percentpeople/pi-background-tasks
 - `bg_logs` reads pipe output or a parsed terminal snapshot.
 - `bg_send` sends a compact text/key input string or an OS process signal.
 - `bg_kill` terminates a task.
-- `/bg-attach <id>` attaches to a PTY task; press `Ctrl+]` to detach.
-- `/kill` terminates a task by ID.
+- `/bg-attach <id>` attaches to an interactive PTY or streams new pipe output; press `Ctrl+]` to detach.
+- `/bg-kill` terminates a task by ID.
 
 Start and attach to a TUI:
 
@@ -25,6 +25,10 @@ Start and attach to a TUI:
 bg_start name="git-ui" command="lazygit" pty=true
 /bg-attach <task-id>
 ```
+
+For pipe tasks, `/bg-attach` streams new stdout and stderr directly until detach.
+It does not replay historical logs or forward keyboard input; use `bg_logs` for
+history and `bg_send` for stdin.
 
 Send text and terminal keys with one input string:
 

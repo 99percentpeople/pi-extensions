@@ -107,6 +107,7 @@ function createHarness() {
   const messages: SentMessage[] = [];
   const children: FakeChildProcess[] = [];
   const ptys: FakePty[] = [];
+  const widgets = new Map<string, any>();
 
   const pi = {
     events: {
@@ -125,7 +126,10 @@ function createHarness() {
     cwd: process.cwd(),
     hasUI: false,
     ui: {
-      setWidget: () => {},
+      setWidget: (key: string, widget: unknown) => {
+        if (widget === undefined) widgets.delete(key);
+        else widgets.set(key, widget);
+      },
       notify: () => {},
     },
   } as unknown as ExtensionContext;
@@ -143,7 +147,7 @@ function createHarness() {
       return pty as unknown as IPty;
     },
   });
-  return { tools, commands, lifecycle, messages, children, ptys, ctx };
+  return { tools, commands, lifecycle, messages, children, ptys, widgets, ctx };
 }
 
 test("background tasks wait explicitly, discourage polling, and expose the latest log", async () => {
@@ -157,13 +161,16 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.ok(bgStart && bgWait && bgStatus && bgLogs && bgSend && bgKill);
   assert.equal(tools.has("bg_stop"), false);
   assert.ok(commands.has("bg-attach"));
+  assert.ok(commands.has("bg-kill"));
+  assert.equal(commands.has("kill"), false);
 
-  assert.equal(bgWait.executionMode, "sequential");
+  assert.equal(bgWait.executionMode, "parallel");
   assert.equal(bgStatus.executionMode, "sequential");
   assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status or bg_logs/i);
   assert.match(bgStatus.promptGuidelines?.join("\n") ?? "", /Do not poll bg_status/);
   assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /Do not repeatedly call bg_logs/);
   assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status\/bg_logs/i);
+  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /independent waits execute in parallel/i);
   assert.equal(bgStart.parameters.properties?.wait.minimum, 1);
   assert.equal(bgStart.parameters.properties?.wait.maximum, 3600);
   assert.equal(bgWait.parameters.properties?.timeout.minimum, 1);
@@ -374,6 +381,116 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.ok(expandedLines.some((line: string) => line.includes("── stdout ──")));
   assert.ok(expandedLines.some((line: string) => line.includes("── stderr ──")));
 
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("background task widget renders running tasks as a tree", async () => {
+  const { tools, lifecycle, ptys, widgets, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  const widgetCtx = { ...ctx, hasUI: true } as ExtensionContext;
+  await lifecycle.get("session_start")?.({}, widgetCtx);
+  await bgStart.execute(
+    "widget-pty-pro",
+    { name: "pi-debate-pro", command: "fake pro", pty: true, cols: 100, rows: 25 },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  await bgStart.execute(
+    "widget-pty-con",
+    { name: "pi-debate-con", command: "fake con", pty: true, cols: 100, rows: 25 },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+
+  const widgetFactory = widgets.get("bg-tasks-widget");
+  assert.ok(widgetFactory);
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const lines = widgetFactory({}, plainTheme).render(200).map((line: string) => line.trimEnd());
+  assert.equal(lines[0], "2 background tasks");
+  assert.match(lines[1], /^├─ pi-debate-pro \([a-z0-9]+\) \d+ms pty:100x25$/);
+  assert.match(lines[2], /^└─ pi-debate-con \([a-z0-9]+\) \d+ms pty:100x25$/);
+
+  ptys[0].finish(0);
+  ptys[1].finish(0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await lifecycle.get("session_shutdown")?.({}, widgetCtx);
+});
+
+test("pipe tasks attach to live output without replaying historical logs", async () => {
+  const { tools, commands, lifecycle, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  const started = await bgStart.execute(
+    "pipe-attach-start",
+    { name: "pipe-attach", command: "fake streaming command" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const id = started.details.id as string;
+  assert.match(started.content[0].text, new RegExp(`/bg-attach ${id}`));
+  children[0].stdout.write("BEFORE_ATTACH\n");
+
+  const completions = commands.get("bg-attach").getArgumentCompletions("");
+  assert.ok(completions.some((item: { value: string; label: string }) => item.value === id && item.label.includes("[pipe]")));
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const stdout = process.stdout as NodeJS.WriteStream;
+  const stderr = process.stderr as NodeJS.WriteStream;
+  const originalStdoutWrite = stdout.write;
+  const originalStderrWrite = stderr.write;
+  (stdout as any).write = (chunk: string | Uint8Array) => {
+    stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  };
+  (stderr as any).write = (chunk: string | Uint8Array) => {
+    stderrChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  };
+
+  const attachCtx = {
+    ...ctx,
+    hasUI: true,
+    mode: "tui",
+    ui: {
+      setWidget: () => {},
+      notify: () => {},
+      custom: (factory: any) => new Promise((resolve) => {
+        const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
+        factory(tui, {}, {}, resolve);
+        queueMicrotask(() => {
+          process.stdin.emit("data", "IGNORED_INPUT");
+          children[0].stdout.write("LIVE_STDOUT\n");
+          children[0].stderr.write("LIVE_STDERR\n");
+          setImmediate(() => children[0].finish(0, null));
+        });
+      }),
+    },
+  } as unknown as ExtensionContext;
+
+  try {
+    await commands.get("bg-attach").handler(id, attachCtx);
+  } finally {
+    (stdout as any).write = originalStdoutWrite;
+    (stderr as any).write = originalStderrWrite;
+  }
+
+  const attachedStdout = stdoutChunks.join("");
+  const attachedStderr = stderrChunks.join("");
+  assert.match(attachedStdout, /Streaming new output/);
+  assert.match(attachedStdout, /LIVE_STDOUT/);
+  assert.doesNotMatch(attachedStdout, /BEFORE_ATTACH/);
+  assert.match(attachedStderr, /LIVE_STDERR/);
+  assert.equal(children[0].stdin.read(), null, "pipe attachment must not forward keyboard input");
+
+  children[0].finish(0, null);
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 

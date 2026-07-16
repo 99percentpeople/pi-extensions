@@ -79,6 +79,9 @@ bg_wait id="abcd" terminal_snapshot=true
 
 # Attach from the Pi command line; press Ctrl+] to detach
 /bg-attach abcd
+
+# Pipe tasks stream new stdout/stderr while attached; use bg_send for stdin
+/bg-attach <pipe-task-id>
 ```
 
 ### PWSh Adapter
