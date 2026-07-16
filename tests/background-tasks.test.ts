@@ -21,14 +21,6 @@ interface SentMessage {
   options?: { deliverAs?: string; triggerTurn?: boolean };
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
 class FakeChildProcess extends EventEmitter {
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
@@ -93,18 +85,27 @@ function createHarness() {
   return { tools, lifecycle, messages, children, ctx };
 }
 
-test("background tasks notify once, discourage polling, and expose the latest log", async () => {
+test("background tasks wait explicitly, discourage polling, and expose the latest log", async () => {
   const { tools, lifecycle, messages, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
+  const bgWait = tools.get("bg_wait");
   const bgStatus = tools.get("bg_status");
-  const bgStop = tools.get("bg_stop");
-  assert.ok(bgStart && bgStatus && bgStop);
+  const bgLogs = tools.get("bg_logs");
+  const bgSend = tools.get("bg_send");
+  const bgKill = tools.get("bg_kill");
+  assert.ok(bgStart && bgWait && bgStatus && bgLogs && bgSend && bgKill);
+  assert.equal(tools.has("bg_stop"), false);
 
+  assert.equal(bgWait.executionMode, "sequential");
   assert.equal(bgStatus.executionMode, "sequential");
-  assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /do not poll bg_status/i);
+  assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status or bg_logs/i);
   assert.match(bgStatus.promptGuidelines?.join("\n") ?? "", /Do not poll bg_status/);
+  assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /Do not repeatedly call bg_logs/);
+  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status\/bg_logs/i);
   assert.equal(bgStart.parameters.properties?.wait.minimum, 1);
   assert.equal(bgStart.parameters.properties?.wait.maximum, 3600);
+  assert.equal(bgWait.parameters.properties?.timeout.minimum, 1);
+  assert.equal(bgWait.parameters.properties?.timeout.maximum, 3600);
 
   const first = await bgStart.execute(
     "start-1",
@@ -118,28 +119,23 @@ test("background tasks notify once, discourage polling, and expose the latest lo
     ctx,
   );
   const firstId = first.details.id as string;
-  assert.match(first.content[0].text, /do not poll bg_status/i);
+  assert.match(first.content[0].text, /Use bg_wait once/i);
   setTimeout(() => {
     children[0].stdout.write("first\nlast\n");
     children[0].finish(0, null);
   }, 40);
 
   const startedAt = Date.now();
-  const listResult = await bgStatus.execute("status-list", {}, undefined, undefined, ctx);
-  assert.ok(Date.now() - startedAt >= 20, "the first status check should wait until the task changes or its delay expires");
-  assert.match(listResult.content[0].text, /Latest log: \[stdout\] last/);
-
-  await waitFor(() => messages.length === 1);
-  assert.equal(messages[0].message.customType, "background-task-complete");
-  assert.match(messages[0].message.content, /completed/);
-  assert.match(messages[0].message.content, /Latest log: \[stdout\] last/);
-  assert.deepEqual(messages[0].options, { deliverAs: "followUp", triggerTurn: true });
+  const waitResult = await bgWait.execute("wait-1", { id: firstId, timeout: 1 }, undefined, undefined, ctx);
+  assert.ok(Date.now() - startedAt >= 20, "bg_wait should wait until the task finishes");
+  assert.match(waitResult.content[0].text, /completed/);
+  assert.match(waitResult.content[0].text, /Latest log: \[stdout\] last/);
+  assert.equal(waitResult.details.timedOut, false);
+  assert.equal(messages.length, 0, "completion should not enqueue an AI follow-up notification");
 
   const detailResult = await bgStatus.execute("status-detail", { id: firstId }, undefined, undefined, ctx);
   assert.match(detailResult.content[0].text, /Latest log: \[stdout\] last/);
   assert.equal(detailResult.details.latestLog.text, "last");
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(messages.length, 1, "completion should be notified exactly once");
 
   const longRunning = await bgStart.execute(
     "start-2",
@@ -150,19 +146,67 @@ test("background tasks notify once, discourage polling, and expose the latest lo
   );
   const longRunningId = longRunning.details.id as string;
   const abortController = new AbortController();
-  const statusPromise = bgStatus.execute("status-cancel", { id: longRunningId }, abortController.signal, undefined, ctx);
+  const waitPromise = bgWait.execute("wait-cancel", { id: longRunningId, timeout: 5 }, abortController.signal, undefined, ctx);
   setTimeout(() => abortController.abort(new Error("cancelled by test")), 30);
-  await assert.rejects(statusPromise, /cancelled by test/);
+  await assert.rejects(waitPromise, /cancelled by test/);
 
-  const stopResult = await bgStop.execute(
-    "stop-2",
+  const timeoutStartedAt = Date.now();
+  const timeoutResult = await bgWait.execute("wait-timeout", { id: longRunningId, timeout: 0.02 }, undefined, undefined, ctx);
+  assert.ok(Date.now() - timeoutStartedAt >= 10, "bg_wait should wait until its timeout");
+  assert.match(timeoutResult.content[0].text, /Timed out/);
+  assert.match(timeoutResult.content[0].text, /timeout did not stop it/);
+  assert.equal(timeoutResult.details.timedOut, true);
+  assert.equal(timeoutResult.details.status, "running");
+
+  const killResult = await bgKill.execute(
+    "kill-2",
     { id: longRunningId, force: true },
     undefined,
     undefined,
     ctx,
   );
-  assert.match(stopResult.content[0].text, /Status: stopped/);
-  assert.equal(messages.length, 1, "an explicit stop should not enqueue a duplicate completion follow-up");
+  assert.match(killResult.content[0].text, /Status: stopped/);
+  assert.equal(messages.length, 0, "stopping should not enqueue an AI follow-up notification");
+
+  const signalTask = await bgStart.execute(
+    "start-3",
+    { name: "signal-task", command: "fake signal task" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const signalTaskId = signalTask.details.id as string;
+  const signalResult = await bgSend.execute(
+    "send-signal",
+    { id: signalTaskId, signal: "SIGTERM" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(signalResult.content[0].text, /Sent SIGTERM/);
+  const signalWait = await bgWait.execute("wait-signal", { id: signalTaskId, timeout: 1 }, undefined, undefined, ctx);
+  assert.match(signalWait.content[0].text, /stopped/);
+  assert.equal(signalWait.details.signal, "SIGTERM");
+
+  const ctrlTask = await bgStart.execute(
+    "start-4",
+    { name: "ctrl-task", command: "fake ctrl task" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const ctrlTaskId = ctrlTask.details.id as string;
+  const ctrlResult = await bgSend.execute(
+    "send-ctrl-c",
+    { id: ctrlTaskId, text: "ctrl+c" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(ctrlResult.content[0].text, /Sent SIGINT/);
+  const ctrlWait = await bgWait.execute("wait-ctrl", { id: ctrlTaskId, timeout: 1 }, undefined, undefined, ctx);
+  assert.equal(ctrlWait.details.signal, "SIGINT");
+  assert.equal(messages.length, 0);
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });

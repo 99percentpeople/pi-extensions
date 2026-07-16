@@ -1,14 +1,16 @@
 /**
  * Background Tasks Extension for Pi
  *
- * 5 tools, clear responsibilities:
+ * 6 tools, clear responsibilities:
  *   bg_start  - Start a background task
- *   bg_status - Check status / list tasks / read output
- *   bg_send   - Interact via stdin (text, control chars, raw bytes)
- *   bg_stop   - Force kill unresponsive processes
+ *   bg_wait   - Wait for a task to finish or time out
+ *   bg_status - Check status / list tasks
+ *   bg_logs   - Read stdout/stderr output
+ *   bg_send   - Interact via stdin or send process signals
+ *   bg_kill   - Terminate unresponsive processes
  *
  * Features:
- *   - Automatic completion notifications (no polling required)
+ *   - Explicit completion waits with timeout (no polling required)
  *   - Auto-throttle via AbortController
  *   - Widget with real-time refresh (100ms)
  *   - Extensible spawn backend via pi.events
@@ -49,8 +51,7 @@ interface BgTask {
   latestLog: LatestLog | null;
   stdoutPending: string;
   stderrPending: string;
-  completionNotified: boolean;
-  requestedStopSignal: "SIGTERM" | "SIGKILL" | null;
+  requestedStopSignal: NodeJS.Signals | null;
 }
 
 interface LatestLog {
@@ -138,7 +139,7 @@ function formatLatestLog(latestLog: LatestLog | null): string {
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return;
-  throw signal.reason instanceof Error ? signal.reason : new Error("bg_status cancelled");
+  throw signal.reason instanceof Error ? signal.reason : new Error("Background task wait cancelled");
 }
 
 async function waitUntilAllowed(
@@ -165,14 +166,13 @@ async function waitForTaskEnd(task: BgTask, timeoutMs: number): Promise<void> {
   await waitUntilAllowed(timeoutMs, [task.done.signal], undefined);
 }
 
-async function sendTaskSignal(task: BgTask, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
+async function sendProcessSignal(task: BgTask, signal: NodeJS.Signals, killTree = false): Promise<void> {
   const child = task.process;
   const pid = child?.pid;
   if (!child || !pid) throw new Error(`Task "${task.name}" process is unavailable.`);
 
-  task.requestedStopSignal = signal;
-  try {
-    if (process.platform === "win32") {
+  if (process.platform === "win32") {
+    if (killTree && (signal === "SIGTERM" || signal === "SIGKILL")) {
       await new Promise<void>((resolve, reject) => {
         const args = ["/T", "/PID", String(pid)];
         if (signal === "SIGKILL") args.unshift("/F");
@@ -182,13 +182,22 @@ async function sendTaskSignal(task: BgTask, signal: "SIGTERM" | "SIGKILL"): Prom
       });
       return;
     }
+    if (!child.kill(signal)) throw new Error(`Failed to send ${signal} to task "${task.name}".`);
+    return;
+  }
 
-    try {
-      process.kill(-pid, signal);
-    } catch (error) {
-      const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
-      if (code !== "ESRCH" || !child.kill(signal)) throw error;
-    }
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code !== "ESRCH" || !child.kill(signal)) throw error;
+  }
+}
+
+async function sendTaskSignal(task: BgTask, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
+  task.requestedStopSignal = signal;
+  try {
+    await sendProcessSignal(task, signal, true);
   } catch (error) {
     task.requestedStopSignal = null;
     throw error;
@@ -202,7 +211,6 @@ async function sendTaskSignal(task: BgTask, signal: "SIGTERM" | "SIGKILL"): Prom
 const WIDGET_KEY = "bg-tasks-widget";
 let uiCtx: ExtensionContext | null = null;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
-let shuttingDown = false;
 
 function getRunningTasks(): BgTask[] {
   return Array.from(tasks.values()).filter((t) => t.status === "running");
@@ -254,20 +262,18 @@ export default function (pi: ExtensionAPI) {
     if (ops.spawn) spawnFn = ops.spawn;
   });
 
-  pi.on("session_start", async (_event, ctx) => { shuttingDown = false; uiCtx = ctx; });
+  pi.on("session_start", async (_event, ctx) => { uiCtx = ctx; });
 
   pi.on("tool_execution_end", async (event, ctx) => {
     if (event.toolName.startsWith("bg_")) { uiCtx = ctx; updateWidget(); }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    shuttingDown = true;
     stopRefreshTimer();
     if (ctx?.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
     uiCtx = null;
     await Promise.all(Array.from(tasks.values()).map(async (task) => {
       if (!task.process || task.status !== "running") return;
-      task.completionNotified = true;
       try {
         await sendTaskSignal(task, "SIGTERM");
         await waitForTaskEnd(task, 3000);
@@ -290,7 +296,8 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Start a long-running command in the background",
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
-      "After bg_start, do not poll bg_status. Background task completion or failure is delivered automatically; continue other useful work or finish the response.",
+      "For a finite task whose result is needed, continue other useful work first and then call bg_wait once instead of polling bg_status or bg_logs.",
+      "Do not call bg_wait for persistent servers or watchers, or when the task result is not needed before responding.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "A short descriptive name for the task" }),
@@ -321,7 +328,7 @@ export default function (pi: ExtensionAPI) {
         wait: params.wait ?? 5, nextCheckAt: Date.now() + (params.wait ?? 5) * 1000,
         done: new AbortController(),
         latestLog: null, stdoutPending: "", stderrPending: "",
-        completionNotified: false, requestedStopSignal: null,
+        requestedStopSignal: null,
       };
       tasks.set(id, task);
 
@@ -351,41 +358,18 @@ export default function (pi: ExtensionAPI) {
           ? "stopped"
           : spawnError
             ? "failed"
-            : signal === "SIGTERM" || signal === "SIGKILL"
+            : signal
               ? "stopped"
               : code === 0 ? "completed" : "failed";
         task.done.abort();
         updateWidget();
-
-        if (task.completionNotified || shuttingDown) return;
-        task.completionNotified = true;
-        const duration = formatDuration(task.endedAt - task.startedAt);
-        const exit = task.exitCode !== null ? ` Exit code: ${task.exitCode}.` : "";
-        const stopped = task.signal ? ` Signal: ${task.signal}.` : "";
-        try {
-          pi.sendMessage({
-            customType: "background-task-complete",
-            content: `Background task "${task.name}" (${task.id}) ${task.status} after ${duration}.${exit}${stopped}\nLatest log: ${formatLatestLog(task.latestLog)}\nDo not call bg_status unless the user explicitly asks for more details.`,
-            display: true,
-            details: {
-              id: task.id,
-              name: task.name,
-              status: task.status,
-              exitCode: task.exitCode,
-              signal: task.signal,
-              latestLog: task.latestLog,
-            },
-          }, { deliverAs: "followUp", triggerTurn: true });
-        } catch {
-          // The extension runtime may already be shutting down or reloading.
-        }
       });
 
       uiCtx = ctx;
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${child.pid}\nCompletion notification: automatic; do not poll bg_status.` }],
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${child.pid}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
         details: { id, name: params.name, command: params.command, pid: child.pid, wait: task.wait },
       };
     },
@@ -412,16 +396,111 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── bg_wait ────────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "bg_wait",
+    label: "BG Wait",
+    description: "Wait for a finite background task to finish or until a timeout. A timeout does not stop the task.",
+    promptSnippet: "Wait once for a finite background task to finish",
+    promptGuidelines: [
+      "Use bg_wait once when the final result of a finite background task is required before responding.",
+      "Prefer doing other useful work first, then use bg_wait instead of polling bg_status/bg_logs or running a shell sleep command.",
+      "Do not use bg_wait for persistent servers or watchers. A timeout leaves the task running; do not immediately call bg_wait again unless the user asks you to keep waiting.",
+    ],
+    parameters: Type.Object({
+      id: Type.String({ description: "Task ID" }),
+      timeout: Type.Optional(Type.Number({ description: "Maximum seconds to wait (default: 300)", minimum: 1, maximum: 3600 })),
+    }),
+
+    executionMode: "sequential",
+
+    async execute(_toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
+      const task = tasks.get(params.id);
+      if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
+
+      const timeoutSeconds = params.timeout ?? 300;
+      const timeoutMs = timeoutSeconds * 1000;
+      if (task.status === "running") {
+        await waitUntilAllowed(timeoutMs, [task.done.signal], signal);
+      }
+
+      const timedOut = task.status === "running";
+      const duration = task.endedAt
+        ? formatDuration(task.endedAt - task.startedAt)
+        : formatDuration(Date.now() - task.startedAt);
+      const parts = timedOut
+        ? [
+            `Timed out after ${formatDuration(timeoutMs)} waiting for task "${task.name}" (${task.id}).`,
+            "The task is still running; the timeout did not stop it.",
+          ]
+        : [`Task "${task.name}" (${task.id}) ${task.status} after ${duration}.`];
+      parts.push(
+        `  Status:     ${task.status}`,
+        `  Duration:   ${duration}`,
+      );
+      if (task.exitCode !== null) parts.push(`  Exit code:  ${task.exitCode}`);
+      if (task.signal) parts.push(`  Signal:     ${task.signal}`);
+      parts.push(
+        `  Stdout:     ${task.stdoutLines} lines`,
+        `  Stderr:     ${task.stderrLines} lines`,
+        `  Latest log: ${formatLatestLog(task.latestLog)}`,
+      );
+      if (!timedOut && task.exitCode === 0 && task.stderrLines > 0) {
+        parts.push("  Note: the task exited with code 0 but wrote output to stderr.");
+      }
+
+      return {
+        content: [{ type: "text", text: parts.join("\n") }],
+        details: {
+          id: task.id,
+          name: task.name,
+          status: task.status,
+          timedOut,
+          timeout: timeoutSeconds,
+          exitCode: task.exitCode,
+          signal: task.signal,
+          stdoutLines: task.stdoutLines,
+          stderrLines: task.stderrLines,
+          latestLog: task.latestLog,
+        },
+      };
+    },
+
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      const task = tasks.get(args.id);
+      const name = task ? theme.fg("accent", task.name) : theme.fg("muted", args.id);
+      const timeout = theme.fg("dim", ` timeout=${args.timeout ?? 300}s`);
+      text.setText(theme.fg("toolTitle", theme.bold("bg_wait ")) + name + timeout);
+      return text;
+    },
+
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Waiting..."), 0, 0);
+      const content = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const details = result.details as { status?: BgTask["status"]; timedOut?: boolean } | undefined;
+      const color = details?.timedOut
+        ? "warning"
+        : details?.status === "failed"
+          ? "error"
+          : details?.status === "stopped"
+            ? "warning"
+            : "toolOutput";
+      return new Text(theme.fg(color, content) || content, 0, 0);
+    },
+  });
+
   // ── bg_status ──────────────────────────────────────────────────────
 
   pi.registerTool({
     name: "bg_status",
     label: "BG Status",
-    description: "Inspect a background task snapshot or list tasks. Completion notifications are automatic; this is not a polling tool.",
+    description: "Inspect a background task snapshot or list tasks. This is not a polling or waiting tool.",
     promptSnippet: "Inspect background tasks only when status details are needed",
     promptGuidelines: [
-      "Do not poll bg_status after bg_start; completion and failure notifications arrive automatically.",
-      "Use bg_status only when the user explicitly asks for current task details, when recovering missing context, or when diagnosing a suspected notification failure.",
+      "Do not poll bg_status after bg_start; use bg_wait once when a finite task's final result is required.",
+      "Use bg_status only when the user explicitly asks for current task details, when recovering missing context, or when diagnosing task state.",
       "Use bg_status without id only when a task ID is unknown and a task list is specifically needed.",
     ],
     parameters: Type.Object({
@@ -477,7 +556,7 @@ export default function (pi: ExtensionAPI) {
         `  Stderr:    ${task.stderrLines} lines`,
         `  Latest log: ${formatLatestLog(task.latestLog)}`,
       );
-      if (task.status === "running") parts.push("  Completion notification: automatic; do not poll bg_status.");
+      if (task.status === "running") parts.push("  Use bg_wait to await completion; do not poll bg_status.");
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
@@ -514,11 +593,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_logs",
     label: "BG Logs",
-    description: "Read stdout/stderr output from a background task.",
+    description: "Read stdout/stderr output from a background task for inspection, not for polling progress.",
     promptSnippet: "Read stdout/stderr output from a background task",
     promptGuidelines: [
       "Use bg_logs to read the output of a background task.",
       "Use bg_logs with tail=N to read the last N lines of output.",
+      "Do not repeatedly call bg_logs to wait for progress; use bg_wait once when a finite task's final result is required.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
@@ -584,27 +664,34 @@ export default function (pi: ExtensionAPI) {
   // ── bg_send ────────────────────────────────────────────────────────
 
   const CTRL: Record<string, Buffer> = {
-    "ctrl+c": Buffer.from([0x03]), "ctrl+d": Buffer.from([0x04]),
-    "ctrl+z": Buffer.from([0x1a]), "ctrl+l": Buffer.from([0x0c]),
-    "ctrl+\\": Buffer.from([0x1c]), "ctrl+u": Buffer.from([0x15]),
+    "ctrl+l": Buffer.from([0x0c]), "ctrl+u": Buffer.from([0x15]),
     "ctrl+k": Buffer.from([0x0b]), "ctrl+a": Buffer.from([0x01]),
-    "ctrl+e": Buffer.from([0x05]), "eof": Buffer.from([0x04]),
+    "ctrl+e": Buffer.from([0x05]),
     "escape": Buffer.from([0x1b]), "tab": Buffer.from([0x09]),
     "backspace": Buffer.from([0x7f]),
   };
+  const SIGNAL_ALIASES: Record<string, NodeJS.Signals> = {
+    "ctrl+c": "SIGINT",
+    "ctrl+z": "SIGTSTP",
+    "ctrl+\\": "SIGQUIT",
+  };
+  const STOP_SIGNALS = new Set<NodeJS.Signals>(["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]);
+  const SEND_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP", "SIGCONT", "SIGUSR1", "SIGUSR2"] as const;
 
   pi.registerTool({
     name: "bg_send",
     label: "BG Send",
-    description: "Send input to a running background task's stdin. Supports control characters and raw mode.",
-    promptSnippet: "Send text or control characters to a background task's stdin",
+    description: "Send stdin input or an OS control signal to a running background task.",
+    promptSnippet: "Send text, EOF, or a control signal to a background task",
     promptGuidelines: [
-      "Use bg_send to interact with a running background task that expects stdin input.",
-      "Use bg_send with text='ctrl+c' to send Ctrl+C, text='eof' to close stdin.",
+      "Use bg_send with text to interact with a task's stdin, or with signal to send an OS signal to its process group; provide only one of them.",
+      "text='ctrl+c', 'ctrl+z', and 'ctrl+\\' send SIGINT, SIGTSTP, and SIGQUIT rather than writing control bytes.",
+      "Use text='ctrl+d' or text='eof' to close stdin. Use bg_kill instead when the task must be terminated forcefully.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
-      text: Type.String({ description: "Text to send. Keywords: ctrl+c, ctrl+d, eof, escape, tab, backspace" }),
+      text: Type.Optional(Type.String({ description: "Text to send. Keywords: ctrl+c, ctrl+z, ctrl+\\, ctrl+d, eof, escape, tab, backspace" })),
+      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "OS signal to send to the task's process group" })),
       raw: Type.Optional(Type.Boolean({ description: "Send raw bytes without newline (default: false)" })),
     }),
 
@@ -612,11 +699,43 @@ export default function (pi: ExtensionAPI) {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is not running.` }], details: {} };
-      if (!task.process) return { content: [{ type: "text", text: `Task "${task.name}" stdin unavailable.` }], details: {} };
+      if (!task.process) return { content: [{ type: "text", text: `Task "${task.name}" process is unavailable.` }], details: {} };
 
-      const keyword = params.text.toLowerCase().trim();
-      const data = CTRL[keyword] || (params.raw ? Buffer.from(params.text, "utf-8") : Buffer.from(params.text + "\n", "utf-8"));
-      const desc = CTRL[keyword] ? keyword : params.raw ? `raw(${params.text})` : JSON.stringify(params.text);
+      if (params.text !== undefined && params.signal !== undefined) {
+        return { content: [{ type: "text", text: "Provide either text or signal, not both." }], details: {} };
+      }
+      if (params.text === undefined && params.signal === undefined) {
+        return { content: [{ type: "text", text: "Provide text or signal to send." }], details: {} };
+      }
+
+      const keyword = params.text?.toLowerCase().trim();
+      const signal = params.signal ?? (keyword ? SIGNAL_ALIASES[keyword] : undefined);
+      if (signal) {
+        const previousStopSignal = task.requestedStopSignal;
+        if (STOP_SIGNALS.has(signal)) task.requestedStopSignal = signal;
+        try {
+          await sendProcessSignal(task, signal);
+          return {
+            content: [{ type: "text", text: `Sent ${signal} to "${task.name}" process group.` }],
+            details: { id: task.id, name: task.name, signal },
+          };
+        } catch (err) {
+          task.requestedStopSignal = previousStopSignal;
+          return { content: [{ type: "text", text: `Failed to send ${signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+        }
+      }
+
+      if (keyword === "ctrl+d" || keyword === "eof") {
+        task.process.stdin?.end();
+        return {
+          content: [{ type: "text", text: `Closed stdin for "${task.name}".` }],
+          details: { id: task.id, name: task.name, eof: true },
+        };
+      }
+
+      const input = params.text ?? "";
+      const data = (keyword && CTRL[keyword]) || (params.raw ? Buffer.from(input, "utf-8") : Buffer.from(input + "\n", "utf-8"));
+      const desc = keyword && CTRL[keyword] ? keyword : params.raw ? `raw(${input})` : JSON.stringify(input);
 
       try {
         task.process.stdin?.write(data);
@@ -630,7 +749,8 @@ export default function (pi: ExtensionAPI) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const t = tasks.get(args.id);
       const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
-      const input = args.text ? theme.fg("dim", ` → ${args.text}`) : "";
+      const value = args.signal ?? args.text;
+      const input = value ? theme.fg("dim", ` → ${value}`) : "";
       text.setText(theme.fg("toolTitle", theme.bold("bg_send ")) + name + input);
       return text;
     },
@@ -642,16 +762,16 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── bg_stop ────────────────────────────────────────────────────────
+  // ── bg_kill ────────────────────────────────────────────────────────
 
   pi.registerTool({
-    name: "bg_stop",
-    label: "BG Stop",
-    description: "Force stop a background task that is not responding. SIGTERM by default, SIGKILL with force=true.",
-    promptSnippet: "Force stop an unresponsive background task",
+    name: "bg_kill",
+    label: "BG Kill",
+    description: "Terminate a background task. Sends SIGTERM by default or SIGKILL with force=true.",
+    promptSnippet: "Terminate an unresponsive background task",
     promptGuidelines: [
-      "Use bg_stop when a background task is stuck or unresponsive and needs to be killed.",
-      "Use bg_stop with force=true to send SIGKILL immediately.",
+      "Use bg_kill when a background task needs to be terminated.",
+      "Use bg_kill with force=true to send SIGKILL immediately; otherwise it sends SIGTERM.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
@@ -665,12 +785,10 @@ export default function (pi: ExtensionAPI) {
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is already ${task.status}.` }], details: {} };
 
       const signal = params.force ? "SIGKILL" : "SIGTERM";
-      task.completionNotified = true;
       try {
         await sendTaskSignal(task, signal);
       }
       catch (err) {
-        task.completionNotified = false;
         return { content: [{ type: "text", text: `Failed to send ${signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
       }
 
@@ -679,7 +797,7 @@ export default function (pi: ExtensionAPI) {
       const tail = params.tail_lines || 30;
       const stdout = await readTail(task.stdoutFile, tail);
       const stderr = await readTail(task.stderrFile, tail);
-      const action = task.status === "running" ? `Sent ${signal} to` : "Stopped";
+      const action = task.status === "running" ? `Sent ${signal} to` : "Terminated";
       const parts = [`${action} "${task.name}". Status: ${task.status}`];
       if (stdout) parts.push(`\n── stdout (last ${tail}) ──\n${stdout}`);
       if (stderr) parts.push(`\n── stderr (last ${tail}) ──\n${stderr}`);
@@ -692,12 +810,12 @@ export default function (pi: ExtensionAPI) {
       const t = tasks.get(args.id);
       const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
       const sig = args.force ? theme.fg("error", " SIGKILL") : "";
-      text.setText(theme.fg("toolTitle", theme.bold("bg_stop ")) + name + sig);
+      text.setText(theme.fg("toolTitle", theme.bold("bg_kill ")) + name + sig);
       return text;
     },
 
     renderResult(result, { isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Stopping..."), 0, 0);
+      if (isPartial) return new Text(theme.fg("warning", "Killing..."), 0, 0);
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
       const lines = content.split("\n").map(l => {
         if (l.includes("SIGKILL")) return theme.fg("error", l) || l;
@@ -744,11 +862,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      task.completionNotified = true;
       try {
         await sendTaskSignal(task, "SIGKILL");
       } catch (error) {
-        task.completionNotified = false;
         ctx.ui.notify(`Failed to kill "${task.name}": ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
       }

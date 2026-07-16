@@ -66,16 +66,17 @@ Run long-running commands in the background with real-time monitoring.
 
 **Tools:**
 - `bg_start` - Start a background task
+- `bg_wait` - Wait once for a finite task to finish or time out
 - `bg_status` - Check status / list tasks
 - `bg_logs` - Read stdout/stderr output
-- `bg_send` - Interact via stdin (text, control chars)
-- `bg_stop` - Force kill unresponsive processes
+- `bg_send` - Send stdin input or OS control signals
+- `bg_kill` - Terminate unresponsive processes
 
 **Commands:**
 - `/kill` - Kill a background task by ID
 
 **Features:**
-- Automatic completion/failure follow-up notifications (no polling required)
+- Explicit completion waits with timeout via `bg_wait` (no polling or AI follow-up notifications)
 - Auto-throttle via AbortController for explicit status checks
 - Latest stdout/stderr log line included in `bg_status`
 - Widget with real-time refresh (100ms)
