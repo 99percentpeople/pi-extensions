@@ -102,13 +102,15 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-### Adding to Package
+### Adding a Package
 
 After creating your extension:
 
-1. Add it to `package.json` under `pi.extensions`
-2. Update `README.md` with documentation
-3. Add to `CHANGELOG.md` under `[Unreleased]`
+1. Add `package.json`, `README.md`, and `LICENSE` to the extension directory
+2. Declare `./index.ts` in that package's `pi.extensions`
+3. Add the directory to the root `workspaces` array
+4. Update the root `README.md` and `CHANGELOG.md`
+5. Validate the package with `bun pm pack --dry-run` from its directory
 
 ## Code Style
 

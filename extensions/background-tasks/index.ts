@@ -5,11 +5,13 @@
  *   bg_start  - Start a background task
  *   bg_wait   - Wait for a task to finish or time out
  *   bg_status - Check status / list tasks
- *   bg_logs   - Read stdout/stderr output
+ *   bg_logs   - Read stdout/stderr output or a PTY screen snapshot
  *   bg_send   - Interact via stdin or send process signals
  *   bg_kill   - Terminate unresponsive processes
  *
  * Features:
+ *   - Optional PTY sessions for interactive commands and full-screen TUIs
+ *   - Detachable terminal attachment via /bg-attach (Ctrl+] to detach)
  *   - Explicit completion waits with timeout (no polling required)
  *   - Auto-throttle via AbortController
  *   - Widget with real-time refresh (100ms)
@@ -22,6 +24,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { stripVTControlCharacters } from "node:util";
@@ -29,14 +32,53 @@ import { keyText, type AgentToolResult, type ExtensionAPI, type ExtensionContext
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, type Component } from "@earendil-works/pi-tui";
+import * as nodePty from "node-pty";
+import type { Terminal as XtermTerminal } from "@xterm/headless";
+import type { SerializeAddon as XtermSerializeAddon } from "@xterm/addon-serialize";
+
+const cjsRequire = createRequire(import.meta.url);
+const { Terminal: HeadlessTerminal } = cjsRequire("@xterm/headless") as typeof import("@xterm/headless");
+const { SerializeAddon } = cjsRequire("@xterm/addon-serialize") as typeof import("@xterm/addon-serialize");
 
 // ── Types ──────────────────────────────────────────────────────────────
+
+interface PipeTaskProcess {
+  kind: "pipe";
+  pid: number;
+  child: ChildProcess;
+}
+
+interface PtyTaskProcess {
+  kind: "pty";
+  pid: number;
+  pty: nodePty.IPty;
+}
+
+type BackgroundProcess = PipeTaskProcess | PtyTaskProcess;
+
+interface PtyState {
+  terminal: XtermTerminal;
+  serializer: XtermSerializeAddon;
+  parsed: Promise<void>;
+  attachedWriter?: (data: string) => void;
+  detach?: (reason: "detached" | "exited" | "shutdown") => void;
+}
+
+interface ShellLaunch {
+  file: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+type ShellResolver = (command: string, interactive: boolean) => ShellLaunch;
 
 interface BgTask {
   id: string;
   name: string;
   command: string;
-  process: ChildProcess | null;
+  mode: "pipe" | "pty";
+  process: BackgroundProcess | null;
+  ptyState: PtyState | null;
   status: "running" | "completed" | "failed" | "stopped";
   exitCode: number | null;
   signal: string | null;
@@ -56,7 +98,7 @@ interface BgTask {
 }
 
 interface LatestLog {
-  stream: "stdout" | "stderr";
+  stream: "stdout" | "stderr" | "terminal";
   text: string;
   at: number;
 }
@@ -64,6 +106,24 @@ interface LatestLog {
 // ── Execution Backend ─────────────────────────────────────────────────
 
 let spawnFn: typeof spawn = spawn;
+let ptySpawnFn: typeof nodePty.spawn = nodePty.spawn;
+
+function defaultShellResolver(command: string): ShellLaunch {
+  if (process.platform === "win32") {
+    return {
+      file: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", command],
+      env: { ...process.env },
+    };
+  }
+  return {
+    file: process.env.SHELL || "/bin/sh",
+    args: ["-c", command],
+    env: { ...process.env },
+  };
+}
+
+let resolveShell: ShellResolver = defaultShellResolver;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -143,6 +203,64 @@ function updateLatestLog(task: BgTask, stream: "stdout" | "stderr", data: Buffer
   };
 }
 
+function getPtySnapshotLines(task: BgTask): string[] {
+  const terminal = task.ptyState?.terminal;
+  if (!terminal) return [];
+
+  const lines: string[] = [];
+  const buffer = terminal.buffer.active;
+  for (let index = 0; index < buffer.length; index++) {
+    const line = buffer.getLine(index)?.translateToString(true) ?? "";
+    lines.push(line.replace(/\0/g, ""));
+  }
+  while (lines.at(-1) === "") lines.pop();
+  return lines;
+}
+
+function updatePtyLatestLog(task: BgTask): void {
+  const latestText = getPtySnapshotLines(task).findLast((line) => line.trim().length > 0)?.trim();
+  if (!latestText) return;
+  task.latestLog = {
+    stream: "terminal",
+    text: truncateText(latestText, MAX_STORED_LOG_CHARS),
+    at: Date.now(),
+  };
+}
+
+function recordPtyData(task: BgTask, data: string): void {
+  const state = task.ptyState;
+  if (!state) return;
+
+  task.stdoutLines += data.split("\n").length - 1;
+  appendToFile(task.stdoutFile, data).catch(() => {});
+  state.parsed = new Promise<void>((resolve) => {
+    state.terminal.write(data, () => {
+      updatePtyLatestLog(task);
+      resolve();
+    });
+  });
+  state.attachedWriter?.(data);
+}
+
+async function flushPty(task: BgTask): Promise<void> {
+  await task.ptyState?.parsed;
+}
+
+function formatTaskOutputStats(task: BgTask): string[] {
+  if (task.mode === "pty") {
+    const terminal = task.ptyState?.terminal;
+    const dimensions = terminal ? ` (${terminal.cols}x${terminal.rows})` : "";
+    return [
+      `  Mode:       pty${dimensions}`,
+      `  Terminal:   ${getPtySnapshotLines(task).length} rows`,
+    ];
+  }
+  return [
+    `  Stdout:     ${task.stdoutLines} lines`,
+    `  Stderr:     ${task.stderrLines} lines`,
+  ];
+}
+
 function formatLatestLog(latestLog: LatestLog | null): string {
   if (!latestLog) return "(no output yet)";
   return `[${latestLog.stream}] ${truncateText(latestLog.text, MAX_DISPLAY_LOG_CHARS)}`;
@@ -178,9 +296,9 @@ async function waitForTaskEnd(task: BgTask, timeoutMs: number): Promise<void> {
 }
 
 async function sendProcessSignal(task: BgTask, signal: NodeJS.Signals, killTree = false): Promise<void> {
-  const child = task.process;
-  const pid = child?.pid;
-  if (!child || !pid) throw new Error(`Task "${task.name}" process is unavailable.`);
+  const taskProcess = task.process;
+  const pid = taskProcess?.pid;
+  if (!taskProcess || !pid) throw new Error(`Task "${task.name}" process is unavailable.`);
 
   if (process.platform === "win32") {
     if (killTree && (signal === "SIGTERM" || signal === "SIGKILL")) {
@@ -193,7 +311,14 @@ async function sendProcessSignal(task: BgTask, signal: NodeJS.Signals, killTree 
       });
       return;
     }
-    if (!child.kill(signal)) throw new Error(`Failed to send ${signal} to task "${task.name}".`);
+    if (taskProcess.kind === "pty") {
+      if (signal !== "SIGTERM" && signal !== "SIGHUP") {
+        throw new Error(`${signal} is not supported by node-pty on Windows; send a terminal control key or use bg_kill.`);
+      }
+      taskProcess.pty.kill();
+      return;
+    }
+    if (!taskProcess.child.kill(signal)) throw new Error(`Failed to send ${signal} to task "${task.name}".`);
     return;
   }
 
@@ -201,7 +326,9 @@ async function sendProcessSignal(task: BgTask, signal: NodeJS.Signals, killTree 
     process.kill(-pid, signal);
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
-    if (code !== "ESRCH" || !child.kill(signal)) throw error;
+    if (code !== "ESRCH") throw error;
+    if (taskProcess.kind === "pty") taskProcess.pty.kill(signal);
+    else if (!taskProcess.child.kill(signal)) throw error;
   }
 }
 
@@ -215,7 +342,175 @@ async function sendTaskSignal(task: BgTask, signal: "SIGTERM" | "SIGKILL"): Prom
   }
 }
 
+function writeTaskInput(task: BgTask, data: Buffer | string): void {
+  const taskProcess = task.process;
+  if (!taskProcess) throw new Error(`Task "${task.name}" process is unavailable.`);
+  if (taskProcess.kind === "pty") {
+    taskProcess.pty.write(data);
+    return;
+  }
+  if (!taskProcess.child.stdin?.write(data)) {
+    throw new Error(`Task "${task.name}" stdin is unavailable or closed.`);
+  }
+}
 
+function closeTaskInput(task: BgTask): void {
+  const taskProcess = task.process;
+  if (!taskProcess) throw new Error(`Task "${task.name}" process is unavailable.`);
+  if (taskProcess.kind === "pty") {
+    taskProcess.pty.write("\x04");
+    return;
+  }
+  taskProcess.child.stdin?.end();
+}
+
+function forceKillProcess(task: BgTask): void {
+  const taskProcess = task.process;
+  if (!taskProcess) return;
+  if (taskProcess.kind === "pty") {
+    if (process.platform === "win32") taskProcess.pty.kill();
+    else taskProcess.pty.kill("SIGKILL");
+    return;
+  }
+  taskProcess.child.kill("SIGKILL");
+}
+
+function finishTask(task: BgTask, code: number | null, signal: string | null, failedToSpawn = false): void {
+  if (task.status !== "running") return;
+  task.endedAt = Date.now();
+  task.exitCode = code;
+  task.signal = task.requestedStopSignal ?? signal;
+  task.process = null;
+  task.status = task.requestedStopSignal
+    ? "stopped"
+    : failedToSpawn
+      ? "failed"
+      : signal
+        ? "stopped"
+        : code === 0 ? "completed" : "failed";
+  task.done.abort();
+  task.ptyState?.detach?.("exited");
+  updateWidget();
+}
+
+const PTY_DETACH_KEY = "\x1d";
+const TERMINAL_RESET = [
+  "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l",
+  "\x1b[?2004l", "\x1b[?1049l", "\x1b[0m", "\x1b[?25h", "\x1b[2J", "\x1b[H",
+].join("");
+
+async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
+  const state = task.ptyState;
+  const taskProcess = task.process;
+  if (!state || task.mode !== "pty") {
+    ctx.ui.notify(`Task "${task.name}" is not a PTY task.`, "warning");
+    return;
+  }
+  if (task.status !== "running" || !taskProcess || taskProcess.kind !== "pty") {
+    ctx.ui.notify(`Task "${task.name}" is not running.`, "warning");
+    return;
+  }
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("PTY attachment requires Pi TUI mode.", "warning");
+    return;
+  }
+  if (state.detach) {
+    ctx.ui.notify(`Task "${task.name}" is already attached.`, "warning");
+    return;
+  }
+
+  let attachError: string | undefined;
+  const reason = await ctx.ui.custom<"detached" | "exited" | "shutdown">((tui, _theme, _keybindings, done) => {
+    let cleaned = false;
+    let terminalStarted = false;
+    let rawBeforeAttach = false;
+    let ptyPaused = false;
+    let inputHandler: ((data: string | Buffer) => void) | undefined;
+    let resizeHandler: (() => void) | undefined;
+
+    const cleanup = (result: "detached" | "exited" | "shutdown") => {
+      if (cleaned) return;
+      cleaned = true;
+      state.attachedWriter = undefined;
+      state.detach = undefined;
+      if (inputHandler) process.stdin.removeListener("data", inputHandler);
+      if (resizeHandler) process.stdout.removeListener("resize", resizeHandler);
+      if (ptyPaused) {
+        try { taskProcess.pty.resume(); } catch {}
+        ptyPaused = false;
+      }
+      if (terminalStarted) {
+        process.stdin.pause();
+        process.stdin.setRawMode?.(rawBeforeAttach);
+        process.stdout.write(TERMINAL_RESET);
+        tui.start();
+        tui.requestRender(true);
+      }
+      done(result);
+    };
+
+    state.detach = cleanup;
+
+    queueMicrotask(async () => {
+      try {
+        if (cleaned) return;
+        tui.stop();
+        terminalStarted = true;
+        rawBeforeAttach = process.stdin.isRaw || false;
+        process.stdin.setRawMode?.(true);
+        process.stdin.setEncoding("utf8");
+        process.stdin.resume();
+
+        inputHandler = (chunk) => {
+          const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+          const detachAt = data.indexOf(PTY_DETACH_KEY);
+          if (detachAt >= 0) {
+            if (detachAt > 0) taskProcess.pty.write(data.slice(0, detachAt));
+            cleanup("detached");
+            return;
+          }
+          taskProcess.pty.write(data);
+        };
+        resizeHandler = () => {
+          const cols = Math.max(20, process.stdout.columns || state.terminal.cols || 80);
+          const rows = Math.max(5, process.stdout.rows || state.terminal.rows || 24);
+          state.terminal.resize(cols, rows);
+          if (task.process?.kind === "pty") task.process.pty.resize(cols, rows);
+        };
+
+        process.stdin.on("data", inputHandler);
+        process.stdout.on("resize", resizeHandler);
+        process.stdout.write("\x1b[2J\x1b[H");
+        taskProcess.pty.pause();
+        ptyPaused = true;
+        await flushPty(task);
+        if (cleaned) return;
+        process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
+        state.attachedWriter = (data) => process.stdout.write(data);
+        resizeHandler();
+        taskProcess.pty.resume();
+        ptyPaused = false;
+      } catch (error) {
+        attachError = error instanceof Error ? error.message : String(error);
+        cleanup("detached");
+      }
+    });
+
+    return {
+      render: () => [],
+      invalidate: () => {},
+      dispose: () => cleanup("detached"),
+    } satisfies Component & { dispose(): void };
+  });
+
+  if (attachError) {
+    ctx.ui.notify(`PTY attachment failed: ${attachError}`, "error");
+  } else if (reason === "exited") {
+    ctx.ui.notify(`PTY task "${task.name}" exited.`, "info");
+  } else if (reason === "detached") {
+    ctx.ui.notify(`Detached from "${task.name}"; the task is still running.`, "info");
+  }
+}
 
 // ── Widget ─────────────────────────────────────────────────────────────
 
@@ -253,7 +548,10 @@ function updateWidget() {
       const now = Date.now();
       const lines = running.map((t) => {
         const dur = formatDuration(now - t.startedAt);
-        return `  ${theme.bold(theme.fg("accent", t.name))} ${theme.fg("dim", `(${t.id})`)} ${theme.fg("muted", dur)} ${theme.fg("dim", `stdout:${t.stdoutLines} stderr:${t.stderrLines}`)}`;
+        const output = t.mode === "pty"
+          ? `pty:${t.ptyState?.terminal.cols ?? "?"}x${t.ptyState?.terminal.rows ?? "?"}`
+          : `stdout:${t.stdoutLines} stderr:${t.stderrLines}`;
+        return `  ${theme.bold(theme.fg("accent", t.name))} ${theme.fg("dim", `(${t.id})`)} ${theme.fg("muted", dur)} ${theme.fg("dim", output)}`;
       });
       const header = theme.fg("warning", `${running.length} background task${running.length > 1 ? "s" : ""}`);
       return new Text([header, ...lines].join("\n"), 0, 0);
@@ -269,8 +567,14 @@ export default function (pi: ExtensionAPI) {
   ensureTaskDir();
 
   pi.events.on("bg:register", (data: unknown) => {
-    const ops = data as { spawn?: typeof spawn };
+    const ops = data as {
+      spawn?: typeof spawn;
+      ptySpawn?: typeof nodePty.spawn;
+      resolveShell?: ShellResolver;
+    };
     if (ops.spawn) spawnFn = ops.spawn;
+    if (ops.ptySpawn) ptySpawnFn = ops.ptySpawn;
+    if (ops.resolveShell) resolveShell = ops.resolveShell;
   });
 
   pi.on("session_start", async (_event, ctx) => { uiCtx = ctx; });
@@ -283,6 +587,7 @@ export default function (pi: ExtensionAPI) {
     stopRefreshTimer();
     if (ctx?.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
     uiCtx = null;
+    for (const task of tasks.values()) task.ptyState?.detach?.("shutdown");
     await Promise.all(Array.from(tasks.values()).map(async (task) => {
       if (!task.process || task.status !== "running") return;
       try {
@@ -293,7 +598,7 @@ export default function (pi: ExtensionAPI) {
           await waitForTaskEnd(task, 1000);
         }
       } catch {
-        task.process?.kill("SIGKILL");
+        forceKillProcess(task);
       }
     }));
   });
@@ -307,6 +612,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Start a long-running command in the background",
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
+      "Set pty=true only when a command requires a terminal or TUI interaction; ordinary builds and servers should keep the default pipe mode.",
       "For a finite task whose result is needed, continue other useful work first and then call bg_wait once instead of polling bg_status or bg_logs.",
       "Do not call bg_wait for persistent servers or watchers, or when the task result is not needed before responding.",
     ],
@@ -315,6 +621,9 @@ export default function (pi: ExtensionAPI) {
       command: Type.String({ description: "The shell command to run" }),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to current)" })),
       wait: Type.Optional(Type.Number({ description: "Minimum seconds between status checks (default: 5)", minimum: 1, maximum: 3600 })),
+      pty: Type.Optional(Type.Boolean({ description: "Run in a pseudoterminal for interactive/TUI programs (default: false)" })),
+      cols: Type.Optional(Type.Number({ description: "Initial PTY columns (default: current terminal or 120)", minimum: 20, maximum: 500 })),
+      rows: Type.Optional(Type.Number({ description: "Initial PTY rows (default: current terminal or 30)", minimum: 5, maximum: 200 })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
@@ -322,17 +631,51 @@ export default function (pi: ExtensionAPI) {
       const id = generateId();
       const stdoutFile = join(dir, `${id}.stdout`);
       const stderrFile = join(dir, `${id}.stderr`);
+      const mode = params.pty ? "pty" : "pipe";
+      const shell = resolveShell(params.command, mode === "pty");
+      const cwd = params.cwd || ctx.cwd;
+      const cols = Math.min(500, Math.max(20, Math.floor(params.cols ?? process.stdout.columns ?? 120)));
+      const rows = Math.min(200, Math.max(5, Math.floor(params.rows ?? process.stdout.rows ?? 30)));
+      let taskProcess: BackgroundProcess;
+      let ptyState: PtyState | null = null;
 
-      const child = spawnFn(process.env.SHELL || "/bin/sh", ["-c", params.command], {
-        cwd: params.cwd || ctx.cwd,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env },
-        detached: process.platform !== "win32",
-      });
+      if (mode === "pty") {
+        const terminal = new HeadlessTerminal({
+          cols,
+          rows,
+          scrollback: 2000,
+          allowProposedApi: true,
+        });
+        const serializer = new SerializeAddon();
+        terminal.loadAddon(serializer);
+        let ptyProcess: nodePty.IPty;
+        try {
+          ptyProcess = ptySpawnFn(shell.file, shell.args, {
+            name: shell.env.TERM || "xterm-256color",
+            cols,
+            rows,
+            cwd,
+            env: { ...shell.env, TERM: shell.env.TERM || "xterm-256color" },
+          });
+        } catch (error) {
+          terminal.dispose();
+          throw error;
+        }
+        taskProcess = { kind: "pty", pid: ptyProcess.pid, pty: ptyProcess };
+        ptyState = { terminal, serializer, parsed: Promise.resolve() };
+      } else {
+        const child = spawnFn(shell.file, shell.args, {
+          cwd,
+          stdio: ["pipe", "pipe", "pipe"],
+          env: shell.env,
+          detached: process.platform !== "win32",
+        });
+        taskProcess = { kind: "pipe", pid: child.pid ?? 0, child };
+      }
 
       const task: BgTask = {
-        id, name: params.name, command: params.command,
-        process: child, status: "running",
+        id, name: params.name, command: params.command, mode,
+        process: taskProcess, ptyState, status: "running",
         exitCode: null, signal: null,
         startedAt: Date.now(), endedAt: null,
         stdoutFile, stderrFile, stdoutLines: 0, stderrLines: 0,
@@ -343,45 +686,41 @@ export default function (pi: ExtensionAPI) {
       };
       tasks.set(id, task);
 
-      child.stdout?.on("data", (d: Buffer) => {
-        task.stdoutLines += d.toString().split("\n").length - 1;
-        updateLatestLog(task, "stdout", d);
-        appendToFile(stdoutFile, d).catch(() => {});
-      });
-      child.stderr?.on("data", (d: Buffer) => {
-        task.stderrLines += d.toString().split("\n").length - 1;
-        updateLatestLog(task, "stderr", d);
-        appendToFile(stderrFile, d).catch(() => {});
-      });
-      let spawnError: Error | null = null;
-      child.on("error", (err) => {
-        spawnError = err;
-        const errorLine = `[error: ${err.message}]`;
-        updateLatestLog(task, "stderr", Buffer.from(`${errorLine}\n`));
-        appendToFile(stderrFile, `\n${errorLine}\n`).catch(() => {});
-      });
-      child.on("close", (code, signal) => {
-        task.endedAt = Date.now();
-        task.exitCode = code;
-        task.signal = signal ?? task.requestedStopSignal;
-        task.process = null;
-        task.status = task.requestedStopSignal
-          ? "stopped"
-          : spawnError
-            ? "failed"
-            : signal
-              ? "stopped"
-              : code === 0 ? "completed" : "failed";
-        task.done.abort();
-        updateWidget();
-      });
+      if (taskProcess.kind === "pty") {
+        taskProcess.pty.onData((data) => recordPtyData(task, data));
+        taskProcess.pty.onExit(({ exitCode, signal }) => {
+          finishTask(task, exitCode, signal ? `signal ${signal}` : null);
+        });
+      } else {
+        const child = taskProcess.child;
+        child.stdout?.on("data", (d: Buffer) => {
+          task.stdoutLines += d.toString().split("\n").length - 1;
+          updateLatestLog(task, "stdout", d);
+          appendToFile(stdoutFile, d).catch(() => {});
+        });
+        child.stderr?.on("data", (d: Buffer) => {
+          task.stderrLines += d.toString().split("\n").length - 1;
+          updateLatestLog(task, "stderr", d);
+          appendToFile(stderrFile, d).catch(() => {});
+        });
+        let spawnError: Error | null = null;
+        child.on("error", (err) => {
+          spawnError = err;
+          const errorLine = `[error: ${err.message}]`;
+          updateLatestLog(task, "stderr", Buffer.from(`${errorLine}\n`));
+          appendToFile(stderrFile, `\n${errorLine}\n`).catch(() => {});
+        });
+        child.on("close", (code, signal) => {
+          finishTask(task, code, signal, Boolean(spawnError));
+        });
+      }
 
       uiCtx = ctx;
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${child.pid}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
-        details: { id, name: params.name, command: params.command, pid: child.pid, wait: task.wait },
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ""}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
+        details: { id, name: params.name, command: params.command, pid: taskProcess.pid, wait: task.wait, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
       };
     },
 
@@ -392,7 +731,8 @@ export default function (pi: ExtensionAPI) {
         ? theme.fg("muted", `$ ${args.command}`)
         : theme.fg("toolOutput", "...");
       const wait = args.wait ? theme.fg("dim", ` (wait ${args.wait}s)`) : "";
-      text.setText(theme.fg("toolTitle", theme.bold(`bg_start `)) + name + ` ${cmd}` + wait);
+      const mode = args.pty ? theme.fg("dim", " [pty]") : "";
+      text.setText(theme.fg("toolTitle", theme.bold(`bg_start `)) + name + ` ${cmd}` + wait + mode);
       return text;
     },
 
@@ -435,6 +775,7 @@ export default function (pi: ExtensionAPI) {
       if (task.status === "running") {
         await waitUntilAllowed(timeoutMs, [task.done.signal], signal);
       }
+      await flushPty(task);
 
       const timedOut = task.status === "running";
       const duration = task.endedAt
@@ -452,12 +793,8 @@ export default function (pi: ExtensionAPI) {
       );
       if (task.exitCode !== null) parts.push(`  Exit code:  ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:     ${task.signal}`);
-      parts.push(
-        `  Stdout:     ${task.stdoutLines} lines`,
-        `  Stderr:     ${task.stderrLines} lines`,
-        `  Latest log: ${formatLatestLog(task.latestLog)}`,
-      );
-      if (!timedOut && task.exitCode === 0 && task.stderrLines > 0) {
+      parts.push(...formatTaskOutputStats(task), `  Latest log: ${formatLatestLog(task.latestLog)}`);
+      if (task.mode === "pipe" && !timedOut && task.exitCode === 0 && task.stderrLines > 0) {
         parts.push("  Note: the task exited with code 0 but wrote output to stderr.");
       }
 
@@ -471,6 +808,7 @@ export default function (pi: ExtensionAPI) {
           timeout: timeoutSeconds,
           exitCode: task.exitCode,
           signal: task.signal,
+          mode: task.mode,
           stdoutLines: task.stdoutLines,
           stderrLines: task.stderrLines,
           latestLog: task.latestLog,
@@ -531,14 +869,15 @@ export default function (pi: ExtensionAPI) {
         for (const task of running) {
           if (task.status === "running") task.nextCheckAt = nextCheckBase + task.wait * 1000;
         }
+        await Promise.all(entries.map((task) => flushPty(task)));
         const lines = entries.map((t) => {
           const dur = t.endedAt ? formatDuration(t.endedAt - t.startedAt) : formatDuration(Date.now() - t.startedAt);
           const exit = t.exitCode !== null ? ` exit=${t.exitCode}` : "";
-          return `[${t.id}] "${t.name}" ${t.status} (${dur})${exit}\n  Latest log: ${formatLatestLog(t.latestLog)}`;
+          return `[${t.id}] "${t.name}" ${t.status} ${t.mode} (${dur})${exit}\n  Latest log: ${formatLatestLog(t.latestLog)}`;
         });
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { tasks: entries.map((t) => ({ id: t.id, name: t.name, status: t.status, latestLog: t.latestLog })) },
+          details: { tasks: entries.map((t) => ({ id: t.id, name: t.name, status: t.status, mode: t.mode, latestLog: t.latestLog })) },
         };
       }
 
@@ -553,6 +892,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (task.status === "running") task.nextCheckAt = Date.now() + task.wait * 1000;
+      await flushPty(task);
 
       const duration = task.endedAt ? formatDuration(task.endedAt - task.startedAt) : formatDuration(Date.now() - task.startedAt);
       const parts: string[] = [
@@ -562,16 +902,12 @@ export default function (pi: ExtensionAPI) {
       if (task.exitCode !== null) parts.push(`  Exit code: ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:    ${task.signal}`);
       if (task.process?.pid) parts.push(`  PID:       ${task.process.pid}`);
-      parts.push(
-        `  Stdout:    ${task.stdoutLines} lines`,
-        `  Stderr:    ${task.stderrLines} lines`,
-        `  Latest log: ${formatLatestLog(task.latestLog)}`,
-      );
+      parts.push(...formatTaskOutputStats(task), `  Latest log: ${formatLatestLog(task.latestLog)}`);
       if (task.status === "running") parts.push("  Use bg_wait to await completion; do not poll bg_status.");
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, wait: task.wait, latestLog: task.latestLog },
+        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, wait: task.wait, latestLog: task.latestLog },
       };
     },
 
@@ -604,34 +940,97 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_logs",
     label: "BG Logs",
-    description: "Read stdout/stderr output from a background task for inspection, not for polling progress.",
-    promptSnippet: "Read stdout/stderr output from a background task",
+    description:
+      "Read stdout/stderr output or a PTY screen snapshot from a background task for inspection, not for polling progress.",
+    promptSnippet: "Read output or a terminal screen snapshot from a background task",
     promptGuidelines: [
       "Use bg_logs to read the output of a background task.",
       "Use bg_logs with tail=N to read the last N lines of output.",
+      "PTY tasks return a terminal screen snapshot because stdout and stderr are merged by the pseudoterminal.",
       "Do not repeatedly call bg_logs to wait for progress; use bg_wait once when a finite task's final result is required.",
     ],
+
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
-      tail: Type.Optional(Type.Number({ description: "Read last N lines (default: 100)" })),
-      stream: Type.Optional(StringEnum(["stdout", "stderr", "both"] as const, { description: "Which stream (default: 'both')" })),
-      from_line: Type.Optional(Type.Number({ description: "Start from this line (0-indexed). Overrides tail." })),
-      max_lines: Type.Optional(Type.Number({ description: "Max lines with from_line (default: 500)" })),
+      tail: Type.Optional(
+        Type.Number({ description: "Read last N lines (default: 100)" }),
+      ),
+      stream: Type.Optional(
+        StringEnum(["stdout", "stderr", "both", "terminal"] as const, {
+          description: "Which stream (default: 'both'); use terminal for PTY snapshots",
+        }),
+      ),
+      from_line: Type.Optional(
+        Type.Number({
+          description: "Start from this line (0-indexed). Overrides tail.",
+        }),
+      ),
+      max_lines: Type.Optional(
+        Type.Number({ description: "Max lines with from_line (default: 500)" }),
+      ),
     }),
 
-    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
+    async execute(
+      _toolCallId,
+      params,
+    ): Promise<AgentToolResult<Record<string, unknown>>> {
       const task = tasks.get(params.id);
-      if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
+      if (!task)
+        return {
+          content: [{ type: "text", text: `Task not found: ${params.id}` }],
+          details: {},
+        };
 
       const stream = params.stream || "both";
       const maxLines = params.max_lines || 500;
       const lines = params.tail || 100;
-      let stdout = "", stderr = "";
+      let stdout = "",
+        stderr = "";
+
+      if (task.mode === "pty") {
+        await flushPty(task);
+        if (stream === "stderr") {
+          return {
+            content: [{ type: "text", text: "(PTY output combines stdout and stderr; use stream=terminal)" }],
+            details: { id: task.id, name: task.name, status: task.status, mode: task.mode },
+          };
+        }
+        const snapshotLines = getPtySnapshotLines(task);
+        const selected = params.from_line !== undefined
+          ? snapshotLines.slice(params.from_line, params.from_line + maxLines)
+          : snapshotLines.slice(-lines);
+        const output = selected.join("\n");
+        return {
+          content: [{ type: "text", text: output ? `── terminal ──\n${output}` : "(no terminal output yet)" }],
+          details: {
+            id: task.id,
+            name: task.name,
+            status: task.status,
+            mode: task.mode,
+            terminalRows: snapshotLines.length,
+            cols: task.ptyState?.terminal.cols,
+            rows: task.ptyState?.terminal.rows,
+          },
+        };
+      }
+
+      if (stream === "terminal") {
+        return {
+          content: [{ type: "text", text: "(terminal snapshots are only available for PTY tasks)" }],
+          details: { id: task.id, name: task.name, status: task.status, mode: task.mode },
+        };
+      }
 
       if (stream === "stdout" || stream === "both")
-        stdout = params.from_line !== undefined ? await readRange(task.stdoutFile, params.from_line, maxLines) : await readTail(task.stdoutFile, lines);
+        stdout =
+          params.from_line !== undefined
+            ? await readRange(task.stdoutFile, params.from_line, maxLines)
+            : await readTail(task.stdoutFile, lines);
       if (stream === "stderr" || stream === "both")
-        stderr = params.from_line !== undefined ? await readRange(task.stderrFile, params.from_line, maxLines) : await readTail(task.stderrFile, lines);
+        stderr =
+          params.from_line !== undefined
+            ? await readRange(task.stderrFile, params.from_line, maxLines)
+            : await readTail(task.stderrFile, lines);
 
       const parts: string[] = [];
       if (stream === "both") {
@@ -639,42 +1038,69 @@ export default function (pi: ExtensionAPI) {
         if (stderr) parts.push(`── stderr ──\n${stderr}`);
         if (!stdout && !stderr) parts.push("(no output yet)");
       } else {
-        parts.push(stream === "stdout" ? stdout || "(no stdout)" : stderr || "(no stderr)");
+        parts.push(
+          stream === "stdout"
+            ? stdout || "(no stdout)"
+            : stderr || "(no stderr)",
+        );
       }
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines },
+        details: {
+          id: task.id,
+          name: task.name,
+          status: task.status,
+          stdoutLines: task.stdoutLines,
+          stderrLines: task.stderrLines,
+        },
       };
     },
 
     renderCall(args, theme, context) {
-      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      const text =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const t = tasks.get(args.id);
       const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
       const extras: string[] = [];
       if (args.tail) extras.push(`tail=${args.tail}`);
       if (args.stream && args.stream !== "both") extras.push(args.stream);
-      const extra = extras.length ? theme.fg("dim", ` ${extras.join(" ")}`) : "";
+      const extra = extras.length
+        ? theme.fg("dim", ` ${extras.join(" ")}`)
+        : "";
       const toggleHint = theme.fg(
         "dim",
         ` (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`,
       );
-      text.setText(theme.fg("toolTitle", theme.bold("bg_logs ")) + name + extra + toggleHint);
+      text.setText(
+        theme.fg("toolTitle", theme.bold("bg_logs ")) +
+          name +
+          extra +
+          toggleHint,
+      );
       return text;
     },
 
     renderResult(result, { expanded, isPartial }, theme, context) {
       if (isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
-      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      const text =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       if (!expanded) {
         text.setText("");
         return text;
       }
-      const content = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const lines = content.split("\n").map(l => {
-        if (l.startsWith("── ") || l.startsWith("-- ")) return theme.fg("accent", l) || l;
-        if (l === "(no output yet)" || l === "(no stdout)" || l === "(no stderr)") return theme.fg("muted", l) || l;
+      const content =
+        result.content[0]?.type === "text" ? result.content[0].text : "";
+      const lines = content.split("\n").map((l) => {
+        if (l.startsWith("── ") || l.startsWith("-- "))
+          return theme.fg("accent", l) || l;
+        if (
+          l === "(no output yet)" ||
+          l === "(no stdout)" ||
+          l === "(no stderr)" ||
+          l === "(no terminal output yet)"
+        )
+          return theme.fg("muted", l) || l;
         return theme.fg("toolOutput", l) || l;
       });
       text.setText(`\n${lines.join("\n")}`);
@@ -691,6 +1117,13 @@ export default function (pi: ExtensionAPI) {
     "escape": Buffer.from([0x1b]), "tab": Buffer.from([0x09]),
     "backspace": Buffer.from([0x7f]),
   };
+  const PTY_CTRL: Record<string, Buffer> = {
+    ...CTRL,
+    "ctrl+c": Buffer.from([0x03]),
+    "ctrl+d": Buffer.from([0x04]),
+    "ctrl+z": Buffer.from([0x1a]),
+    "ctrl+\\": Buffer.from([0x1c]),
+  };
   const SIGNAL_ALIASES: Record<string, NodeJS.Signals> = {
     "ctrl+c": "SIGINT",
     "ctrl+z": "SIGTSTP",
@@ -706,7 +1139,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Send text, EOF, or a control signal to a background task",
     promptGuidelines: [
       "Use bg_send with text to interact with a task's stdin, or with signal to send an OS signal to its process group; provide only one of them.",
-      "text='ctrl+c', 'ctrl+z', and 'ctrl+\\' send SIGINT, SIGTSTP, and SIGQUIT rather than writing control bytes.",
+      "For pipe tasks, text='ctrl+c', 'ctrl+z', and 'ctrl+\\' send process signals. For PTY tasks, control keywords write terminal control bytes so the foreground TUI handles them normally.",
       "Use text='ctrl+d' or text='eof' to close stdin. Use bg_kill instead when the task must be terminated forcefully.",
     ],
     parameters: Type.Object({
@@ -730,6 +1163,19 @@ export default function (pi: ExtensionAPI) {
       }
 
       const keyword = params.text?.toLowerCase().trim();
+      if (task.mode === "pty" && keyword && PTY_CTRL[keyword]) {
+        const data = PTY_CTRL[keyword];
+        try {
+          writeTaskInput(task, data);
+          return {
+            content: [{ type: "text", text: `Sent ${keyword} to "${task.name}" PTY (${data.length} byte).` }],
+            details: { id: task.id, name: task.name, bytes: data.length, keyword, mode: task.mode },
+          };
+        } catch (err) {
+          return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+        }
+      }
+
       const signal = params.signal ?? (keyword ? SIGNAL_ALIASES[keyword] : undefined);
       if (signal) {
         const previousStopSignal = task.requestedStopSignal;
@@ -747,20 +1193,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (keyword === "ctrl+d" || keyword === "eof") {
-        task.process.stdin?.end();
+        closeTaskInput(task);
         return {
-          content: [{ type: "text", text: `Closed stdin for "${task.name}".` }],
+          content: [{ type: "text", text: task.mode === "pty" ? `Sent EOF (Ctrl+D) to "${task.name}" PTY.` : `Closed stdin for "${task.name}".` }],
           details: { id: task.id, name: task.name, eof: true },
         };
       }
 
       const input = params.text ?? "";
-      const data = (keyword && CTRL[keyword]) || (params.raw ? Buffer.from(input, "utf-8") : Buffer.from(input + "\n", "utf-8"));
+      const data = (keyword && CTRL[keyword]) || (params.raw ? Buffer.from(input, "utf-8") : Buffer.from(input + (task.mode === "pty" ? "\r" : "\n"), "utf-8"));
       const desc = keyword && CTRL[keyword] ? keyword : params.raw ? `raw(${input})` : JSON.stringify(input);
 
       try {
-        task.process.stdin?.write(data);
-        return { content: [{ type: "text", text: `Sent to "${task.name}": ${desc} (${data.length} bytes)` }], details: { id: task.id, name: task.name, bytes: data.length, keyword } };
+        writeTaskInput(task, data);
+        return { content: [{ type: "text", text: `Sent to "${task.name}": ${desc} (${data.length} bytes)` }], details: { id: task.id, name: task.name, bytes: data.length, keyword, mode: task.mode } };
       } catch (err) {
         return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
       }
@@ -816,12 +1262,18 @@ export default function (pi: ExtensionAPI) {
       await waitForTaskEnd(task, params.force ? 500 : 2500);
 
       const tail = params.tail_lines || 30;
-      const stdout = await readTail(task.stdoutFile, tail);
-      const stderr = await readTail(task.stderrFile, tail);
       const action = task.status === "running" ? `Sent ${signal} to` : "Terminated";
       const parts = [`${action} "${task.name}". Status: ${task.status}`];
-      if (stdout) parts.push(`\n── stdout (last ${tail}) ──\n${stdout}`);
-      if (stderr) parts.push(`\n── stderr (last ${tail}) ──\n${stderr}`);
+      if (task.mode === "pty") {
+        await flushPty(task);
+        const terminal = getPtySnapshotLines(task).slice(-tail).join("\n");
+        if (terminal) parts.push(`\n── terminal (last ${tail}) ──\n${terminal}`);
+      } else {
+        const stdout = await readTail(task.stdoutFile, tail);
+        const stderr = await readTail(task.stderrFile, tail);
+        if (stdout) parts.push(`\n── stdout (last ${tail}) ──\n${stdout}`);
+        if (stderr) parts.push(`\n── stderr (last ${tail}) ──\n${stderr}`);
+      }
 
       return { content: [{ type: "text", text: parts.join("\n") }], details: { id: task.id, name: task.name, status: task.status, signal } };
     },
@@ -845,6 +1297,41 @@ export default function (pi: ExtensionAPI) {
         return theme.fg("toolOutput", l) || l;
       });
       return new Text(lines.join("\n"), 0, 0);
+    },
+  });
+
+  // ── /bg-attach command ─────────────────────────────────────────────
+
+  pi.registerCommand("bg-attach", {
+    description: "Attach the terminal to a running PTY background task (Ctrl+] to detach)",
+    getArgumentCompletions: (prefix: string) => {
+      const items = Array.from(tasks.values())
+        .filter((task) => task.mode === "pty" && task.status === "running")
+        .map((task) => ({ value: task.id, label: `${task.id} ${task.name}` }));
+      return items.filter((item) => item.value.startsWith(prefix));
+    },
+    handler: async (args, ctx) => {
+      let id = args.trim().split(/\s+/, 1)[0];
+      if (!id) {
+        const running = Array.from(tasks.values()).filter((task) => task.mode === "pty" && task.status === "running");
+        if (running.length === 0) {
+          ctx.ui.notify("No running PTY tasks.", "info");
+          return;
+        }
+        const choice = await ctx.ui.select(
+          "Attach to which PTY task? (Ctrl+] to detach)",
+          running.map((task) => `${task.id} ${task.name}`),
+        );
+        if (!choice) return;
+        id = choice.split(" ", 1)[0];
+      }
+
+      const task = tasks.get(id);
+      if (!task) {
+        ctx.ui.notify(`Task not found: ${id}`, "error");
+        return;
+      }
+      await attachPtyTask(task, ctx);
     },
   });
 

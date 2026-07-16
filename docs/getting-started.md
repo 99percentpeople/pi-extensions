@@ -14,10 +14,13 @@ Before you begin, make sure you have:
 
 ## Installation
 
-### Option 1: Install from npm (Recommended)
+### Option 1: Install independent packages from npm (Recommended)
 
 ```bash
-pi install npm:pi-extensions
+pi install npm:@99percentpeople/pi-background-tasks
+
+# Windows only, when PowerShell 7 integration is wanted
+pi install npm:@99percentpeople/pi-pwsh-adapter
 ```
 
 ### Option 2: Install from source
@@ -30,12 +33,12 @@ cd pi-extensions
 # Install dependencies
 bun install
 
-# Install globally
-pi install .
+# Install background-tasks globally from the checkout
+pi install ./extensions/background-tasks
 
 # Or install to a specific project
 cd ~/your-project
-pi install -l /path/to/pi-extensions
+pi install -l /path/to/pi-extensions/extensions/background-tasks
 ```
 
 ### Option 3: Quick test without installing
@@ -63,8 +66,14 @@ bg_logs id="abcd" tail=50
 # Send input
 bg_send id="abcd" text="y"
 
-# Stop task
-bg_stop id="abcd" force=true
+# Terminate a task
+bg_kill id="abcd" force=true
+
+# Start a full-screen TUI in a pseudoterminal
+bg_start name="git-ui" command="lazygit" pty=true
+
+# Attach from the Pi command line; press Ctrl+] to detach
+/bg-attach abcd
 ```
 
 ### PWSh Adapter
@@ -135,19 +144,21 @@ export default function (pi: ExtensionAPI) {
 pi -e ./extensions/my-extension/index.ts
 ```
 
-### Step 4: Add to package.json
+### Step 4: Add an extension package.json
 
 ```json
 {
+  "name": "@your-scope/pi-my-extension",
+  "version": "1.0.0",
+  "type": "module",
   "pi": {
-    "extensions": [
-      "./extensions/background-tasks/index.ts",
-      "./extensions/pwsh-adapter/index.ts",
-      "./extensions/my-extension/index.ts"
-    ]
+    "extensions": ["./index.ts"]
   }
 }
 ```
+
+Add `extensions/my-extension` to the root Bun `workspaces` array. Each
+extension is versioned and published from its own directory.
 
 ### Step 5: Update documentation
 
@@ -202,7 +213,7 @@ ctx.ui.setWidget("my-ext", ["Line 1", "Line 2"]);
 ### Extension not loading
 
 1. Check for TypeScript errors: `bun run lint`
-2. Verify the extension path in `package.json`
+2. Verify the extension path in the extension's own `package.json`
 3. Check Pi's error output
 
 ### Tool not appearing

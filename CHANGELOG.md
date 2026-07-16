@@ -8,12 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- PTY-backed background tasks via `bg_start pty=true`
+- `/bg-attach` full-screen terminal attachment with `Ctrl+]` detach
+- Headless terminal snapshots for `bg_logs` on PTY tasks
 - Initial project structure
 - background-tasks extension for running long commands in the background
 - pwsh-adapter extension for PowerShell 7 support on Windows
 - midnight theme
 - git-workflow skill
 - code-review prompt template
+
+### Changed
+- Split background-tasks and pwsh-adapter into independently published npm packages
+- Made pwsh-adapter a no-op outside Windows
 
 ## [1.0.0] - 2026-06-07
 

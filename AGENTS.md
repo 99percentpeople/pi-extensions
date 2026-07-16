@@ -12,8 +12,8 @@ The repository uses Bun 1.3.14 for dependency management and commits `bun.lock`.
 
 ```
 pi-extensions/
-├── extensions/           # TypeScript extensions (each in its own directory)
-├── package.json          # Pi package configuration
+├── extensions/           # Independently published Pi extension packages
+├── package.json          # Private Bun workspace configuration
 ├── tsconfig.json         # TypeScript configuration
 ├── README.md             # Project documentation
 └── AGENTS.md             # This file
@@ -25,10 +25,11 @@ pi-extensions/
 
 Each extension should:
 1. Live in its own directory under `extensions/`
-2. Export a default function that receives `ExtensionAPI`
-3. Use TypeScript with proper type annotations
-4. Include `promptSnippet` and `promptGuidelines` for tools
-5. Provide custom rendering when appropriate
+2. Include its own publishable `package.json`, `README.md`, and `LICENSE`
+3. Export a default function that receives `ExtensionAPI`
+4. Use TypeScript with proper type annotations
+5. Include `promptSnippet` and `promptGuidelines` for tools
+6. Provide custom rendering when appropriate
 
 ### Extension Types
 
@@ -54,11 +55,12 @@ pi -e ./extensions/my-extension/index.ts
 
 ## Development Workflow
 
-1. Create extension in `extensions/my-extension/index.ts`
-2. Add to `package.json` under `pi.extensions`
-3. Test with `pi -e ./extensions/my-extension/index.ts`
-4. Update README.md with documentation
-5. Run `bun run lint` for type checking
+1. Create an extension package under `extensions/my-extension/`
+2. Declare `./index.ts` under `pi.extensions` in that package's `package.json`
+3. Add the package directory to the root Bun `workspaces` array
+4. Test with `pi -e ./extensions/my-extension/index.ts`
+5. Update README.md with documentation
+6. Run `bun run check` and the package's pack dry-run
 
 ## Resources
 

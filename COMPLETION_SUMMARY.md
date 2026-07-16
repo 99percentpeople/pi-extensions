@@ -9,7 +9,7 @@
 - ✅ Created development tools and scripts
 
 ### 2. Extensions Development
-- ✅ **background-tasks**: Background task management with 5 tools
+- ✅ **background-tasks**: Background task management with 6 tools and PTY support
 - ✅ **pwsh-adapter**: PowerShell 7 adapter for Windows
 
 ### 3. Documentation
@@ -32,7 +32,7 @@
 ### 5. CI/CD Setup
 - ✅ **.github/workflows/ci.yml**: GitHub Actions workflow
 - ✅ Type checking on multiple platforms
-- ✅ Automated npm publishing
+- ✅ Independent npm package validation
 
 ### 6. Additional Resources
 - ✅ **themes/midnight.json**: Dark theme for night coding
@@ -56,7 +56,7 @@ pi-extensions/
 ├── examples/                   # Example configurations
 ├── tests/                      # Test documentation
 ├── docs/                       # Documentation
-├── package.json                # Pi package configuration
+├── package.json                # Private Bun workspace configuration
 ├── tsconfig.json               # TypeScript configuration
 ├── README.md                   # Main documentation
 ├── AGENTS.md                   # AI agent configuration
@@ -76,7 +76,10 @@ pi-extensions/
 
 1. **Install the extensions**:
    ```bash
-   pi install npm:pi-extensions
+   pi install npm:@99percentpeople/pi-background-tasks
+
+   # Windows only
+   pi install npm:@99percentpeople/pi-pwsh-adapter
    ```
 
 2. **Test the extensions**:
@@ -125,7 +128,7 @@ pi-extensions/
 - **Cross-platform scripts**: Windows and Linux/macOS support
 - **Makefile**: Common development commands
 - **VS Code integration**: Recommended extensions and settings
-- **CI/CD**: Automated testing and publishing
+- **CI/CD**: Cross-platform validation and independent package checks
 
 ### Documentation
 - **Comprehensive guides**: Getting started, contribution guidelines

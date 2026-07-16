@@ -1,0 +1,49 @@
+{
+  "name": "@99percentpeople/pi-pwsh-adapter",
+  "version": "1.0.0",
+  "description": "Optional PowerShell 7 shell adapter for Pi on Windows",
+  "type": "module",
+  "os": [
+    "win32"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepublishOnly": "bun run --cwd ../.. check"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "powershell",
+    "pwsh",
+    "windows"
+  ],
+  "author": "99percentpeople",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/99percentpeople/pi-extensions.git",
+    "directory": "extensions/pwsh-adapter"
+  },
+  "bugs": {
+    "url": "https://github.com/99percentpeople/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/99percentpeople/pi-extensions#pwsh-adapter",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

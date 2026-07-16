@@ -5,6 +5,7 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { IPty } from "node-pty";
 import backgroundTasks from "../extensions/background-tasks/index.ts";
 
 interface RegisteredTool {
@@ -48,12 +49,64 @@ class FakeChildProcess extends EventEmitter {
   }
 }
 
+class FakePty {
+  readonly process = "fake";
+  readonly writes: Array<string | Buffer> = [];
+  readonly onDataListeners = new Set<(data: string) => void>();
+  readonly onExitListeners = new Set<(event: { exitCode: number; signal?: number }) => void>();
+  handleFlowControl = false;
+  closed = false;
+
+  constructor(readonly pid: number, public cols: number, public rows: number) {}
+
+  onData(listener: (data: string) => void) {
+    this.onDataListeners.add(listener);
+    return { dispose: () => this.onDataListeners.delete(listener) };
+  }
+
+  onExit(listener: (event: { exitCode: number; signal?: number }) => void) {
+    this.onExitListeners.add(listener);
+    return { dispose: () => this.onExitListeners.delete(listener) };
+  }
+
+  emitData(data: string): void {
+    for (const listener of this.onDataListeners) listener(data);
+  }
+
+  write(data: string | Buffer): void {
+    this.writes.push(data);
+  }
+
+  resize(cols: number, rows: number): void {
+    this.cols = cols;
+    this.rows = rows;
+  }
+
+  clear(): void {}
+  pause(): void {}
+  resume(): void {}
+
+  kill(signal?: string): void {
+    this.finish(signal ? 1 : 0, signal ? 9 : undefined);
+  }
+
+  finish(exitCode: number, signal?: number): void {
+    if (this.closed) return;
+    this.closed = true;
+    queueMicrotask(() => {
+      for (const listener of this.onExitListeners) listener({ exitCode, signal });
+    });
+  }
+}
+
 function createHarness() {
   const tools = new Map<string, RegisteredTool>();
+  const commands = new Map<string, any>();
   const lifecycle = new Map<string, (...args: any[]) => Promise<void> | void>();
   const eventBus = new EventEmitter();
   const messages: SentMessage[] = [];
   const children: FakeChildProcess[] = [];
+  const ptys: FakePty[] = [];
 
   const pi = {
     events: {
@@ -62,7 +115,7 @@ function createHarness() {
     },
     on: (name: string, handler: (...args: any[]) => Promise<void> | void) => lifecycle.set(name, handler),
     registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
-    registerCommand: () => {},
+    registerCommand: (name: string, command: any) => commands.set(name, command),
     sendMessage: (message: SentMessage["message"], options?: SentMessage["options"]) => {
       messages.push({ message, options });
     },
@@ -84,12 +137,17 @@ function createHarness() {
       children.push(child);
       return child as unknown as ChildProcess;
     },
+    ptySpawn: (_file: string, _args: string[] | string, options: { cols?: number; rows?: number }) => {
+      const pty = new FakePty(91_000_000 + ptys.length, options.cols ?? 80, options.rows ?? 24);
+      ptys.push(pty);
+      return pty as unknown as IPty;
+    },
   });
-  return { tools, lifecycle, messages, children, ctx };
+  return { tools, commands, lifecycle, messages, children, ptys, ctx };
 }
 
 test("background tasks wait explicitly, discourage polling, and expose the latest log", async () => {
-  const { tools, lifecycle, messages, children, ctx } = createHarness();
+  const { tools, commands, lifecycle, messages, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgWait = tools.get("bg_wait");
   const bgStatus = tools.get("bg_status");
@@ -98,6 +156,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   const bgKill = tools.get("bg_kill");
   assert.ok(bgStart && bgWait && bgStatus && bgLogs && bgSend && bgKill);
   assert.equal(tools.has("bg_stop"), false);
+  assert.ok(commands.has("bg-attach"));
 
   assert.equal(bgWait.executionMode, "sequential");
   assert.equal(bgStatus.executionMode, "sequential");
@@ -270,6 +329,100 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   const expandedLines = expanded.render(80);
   assert.ok(expandedLines.some((line: string) => line.includes("── stdout ──")));
   assert.ok(expandedLines.some((line: string) => line.includes("── stderr ──")));
+
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("PTY tasks preserve terminal state and use terminal input semantics", async () => {
+  const { tools, lifecycle, ptys, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgWait = tools.get("bg_wait");
+  const bgLogs = tools.get("bg_logs");
+  const bgSend = tools.get("bg_send");
+  const bgKill = tools.get("bg_kill");
+  assert.ok(bgStart && bgWait && bgLogs && bgSend && bgKill);
+
+  const started = await bgStart.execute(
+    "pty-start",
+    { name: "pty-demo", command: "fake tui", pty: true, cols: 40, rows: 8 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const id = started.details.id as string;
+  assert.equal(started.details.mode, "pty");
+  assert.match(started.content[0].text, new RegExp(`/bg-attach ${id}`));
+  assert.equal(ptys[0].cols, 40);
+  assert.equal(ptys[0].rows, 8);
+
+  ptys[0].emitData("\x1b[2J\x1b[HPTY_READY\r\n");
+  ptys[0].emitData("name: ");
+
+  const snapshot = await bgLogs.execute(
+    "pty-logs",
+    { id, stream: "terminal", tail: 10 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(snapshot.details.mode, "pty");
+  assert.match(snapshot.content[0].text, /── terminal ──/);
+  assert.match(snapshot.content[0].text, /PTY_READY/);
+  assert.match(snapshot.content[0].text, /name:/);
+
+  const sent = await bgSend.execute(
+    "pty-send",
+    { id, text: "Alice" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(sent.content[0].text, /Sent to/);
+  assert.equal(Buffer.from(ptys[0].writes.at(-1) as Buffer).toString("utf8"), "Alice\r");
+
+  const interrupted = await bgSend.execute(
+    "pty-ctrl-c",
+    { id, text: "ctrl+c" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(interrupted.content[0].text, /Sent ctrl\+c/);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([0x03]));
+  assert.equal(ptys[0].closed, false, "PTY Ctrl+C should be terminal input, not an immediate kill");
+
+  const stderr = await bgLogs.execute(
+    "pty-stderr",
+    { id, stream: "stderr" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(stderr.content[0].text, /combines stdout and stderr/);
+
+  ptys[0].emitData("Alice\r\nDONE\r\n");
+  ptys[0].finish(0);
+  const waited = await bgWait.execute("pty-wait", { id, timeout: 1 }, undefined, undefined, ctx);
+  assert.equal(waited.details.status, "completed");
+  assert.equal(waited.details.mode, "pty");
+  assert.match(waited.content[0].text, /Mode:\s+pty/);
+  assert.match(waited.content[0].text, /Latest log: \[terminal\] DONE/);
+
+  const killStarted = await bgStart.execute(
+    "pty-kill-start",
+    { name: "pty-kill", command: "fake persistent tui", pty: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const killed = await bgKill.execute(
+    "pty-kill",
+    { id: killStarted.details.id, force: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(killed.content[0].text, /Status: stopped/);
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });

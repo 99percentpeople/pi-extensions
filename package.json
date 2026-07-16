@@ -1,48 +1,22 @@
 {
-  "name": "@99percentpeople/pi-extensions",
+  "name": "pi-extensions-workspace",
+  "private": true,
   "version": "1.0.0",
   "packageManager": "bun@1.3.14",
-  "description": "Custom extensions for Pi coding agent - background tasks and PowerShell adapter",
+  "description": "Bun workspace for independently published Pi extensions",
   "type": "module",
-  "main": "index.js",
-  "files": [
-    "extensions/",
-    "themes/",
-    "skills/",
-    "prompts/",
-    "README.md",
-    "LICENSE",
-    "CHANGELOG.md"
+  "workspaces": [
+    "extensions/background-tasks",
+    "extensions/pwsh-adapter"
   ],
   "scripts": {
-    "test": "node --import tsx --test tests/background-tasks.test.ts",
+    "test": "node --import tsx --test tests/background-tasks.test.ts tests/packages.test.ts",
     "lint": "tsc --noEmit",
-    "check": "tsc --noEmit"
+    "check": "bun run lint && bun run test",
+    "pack:background-tasks": "bun pm pack --dry-run --cwd extensions/background-tasks",
+    "pack:pwsh-adapter": "bun pm pack --dry-run --cwd extensions/pwsh-adapter",
+    "pack:check": "bun run check && bun run pack:background-tasks && bun run pack:pwsh-adapter"
   },
-  "pi": {
-    "extensions": [
-      "./extensions/background-tasks/index.ts",
-      "./extensions/pwsh-adapter/index.ts"
-    ],
-    "themes": [
-      "./themes/midnight.json"
-    ],
-    "skills": [
-      "./skills/git-workflow/SKILL.md"
-    ],
-    "prompts": [
-      "./prompts/code-review.md"
-    ]
-  },
-  "keywords": [
-    "pi",
-    "extensions",
-    "coding-agent",
-    "ai",
-    "background-tasks",
-    "powershell",
-    "pwsh"
-  ],
   "author": "99percentpeople",
   "license": "MIT",
   "repository": {
@@ -53,12 +27,6 @@
     "url": "https://github.com/99percentpeople/pi-extensions/issues"
   },
   "homepage": "https://github.com/99percentpeople/pi-extensions#readme",
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
-  },
   "devDependencies": {
     "@earendil-works/pi-ai": "latest",
     "@earendil-works/pi-coding-agent": "latest",
@@ -67,5 +35,8 @@
     "tsx": "latest",
     "typebox": "latest",
     "typescript": "^5.0.0"
-  }
+  },
+  "trustedDependencies": [
+    "node-pty"
+  ]
 }

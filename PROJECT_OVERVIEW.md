@@ -20,8 +20,12 @@ pi-extensions/
 │       └── ci.yml              # Continuous integration
 ├── extensions/                 # TypeScript extensions (main content)
 │   ├── background-tasks/       # Background task management
+│   │   ├── package.json         # Independent npm package
+│   │   ├── README.md
 │   │   └── index.ts
 │   └── pwsh-adapter/           # PowerShell 7 adapter
+│       ├── package.json         # Independent npm package
+│       ├── README.md
 │       └── index.ts
 ├── themes/                     # Color themes
 │   └── midnight.json
@@ -39,7 +43,7 @@ pi-extensions/
 │   └── settings.json
 ├── tests/                      # Test documentation
 │   └── README.md
-├── package.json                # Pi package configuration
+├── package.json                # Private Bun workspace configuration
 ├── tsconfig.json               # TypeScript configuration
 ├── README.md                   # Main documentation
 ├── AGENTS.md                   # AI agent configuration
@@ -97,8 +101,8 @@ touch extensions/my-extension/index.ts
 # Implement extension
 # (see AGENTS.md for guidelines)
 
-# Add to package.json
-# Update README.md
+# Add an extension-local package.json and README.md
+# Add the package to the root workspaces array
 ```
 
 ### 2. Testing Extensions
@@ -119,16 +123,17 @@ pi -e ./extensions/background-tasks/index.ts \
 ### 3. Publishing Extensions
 
 ```bash
-# Update version
+# Enter the package being released and update its version
+cd extensions/background-tasks
 bun pm version patch
 
 # Update CHANGELOG.md
 
-# Publish to npm
-bun publish
+# Publish only that package to npm
+bun publish --access public
 
 # Or share via GitHub
-git push origin main
+git push origin master
 ```
 
 ## Best Practices
@@ -161,7 +166,7 @@ git push origin main
 
 1. Fork this repository
 2. Create your extensions in `extensions/`
-3. Update `package.json` with your extensions
+3. Give each extension its own package metadata and add it to the workspace
 4. Update `README.md` with documentation
 5. Share with the community
 

@@ -3,6 +3,7 @@
 
 param(
     [switch]$Global,
+    [switch]$WithPwsh,
     [switch]$Test,
     [switch]$Help
 )
@@ -11,13 +12,15 @@ if ($Help) {
     Write-Host "Pi Extensions Installation Script"
     Write-Host ""
     Write-Host "Usage:"
-    Write-Host "  .\scripts\install.ps1              # Install to current project"
-    Write-Host "  .\scripts\install.ps1 -Global      # Install globally"
+    Write-Host "  .\scripts\install.ps1              # Install background-tasks to current project"
+    Write-Host "  .\scripts\install.ps1 -Global      # Install background-tasks globally"
+    Write-Host "  .\scripts\install.ps1 -WithPwsh    # Also install the PowerShell adapter"
     Write-Host "  .\scripts\install.ps1 -Test        # Test extensions"
     Write-Host "  .\scripts\install.ps1 -Help        # Show this help"
     Write-Host ""
     Write-Host "Examples:"
-    Write-Host "  .\scripts\install.ps1 -Global      # Install globally for all projects"
+    Write-Host "  .\scripts\install.ps1 -Global                 # Install background-tasks globally"
+    Write-Host "  .\scripts\install.ps1 -Global -WithPwsh      # Install both packages globally"
     Write-Host "  .\scripts\install.ps1 -Test        # Test all extensions"
     exit 0
 }
@@ -62,9 +65,12 @@ if ($Global) {
         exit 1
     }
     
-    # Install globally
-    Write-Host "Installing to global Pi directory..." -ForegroundColor Yellow
-    pi install $rootDir
+    Write-Host "Installing background-tasks to global Pi directory..." -ForegroundColor Yellow
+    pi install (Join-Path $rootDir "extensions\background-tasks")
+    if ($WithPwsh) {
+        Write-Host "Installing pwsh-adapter..." -ForegroundColor Yellow
+        pi install (Join-Path $rootDir "extensions\pwsh-adapter")
+    }
     
     Write-Host ""
     Write-Host "Installation complete!" -ForegroundColor Green
@@ -78,9 +84,12 @@ if ($Global) {
         New-Item -ItemType Directory -Path ".pi" -Force | Out-Null
     }
     
-    # Install to current project
-    Write-Host "Installing to project..." -ForegroundColor Yellow
-    pi install -l $rootDir
+    Write-Host "Installing background-tasks to project..." -ForegroundColor Yellow
+    pi install -l (Join-Path $rootDir "extensions\background-tasks")
+    if ($WithPwsh) {
+        Write-Host "Installing pwsh-adapter..." -ForegroundColor Yellow
+        pi install -l (Join-Path $rootDir "extensions\pwsh-adapter")
+    }
     
     Write-Host ""
     Write-Host "Installation complete!" -ForegroundColor Green

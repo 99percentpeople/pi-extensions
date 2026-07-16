@@ -1,7 +1,7 @@
 # Pi Extensions Makefile
 # Provides common development commands
 
-.PHONY: help install lint test clean publish
+.PHONY: help install lint test clean pack publish-background publish-pwsh
 
 # Default target
 help:
@@ -11,7 +11,9 @@ help:
 	@echo "  make lint       - Run type checking"
 	@echo "  make test       - Test extensions"
 	@echo "  make clean      - Clean build artifacts"
-	@echo "  make publish    - Publish to npm"
+	@echo "  make pack       - Validate both npm package tarballs"
+	@echo "  make publish-background - Publish background-tasks"
+	@echo "  make publish-pwsh       - Publish pwsh-adapter"
 	@echo "  make help       - Show this help"
 	@echo ""
 	@echo "Extension Commands:"
@@ -67,9 +69,16 @@ clean:
 	rm -rf build
 	rm -f *.tsbuildinfo
 
-# Publish to npm
-publish:
-	bun publish
+# Validate independently published packages
+pack:
+	bun run pack:check
+
+# Publish one package at a time; the root workspace is private.
+publish-background:
+	cd extensions/background-tasks && bun publish --access public
+
+publish-pwsh:
+	cd extensions/pwsh-adapter && bun publish --access public
 
 # Initialize git repository
 init:

@@ -154,16 +154,38 @@ function createBgSpawnWrapper() {
   };
 }
 
+function createBgShellResolver() {
+  return (command: string, interactive: boolean) => ({
+    file: "pwsh",
+    args: [
+      "-NoProfile",
+      ...(interactive ? [] : ["-NonInteractive"]),
+      "-NoLogo",
+      "-Command",
+      `${UTF8_PRELUDE}\n${command}`,
+    ],
+    env: {
+      ...process.env,
+      PYTHONUTF8: "1",
+      PYTHONIOENCODING: "utf-8",
+    },
+  });
+}
+
 export default function (pi: ExtensionAPI) {
+  // This package is Windows-only. Keep accidental local loads on Unix as a no-op.
+  if (process.platform !== "win32") return;
+
   const pwshOps = createPwshBashOperations();
   const bgSpawn = createBgSpawnWrapper();
+  const bgShell = createBgShellResolver();
 
   // Adapt background-tasks extension to use pwsh instead of /bin/sh
-  pi.events.emit("bg:register", { spawn: bgSpawn });
+  pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
 
   // Re-register on session start in case bg extension loads after us
   pi.on("session_start", async (_event, ctx) => {
-    pi.events.emit("bg:register", { spawn: bgSpawn });
+    pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
     ctx.ui.notify(
       "bash tool loaded. AI bash calls and user !/!! commands now run through pwsh. background-tasks adapted.",
       "info",
