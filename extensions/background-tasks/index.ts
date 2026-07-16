@@ -217,6 +217,22 @@ function getPtySnapshotLines(task: BgTask): string[] {
   return lines;
 }
 
+const TERMINAL_SNAPSHOT_HEADER = "── terminal snapshot";
+
+function formatPtyScreenSnapshot(task: BgTask, label?: string): string {
+  const rows = task.ptyState?.terminal.rows ?? 30;
+  const snapshot = getPtySnapshotLines(task).slice(-rows).join("\n");
+  const header = label ? `${TERMINAL_SNAPSHOT_HEADER}: ${label} ──` : `${TERMINAL_SNAPSHOT_HEADER} ──`;
+  return `${header}\n${snapshot || "(no terminal output yet)"}`;
+}
+
+function renderContentWithoutCollapsedSnapshots(content: string, expanded: boolean): string {
+  if (expanded) return content;
+  const lines = content.split("\n");
+  const snapshotIndex = lines.findIndex((line) => line.startsWith(TERMINAL_SNAPSHOT_HEADER));
+  return snapshotIndex === -1 ? content : lines.slice(0, snapshotIndex).join("\n").trimEnd();
+}
+
 function updatePtyLatestLog(task: BgTask): void {
   const latestText = getPtySnapshotLines(task).findLast((line) => line.trim().length > 0)?.trim();
   if (!latestText) return;
@@ -757,11 +773,13 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use bg_wait once when the final result of a finite background task is required before responding.",
       "Prefer doing other useful work first, then use bg_wait instead of polling bg_status/bg_logs or running a shell sleep command.",
+      "For a PTY task, set terminal_snapshot=true when the final terminal screen is needed; it is omitted by default.",
       "Do not use bg_wait for persistent servers or watchers. A timeout leaves the task running; do not immediately call bg_wait again unless the user asks you to keep waiting.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
       timeout: Type.Optional(Type.Number({ description: "Maximum seconds to wait (default: 300)", minimum: 1, maximum: 3600 })),
+      terminal_snapshot: Type.Optional(Type.Boolean({ description: "For PTY tasks, include the current terminal screen in the result (default: false)" })),
     }),
 
     executionMode: "sequential",
@@ -793,7 +811,9 @@ export default function (pi: ExtensionAPI) {
       );
       if (task.exitCode !== null) parts.push(`  Exit code:  ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:     ${task.signal}`);
-      parts.push(...formatTaskOutputStats(task), `  Latest log: ${formatLatestLog(task.latestLog)}`);
+      parts.push(...formatTaskOutputStats(task));
+      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
+      else if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
       if (task.mode === "pipe" && !timedOut && task.exitCode === 0 && task.stderrLines > 0) {
         parts.push("  Note: the task exited with code 0 but wrote output to stderr.");
       }
@@ -811,7 +831,8 @@ export default function (pi: ExtensionAPI) {
           mode: task.mode,
           stdoutLines: task.stdoutLines,
           stderrLines: task.stderrLines,
-          latestLog: task.latestLog,
+          latestLog: task.mode === "pipe" ? task.latestLog : null,
+          terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot),
         },
       };
     },
@@ -821,13 +842,17 @@ export default function (pi: ExtensionAPI) {
       const task = tasks.get(args.id);
       const name = task ? theme.fg("accent", task.name) : theme.fg("muted", args.id);
       const timeout = theme.fg("dim", ` timeout=${args.timeout ?? 300}s`);
-      text.setText(theme.fg("toolTitle", theme.bold("bg_wait ")) + name + timeout);
+      const snapshot = args.terminal_snapshot
+        ? theme.fg("dim", ` snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
+        : "";
+      text.setText(theme.fg("toolTitle", theme.bold("bg_wait ")) + name + timeout + snapshot);
       return text;
     },
 
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Waiting..."), 0, 0);
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const visibleContent = renderContentWithoutCollapsedSnapshots(content, Boolean(expanded));
       const details = result.details as { status?: BgTask["status"]; timedOut?: boolean } | undefined;
       const color = details?.timedOut
         ? "warning"
@@ -836,7 +861,7 @@ export default function (pi: ExtensionAPI) {
           : details?.status === "stopped"
             ? "warning"
             : "toolOutput";
-      return new Text(theme.fg(color, content) || content, 0, 0);
+      return new Text(theme.fg(color, visibleContent) || visibleContent, 0, 0);
     },
   });
 
@@ -851,9 +876,11 @@ export default function (pi: ExtensionAPI) {
       "Do not poll bg_status after bg_start; use bg_wait once when a finite task's final result is required.",
       "Use bg_status only when the user explicitly asks for current task details, when recovering missing context, or when diagnosing task state.",
       "Use bg_status without id only when a task ID is unknown and a task list is specifically needed.",
+      "For PTY tasks, set terminal_snapshot=true only when the current terminal screen is needed; it is omitted by default.",
     ],
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task ID. If omitted, lists all tasks." })),
+      terminal_snapshot: Type.Optional(Type.Boolean({ description: "For PTY tasks, include the current terminal screen in the result (default: false)" })),
     }),
 
     executionMode: "sequential",
@@ -873,11 +900,18 @@ export default function (pi: ExtensionAPI) {
         const lines = entries.map((t) => {
           const dur = t.endedAt ? formatDuration(t.endedAt - t.startedAt) : formatDuration(Date.now() - t.startedAt);
           const exit = t.exitCode !== null ? ` exit=${t.exitCode}` : "";
-          return `[${t.id}] "${t.name}" ${t.status} ${t.mode} (${dur})${exit}\n  Latest log: ${formatLatestLog(t.latestLog)}`;
+          const summary = `[${t.id}] "${t.name}" ${t.status} ${t.mode} (${dur})${exit}`;
+          if (t.mode === "pipe") return `${summary}\n  Latest log: ${formatLatestLog(t.latestLog)}`;
+          return summary;
         });
+        if (params.terminal_snapshot) {
+          lines.push(...entries
+            .filter((task) => task.mode === "pty")
+            .map((task) => formatPtyScreenSnapshot(task, `"${task.name}" (${task.id})`)));
+        }
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { tasks: entries.map((t) => ({ id: t.id, name: t.name, status: t.status, mode: t.mode, latestLog: t.latestLog })) },
+          details: { tasks: entries.map((t) => ({ id: t.id, name: t.name, status: t.status, mode: t.mode, latestLog: t.mode === "pipe" ? t.latestLog : null, terminalSnapshot: t.mode === "pty" && Boolean(params.terminal_snapshot) })) },
         };
       }
 
@@ -902,12 +936,14 @@ export default function (pi: ExtensionAPI) {
       if (task.exitCode !== null) parts.push(`  Exit code: ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:    ${task.signal}`);
       if (task.process?.pid) parts.push(`  PID:       ${task.process.pid}`);
-      parts.push(...formatTaskOutputStats(task), `  Latest log: ${formatLatestLog(task.latestLog)}`);
+      parts.push(...formatTaskOutputStats(task));
+      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
+      else if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
       if (task.status === "running") parts.push("  Use bg_wait to await completion; do not poll bg_status.");
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, wait: task.wait, latestLog: task.latestLog },
+        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, wait: task.wait, latestLog: task.mode === "pipe" ? task.latestLog : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
       };
     },
 
@@ -915,14 +951,18 @@ export default function (pi: ExtensionAPI) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const t = args.id ? tasks.get(args.id) : undefined;
       const label = t ? theme.fg("accent", t.name) : args.id ? theme.fg("muted", args.id) : theme.fg("toolOutput", "all");
-      text.setText(theme.fg("toolTitle", theme.bold("bg_status ")) + label);
+      const snapshot = args.terminal_snapshot
+        ? theme.fg("dim", ` snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
+        : "";
+      text.setText(theme.fg("toolTitle", theme.bold("bg_status ")) + label + snapshot);
       return text;
     },
 
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Checking..."), 0, 0);
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const lines = content.split("\n").map(l => {
+      const visibleContent = renderContentWithoutCollapsedSnapshots(content, Boolean(expanded));
+      const lines = visibleContent.split("\n").map(l => {
         if (l.includes("Status:")) {
           if (l.includes("running")) return l.replace("running", theme.fg("success", "running"));
           if (l.includes("completed")) return l.replace("completed", theme.fg("accent", "completed"));
@@ -1239,11 +1279,12 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use bg_kill when a background task needs to be terminated.",
       "Use bg_kill with force=true to send SIGKILL immediately; otherwise it sends SIGTERM.",
+      "For PTY tasks, set terminal_snapshot=true when the final terminal screen is needed; it is omitted by default.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
       force: Type.Optional(Type.Boolean({ description: "Send SIGKILL instead of SIGTERM (default: false)" })),
-      tail_lines: Type.Optional(Type.Number({ description: "Return last N lines of output (default: 30)" })),
+      terminal_snapshot: Type.Optional(Type.Boolean({ description: "For PTY tasks, include the final terminal screen in the result (default: false)" })),
     }),
 
     async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
@@ -1261,21 +1302,19 @@ export default function (pi: ExtensionAPI) {
 
       await waitForTaskEnd(task, params.force ? 500 : 2500);
 
-      const tail = params.tail_lines || 30;
       const action = task.status === "running" ? `Sent ${signal} to` : "Terminated";
       const parts = [`${action} "${task.name}". Status: ${task.status}`];
       if (task.mode === "pty") {
         await flushPty(task);
-        const terminal = getPtySnapshotLines(task).slice(-tail).join("\n");
-        if (terminal) parts.push(`\n── terminal (last ${tail}) ──\n${terminal}`);
+        if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
       } else {
-        const stdout = await readTail(task.stdoutFile, tail);
-        const stderr = await readTail(task.stderrFile, tail);
-        if (stdout) parts.push(`\n── stdout (last ${tail}) ──\n${stdout}`);
-        if (stderr) parts.push(`\n── stderr (last ${tail}) ──\n${stderr}`);
+        parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
       }
 
-      return { content: [{ type: "text", text: parts.join("\n") }], details: { id: task.id, name: task.name, status: task.status, signal } };
+      return {
+        content: [{ type: "text", text: parts.join("\n") }],
+        details: { id: task.id, name: task.name, status: task.status, signal, mode: task.mode, latestLog: task.mode === "pipe" ? task.latestLog : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
+      };
     },
 
     renderCall(args, theme, context) {
@@ -1283,14 +1322,18 @@ export default function (pi: ExtensionAPI) {
       const t = tasks.get(args.id);
       const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
       const sig = args.force ? theme.fg("error", " SIGKILL") : "";
-      text.setText(theme.fg("toolTitle", theme.bold("bg_kill ")) + name + sig);
+      const snapshot = args.terminal_snapshot
+        ? theme.fg("dim", ` snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
+        : "";
+      text.setText(theme.fg("toolTitle", theme.bold("bg_kill ")) + name + sig + snapshot);
       return text;
     },
 
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Killing..."), 0, 0);
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const lines = content.split("\n").map(l => {
+      const visibleContent = renderContentWithoutCollapsedSnapshots(content, Boolean(expanded));
+      const lines = visibleContent.split("\n").map(l => {
         if (l.includes("SIGKILL")) return theme.fg("error", l) || l;
         if (l.includes("SIGTERM")) return theme.fg("warning", l) || l;
         if (l.startsWith("── ") || l.startsWith("-- ")) return theme.fg("accent", l) || l;

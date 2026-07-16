@@ -93,7 +93,7 @@ Run long-running commands in the background with real-time monitoring.
 - Detachable, resizable terminal sessions backed by `node-pty` and xterm headless
 - Explicit completion waits with timeout via `bg_wait` (no polling or AI follow-up notifications)
 - Auto-throttle via AbortController for explicit status checks
-- Latest stdout/stderr/terminal log line included in `bg_status`
+- Latest stdout/stderr line included for pipe tasks; PTY snapshots are opt-in with `terminal_snapshot=true` and collapsed by default
 - ANSI-safe `bg_logs` output, collapsed by default with dynamic standard-key expand/collapse hints
 - Widget with real-time refresh (100ms)
 - Extensible spawn backend via pi.events

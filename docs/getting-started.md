@@ -72,6 +72,9 @@ bg_kill id="abcd" force=true
 # Start a full-screen TUI in a pseudoterminal
 bg_start name="git-ui" command="lazygit" pty=true
 
+# Wait and include the final PTY screen without a separate bg_logs call
+bg_wait id="abcd" terminal_snapshot=true
+
 # Attach from the Pi command line; press Ctrl+] to detach
 /bg-attach abcd
 ```

@@ -27,6 +27,10 @@ bg_start name="git-ui" command="lazygit" pty=true
 ```
 
 PTY output combines stdout and stderr. `bg_logs` returns the parsed terminal buffer rather than raw control sequences.
+`bg_wait`, `bg_status`, and `bg_kill` omit PTY screen output by default; pass
+`terminal_snapshot=true` when the current or final terminal screen is needed in the same result.
+Snapshots are collapsed in Pi's TUI by default and can be expanded with the standard tool
+expand key. Pipe tasks continue to include their ordinary latest stdout/stderr log line.
 
 ## Native dependency
 

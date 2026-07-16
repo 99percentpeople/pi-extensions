@@ -168,6 +168,10 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.equal(bgStart.parameters.properties?.wait.maximum, 3600);
   assert.equal(bgWait.parameters.properties?.timeout.minimum, 1);
   assert.equal(bgWait.parameters.properties?.timeout.maximum, 3600);
+  assert.ok(bgWait.parameters.properties?.terminal_snapshot);
+  assert.ok(bgStatus.parameters.properties?.terminal_snapshot);
+  assert.ok(bgKill.parameters.properties?.terminal_snapshot);
+  assert.equal(bgKill.parameters.properties?.tail_lines, undefined);
 
   const first = await bgStart.execute(
     "start-1",
@@ -220,6 +224,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.equal(timeoutResult.details.timedOut, true);
   assert.equal(timeoutResult.details.status, "running");
 
+  children[1].stdout.write("older kill output\nlatest kill output\n");
   const killResult = await bgKill.execute(
     "kill-2",
     { id: longRunningId, force: true },
@@ -228,6 +233,9 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     ctx,
   );
   assert.match(killResult.content[0].text, /Status: stopped/);
+  assert.match(killResult.content[0].text, /Latest log: \[stdout\] latest kill output/);
+  assert.doesNotMatch(killResult.content[0].text, /older kill output|── stdout/);
+  assert.equal(killResult.details.latestLog.text, "latest kill output");
   assert.equal(messages.length, 0, "stopping should not enqueue an AI follow-up notification");
 
   const signalTask = await bgStart.execute(
@@ -337,10 +345,11 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   const { tools, lifecycle, ptys, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgWait = tools.get("bg_wait");
+  const bgStatus = tools.get("bg_status");
   const bgLogs = tools.get("bg_logs");
   const bgSend = tools.get("bg_send");
   const bgKill = tools.get("bg_kill");
-  assert.ok(bgStart && bgWait && bgLogs && bgSend && bgKill);
+  assert.ok(bgStart && bgWait && bgStatus && bgLogs && bgSend && bgKill);
 
   const started = await bgStart.execute(
     "pty-start",
@@ -406,7 +415,53 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   assert.equal(waited.details.status, "completed");
   assert.equal(waited.details.mode, "pty");
   assert.match(waited.content[0].text, /Mode:\s+pty/);
-  assert.match(waited.content[0].text, /Latest log: \[terminal\] DONE/);
+  assert.doesNotMatch(waited.content[0].text, /Latest log:|terminal snapshot|DONE/);
+  assert.equal(waited.details.latestLog, null);
+  assert.equal(waited.details.terminalSnapshot, false);
+
+  const waitedSnapshot = await bgWait.execute(
+    "pty-wait-snapshot",
+    { id, timeout: 1, terminal_snapshot: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(waitedSnapshot.content[0].text, /── terminal snapshot ──/);
+  assert.match(waitedSnapshot.content[0].text, /DONE/);
+  assert.doesNotMatch(waitedSnapshot.content[0].text, /Latest log:/);
+  assert.equal(waitedSnapshot.details.terminalSnapshot, true);
+
+  const status = await bgStatus.execute("pty-status", { id }, undefined, undefined, ctx);
+  assert.match(status.content[0].text, /Mode:\s+pty/);
+  assert.doesNotMatch(status.content[0].text, /Latest log:/);
+  assert.equal(status.details.latestLog, null);
+
+  const statusSnapshot = await bgStatus.execute(
+    "pty-status-snapshot",
+    { id, terminal_snapshot: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(statusSnapshot.content[0].text, /── terminal snapshot ──/);
+  assert.match(statusSnapshot.content[0].text, /DONE/);
+  assert.doesNotMatch(statusSnapshot.content[0].text, /Latest log:/);
+
+  const statusList = await bgStatus.execute("pty-status-list", {}, undefined, undefined, ctx);
+  const listedPty = statusList.details.tasks.find((task: { id: string }) => task.id === id);
+  assert.ok(listedPty);
+  assert.equal(listedPty.latestLog, null);
+  assert.doesNotMatch(statusList.content[0].text, new RegExp(`\\[${id}\\].*pty.*\\n  Latest log:`));
+
+  const statusListSnapshot = await bgStatus.execute(
+    "pty-status-list-snapshot",
+    { terminal_snapshot: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(statusListSnapshot.content[0].text, /── terminal snapshot:/);
+  assert.match(statusListSnapshot.content[0].text, /DONE/);
 
   const killStarted = await bgStart.execute(
     "pty-kill-start",
@@ -415,6 +470,7 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     undefined,
     ctx,
   );
+  ptys[1].emitData("FIRST SCREEN ROW\r\nLAST SCREEN ROW\r\n");
   const killed = await bgKill.execute(
     "pty-kill",
     { id: killStarted.details.id, force: true },
@@ -423,6 +479,59 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     ctx,
   );
   assert.match(killed.content[0].text, /Status: stopped/);
+  assert.doesNotMatch(killed.content[0].text, /Latest log:|terminal|FIRST SCREEN ROW|LAST SCREEN ROW/);
+  assert.equal(killed.details.latestLog, null);
+
+  const snapshotKillStarted = await bgStart.execute(
+    "pty-kill-snapshot-start",
+    { name: "pty-kill-snapshot", command: "fake persistent tui", pty: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  ptys[2].emitData("SNAPSHOT FIRST ROW\r\nSNAPSHOT FINAL ROW\r\n");
+  const snapshotKilled = await bgKill.execute(
+    "pty-kill-snapshot",
+    { id: snapshotKillStarted.details.id, force: true, terminal_snapshot: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(snapshotKilled.content[0].text, /Status: stopped/);
+  assert.match(snapshotKilled.content[0].text, /── terminal snapshot ──/);
+  assert.match(snapshotKilled.content[0].text, /SNAPSHOT FINAL ROW/);
+  assert.doesNotMatch(snapshotKilled.content[0].text, /Latest log:/);
+
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const renderCases = [
+    { tool: bgWait, args: { id, timeout: 1, terminal_snapshot: true }, result: waitedSnapshot },
+    { tool: bgStatus, args: { id, terminal_snapshot: true }, result: statusSnapshot },
+    { tool: bgStatus, args: { terminal_snapshot: true }, result: statusListSnapshot },
+    { tool: bgKill, args: { id: snapshotKillStarted.details.id, force: true, terminal_snapshot: true }, result: snapshotKilled },
+  ];
+  for (const { tool, args, result } of renderCases) {
+    const collapsedCall = tool.renderCall?.(args, plainTheme, { lastComponent: undefined, expanded: false });
+    assert.ok(collapsedCall);
+    assert.match(stripVTControlCharacters(collapsedCall.render(120).join("\n")), /to expand/);
+
+    const collapsedResult = tool.renderResult?.(
+      result,
+      { expanded: false, isPartial: false },
+      plainTheme,
+      { lastComponent: undefined },
+    );
+    assert.ok(collapsedResult);
+    assert.doesNotMatch(stripVTControlCharacters(collapsedResult.render(120).join("\n")), /terminal snapshot/);
+
+    const expandedResult = tool.renderResult?.(
+      result,
+      { expanded: true, isPartial: false },
+      plainTheme,
+      { lastComponent: collapsedResult },
+    );
+    assert.ok(expandedResult);
+    assert.match(stripVTControlCharacters(expandedResult.render(120).join("\n")), /terminal snapshot/);
+  }
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });

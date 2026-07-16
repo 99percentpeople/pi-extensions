@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PTY-backed background tasks via `bg_start pty=true`
 - `/bg-attach` full-screen terminal attachment with `Ctrl+]` detach
 - Headless terminal snapshots for `bg_logs` on PTY tasks
+- Opt-in, collapsed-by-default `terminal_snapshot` results for PTY-aware wait, status, and kill tools
 - Initial project structure
 - background-tasks extension for running long commands in the background
 - pwsh-adapter extension for PowerShell 7 support on Windows
