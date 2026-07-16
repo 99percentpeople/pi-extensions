@@ -422,6 +422,38 @@ const TERMINAL_RESET = [
   "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l",
   "\x1b[?2004l", "\x1b[?1049l", "\x1b[0m", "\x1b[?25h", "\x1b[2J", "\x1b[H",
 ].join("");
+const ATTACH_STATUS_GRACE_MS = 100;
+
+async function notifyAttachmentResult(
+  task: BgTask,
+  modeLabel: "PTY" | "Pipe",
+  reason: AttachmentReason,
+  attachError: string | undefined,
+  ctx: ExtensionContext,
+): Promise<void> {
+  if (attachError) {
+    ctx.ui.notify(`${modeLabel} attachment failed: ${attachError}`, "error");
+    return;
+  }
+  if (reason === "shutdown") return;
+
+  if (reason === "detached" && task.status === "running") {
+    await waitForTaskEnd(task, ATTACH_STATUS_GRACE_MS);
+  }
+  if (task.status !== "running") {
+    const detail = task.exitCode !== null
+      ? ` (exit code ${task.exitCode})`
+      : task.signal
+        ? ` (${task.signal})`
+        : "";
+    ctx.ui.notify(
+      `${modeLabel} task "${task.name}" ${task.status}${detail}.`,
+      task.status === "failed" ? "error" : "info",
+    );
+    return;
+  }
+  ctx.ui.notify(`Detached from "${task.name}".`, "info");
+}
 
 async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
   const state = task.ptyState;
@@ -527,13 +559,7 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
     } satisfies Component & { dispose(): void };
   });
 
-  if (attachError) {
-    ctx.ui.notify(`PTY attachment failed: ${attachError}`, "error");
-  } else if (reason === "exited") {
-    ctx.ui.notify(`PTY task "${task.name}" exited.`, "info");
-  } else if (reason === "detached") {
-    ctx.ui.notify(`Detached from "${task.name}"; the task is still running.`, "info");
-  }
+  await notifyAttachmentResult(task, "PTY", reason, attachError, ctx);
 }
 
 async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
@@ -615,13 +641,7 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
     } satisfies Component & { dispose(): void };
   });
 
-  if (attachError) {
-    ctx.ui.notify(`Pipe attachment failed: ${attachError}`, "error");
-  } else if (reason === "exited") {
-    ctx.ui.notify(`Pipe task "${task.name}" exited.`, "info");
-  } else if (reason === "detached") {
-    ctx.ui.notify(`Detached from "${task.name}"; the task is still running.`, "info");
-  }
+  await notifyAttachmentResult(task, "Pipe", reason, attachError, ctx);
 }
 
 async function attachTask(task: BgTask, ctx: ExtensionContext): Promise<void> {

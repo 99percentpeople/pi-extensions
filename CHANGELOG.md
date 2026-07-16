@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Allowed independent `bg_wait` calls to execute in parallel
 - Accepted common Ctrl-chord spellings and backslash-escaped literal token text in `bg_send`, while keeping terminal keys distinct from OS signals
 
+### Fixed
+- Attach exit notifications now report the settled task status instead of incorrectly claiming that a completed or stopped task is still running
+
 ## [1.0.0] - 2026-06-07
 
 ### Added

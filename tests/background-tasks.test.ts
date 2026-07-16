@@ -472,6 +472,7 @@ test("pipe tasks attach to live output without replaying historical logs", async
   await new Promise<void>((resolve) => setImmediate(resolve));
   const stdoutChunks: string[] = [];
   const stderrChunks: string[] = [];
+  const notifications: string[] = [];
   const stdout = process.stdout as NodeJS.WriteStream;
   const stderr = process.stderr as NodeJS.WriteStream;
   const originalStdoutWrite = stdout.write;
@@ -491,15 +492,18 @@ test("pipe tasks attach to live output without replaying historical logs", async
     mode: "tui",
     ui: {
       setWidget: () => {},
-      notify: () => {},
+      notify: (message: string) => notifications.push(message),
       custom: (factory: any) => new Promise((resolve) => {
         const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
-        factory(tui, {}, {}, resolve);
+        const component = factory(tui, {}, {}, resolve);
         queueMicrotask(() => {
           process.stdin.emit("data", "IGNORED_INPUT");
           children[0].stdout.write("LIVE_STDOUT\n");
           children[0].stderr.write("LIVE_STDERR\n");
-          setImmediate(() => children[0].finish(0, null));
+          setImmediate(() => {
+            component.dispose();
+            queueMicrotask(() => children[0].finish(0, null));
+          });
         });
       }),
     },
@@ -519,8 +523,8 @@ test("pipe tasks attach to live output without replaying historical logs", async
   assert.doesNotMatch(attachedStdout, /BEFORE_ATTACH/);
   assert.match(attachedStderr, /LIVE_STDERR/);
   assert.equal(children[0].stdin.read(), null, "pipe attachment must not forward keyboard input");
+  assert.deepEqual(notifications, ['Pipe task "pipe-attach" completed (exit code 0).']);
 
-  children[0].finish(0, null);
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
@@ -671,6 +675,7 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1bOA"));
 
   const attachOrder: string[] = [];
+  const attachNotifications: string[] = [];
   const pty = ptys[0];
   const originalPtyResize = pty.resize.bind(pty);
   pty.pause = () => attachOrder.push("pause");
@@ -699,7 +704,7 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     mode: "tui",
     ui: {
       setWidget: () => {},
-      notify: () => {},
+      notify: (message: string) => attachNotifications.push(message),
       custom: (factory: any) => new Promise((resolve) => {
         const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
         const component = factory(tui, {}, {}, resolve);
@@ -719,6 +724,7 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   }
 
   assert.deepEqual(attachOrder, ["pause", "resize:80x24", "clear", "snapshot", "resume"]);
+  assert.deepEqual(attachNotifications, ['Detached from "pty-demo".']);
   assert.equal(pty.cols, 80);
   assert.equal(pty.rows, 24);
 
