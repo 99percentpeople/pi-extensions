@@ -63,12 +63,10 @@ bg_status id="abcd"
 # Read logs
 bg_logs id="abcd" tail=50
 
-# Send exact text and explicitly press Enter
-bg_send id="abcd" text="y" enter=true
-
-# Send a named terminal key or an ordered PTY input sequence
-bg_send id="abcd" key="f10"
-bg_send id="abcd" sequence=[{"key":"escape"},{"text":"iHello"},{"key":"enter"}]
+# Send text and keys using the single-string input DSL
+bg_send id="abcd" input="y<Enter>"
+bg_send id="abcd" input="<F10>"
+bg_send id="abcd" input="<Esc>iHello<Enter>"
 
 # Terminate a task
 bg_kill id="abcd" force=true

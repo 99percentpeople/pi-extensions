@@ -1163,6 +1163,8 @@ export default function (pi: ExtensionAPI) {
     "eof",
   ] as const;
   type InputKey = (typeof INPUT_KEYS)[number];
+  const MAX_INPUT_BYTES = 65_536;
+  const MAX_KEY_REPEAT = 100;
 
   const FIXED_KEY_SEQUENCES: Partial<Record<InputKey, Buffer>> = {
     enter: Buffer.from("\r"), return: Buffer.from("\r"),
@@ -1206,34 +1208,125 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  const SIGNAL_ALIASES: Record<string, NodeJS.Signals> = {
-    "ctrl+c": "SIGINT",
-    "ctrl+z": "SIGTSTP",
-    "ctrl+\\": "SIGQUIT",
-  };
+  function normalizeInputToken(token: string): InputKey | "lt" | null {
+    const normalized = token.trim().toLowerCase();
+    const aliases: Record<string, InputKey | "lt"> = {
+      lt: "lt",
+      esc: "escape", escape: "escape",
+      enter: "enter", return: "enter", cr: "enter",
+      tab: "tab", "s-tab": "shift+tab", backtab: "shift+tab",
+      bs: "backspace", backspace: "backspace",
+      ins: "insert", insert: "insert", del: "delete", delete: "delete",
+      home: "home", end: "end",
+      pageup: "pageup", pgup: "pageup", pagedown: "pagedown", pgdn: "pagedown",
+      up: "up", down: "down", left: "left", right: "right",
+      eof: "eof",
+    };
+    if (aliases[normalized]) return aliases[normalized];
+    if (/^f(?:[1-9]|1[0-2])$/.test(normalized)) return normalized as InputKey;
+
+    const control = /^c-(.+)$/.exec(normalized)?.[1];
+    if (!control) return null;
+    if (/^[a-z]$/.test(control)) return `ctrl+${control}` as InputKey;
+    const controlAliases: Record<string, InputKey> = {
+      "@": "ctrl+@", space: "ctrl+space", "[": "ctrl+[",
+      "\\": "ctrl+\\", backslash: "ctrl+\\", "]": "ctrl+]",
+      "^": "ctrl+^", "_": "ctrl+_", "?": "ctrl+?",
+    };
+    return controlAliases[control] ?? null;
+  }
+
+  interface ParsedInput {
+    data: Buffer;
+    eof: boolean;
+    keyTokens: number;
+    textBytes: number;
+  }
+
+  function parseInput(task: BgTask, input: string): ParsedInput {
+    if (input.length === 0) throw new Error("Input cannot be empty; use <Enter> to press Enter.");
+
+    const chunks: Buffer[] = [];
+    let expandedBytes = 0;
+    let keyTokens = 0;
+    let textBytes = 0;
+    let eof = false;
+
+    const pushChunk = (chunk: Buffer, text: boolean): void => {
+      expandedBytes += chunk.length;
+      if (expandedBytes > MAX_INPUT_BYTES) throw new Error(`Expanded input exceeds ${MAX_INPUT_BYTES} bytes.`);
+      chunks.push(chunk);
+      if (text) textBytes += chunk.length;
+    };
+
+    let cursor = 0;
+    while (cursor < input.length) {
+      const tokenStart = input.indexOf("<", cursor);
+      if (tokenStart === -1) {
+        pushChunk(Buffer.from(input.slice(cursor), "utf-8"), true);
+        break;
+      }
+      if (tokenStart > cursor) pushChunk(Buffer.from(input.slice(cursor, tokenStart), "utf-8"), true);
+
+      const tokenEnd = input.indexOf(">", tokenStart + 1);
+      if (tokenEnd === -1) throw new Error(`Unclosed input token at offset ${tokenStart}; use <lt> for a literal '<'.`);
+      const rawToken = input.slice(tokenStart + 1, tokenEnd);
+      const repeated = /^(.*?)(?:\*([0-9]+))?$/.exec(rawToken);
+      const tokenName = repeated?.[1] ?? rawToken;
+      const repeat = repeated?.[2] === undefined ? 1 : Number(repeated[2]);
+      if (!Number.isInteger(repeat) || repeat < 1 || repeat > MAX_KEY_REPEAT) {
+        throw new Error(`Invalid repeat count in <${rawToken}> at offset ${tokenStart}; use 1-${MAX_KEY_REPEAT}.`);
+      }
+
+      const key = normalizeInputToken(tokenName);
+      if (!key) throw new Error(`Unknown input token <${tokenName}> at offset ${tokenStart}.`);
+
+      if (key === "lt") {
+        pushChunk(Buffer.from("<".repeat(repeat)), true);
+      } else {
+        keyTokens += repeat;
+        if (task.mode === "pipe") {
+          if (key === "eof" || key === "ctrl+d") {
+            if (repeat !== 1) throw new Error("<EOF> cannot be repeated for a pipe task.");
+            eof = true;
+          } else if (key === "enter") {
+            pushChunk(Buffer.from("\n".repeat(repeat)), false);
+          } else {
+            throw new Error(`Key token <${tokenName}> requires a PTY task; use signal for process signals.`);
+          }
+        } else {
+          const encoded = encodeInputKey(task, key);
+          for (let index = 0; index < repeat; index++) pushChunk(encoded, false);
+        }
+      }
+
+      cursor = tokenEnd + 1;
+    }
+
+    const data = Buffer.concat(chunks);
+    if (eof && (data.length > 0 || keyTokens !== 1)) {
+      throw new Error("For a pipe task, <EOF> must be the only input token.");
+    }
+    return { data, eof, keyTokens, textBytes };
+  }
+
   const STOP_SIGNALS = new Set<NodeJS.Signals>(["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]);
   const SEND_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP", "SIGCONT", "SIGUSR1", "SIGUSR2"] as const;
 
   pi.registerTool({
     name: "bg_send",
     label: "BG Send",
-    description: "Send exact text, named terminal keys, ordered input sequences, or an OS signal to a running background task.",
-    promptSnippet: "Send exact text, terminal keys, or a control signal to a background task",
+    description: "Send text and terminal keys using one compact input string, or send an OS signal to a running background task.",
+    promptSnippet: "Send a compact text/key input string or an OS signal to a background task",
     promptGuidelines: [
-      "Provide exactly one of text, key, sequence, or signal. Plain text is sent exactly and does not press Enter unless enter=true.",
-      "Use key for named keys such as enter, escape, arrows, ctrl+o, or f10. Use sequence to interleave exact text and named keys in one PTY write.",
-      "For pipe tasks, key=ctrl+c, ctrl+z, or ctrl+\\ sends the matching process signal; key=ctrl+d or eof closes stdin.",
-      "Use bg_kill instead when the task must be terminated forcefully.",
+      "Provide exactly one of input or signal. Plain input text is sent exactly with no implicit Enter.",
+      "Embed terminal keys in input with Vim-style tokens such as <Enter>, <Esc>, <C-o>, <Up>, or <F10>; combine them directly, for example <Esc>iHello<Enter>.",
+      "Use <Key*3> to repeat a key and <lt> for a literal '<'. Tokens are case-insensitive.",
+      "Pipe tasks accept plain text, <Enter>, or <EOF>. Use signal for OS process signals and bg_kill for forceful termination.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
-      text: Type.Optional(Type.String({ description: "Exact UTF-8 text to send; no implicit Enter" })),
-      enter: Type.Optional(Type.Boolean({ description: "Press Enter after text (default: false; only valid with text)" })),
-      key: Type.Optional(StringEnum(INPUT_KEYS, { description: "Named terminal key to send" })),
-      sequence: Type.Optional(Type.Array(Type.Union([
-        Type.Object({ text: Type.String({ description: "Exact UTF-8 text step" }) }),
-        Type.Object({ key: StringEnum(INPUT_KEYS, { description: "Named key step" }) }),
-      ]), { description: "Ordered PTY input steps, for example escape then text then enter", minItems: 1, maxItems: 100 })),
+      input: Type.Optional(Type.String({ description: "Exact text with Vim-style key tokens, for example <Esc>iHello<Enter>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
       signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "OS signal to send to the task's process group" })),
     }),
 
@@ -1243,36 +1336,34 @@ export default function (pi: ExtensionAPI) {
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is not running.` }], details: {} };
       if (!task.process) return { content: [{ type: "text", text: `Task "${task.name}" process is unavailable.` }], details: {} };
 
-      const sourceCount = [params.text !== undefined, params.key !== undefined, params.sequence !== undefined, params.signal !== undefined]
-        .filter(Boolean).length;
+      const sourceCount = [params.input !== undefined, params.signal !== undefined].filter(Boolean).length;
       if (sourceCount !== 1) {
-        return { content: [{ type: "text", text: "Provide exactly one of text, key, sequence, or signal." }], details: {} };
-      }
-      if (params.enter && params.text === undefined) {
-        return { content: [{ type: "text", text: "enter=true is only valid with text." }], details: {} };
-      }
-      if (params.sequence !== undefined && task.mode !== "pty") {
-        return { content: [{ type: "text", text: "Input sequences are only supported for PTY tasks." }], details: {} };
+        return { content: [{ type: "text", text: "Provide exactly one of input or signal." }], details: {} };
       }
 
-      const normalizedKey = params.key?.toLowerCase();
-      const signal = params.signal ?? (task.mode === "pipe" && normalizedKey ? SIGNAL_ALIASES[normalizedKey] : undefined);
-      if (signal) {
+      if (params.signal) {
         const previousStopSignal = task.requestedStopSignal;
-        if (STOP_SIGNALS.has(signal)) task.requestedStopSignal = signal;
+        if (STOP_SIGNALS.has(params.signal)) task.requestedStopSignal = params.signal;
         try {
-          await sendProcessSignal(task, signal);
+          await sendProcessSignal(task, params.signal);
           return {
-            content: [{ type: "text", text: `Sent ${signal} to "${task.name}" process group.` }],
-            details: { id: task.id, name: task.name, signal },
+            content: [{ type: "text", text: `Sent ${params.signal} to "${task.name}" process group.` }],
+            details: { id: task.id, name: task.name, signal: params.signal },
           };
         } catch (err) {
           task.requestedStopSignal = previousStopSignal;
-          return { content: [{ type: "text", text: `Failed to send ${signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+          return { content: [{ type: "text", text: `Failed to send ${params.signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
         }
       }
 
-      if (task.mode === "pipe" && (normalizedKey === "ctrl+d" || normalizedKey === "eof")) {
+      let parsed: ParsedInput;
+      try {
+        parsed = parseInput(task, params.input ?? "");
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+      }
+
+      if (parsed.eof) {
         closeTaskInput(task);
         return {
           content: [{ type: "text", text: `Closed stdin for "${task.name}".` }],
@@ -1280,38 +1371,12 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      let data: Buffer;
-      let desc: string;
-      let inputKind: "text" | "key" | "sequence";
       try {
-        if (params.sequence !== undefined) {
-          const chunks = params.sequence.map((step) => {
-            const hasKey = "key" in step;
-            const hasText = "text" in step;
-            if (hasKey === hasText) throw new Error("Each sequence step must provide exactly one of text or key.");
-            if (hasKey) return encodeInputKey(task, step.key);
-            return Buffer.from(step.text, "utf-8");
-          });
-          data = Buffer.concat(chunks);
-          desc = `sequence(${params.sequence.length} steps)`;
-          inputKind = "sequence";
-        } else if (params.key !== undefined) {
-          data = encodeInputKey(task, params.key);
-          desc = params.key;
-          inputKind = "key";
-        } else {
-          const input = params.text ?? "";
-          data = Buffer.from(input + (params.enter ? (task.mode === "pty" ? "\r" : "\n") : ""), "utf-8");
-          desc = params.enter ? `text(${Buffer.byteLength(input, "utf-8")} bytes)+enter` : `text(${Buffer.byteLength(input, "utf-8")} bytes)`;
-          inputKind = "text";
-        }
-      } catch (err) {
-        return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
-      }
-
-      try {
-        writeTaskInput(task, data);
-        return { content: [{ type: "text", text: `Sent to "${task.name}": ${desc} (${data.length} bytes)` }], details: { id: task.id, name: task.name, bytes: data.length, inputKind, key: params.key, enter: Boolean(params.enter), mode: task.mode } };
+        writeTaskInput(task, parsed.data);
+        return {
+          content: [{ type: "text", text: `Sent to "${task.name}": ${parsed.data.length} bytes (${parsed.keyTokens} key tokens)` }],
+          details: { id: task.id, name: task.name, bytes: parsed.data.length, keyTokens: parsed.keyTokens, textBytes: parsed.textBytes, mode: task.mode },
+        };
       } catch (err) {
         return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
       }
@@ -1321,7 +1386,7 @@ export default function (pi: ExtensionAPI) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const t = tasks.get(args.id);
       const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
-      const value = args.signal ?? args.key ?? (args.sequence ? `${args.sequence.length} steps` : args.text);
+      const value = args.signal ?? (args.input !== undefined ? truncateText(JSON.stringify(args.input), 80) : undefined);
       const input = value ? theme.fg("dim", ` → ${value}`) : "";
       text.setText(theme.fg("toolTitle", theme.bold("bg_send ")) + name + input);
       return text;

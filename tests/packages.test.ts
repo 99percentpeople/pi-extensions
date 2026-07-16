@@ -19,6 +19,7 @@ test("extensions are independently publishable workspace packages", async () => 
   ]);
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
+  assert.equal(background.version, "1.0.1");
   assert.deepEqual(background.pi?.extensions, ["./index.ts"]);
   assert.equal(background.dependencies?.["node-pty"], "1.1.0");
   assert.equal(background.dependencies?.["@xterm/headless"], "6.0.0");

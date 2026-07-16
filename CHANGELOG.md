@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/bg-attach` full-screen terminal attachment with `Ctrl+]` detach
 - Headless terminal snapshots for `bg_logs` on PTY tasks
 - Opt-in, collapsed-by-default `terminal_snapshot` results for PTY-aware wait, status, and kill tools
-- Complete PTY key input for Ctrl chords, navigation keys, F1-F12, and ordered text/key sequences
+- Single-string PTY input DSL for Ctrl chords, navigation keys, F1-F12, repetition, and literal text
 - Initial project structure
 - background-tasks extension for running long commands in the background
 - pwsh-adapter extension for PowerShell 7 support on Windows
@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Split background-tasks and pwsh-adapter into independently published npm packages
 - Made pwsh-adapter a no-op outside Windows
-- Made `bg_send text` exact by default; use `enter=true` to submit text explicitly
+- Replaced the `bg_send` text/key/sequence/enter parameters with the breaking `input` string DSL
 
 ## [1.0.0] - 2026-06-07
 

@@ -14,7 +14,7 @@ pi install npm:@99percentpeople/pi-background-tasks
 - `bg_wait` waits once for completion or timeout without polling.
 - `bg_status` inspects task state.
 - `bg_logs` reads pipe output or a parsed terminal snapshot.
-- `bg_send` sends text, terminal control keys, or process signals.
+- `bg_send` sends a compact text/key input string or an OS process signal.
 - `bg_kill` terminates a task.
 - `/bg-attach <id>` attaches to a PTY task; press `Ctrl+]` to detach.
 - `/kill` terminates a task by ID.
@@ -26,19 +26,20 @@ bg_start name="git-ui" command="lazygit" pty=true
 /bg-attach <task-id>
 ```
 
-Send exact text and terminal keys:
+Send text and terminal keys with one input string:
 
 ```text
-bg_send id="<task-id>" key="ctrl+o"
-bg_send id="<task-id>" key="f10"
-bg_send id="<task-id>" text="filename.txt" enter=true
-bg_send id="<task-id>" sequence=[{"key":"escape"},{"text":"iHello"},{"key":"enter"}]
+bg_send id="<task-id>" input="<C-o>filename.txt<Enter>"
+bg_send id="<task-id>" input="<F10>"
+bg_send id="<task-id>" input="<Esc>iHello<Enter>"
+bg_send id="<task-id>" input="<Down*3><Enter>"
 ```
 
-`key` supports Ctrl+A–Z, Ctrl punctuation combinations, arrows, Home/End,
+The input DSL supports Ctrl+A–Z, Ctrl punctuation combinations, arrows, Home/End,
 PageUp/PageDown, Insert/Delete, F1–F12, Enter, Escape, Tab, and Backspace.
-Plain `text` is exact and never presses Enter unless `enter=true`; `sequence`
-can interleave text and named keys without implicit input.
+Plain characters are exact and never imply Enter. Tokens are case-insensitive;
+`<Key*3>` repeats a key and `<lt>` sends a literal `<`. Invalid input is rejected
+before any bytes are written.
 
 PTY output combines stdout and stderr. `bg_logs` returns the parsed terminal buffer rather than raw control sequences.
 `bg_wait`, `bg_status`, and `bg_kill` omit PTY screen output by default; pass

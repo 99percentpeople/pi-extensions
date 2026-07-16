@@ -171,9 +171,11 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.ok(bgWait.parameters.properties?.terminal_snapshot);
   assert.ok(bgStatus.parameters.properties?.terminal_snapshot);
   assert.ok(bgKill.parameters.properties?.terminal_snapshot);
-  assert.ok(bgSend.parameters.properties?.key);
-  assert.ok(bgSend.parameters.properties?.sequence);
-  assert.ok(bgSend.parameters.properties?.enter);
+  assert.ok(bgSend.parameters.properties?.input);
+  assert.equal(bgSend.parameters.properties?.text, undefined);
+  assert.equal(bgSend.parameters.properties?.key, undefined);
+  assert.equal(bgSend.parameters.properties?.sequence, undefined);
+  assert.equal(bgSend.parameters.properties?.enter, undefined);
   assert.equal(bgSend.parameters.properties?.raw, undefined);
   assert.equal(bgKill.parameters.properties?.tail_lines, undefined);
 
@@ -270,9 +272,39 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     ctx,
   );
   const ctrlTaskId = ctrlTask.details.id as string;
+  const pipeInput = await bgSend.execute(
+    "send-pipe-input",
+    { id: ctrlTaskId, input: "hello<Enter>" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(pipeInput.content[0].text, /6 bytes \(1 key tokens\)/);
+  assert.deepEqual(children[3].stdin.read(), Buffer.from("hello\n"));
+
+  const rejectedPipeKey = await bgSend.execute(
+    "reject-pipe-key",
+    { id: ctrlTaskId, input: "before<Up>" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(rejectedPipeKey.content[0].text, /requires a PTY task/);
+  assert.equal(children[3].stdin.read(), null, "invalid input must not be partially written");
+
+  const pipeEof = await bgSend.execute(
+    "send-pipe-eof",
+    { id: ctrlTaskId, input: "<EOF>" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(pipeEof.content[0].text, /Closed stdin/);
+  assert.equal(children[3].stdin.writableEnded, true);
+
   const ctrlResult = await bgSend.execute(
     "send-ctrl-c",
-    { id: ctrlTaskId, key: "ctrl+c" },
+    { id: ctrlTaskId, signal: "SIGINT" },
     undefined,
     undefined,
     ctx,
@@ -385,7 +417,7 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
 
   const sent = await bgSend.execute(
     "pty-send",
-    { id, text: "Alice" },
+    { id, input: "Alice" },
     undefined,
     undefined,
     ctx,
@@ -395,62 +427,80 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
 
   const entered = await bgSend.execute(
     "pty-enter",
-    { id, key: "enter" },
+    { id, input: "<Enter>" },
     undefined,
     undefined,
     ctx,
   );
-  assert.match(entered.content[0].text, /enter/);
+  assert.match(entered.content[0].text, /1 key tokens/);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\r"));
 
-  await bgSend.execute("pty-text-enter", { id, text: "Bob", enter: true }, undefined, undefined, ctx);
+  await bgSend.execute("pty-text-enter", { id, input: "Bob<Enter>" }, undefined, undefined, ctx);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("Bob\r"));
 
   const interrupted = await bgSend.execute(
     "pty-ctrl-c",
-    { id, key: "ctrl+c" },
+    { id, input: "<C-c>" },
     undefined,
     undefined,
     ctx,
   );
-  assert.match(interrupted.content[0].text, /ctrl\+c/);
+  assert.match(interrupted.content[0].text, /1 key tokens/);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([0x03]));
   assert.equal(ptys[0].closed, false, "PTY Ctrl+C should be terminal input, not an immediate kill");
 
   const ctrlCases: Array<[string, number]> = [
-    ["ctrl+b", 0x02], ["ctrl+f", 0x06], ["ctrl+n", 0x0e], ["ctrl+o", 0x0f],
-    ["ctrl+p", 0x10], ["ctrl+w", 0x17], ["ctrl+x", 0x18],
+    ["<C-b>", 0x02], ["<C-f>", 0x06], ["<C-n>", 0x0e], ["<C-o>", 0x0f],
+    ["<C-p>", 0x10], ["<C-w>", 0x17], ["<C-x>", 0x18],
+    ["<C-Backslash>", 0x1c], ["<C-]>", 0x1d], ["<C-?>", 0x7f],
   ];
-  for (const [key, byte] of ctrlCases) {
-    await bgSend.execute(`pty-${key}`, { id, key }, undefined, undefined, ctx);
-    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([byte]), `${key} byte`);
+  for (const [input, byte] of ctrlCases) {
+    await bgSend.execute(`pty-${input}`, { id, input }, undefined, undefined, ctx);
+    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([byte]), `${input} byte`);
   }
 
   const namedKeyCases: Array<[string, string]> = [
-    ["up", "\x1b[A"], ["down", "\x1b[B"], ["right", "\x1b[C"], ["left", "\x1b[D"],
-    ["home", "\x1b[H"], ["end", "\x1b[F"], ["pageup", "\x1b[5~"], ["pagedown", "\x1b[6~"],
-    ["f1", "\x1bOP"], ["f2", "\x1bOQ"], ["f3", "\x1bOR"], ["f4", "\x1bOS"],
-    ["f5", "\x1b[15~"], ["f6", "\x1b[17~"], ["f7", "\x1b[18~"], ["f8", "\x1b[19~"],
-    ["f9", "\x1b[20~"], ["f10", "\x1b[21~"], ["f11", "\x1b[23~"], ["f12", "\x1b[24~"],
+    ["<Up>", "\x1b[A"], ["<Down>", "\x1b[B"], ["<Right>", "\x1b[C"], ["<Left>", "\x1b[D"],
+    ["<Home>", "\x1b[H"], ["<End>", "\x1b[F"], ["<PageUp>", "\x1b[5~"], ["<PageDown>", "\x1b[6~"],
+    ["<F1>", "\x1bOP"], ["<F2>", "\x1bOQ"], ["<F3>", "\x1bOR"], ["<F4>", "\x1bOS"],
+    ["<F5>", "\x1b[15~"], ["<F6>", "\x1b[17~"], ["<F7>", "\x1b[18~"], ["<F8>", "\x1b[19~"],
+    ["<F9>", "\x1b[20~"], ["<F10>", "\x1b[21~"], ["<F11>", "\x1b[23~"], ["<F12>", "\x1b[24~"],
   ];
-  for (const [key, expected] of namedKeyCases) {
-    await bgSend.execute(`pty-${key}`, { id, key }, undefined, undefined, ctx);
-    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from(expected), `${key} sequence`);
+  for (const [input, expected] of namedKeyCases) {
+    await bgSend.execute(`pty-${input}`, { id, input }, undefined, undefined, ctx);
+    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from(expected), `${input} sequence`);
   }
 
   const combined = await bgSend.execute(
     "pty-sequence",
-    { id, sequence: [{ key: "escape" }, { text: "iHello" }, { key: "enter" }] },
+    { id, input: "<Esc>iHello<Enter>" },
     undefined,
     undefined,
     ctx,
   );
-  assert.match(combined.content[0].text, /sequence\(3 steps\)/);
+  assert.match(combined.content[0].text, /2 key tokens/);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1biHello\r"));
+
+  await bgSend.execute("pty-repeat", { id, input: "<Down*3>" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1b[B\x1b[B\x1b[B"));
+
+  await bgSend.execute("pty-literal-lt", { id, input: "a <lt> b" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("a < b"));
+
+  const writesBeforeInvalidInput = ptys[0].writes.length;
+  const invalidInput = await bgSend.execute(
+    "pty-invalid-input",
+    { id, input: "before<Unknown>" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(invalidInput.content[0].text, /Unknown input token <Unknown> at offset 6/);
+  assert.equal(ptys[0].writes.length, writesBeforeInvalidInput, "invalid DSL must be atomic");
 
   ptys[0].emitData("\x1b[?1h");
   await bgLogs.execute("pty-flush-application-mode", { id, stream: "terminal" }, undefined, undefined, ctx);
-  await bgSend.execute("pty-application-up", { id, key: "up" }, undefined, undefined, ctx);
+  await bgSend.execute("pty-application-up", { id, input: "<Up>" }, undefined, undefined, ctx);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1bOA"));
 
   const stderr = await bgLogs.execute(
