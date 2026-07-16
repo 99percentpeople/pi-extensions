@@ -15,7 +15,8 @@ Thank you for your interest in contributing to Pi Extensions! This document prov
 
 ### Prerequisites
 
-- Node.js 18+ or Bun
+- Bun 1.3.14
+- Node.js 18+ (Pi runtime and compatibility tests)
 - Pi coding agent installed
 - TypeScript knowledge
 
@@ -27,10 +28,10 @@ git clone https://github.com/YOUR_USERNAME/pi-extensions.git
 cd pi-extensions
 
 # Install dependencies
-npm install
+bun install
 
 # Type checking
-npm run lint
+bun run lint
 ```
 
 ### Testing Extensions

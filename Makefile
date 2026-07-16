@@ -21,11 +21,11 @@ help:
 
 # Install dependencies
 install:
-	npm install
+	bun install
 
 # Type checking
 lint:
-	npm run lint
+	bun run lint
 
 # Test extensions
 test:
@@ -69,7 +69,7 @@ clean:
 
 # Publish to npm
 publish:
-	npm publish
+	bun publish
 
 # Initialize git repository
 init:
@@ -84,12 +84,12 @@ tree:
 
 # Check for TypeScript errors
 check:
-	npm run check
+	bun run check
 
 # Format code (if prettier is installed)
 format:
-	npx prettier --write "**/*.{ts,js,json,md}"
+	bunx prettier --write "**/*.{ts,js,json,md}"
 
 # Lint code (if eslint is installed)
 eslint:
-	npx eslint "**/*.{ts,js}"
+	bunx eslint "**/*.{ts,js}"

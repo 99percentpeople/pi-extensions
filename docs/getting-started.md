@@ -7,9 +7,10 @@ This guide will help you get started with creating and using Pi extensions.
 Before you begin, make sure you have:
 
 1. [Pi coding agent](https://github.com/badlogic/pi-mono) installed
-2. [Node.js](https://nodejs.org/) 18+ or [Bun](https://bun.sh/)
-3. Basic TypeScript knowledge
-4. A code editor (VS Code recommended)
+2. [Bun](https://bun.com/) 1.3.14 for dependency management
+3. [Node.js](https://nodejs.org/) 18+ for Pi runtime compatibility
+4. Basic TypeScript knowledge
+5. A code editor (VS Code recommended)
 
 ## Installation
 
@@ -25,6 +26,9 @@ pi install npm:pi-extensions
 # Clone the repository
 git clone https://github.com/YOUR_USERNAME/pi-extensions.git
 cd pi-extensions
+
+# Install dependencies
+bun install
 
 # Install globally
 pi install .
@@ -48,7 +52,7 @@ Run long commands in the background:
 
 ```bash
 # Start a background task
-bg_start name="build" command="npm run build"
+bg_start name="build" command="bun run build"
 
 # Check status
 bg_status id="abcd"
@@ -197,7 +201,7 @@ ctx.ui.setWidget("my-ext", ["Line 1", "Line 2"]);
 
 ### Extension not loading
 
-1. Check for TypeScript errors: `npm run lint`
+1. Check for TypeScript errors: `bun run lint`
 2. Verify the extension path in `package.json`
 3. Check Pi's error output
 

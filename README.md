@@ -24,6 +24,9 @@ pi install npm:@99percentpeople/pi-extensions
 git clone https://github.com/99percentpeople/pi-extensions.git
 cd pi-extensions
 
+# Install dependencies
+bun install
+
 # Install globally (Windows)
 .\scripts\install.ps1 -Global
 
@@ -117,6 +120,9 @@ This will:
 
 ## Development
 
+This repository uses Bun 1.3.14 for dependency management. Run `bun install`
+after cloning and commit `bun.lock` whenever dependencies change.
+
 ### Project Structure
 
 ```
@@ -173,7 +179,7 @@ pi-extensions/
 
 ```bash
 # Type checking
-npm run lint
+bun run lint
 
 # Test specific extension
 pi -e ./extensions/my-extension/index.ts
@@ -199,7 +205,7 @@ pi remove pi-extensions
 4. Publish to npm:
 
 ```bash
-npm publish --access public
+bun publish --access public
 ```
 
 ### To GitHub

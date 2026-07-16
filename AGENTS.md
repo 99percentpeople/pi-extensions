@@ -6,6 +6,8 @@ This file provides configuration and context for AI coding agents working with t
 
 This is a Pi extensions repository containing custom TypeScript extensions for the Pi coding agent. Extensions enhance Pi's capabilities with new tools, commands, UI components, and integrations.
 
+The repository uses Bun 1.3.14 for dependency management and commits `bun.lock`.
+
 ## Repository Structure
 
 ```
@@ -56,7 +58,7 @@ pi -e ./extensions/my-extension/index.ts
 2. Add to `package.json` under `pi.extensions`
 3. Test with `pi -e ./extensions/my-extension/index.ts`
 4. Update README.md with documentation
-5. Run `npm run lint` for type checking
+5. Run `bun run lint` for type checking
 
 ## Resources
 

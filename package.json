@@ -1,6 +1,7 @@
 {
   "name": "@99percentpeople/pi-extensions",
   "version": "1.0.0",
+  "packageManager": "bun@1.3.14",
   "description": "Custom extensions for Pi coding agent - background tasks and PowerShell adapter",
   "type": "module",
   "main": "index.js",

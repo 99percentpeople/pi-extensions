@@ -120,12 +120,12 @@ pi -e ./extensions/background-tasks/index.ts \
 
 ```bash
 # Update version
-npm version patch
+bun pm version patch
 
 # Update CHANGELOG.md
 
 # Publish to npm
-npm publish
+bun publish
 
 # Or share via GitHub
 git push origin main
