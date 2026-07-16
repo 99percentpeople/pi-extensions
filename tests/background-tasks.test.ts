@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import backgroundTasks from "../extensions/background-tasks/index.ts";
 
@@ -14,6 +15,8 @@ interface RegisteredTool {
   };
   executionMode?: string;
   execute: (...args: any[]) => Promise<any>;
+  renderCall?: (...args: any[]) => any;
+  renderResult?: (...args: any[]) => any;
 }
 
 interface SentMessage {
@@ -207,6 +210,66 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   const ctrlWait = await bgWait.execute("wait-ctrl", { id: ctrlTaskId, timeout: 1 }, undefined, undefined, ctx);
   assert.equal(ctrlWait.details.signal, "SIGINT");
   assert.equal(messages.length, 0);
+
+  const logTask = await bgStart.execute(
+    "start-5",
+    { name: "formatted-logs", command: "fake formatted logs" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const logTaskId = logTask.details.id as string;
+  children[4].stdout.write("\x1b[31mout\x1b[0m\r\n");
+  children[4].stderr.write("\x1b[33merr\x1b[0m\n");
+  children[4].finish(0, null);
+  await bgWait.execute("wait-logs", { id: logTaskId, timeout: 1 }, undefined, undefined, ctx);
+
+  const logsResult = await bgLogs.execute(
+    "logs-formatted",
+    { id: logTaskId, stream: "both", tail: 5 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(logsResult.content[0].text, "── stdout ──\nout\n── stderr ──\nerr");
+  assert.doesNotMatch(logsResult.content[0].text, /\x1b/);
+
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const collapsedCall = bgLogs.renderCall?.(
+    { id: logTaskId, stream: "both", tail: 5 },
+    plainTheme,
+    { lastComponent: undefined, expanded: false },
+  );
+  assert.ok(collapsedCall);
+  assert.match(stripVTControlCharacters(collapsedCall.render(80).join("\n")), /to expand/);
+
+  const expandedCall = bgLogs.renderCall?.(
+    { id: logTaskId, stream: "both", tail: 5 },
+    plainTheme,
+    { lastComponent: collapsedCall, expanded: true },
+  );
+  assert.ok(expandedCall);
+  assert.match(stripVTControlCharacters(expandedCall.render(80).join("\n")), /to collapse/);
+
+  const collapsed = bgLogs.renderResult?.(
+    logsResult,
+    { expanded: false, isPartial: false },
+    plainTheme,
+    { lastComponent: undefined },
+  );
+  assert.ok(collapsed);
+  assert.deepEqual(collapsed.render(80), []);
+
+  const expanded = bgLogs.renderResult?.(
+    logsResult,
+    { expanded: true, isPartial: false },
+    plainTheme,
+    { lastComponent: collapsed },
+  );
+  assert.ok(expanded);
+  const expandedLines = expanded.render(80);
+  assert.ok(expandedLines.some((line: string) => line.includes("── stdout ──")));
+  assert.ok(expandedLines.some((line: string) => line.includes("── stderr ──")));
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });

@@ -24,7 +24,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { stripVTControlCharacters } from "node:util";
+import { keyText, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, type Component } from "@earendil-works/pi-tui";
@@ -89,13 +90,23 @@ async function appendToFile(filePath: string, data: Buffer | string): Promise<vo
   catch { await writeFile(filePath, data); }
 }
 
+function sanitizeLogOutput(text: string): string {
+  return stripVTControlCharacters(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function splitLogLines(text: string): string[] {
+  const lines = sanitizeLogOutput(text).split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
+}
+
 async function readTail(filePath: string, lines: number): Promise<string> {
-  try { return (await readFile(filePath, "utf-8")).split("\n").slice(-lines).join("\n"); }
+  try { return splitLogLines(await readFile(filePath, "utf-8")).slice(-lines).join("\n"); }
   catch { return ""; }
 }
 
 async function readRange(filePath: string, fromLine: number, maxLines: number): Promise<string> {
-  try { return (await readFile(filePath, "utf-8")).split("\n").slice(fromLine, fromLine + maxLines).join("\n"); }
+  try { return splitLogLines(await readFile(filePath, "utf-8")).slice(fromLine, fromLine + maxLines).join("\n"); }
   catch { return ""; }
 }
 
@@ -122,7 +133,7 @@ function updateLatestLog(task: BgTask, stream: "stdout" | "stderr", data: Buffer
   task[pendingKey] = endsWithLineBreak ? "" : (lines.pop() ?? "");
 
   const latestCompleteLine = lines.filter((line) => line.length > 0).at(-1);
-  const latestText = task[pendingKey] || latestCompleteLine;
+  const latestText = sanitizeLogOutput(task[pendingKey] || latestCompleteLine || "");
   if (!latestText) return;
 
   task.latestLog = {
@@ -632,7 +643,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       return {
-        content: [{ type: "text", text: parts.join("\n\n") }],
+        content: [{ type: "text", text: parts.join("\n") }],
         details: { id: task.id, name: task.name, status: task.status, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines },
       };
     },
@@ -645,19 +656,29 @@ export default function (pi: ExtensionAPI) {
       if (args.tail) extras.push(`tail=${args.tail}`);
       if (args.stream && args.stream !== "both") extras.push(args.stream);
       const extra = extras.length ? theme.fg("dim", ` ${extras.join(" ")}`) : "";
-      text.setText(theme.fg("toolTitle", theme.bold("bg_logs ")) + name + extra);
+      const toggleHint = theme.fg(
+        "dim",
+        ` (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`,
+      );
+      text.setText(theme.fg("toolTitle", theme.bold("bg_logs ")) + name + extra + toggleHint);
       return text;
     },
 
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, context) {
       if (isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      if (!expanded) {
+        text.setText("");
+        return text;
+      }
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
       const lines = content.split("\n").map(l => {
         if (l.startsWith("── ") || l.startsWith("-- ")) return theme.fg("accent", l) || l;
         if (l === "(no output yet)" || l === "(no stdout)" || l === "(no stderr)") return theme.fg("muted", l) || l;
         return theme.fg("toolOutput", l) || l;
       });
-      return new Text(lines.join("\n"), 0, 0);
+      text.setText(`\n${lines.join("\n")}`);
+      return text;
     },
   });
 
