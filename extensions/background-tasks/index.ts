@@ -496,14 +496,14 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
 
         process.stdin.on("data", inputHandler);
         process.stdout.on("resize", resizeHandler);
-        process.stdout.write("\x1b[2J\x1b[H");
         taskProcess.pty.pause();
         ptyPaused = true;
         await flushPty(task);
         if (cleaned) return;
+        resizeHandler();
+        process.stdout.write("\x1b[2J\x1b[H");
         process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
         state.attachedWriter = (data) => process.stdout.write(data);
-        resizeHandler();
         taskProcess.pty.resume();
         ptyPaused = false;
       } catch (error) {

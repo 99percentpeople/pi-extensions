@@ -378,7 +378,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
 });
 
 test("PTY tasks preserve terminal state and use terminal input semantics", async () => {
-  const { tools, lifecycle, ptys, ctx } = createHarness();
+  const { tools, commands, lifecycle, ptys, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgWait = tools.get("bg_wait");
   const bgStatus = tools.get("bg_status");
@@ -502,6 +502,58 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   await bgLogs.execute("pty-flush-application-mode", { id, stream: "terminal" }, undefined, undefined, ctx);
   await bgSend.execute("pty-application-up", { id, input: "<Up>" }, undefined, undefined, ctx);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1bOA"));
+
+  const attachOrder: string[] = [];
+  const pty = ptys[0];
+  const originalPtyResize = pty.resize.bind(pty);
+  pty.pause = () => attachOrder.push("pause");
+  pty.resize = (cols, rows) => {
+    attachOrder.push(`resize:${cols}x${rows}`);
+    originalPtyResize(cols, rows);
+  };
+  pty.resume = () => attachOrder.push("resume");
+
+  const stdout = process.stdout as NodeJS.WriteStream;
+  const originalWrite = stdout.write;
+  const columnsDescriptor = Object.getOwnPropertyDescriptor(stdout, "columns");
+  const rowsDescriptor = Object.getOwnPropertyDescriptor(stdout, "rows");
+  Object.defineProperty(stdout, "columns", { configurable: true, value: 80 });
+  Object.defineProperty(stdout, "rows", { configurable: true, value: 24 });
+  (stdout as any).write = (chunk: string | Uint8Array) => {
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    if (text === "\x1b[2J\x1b[H") attachOrder.push("clear");
+    else if (text.includes("PTY_READY")) attachOrder.push("snapshot");
+    return true;
+  };
+
+  const attachCtx = {
+    ...ctx,
+    hasUI: true,
+    mode: "tui",
+    ui: {
+      setWidget: () => {},
+      notify: () => {},
+      custom: (factory: any) => new Promise((resolve) => {
+        const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
+        const component = factory(tui, {}, {}, resolve);
+        setTimeout(() => component.dispose(), 10);
+      }),
+    },
+  } as unknown as ExtensionContext;
+
+  try {
+    await commands.get("bg-attach").handler(id, attachCtx);
+  } finally {
+    (stdout as any).write = originalWrite;
+    if (columnsDescriptor) Object.defineProperty(stdout, "columns", columnsDescriptor);
+    else delete (stdout as any).columns;
+    if (rowsDescriptor) Object.defineProperty(stdout, "rows", rowsDescriptor);
+    else delete (stdout as any).rows;
+  }
+
+  assert.deepEqual(attachOrder, ["pause", "resize:80x24", "clear", "snapshot", "resume"]);
+  assert.equal(pty.cols, 80);
+  assert.equal(pty.rows, 24);
 
   const stderr = await bgLogs.execute(
     "pty-stderr",
