@@ -1150,20 +1150,62 @@ export default function (pi: ExtensionAPI) {
 
   // ── bg_send ────────────────────────────────────────────────────────
 
-  const CTRL: Record<string, Buffer> = {
-    "ctrl+l": Buffer.from([0x0c]), "ctrl+u": Buffer.from([0x15]),
-    "ctrl+k": Buffer.from([0x0b]), "ctrl+a": Buffer.from([0x01]),
-    "ctrl+e": Buffer.from([0x05]),
-    "escape": Buffer.from([0x1b]), "tab": Buffer.from([0x09]),
-    "backspace": Buffer.from([0x7f]),
+  const INPUT_KEYS = [
+    "ctrl+a", "ctrl+b", "ctrl+c", "ctrl+d", "ctrl+e", "ctrl+f", "ctrl+g",
+    "ctrl+h", "ctrl+i", "ctrl+j", "ctrl+k", "ctrl+l", "ctrl+m", "ctrl+n",
+    "ctrl+o", "ctrl+p", "ctrl+q", "ctrl+r", "ctrl+s", "ctrl+t", "ctrl+u",
+    "ctrl+v", "ctrl+w", "ctrl+x", "ctrl+y", "ctrl+z", "ctrl+@", "ctrl+space",
+    "ctrl+[", "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_", "ctrl+?",
+    "enter", "return", "escape", "esc", "tab", "shift+tab", "backspace",
+    "insert", "delete", "home", "end", "pageup", "pagedown",
+    "up", "down", "left", "right",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "eof",
+  ] as const;
+  type InputKey = (typeof INPUT_KEYS)[number];
+
+  const FIXED_KEY_SEQUENCES: Partial<Record<InputKey, Buffer>> = {
+    enter: Buffer.from("\r"), return: Buffer.from("\r"),
+    escape: Buffer.from("\x1b"), esc: Buffer.from("\x1b"),
+    tab: Buffer.from("\t"), "shift+tab": Buffer.from("\x1b[Z"),
+    backspace: Buffer.from([0x7f]), insert: Buffer.from("\x1b[2~"), delete: Buffer.from("\x1b[3~"),
+    pageup: Buffer.from("\x1b[5~"), pagedown: Buffer.from("\x1b[6~"),
+    f1: Buffer.from("\x1bOP"), f2: Buffer.from("\x1bOQ"),
+    f3: Buffer.from("\x1bOR"), f4: Buffer.from("\x1bOS"),
+    f5: Buffer.from("\x1b[15~"), f6: Buffer.from("\x1b[17~"),
+    f7: Buffer.from("\x1b[18~"), f8: Buffer.from("\x1b[19~"),
+    f9: Buffer.from("\x1b[20~"), f10: Buffer.from("\x1b[21~"),
+    f11: Buffer.from("\x1b[23~"), f12: Buffer.from("\x1b[24~"),
+    eof: Buffer.from([0x04]),
   };
-  const PTY_CTRL: Record<string, Buffer> = {
-    ...CTRL,
-    "ctrl+c": Buffer.from([0x03]),
-    "ctrl+d": Buffer.from([0x04]),
-    "ctrl+z": Buffer.from([0x1a]),
-    "ctrl+\\": Buffer.from([0x1c]),
-  };
+
+  function encodeInputKey(task: BgTask, inputKey: string): Buffer {
+    const key = inputKey.toLowerCase() as InputKey;
+    if (!INPUT_KEYS.includes(key)) throw new Error(`Unsupported key: ${inputKey}`);
+
+    const ctrlLetter = /^ctrl\+([a-z])$/.exec(key)?.[1];
+    if (ctrlLetter) return Buffer.from([ctrlLetter.charCodeAt(0) - 96]);
+    switch (key) {
+      case "ctrl+@": case "ctrl+space": return Buffer.from([0x00]);
+      case "ctrl+[": return Buffer.from([0x1b]);
+      case "ctrl+\\": return Buffer.from([0x1c]);
+      case "ctrl+]": return Buffer.from([0x1d]);
+      case "ctrl+^": return Buffer.from([0x1e]);
+      case "ctrl+_": return Buffer.from([0x1f]);
+      case "ctrl+?": return Buffer.from([0x7f]);
+      case "up": case "down": case "left": case "right": case "home": case "end": {
+        const final = { up: "A", down: "B", right: "C", left: "D", home: "H", end: "F" }[key];
+        const prefix = task.ptyState?.terminal.modes.applicationCursorKeysMode ? "\x1bO" : "\x1b[";
+        return Buffer.from(`${prefix}${final}`);
+      }
+      default: {
+        const sequence = FIXED_KEY_SEQUENCES[key];
+        if (!sequence) throw new Error(`Unsupported key: ${inputKey}`);
+        return sequence;
+      }
+    }
+  }
+
   const SIGNAL_ALIASES: Record<string, NodeJS.Signals> = {
     "ctrl+c": "SIGINT",
     "ctrl+z": "SIGTSTP",
@@ -1175,18 +1217,24 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_send",
     label: "BG Send",
-    description: "Send stdin input or an OS control signal to a running background task.",
-    promptSnippet: "Send text, EOF, or a control signal to a background task",
+    description: "Send exact text, named terminal keys, ordered input sequences, or an OS signal to a running background task.",
+    promptSnippet: "Send exact text, terminal keys, or a control signal to a background task",
     promptGuidelines: [
-      "Use bg_send with text to interact with a task's stdin, or with signal to send an OS signal to its process group; provide only one of them.",
-      "For pipe tasks, text='ctrl+c', 'ctrl+z', and 'ctrl+\\' send process signals. For PTY tasks, control keywords write terminal control bytes so the foreground TUI handles them normally.",
-      "Use text='ctrl+d' or text='eof' to close stdin. Use bg_kill instead when the task must be terminated forcefully.",
+      "Provide exactly one of text, key, sequence, or signal. Plain text is sent exactly and does not press Enter unless enter=true.",
+      "Use key for named keys such as enter, escape, arrows, ctrl+o, or f10. Use sequence to interleave exact text and named keys in one PTY write.",
+      "For pipe tasks, key=ctrl+c, ctrl+z, or ctrl+\\ sends the matching process signal; key=ctrl+d or eof closes stdin.",
+      "Use bg_kill instead when the task must be terminated forcefully.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
-      text: Type.Optional(Type.String({ description: "Text to send. Keywords: ctrl+c, ctrl+z, ctrl+\\, ctrl+d, eof, escape, tab, backspace" })),
+      text: Type.Optional(Type.String({ description: "Exact UTF-8 text to send; no implicit Enter" })),
+      enter: Type.Optional(Type.Boolean({ description: "Press Enter after text (default: false; only valid with text)" })),
+      key: Type.Optional(StringEnum(INPUT_KEYS, { description: "Named terminal key to send" })),
+      sequence: Type.Optional(Type.Array(Type.Union([
+        Type.Object({ text: Type.String({ description: "Exact UTF-8 text step" }) }),
+        Type.Object({ key: StringEnum(INPUT_KEYS, { description: "Named key step" }) }),
+      ]), { description: "Ordered PTY input steps, for example escape then text then enter", minItems: 1, maxItems: 100 })),
       signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "OS signal to send to the task's process group" })),
-      raw: Type.Optional(Type.Boolean({ description: "Send raw bytes without newline (default: false)" })),
     }),
 
     async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
@@ -1195,28 +1243,20 @@ export default function (pi: ExtensionAPI) {
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is not running.` }], details: {} };
       if (!task.process) return { content: [{ type: "text", text: `Task "${task.name}" process is unavailable.` }], details: {} };
 
-      if (params.text !== undefined && params.signal !== undefined) {
-        return { content: [{ type: "text", text: "Provide either text or signal, not both." }], details: {} };
+      const sourceCount = [params.text !== undefined, params.key !== undefined, params.sequence !== undefined, params.signal !== undefined]
+        .filter(Boolean).length;
+      if (sourceCount !== 1) {
+        return { content: [{ type: "text", text: "Provide exactly one of text, key, sequence, or signal." }], details: {} };
       }
-      if (params.text === undefined && params.signal === undefined) {
-        return { content: [{ type: "text", text: "Provide text or signal to send." }], details: {} };
+      if (params.enter && params.text === undefined) {
+        return { content: [{ type: "text", text: "enter=true is only valid with text." }], details: {} };
       }
-
-      const keyword = params.text?.toLowerCase().trim();
-      if (task.mode === "pty" && keyword && PTY_CTRL[keyword]) {
-        const data = PTY_CTRL[keyword];
-        try {
-          writeTaskInput(task, data);
-          return {
-            content: [{ type: "text", text: `Sent ${keyword} to "${task.name}" PTY (${data.length} byte).` }],
-            details: { id: task.id, name: task.name, bytes: data.length, keyword, mode: task.mode },
-          };
-        } catch (err) {
-          return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
-        }
+      if (params.sequence !== undefined && task.mode !== "pty") {
+        return { content: [{ type: "text", text: "Input sequences are only supported for PTY tasks." }], details: {} };
       }
 
-      const signal = params.signal ?? (keyword ? SIGNAL_ALIASES[keyword] : undefined);
+      const normalizedKey = params.key?.toLowerCase();
+      const signal = params.signal ?? (task.mode === "pipe" && normalizedKey ? SIGNAL_ALIASES[normalizedKey] : undefined);
       if (signal) {
         const previousStopSignal = task.requestedStopSignal;
         if (STOP_SIGNALS.has(signal)) task.requestedStopSignal = signal;
@@ -1232,21 +1272,46 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      if (keyword === "ctrl+d" || keyword === "eof") {
+      if (task.mode === "pipe" && (normalizedKey === "ctrl+d" || normalizedKey === "eof")) {
         closeTaskInput(task);
         return {
-          content: [{ type: "text", text: task.mode === "pty" ? `Sent EOF (Ctrl+D) to "${task.name}" PTY.` : `Closed stdin for "${task.name}".` }],
-          details: { id: task.id, name: task.name, eof: true },
+          content: [{ type: "text", text: `Closed stdin for "${task.name}".` }],
+          details: { id: task.id, name: task.name, eof: true, mode: task.mode },
         };
       }
 
-      const input = params.text ?? "";
-      const data = (keyword && CTRL[keyword]) || (params.raw ? Buffer.from(input, "utf-8") : Buffer.from(input + (task.mode === "pty" ? "\r" : "\n"), "utf-8"));
-      const desc = keyword && CTRL[keyword] ? keyword : params.raw ? `raw(${input})` : JSON.stringify(input);
+      let data: Buffer;
+      let desc: string;
+      let inputKind: "text" | "key" | "sequence";
+      try {
+        if (params.sequence !== undefined) {
+          const chunks = params.sequence.map((step) => {
+            const hasKey = "key" in step;
+            const hasText = "text" in step;
+            if (hasKey === hasText) throw new Error("Each sequence step must provide exactly one of text or key.");
+            if (hasKey) return encodeInputKey(task, step.key);
+            return Buffer.from(step.text, "utf-8");
+          });
+          data = Buffer.concat(chunks);
+          desc = `sequence(${params.sequence.length} steps)`;
+          inputKind = "sequence";
+        } else if (params.key !== undefined) {
+          data = encodeInputKey(task, params.key);
+          desc = params.key;
+          inputKind = "key";
+        } else {
+          const input = params.text ?? "";
+          data = Buffer.from(input + (params.enter ? (task.mode === "pty" ? "\r" : "\n") : ""), "utf-8");
+          desc = params.enter ? `text(${Buffer.byteLength(input, "utf-8")} bytes)+enter` : `text(${Buffer.byteLength(input, "utf-8")} bytes)`;
+          inputKind = "text";
+        }
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+      }
 
       try {
         writeTaskInput(task, data);
-        return { content: [{ type: "text", text: `Sent to "${task.name}": ${desc} (${data.length} bytes)` }], details: { id: task.id, name: task.name, bytes: data.length, keyword, mode: task.mode } };
+        return { content: [{ type: "text", text: `Sent to "${task.name}": ${desc} (${data.length} bytes)` }], details: { id: task.id, name: task.name, bytes: data.length, inputKind, key: params.key, enter: Boolean(params.enter), mode: task.mode } };
       } catch (err) {
         return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
       }
@@ -1256,7 +1321,7 @@ export default function (pi: ExtensionAPI) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const t = tasks.get(args.id);
       const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
-      const value = args.signal ?? args.text;
+      const value = args.signal ?? args.key ?? (args.sequence ? `${args.sequence.length} steps` : args.text);
       const input = value ? theme.fg("dim", ` → ${value}`) : "";
       text.setText(theme.fg("toolTitle", theme.bold("bg_send ")) + name + input);
       return text;

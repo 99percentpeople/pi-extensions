@@ -81,7 +81,7 @@ Run long-running commands in the background with real-time monitoring.
 - `bg_wait` - Wait once for a finite task to finish or time out
 - `bg_status` - Check status / list tasks
 - `bg_logs` - Read stdout/stderr output or a PTY screen snapshot
-- `bg_send` - Send stdin input or OS control signals
+- `bg_send` - Send exact text, terminal keys/sequences, or OS control signals
 - `bg_kill` - Terminate unresponsive processes
 
 **Commands:**
@@ -91,6 +91,7 @@ Run long-running commands in the background with real-time monitoring.
 **Features:**
 - Optional pseudoterminals for interactive commands and full-screen TUIs
 - Detachable, resizable terminal sessions backed by `node-pty` and xterm headless
+- Complete Ctrl key chords, arrows/navigation keys, F1-F12, and ordered text/key input sequences
 - Explicit completion waits with timeout via `bg_wait` (no polling or AI follow-up notifications)
 - Auto-throttle via AbortController for explicit status checks
 - Latest stdout/stderr line included for pipe tasks; PTY snapshots are opt-in with `terminal_snapshot=true` and collapsed by default

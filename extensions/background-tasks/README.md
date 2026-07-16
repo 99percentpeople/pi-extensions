@@ -26,6 +26,20 @@ bg_start name="git-ui" command="lazygit" pty=true
 /bg-attach <task-id>
 ```
 
+Send exact text and terminal keys:
+
+```text
+bg_send id="<task-id>" key="ctrl+o"
+bg_send id="<task-id>" key="f10"
+bg_send id="<task-id>" text="filename.txt" enter=true
+bg_send id="<task-id>" sequence=[{"key":"escape"},{"text":"iHello"},{"key":"enter"}]
+```
+
+`key` supports Ctrl+A–Z, Ctrl punctuation combinations, arrows, Home/End,
+PageUp/PageDown, Insert/Delete, F1–F12, Enter, Escape, Tab, and Backspace.
+Plain `text` is exact and never presses Enter unless `enter=true`; `sequence`
+can interleave text and named keys without implicit input.
+
 PTY output combines stdout and stderr. `bg_logs` returns the parsed terminal buffer rather than raw control sequences.
 `bg_wait`, `bg_status`, and `bg_kill` omit PTY screen output by default; pass
 `terminal_snapshot=true` when the current or final terminal screen is needed in the same result.

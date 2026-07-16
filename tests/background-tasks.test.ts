@@ -171,6 +171,10 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.ok(bgWait.parameters.properties?.terminal_snapshot);
   assert.ok(bgStatus.parameters.properties?.terminal_snapshot);
   assert.ok(bgKill.parameters.properties?.terminal_snapshot);
+  assert.ok(bgSend.parameters.properties?.key);
+  assert.ok(bgSend.parameters.properties?.sequence);
+  assert.ok(bgSend.parameters.properties?.enter);
+  assert.equal(bgSend.parameters.properties?.raw, undefined);
   assert.equal(bgKill.parameters.properties?.tail_lines, undefined);
 
   const first = await bgStart.execute(
@@ -268,7 +272,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   const ctrlTaskId = ctrlTask.details.id as string;
   const ctrlResult = await bgSend.execute(
     "send-ctrl-c",
-    { id: ctrlTaskId, text: "ctrl+c" },
+    { id: ctrlTaskId, key: "ctrl+c" },
     undefined,
     undefined,
     ctx,
@@ -387,18 +391,67 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     ctx,
   );
   assert.match(sent.content[0].text, /Sent to/);
-  assert.equal(Buffer.from(ptys[0].writes.at(-1) as Buffer).toString("utf8"), "Alice\r");
+  assert.equal(Buffer.from(ptys[0].writes.at(-1) as Buffer).toString("utf8"), "Alice");
 
-  const interrupted = await bgSend.execute(
-    "pty-ctrl-c",
-    { id, text: "ctrl+c" },
+  const entered = await bgSend.execute(
+    "pty-enter",
+    { id, key: "enter" },
     undefined,
     undefined,
     ctx,
   );
-  assert.match(interrupted.content[0].text, /Sent ctrl\+c/);
+  assert.match(entered.content[0].text, /enter/);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\r"));
+
+  await bgSend.execute("pty-text-enter", { id, text: "Bob", enter: true }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("Bob\r"));
+
+  const interrupted = await bgSend.execute(
+    "pty-ctrl-c",
+    { id, key: "ctrl+c" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(interrupted.content[0].text, /ctrl\+c/);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([0x03]));
   assert.equal(ptys[0].closed, false, "PTY Ctrl+C should be terminal input, not an immediate kill");
+
+  const ctrlCases: Array<[string, number]> = [
+    ["ctrl+b", 0x02], ["ctrl+f", 0x06], ["ctrl+n", 0x0e], ["ctrl+o", 0x0f],
+    ["ctrl+p", 0x10], ["ctrl+w", 0x17], ["ctrl+x", 0x18],
+  ];
+  for (const [key, byte] of ctrlCases) {
+    await bgSend.execute(`pty-${key}`, { id, key }, undefined, undefined, ctx);
+    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([byte]), `${key} byte`);
+  }
+
+  const namedKeyCases: Array<[string, string]> = [
+    ["up", "\x1b[A"], ["down", "\x1b[B"], ["right", "\x1b[C"], ["left", "\x1b[D"],
+    ["home", "\x1b[H"], ["end", "\x1b[F"], ["pageup", "\x1b[5~"], ["pagedown", "\x1b[6~"],
+    ["f1", "\x1bOP"], ["f2", "\x1bOQ"], ["f3", "\x1bOR"], ["f4", "\x1bOS"],
+    ["f5", "\x1b[15~"], ["f6", "\x1b[17~"], ["f7", "\x1b[18~"], ["f8", "\x1b[19~"],
+    ["f9", "\x1b[20~"], ["f10", "\x1b[21~"], ["f11", "\x1b[23~"], ["f12", "\x1b[24~"],
+  ];
+  for (const [key, expected] of namedKeyCases) {
+    await bgSend.execute(`pty-${key}`, { id, key }, undefined, undefined, ctx);
+    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from(expected), `${key} sequence`);
+  }
+
+  const combined = await bgSend.execute(
+    "pty-sequence",
+    { id, sequence: [{ key: "escape" }, { text: "iHello" }, { key: "enter" }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(combined.content[0].text, /sequence\(3 steps\)/);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1biHello\r"));
+
+  ptys[0].emitData("\x1b[?1h");
+  await bgLogs.execute("pty-flush-application-mode", { id, stream: "terminal" }, undefined, undefined, ctx);
+  await bgSend.execute("pty-application-up", { id, key: "up" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1bOA"));
 
   const stderr = await bgLogs.execute(
     "pty-stderr",
