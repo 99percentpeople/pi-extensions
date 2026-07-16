@@ -37,13 +37,14 @@ bg_send id="<task-id>" input="<C-o>filename.txt<Enter>"
 bg_send id="<task-id>" input="<F10>"
 bg_send id="<task-id>" input="<Esc>iHello<Enter>"
 bg_send id="<task-id>" input="<Down*3><Enter>"
+bg_send id="<task-id>" input="<C-d>"
 ```
 
 The input DSL supports Ctrl+A–Z, Ctrl punctuation combinations, arrows, Home/End,
 PageUp/PageDown, Insert/Delete, F1–F12, Enter, Escape, Tab, and Backspace.
-Plain characters are exact and never imply Enter. Tokens are case-insensitive;
-`<Key*3>` repeats a key and `<lt>` sends a literal `<`. Invalid input is rejected
-before any bytes are written.
+Plain characters are exact and never imply Enter. Terminal keys use `<...>` tokens;
+for example, Ctrl+D is `<C-d>`. Use `\<` for a literal `<` and `\\` for a literal
+backslash. Common Ctrl spellings are accepted inside key tokens.
 
 PTY output combines stdout and stderr. `bg_logs` returns the parsed terminal buffer rather than raw control sequences.
 `bg_wait`, `bg_status`, and `bg_kill` omit PTY screen output by default; pass

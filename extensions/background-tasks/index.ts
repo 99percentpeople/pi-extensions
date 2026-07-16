@@ -1314,7 +1314,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function normalizeInputToken(token: string): InputKey | "lt" | null {
-    const normalized = token.trim().toLowerCase();
+    const normalized = token.trim().toLowerCase().replace(/\s+/g, "");
     const aliases: Record<string, InputKey | "lt"> = {
       lt: "lt",
       esc: "escape", escape: "escape",
@@ -1330,7 +1330,7 @@ export default function (pi: ExtensionAPI) {
     if (aliases[normalized]) return aliases[normalized];
     if (/^f(?:[1-9]|1[0-2])$/.test(normalized)) return normalized as InputKey;
 
-    const control = /^c-(.+)$/.exec(normalized)?.[1];
+    const control = /^(?:c|ctrl|control)[+-](.+)$/.exec(normalized)?.[1];
     if (!control) return null;
     if (/^[a-z]$/.test(control)) return `ctrl+${control}` as InputKey;
     const controlAliases: Record<string, InputKey> = {
@@ -1365,16 +1365,25 @@ export default function (pi: ExtensionAPI) {
     };
 
     let cursor = 0;
+    let textStart = 0;
     while (cursor < input.length) {
-      const tokenStart = input.indexOf("<", cursor);
-      if (tokenStart === -1) {
-        pushChunk(Buffer.from(input.slice(cursor), "utf-8"), true);
-        break;
+      if (input[cursor] === "\\" && (input[cursor + 1] === "<" || input[cursor + 1] === "\\")) {
+        if (cursor > textStart) pushChunk(Buffer.from(input.slice(textStart, cursor), "utf-8"), true);
+        pushChunk(Buffer.from(input[cursor + 1], "utf-8"), true);
+        cursor += 2;
+        textStart = cursor;
+        continue;
       }
-      if (tokenStart > cursor) pushChunk(Buffer.from(input.slice(cursor, tokenStart), "utf-8"), true);
+      if (input[cursor] !== "<") {
+        cursor += 1;
+        continue;
+      }
+
+      const tokenStart = cursor;
+      if (tokenStart > textStart) pushChunk(Buffer.from(input.slice(textStart, tokenStart), "utf-8"), true);
 
       const tokenEnd = input.indexOf(">", tokenStart + 1);
-      if (tokenEnd === -1) throw new Error(`Unclosed input token at offset ${tokenStart}; use <lt> for a literal '<'.`);
+      if (tokenEnd === -1) throw new Error(`Unclosed input token at offset ${tokenStart}; use \\< for a literal '<'.`);
       const rawToken = input.slice(tokenStart + 1, tokenEnd);
       const repeated = /^(.*?)(?:\*([0-9]+))?$/.exec(rawToken);
       const tokenName = repeated?.[1] ?? rawToken;
@@ -1392,12 +1401,12 @@ export default function (pi: ExtensionAPI) {
         keyTokens += repeat;
         if (task.mode === "pipe") {
           if (key === "eof" || key === "ctrl+d") {
-            if (repeat !== 1) throw new Error("<EOF> cannot be repeated for a pipe task.");
+            if (repeat !== 1) throw new Error("Ctrl+D/<EOF> cannot be repeated for a pipe task.");
             eof = true;
           } else if (key === "enter") {
             pushChunk(Buffer.from("\n".repeat(repeat)), false);
           } else {
-            throw new Error(`Key token <${tokenName}> requires a PTY task; use signal for process signals.`);
+            throw new Error(`Key token <${tokenName}> requires a PTY task; pipe tasks accept text, <Enter>, and <C-d>/<EOF>.`);
           }
         } else {
           const encoded = encodeInputKey(task, key);
@@ -1406,11 +1415,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       cursor = tokenEnd + 1;
+      textStart = cursor;
     }
+    if (textStart < input.length) pushChunk(Buffer.from(input.slice(textStart), "utf-8"), true);
 
     const data = Buffer.concat(chunks);
     if (eof && (data.length > 0 || keyTokens !== 1)) {
-      throw new Error("For a pipe task, <EOF> must be the only input token.");
+      throw new Error("For a pipe task, Ctrl+D/<EOF> must be the only input token.");
     }
     return { data, eof, keyTokens, textBytes };
   }
@@ -1424,15 +1435,14 @@ export default function (pi: ExtensionAPI) {
     description: "Send text and terminal keys using one compact input string, or send an OS signal to a running background task.",
     promptSnippet: "Send a compact text/key input string or an OS signal to a background task",
     promptGuidelines: [
-      "Provide exactly one of input or signal. Plain input text is sent exactly with no implicit Enter.",
-      "Embed terminal keys in input with Vim-style tokens such as <Enter>, <Esc>, <C-o>, <Up>, or <F10>; combine them directly, for example <Esc>iHello<Enter>.",
-      "Use <Key*3> to repeat a key and <lt> for a literal '<'. Tokens are case-insensitive.",
-      "Pipe tasks accept plain text, <Enter>, or <EOF>. Use signal for OS process signals and bg_kill for forceful termination.",
+      "Provide exactly one of input or signal. Plain input is exact text; every terminal key must be inside an angle-bracket token such as <C-d>, <Enter>, or <Up>. Escape a literal '<' as \\<.",
+      "Terminal keys always use input. Use signal only when an OS process signal is explicitly intended.",
+      "For pipe tasks, <C-d> or <EOF> closes stdin.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
-      input: Type.Optional(Type.String({ description: "Exact text with Vim-style key tokens, for example <Esc>iHello<Enter>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
-      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "OS signal to send to the task's process group" })),
+      input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter> or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
+      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "OS signal for the process group" })),
     }),
 
     async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {

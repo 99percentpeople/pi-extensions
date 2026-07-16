@@ -67,6 +67,7 @@ bg_logs id="abcd" tail=50
 bg_send id="abcd" input="y<Enter>"
 bg_send id="abcd" input="<F10>"
 bg_send id="abcd" input="<Esc>iHello<Enter>"
+bg_send id="abcd" input="<C-d>"
 
 # Terminate a task
 bg_kill id="abcd" force=true

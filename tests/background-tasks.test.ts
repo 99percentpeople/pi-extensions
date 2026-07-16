@@ -171,6 +171,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /Do not repeatedly call bg_logs/);
   assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status\/bg_logs/i);
   assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /independent waits execute in parallel/i);
+  assert.match(bgSend.promptGuidelines?.join("\n") ?? "", /Terminal keys always use input/i);
   assert.equal(bgStart.parameters.properties?.wait.minimum, 1);
   assert.equal(bgStart.parameters.properties?.wait.maximum, 3600);
   assert.equal(bgWait.parameters.properties?.timeout.minimum, 1);
@@ -299,9 +300,20 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.match(rejectedPipeKey.content[0].text, /requires a PTY task/);
   assert.equal(children[3].stdin.read(), null, "invalid input must not be partially written");
 
+  const escapedPipeKey = await bgSend.execute(
+    "send-escaped-pipe-key",
+    { id: ctrlTaskId, input: "\\<C-d>" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(escapedPipeKey.content[0].text, /5 bytes/);
+  assert.deepEqual(children[3].stdin.read(), Buffer.from("<C-d>"));
+  assert.equal(children[3].stdin.writableEnded, false);
+
   const pipeEof = await bgSend.execute(
     "send-pipe-eof",
-    { id: ctrlTaskId, input: "<EOF>" },
+    { id: ctrlTaskId, input: "<Ctrl+d>" },
     undefined,
     undefined,
     ctx,
@@ -380,6 +392,24 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   const expandedLines = expanded.render(80);
   assert.ok(expandedLines.some((line: string) => line.includes("── stdout ──")));
   assert.ok(expandedLines.some((line: string) => line.includes("── stderr ──")));
+
+  const canonicalEofTask = await bgStart.execute(
+    "start-canonical-eof",
+    { name: "canonical-eof", command: "fake canonical eof" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const canonicalEof = await bgSend.execute(
+    "send-canonical-eof",
+    { id: canonicalEofTask.details.id, input: "<EOF>" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(canonicalEof.content[0].text, /Closed stdin/);
+  assert.equal(children[5].stdin.writableEnded, true);
+  children[5].finish(0, null);
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
@@ -575,6 +605,26 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     await bgSend.execute(`pty-${input}`, { id, input }, undefined, undefined, ctx);
     assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([byte]), `${input} byte`);
   }
+
+  for (const input of ["<Ctrl+d>", "<Control-D>", "<C+D>", "<Ctrl + d>"]) {
+    await bgSend.execute(`pty-alias-${input}`, { id, input }, undefined, undefined, ctx);
+    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([0x04]), `${input} Ctrl+D byte`);
+  }
+
+  await bgSend.execute("pty-literal-bare-ctrl", { id, input: "Ctrl+d" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("Ctrl+d"));
+
+  await bgSend.execute("pty-escaped-ctrl", { id, input: "\\<C-d>" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("<C-d>"));
+
+  await bgSend.execute("pty-escaped-backslash-before-key", { id, input: "\\\\<C-d>" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from([0x5c, 0x04]));
+
+  await bgSend.execute("pty-preserve-ordinary-backslash", { id, input: "C:\\temp\\file" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("C:\\temp\\file"));
+
+  await bgSend.execute("pty-literal-ctrl-text", { id, input: "press Ctrl+d now" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("press Ctrl+d now"));
 
   const namedKeyCases: Array<[string, string]> = [
     ["<Up>", "\x1b[A"], ["<Down>", "\x1b[B"], ["<Right>", "\x1b[C"], ["<Left>", "\x1b[D"],

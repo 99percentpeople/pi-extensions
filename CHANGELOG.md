@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced the `bg_send` text/key/sequence/enter parameters with the breaking `input` string DSL
 - Renamed the `/kill` command to `/bg-kill` for consistent background-task command names
 - Allowed independent `bg_wait` calls to execute in parallel
+- Accepted common Ctrl-chord spellings and backslash-escaped literal token text in `bg_send`, while keeping terminal keys distinct from OS signals
 
 ## [1.0.0] - 2026-06-07
 
