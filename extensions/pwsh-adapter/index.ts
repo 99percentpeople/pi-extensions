@@ -150,7 +150,7 @@ function createBgSpawnWrapper() {
       );
     }
     // Fallback: pass through unchanged
-    return spawn(command, args as string[], options);
+    return spawn(command, args as string[], options ?? {});
   };
 }
 

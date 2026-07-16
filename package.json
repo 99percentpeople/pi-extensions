@@ -14,7 +14,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --import tsx --test tests/background-tasks.test.ts",
     "lint": "tsc --noEmit",
     "check": "tsc --noEmit"
   },
@@ -52,8 +52,19 @@
     "url": "https://github.com/99percentpeople/pi-extensions/issues"
   },
   "homepage": "https://github.com/99percentpeople/pi-extensions#readme",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
+    "@earendil-works/pi-ai": "latest",
     "@earendil-works/pi-coding-agent": "latest",
+    "@earendil-works/pi-tui": "latest",
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typebox": "latest",
     "typescript": "^5.0.0"
   }
 }

@@ -75,7 +75,9 @@ Run long-running commands in the background with real-time monitoring.
 - `/kill` - Kill a background task by ID
 
 **Features:**
-- Auto-throttle via AbortController
+- Automatic completion/failure follow-up notifications (no polling required)
+- Auto-throttle via AbortController for explicit status checks
+- Latest stdout/stderr log line included in `bg_status`
 - Widget with real-time refresh (100ms)
 - Extensible spawn backend via pi.events
 

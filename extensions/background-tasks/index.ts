@@ -1,14 +1,15 @@
 /**
  * Background Tasks Extension for Pi
  *
- * 4 tools, clear responsibilities:
+ * 5 tools, clear responsibilities:
  *   bg_start  - Start a background task
  *   bg_status - Check status / list tasks / read output
  *   bg_send   - Interact via stdin (text, control chars, raw bytes)
  *   bg_stop   - Force kill unresponsive processes
  *
  * Features:
- *   - Auto-throttle via AbortController (no polling)
+ *   - Automatic completion notifications (no polling required)
+ *   - Auto-throttle via AbortController
  *   - Widget with real-time refresh (100ms)
  *   - Extensible spawn backend via pi.events
  *
@@ -21,7 +22,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, type Component } from "@earendil-works/pi-tui";
@@ -45,6 +46,17 @@ interface BgTask {
   wait: number;
   nextCheckAt: number;
   done: AbortController;
+  latestLog: LatestLog | null;
+  stdoutPending: string;
+  stderrPending: string;
+  completionNotified: boolean;
+  requestedStopSignal: "SIGTERM" | "SIGKILL" | null;
+}
+
+interface LatestLog {
+  stream: "stdout" | "stderr";
+  text: string;
+  at: number;
 }
 
 // ── Execution Backend ─────────────────────────────────────────────────
@@ -94,6 +106,95 @@ function formatDuration(ms: number): string {
   return `${min}m${sec}s`;
 }
 
+const MAX_STORED_LOG_CHARS = 500;
+const MAX_DISPLAY_LOG_CHARS = 240;
+
+function truncateText(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
+}
+
+function updateLatestLog(task: BgTask, stream: "stdout" | "stderr", data: Buffer): void {
+  const pendingKey = stream === "stdout" ? "stdoutPending" : "stderrPending";
+  const combined = task[pendingKey] + data.toString("utf-8");
+  const lines = combined.split(/\r\n|[\r\n]/);
+  const endsWithLineBreak = /[\r\n]$/.test(combined);
+  task[pendingKey] = endsWithLineBreak ? "" : (lines.pop() ?? "");
+
+  const latestCompleteLine = lines.filter((line) => line.length > 0).at(-1);
+  const latestText = task[pendingKey] || latestCompleteLine;
+  if (!latestText) return;
+
+  task.latestLog = {
+    stream,
+    text: truncateText(latestText, MAX_STORED_LOG_CHARS),
+    at: Date.now(),
+  };
+}
+
+function formatLatestLog(latestLog: LatestLog | null): string {
+  if (!latestLog) return "(no output yet)";
+  return `[${latestLog.stream}] ${truncateText(latestLog.text, MAX_DISPLAY_LOG_CHARS)}`;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("bg_status cancelled");
+}
+
+async function waitUntilAllowed(
+  remainingMs: number,
+  doneSignals: AbortSignal[],
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  throwIfAborted(signal);
+  if (remainingMs <= 0) return;
+
+  const combined = AbortSignal.any([
+    AbortSignal.timeout(Math.ceil(remainingMs)),
+    ...doneSignals,
+    ...(signal ? [signal] : []),
+  ]);
+  if (!combined.aborted) {
+    await new Promise<void>((resolve) => combined.addEventListener("abort", () => resolve(), { once: true }));
+  }
+  throwIfAborted(signal);
+}
+
+async function waitForTaskEnd(task: BgTask, timeoutMs: number): Promise<void> {
+  if (task.status !== "running" || task.done.signal.aborted) return;
+  await waitUntilAllowed(timeoutMs, [task.done.signal], undefined);
+}
+
+async function sendTaskSignal(task: BgTask, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
+  const child = task.process;
+  const pid = child?.pid;
+  if (!child || !pid) throw new Error(`Task "${task.name}" process is unavailable.`);
+
+  task.requestedStopSignal = signal;
+  try {
+    if (process.platform === "win32") {
+      await new Promise<void>((resolve, reject) => {
+        const args = ["/T", "/PID", String(pid)];
+        if (signal === "SIGKILL") args.unshift("/F");
+        const killer = spawn("taskkill", args, { stdio: "ignore", windowsHide: true });
+        killer.once("error", reject);
+        killer.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with code ${code}`)));
+      });
+      return;
+    }
+
+    try {
+      process.kill(-pid, signal);
+    } catch (error) {
+      const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+      if (code !== "ESRCH" || !child.kill(signal)) throw error;
+    }
+  } catch (error) {
+    task.requestedStopSignal = null;
+    throw error;
+  }
+}
+
 
 
 // ── Widget ─────────────────────────────────────────────────────────────
@@ -101,6 +202,7 @@ function formatDuration(ms: number): string {
 const WIDGET_KEY = "bg-tasks-widget";
 let uiCtx: ExtensionContext | null = null;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let shuttingDown = false;
 
 function getRunningTasks(): BgTask[] {
   return Array.from(tasks.values()).filter((t) => t.status === "running");
@@ -147,35 +249,36 @@ function updateWidget() {
 export default function (pi: ExtensionAPI) {
   ensureTaskDir();
 
-  pi.events.on("bg:register", (ops: { spawn?: typeof spawn }) => {
+  pi.events.on("bg:register", (data: unknown) => {
+    const ops = data as { spawn?: typeof spawn };
     if (ops.spawn) spawnFn = ops.spawn;
   });
 
-  pi.on("session_start", async (_event, ctx) => { uiCtx = ctx; });
+  pi.on("session_start", async (_event, ctx) => { shuttingDown = false; uiCtx = ctx; });
 
   pi.on("tool_execution_end", async (event, ctx) => {
     if (event.toolName.startsWith("bg_")) { uiCtx = ctx; updateWidget(); }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    shuttingDown = true;
     stopRefreshTimer();
     if (ctx?.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
     uiCtx = null;
-    for (const [, task] of tasks) {
-      if (task.process && task.status === "running") {
-        const pid = task.process.pid;
-        if (pid) {
-          // Windows: use taskkill to kill entire process tree
-          try {
-            spawn("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", windowsHide: true });
-          } catch {
-            task.process.kill("SIGKILL");
-          }
-        } else {
-          task.process.kill("SIGKILL");
+    await Promise.all(Array.from(tasks.values()).map(async (task) => {
+      if (!task.process || task.status !== "running") return;
+      task.completionNotified = true;
+      try {
+        await sendTaskSignal(task, "SIGTERM");
+        await waitForTaskEnd(task, 3000);
+        if (task.status === "running") {
+          await sendTaskSignal(task, "SIGKILL");
+          await waitForTaskEnd(task, 1000);
         }
+      } catch {
+        task.process?.kill("SIGKILL");
       }
-    }
+    }));
   });
 
   // ── bg_start ───────────────────────────────────────────────────────
@@ -187,16 +290,16 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Start a long-running command in the background",
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
-      "After bg_start, use bg_status to check the task later instead of waiting synchronously.",
+      "After bg_start, do not poll bg_status. Background task completion or failure is delivered automatically; continue other useful work or finish the response.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "A short descriptive name for the task" }),
       command: Type.String({ description: "The shell command to run" }),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to current)" })),
-      wait: Type.Optional(Type.Number({ description: "Minimum seconds between status checks (default: 5)" })),
+      wait: Type.Optional(Type.Number({ description: "Minimum seconds between status checks (default: 5)", minimum: 1, maximum: 3600 })),
     }),
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
       const dir = await ensureTaskDir();
       const id = generateId();
       const stdoutFile = join(dir, `${id}.stdout`);
@@ -206,6 +309,7 @@ export default function (pi: ExtensionAPI) {
         cwd: params.cwd || ctx.cwd,
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
+        detached: process.platform !== "win32",
       });
 
       const task: BgTask = {
@@ -214,43 +318,75 @@ export default function (pi: ExtensionAPI) {
         exitCode: null, signal: null,
         startedAt: Date.now(), endedAt: null,
         stdoutFile, stderrFile, stdoutLines: 0, stderrLines: 0,
-        wait: params.wait ?? 5, nextCheckAt: Date.now(),
+        wait: params.wait ?? 5, nextCheckAt: Date.now() + (params.wait ?? 5) * 1000,
         done: new AbortController(),
+        latestLog: null, stdoutPending: "", stderrPending: "",
+        completionNotified: false, requestedStopSignal: null,
       };
       tasks.set(id, task);
 
       child.stdout?.on("data", (d: Buffer) => {
         task.stdoutLines += d.toString().split("\n").length - 1;
+        updateLatestLog(task, "stdout", d);
         appendToFile(stdoutFile, d).catch(() => {});
       });
       child.stderr?.on("data", (d: Buffer) => {
         task.stderrLines += d.toString().split("\n").length - 1;
+        updateLatestLog(task, "stderr", d);
         appendToFile(stderrFile, d).catch(() => {});
       });
-      child.on("exit", (code, signal) => {
+      let spawnError: Error | null = null;
+      child.on("error", (err) => {
+        spawnError = err;
+        const errorLine = `[error: ${err.message}]`;
+        updateLatestLog(task, "stderr", Buffer.from(`${errorLine}\n`));
+        appendToFile(stderrFile, `\n${errorLine}\n`).catch(() => {});
+      });
+      child.on("close", (code, signal) => {
         task.endedAt = Date.now();
         task.exitCode = code;
-        task.signal = signal;
+        task.signal = signal ?? task.requestedStopSignal;
         task.process = null;
-        task.status = signal === "SIGTERM" || signal === "SIGKILL" ? "stopped" : code === 0 ? "completed" : "failed";
+        task.status = task.requestedStopSignal
+          ? "stopped"
+          : spawnError
+            ? "failed"
+            : signal === "SIGTERM" || signal === "SIGKILL"
+              ? "stopped"
+              : code === 0 ? "completed" : "failed";
         task.done.abort();
         updateWidget();
-      });
-      child.on("error", (err) => {
-        task.endedAt = Date.now();
-        task.status = "failed";
-        task.process = null;
-        task.done.abort();
-        appendToFile(stderrFile, `\n[error: ${err.message}]\n`).catch(() => {});
-        updateWidget();
+
+        if (task.completionNotified || shuttingDown) return;
+        task.completionNotified = true;
+        const duration = formatDuration(task.endedAt - task.startedAt);
+        const exit = task.exitCode !== null ? ` Exit code: ${task.exitCode}.` : "";
+        const stopped = task.signal ? ` Signal: ${task.signal}.` : "";
+        try {
+          pi.sendMessage({
+            customType: "background-task-complete",
+            content: `Background task "${task.name}" (${task.id}) ${task.status} after ${duration}.${exit}${stopped}\nLatest log: ${formatLatestLog(task.latestLog)}\nDo not call bg_status unless the user explicitly asks for more details.`,
+            display: true,
+            details: {
+              id: task.id,
+              name: task.name,
+              status: task.status,
+              exitCode: task.exitCode,
+              signal: task.signal,
+              latestLog: task.latestLog,
+            },
+          }, { deliverAs: "followUp", triggerTurn: true });
+        } catch {
+          // The extension runtime may already be shutting down or reloading.
+        }
       });
 
       uiCtx = ctx;
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${child.pid}` }],
-        details: { id, name: params.name, command: params.command, pid: child.pid },
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${child.pid}\nCompletion notification: automatic; do not poll bg_status.` }],
+        details: { id, name: params.name, command: params.command, pid: child.pid, wait: task.wait },
       };
     },
 
@@ -281,26 +417,39 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_status",
     label: "BG Status",
-    description: "Check background task status or list all tasks. With id: detailed status. Without id: list all.",
-    promptSnippet: "Check background task status or list all tasks",
+    description: "Inspect a background task snapshot or list tasks. Completion notifications are automatic; this is not a polling tool.",
+    promptSnippet: "Inspect background tasks only when status details are needed",
     promptGuidelines: [
-      "Use bg_status to check if a background task is still running, or to see its exit code and output size.",
-      "Use bg_status without id to list all background tasks.",
+      "Do not poll bg_status after bg_start; completion and failure notifications arrive automatically.",
+      "Use bg_status only when the user explicitly asks for current task details, when recovering missing context, or when diagnosing a suspected notification failure.",
+      "Use bg_status without id only when a task ID is unknown and a task list is specifically needed.",
     ],
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task ID. If omitted, lists all tasks." })),
     }),
 
-    async execute(_toolCallId, params) {
+    executionMode: "sequential",
+
+    async execute(_toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!params.id) {
         const entries = Array.from(tasks.values());
         if (entries.length === 0) return { content: [{ type: "text", text: "No background tasks." }], details: { tasks: [] } };
+        const running = entries.filter((task) => task.status === "running");
+        const remaining = Math.max(0, ...running.map((task) => task.nextCheckAt - Date.now()));
+        await waitUntilAllowed(remaining, running.map((task) => task.done.signal), signal);
+        const nextCheckBase = Date.now();
+        for (const task of running) {
+          if (task.status === "running") task.nextCheckAt = nextCheckBase + task.wait * 1000;
+        }
         const lines = entries.map((t) => {
           const dur = t.endedAt ? formatDuration(t.endedAt - t.startedAt) : formatDuration(Date.now() - t.startedAt);
           const exit = t.exitCode !== null ? ` exit=${t.exitCode}` : "";
-          return `[${t.id}] "${t.name}" ${t.status} (${dur})${exit}`;
+          return `[${t.id}] "${t.name}" ${t.status} (${dur})${exit}\n  Latest log: ${formatLatestLog(t.latestLog)}`;
         });
-        return { content: [{ type: "text", text: lines.join("\n") }], details: { tasks: entries.map((t) => ({ id: t.id, name: t.name, status: t.status })) } };
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { tasks: entries.map((t) => ({ id: t.id, name: t.name, status: t.status, latestLog: t.latestLog })) },
+        };
       }
 
       const task = tasks.get(params.id);
@@ -310,13 +459,10 @@ export default function (pi: ExtensionAPI) {
       if (task.status === "running" && task.nextCheckAt > 0) {
         const remaining = task.nextCheckAt - Date.now();
         if (remaining > 0) {
-          await new Promise<void>((resolve) => {
-            const signal = AbortSignal.any([AbortSignal.timeout(remaining), task.done.signal]);
-            signal.addEventListener("abort", () => resolve(), { once: true });
-          });
+          await waitUntilAllowed(remaining, [task.done.signal], signal);
         }
       }
-      task.nextCheckAt = Date.now() + task.wait * 1000;
+      if (task.status === "running") task.nextCheckAt = Date.now() + task.wait * 1000;
 
       const duration = task.endedAt ? formatDuration(task.endedAt - task.startedAt) : formatDuration(Date.now() - task.startedAt);
       const parts: string[] = [
@@ -326,11 +472,16 @@ export default function (pi: ExtensionAPI) {
       if (task.exitCode !== null) parts.push(`  Exit code: ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:    ${task.signal}`);
       if (task.process?.pid) parts.push(`  PID:       ${task.process.pid}`);
-      parts.push(`  Stdout:    ${task.stdoutLines} lines`, `  Stderr:    ${task.stderrLines} lines`);
+      parts.push(
+        `  Stdout:    ${task.stdoutLines} lines`,
+        `  Stderr:    ${task.stderrLines} lines`,
+        `  Latest log: ${formatLatestLog(task.latestLog)}`,
+      );
+      if (task.status === "running") parts.push("  Completion notification: automatic; do not poll bg_status.");
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, wait: task.wait },
+        details: { id: task.id, name: task.name, status: task.status, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, wait: task.wait, latestLog: task.latestLog },
       };
     },
 
@@ -352,7 +503,7 @@ export default function (pi: ExtensionAPI) {
           if (l.includes("failed")) return l.replace("failed", theme.fg("error", "failed"));
           if (l.includes("stopped")) return l.replace("stopped", theme.fg("warning", "stopped"));
         }
-        return theme.fg("foreground", l) || l;
+        return theme.fg("toolOutput", l) || l;
       });
       return new Text(lines.join("\n"), 0, 0);
     },
@@ -377,7 +528,7 @@ export default function (pi: ExtensionAPI) {
       max_lines: Type.Optional(Type.Number({ description: "Max lines with from_line (default: 500)" })),
     }),
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
@@ -424,7 +575,7 @@ export default function (pi: ExtensionAPI) {
       const lines = content.split("\n").map(l => {
         if (l.startsWith("── ") || l.startsWith("-- ")) return theme.fg("accent", l) || l;
         if (l === "(no output yet)" || l === "(no stdout)" || l === "(no stderr)") return theme.fg("muted", l) || l;
-        return theme.fg("foreground", l) || l;
+        return theme.fg("toolOutput", l) || l;
       });
       return new Text(lines.join("\n"), 0, 0);
     },
@@ -457,7 +608,7 @@ export default function (pi: ExtensionAPI) {
       raw: Type.Optional(Type.Boolean({ description: "Send raw bytes without newline (default: false)" })),
     }),
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is not running.` }], details: {} };
@@ -487,7 +638,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Sending..."), 0, 0);
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
-      return new Text(theme.fg("foreground", content) || content, 0, 0);
+      return new Text(theme.fg("toolOutput", content) || content, 0, 0);
     },
   });
 
@@ -508,30 +659,28 @@ export default function (pi: ExtensionAPI) {
       tail_lines: Type.Optional(Type.Number({ description: "Return last N lines of output (default: 30)" })),
     }),
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is already ${task.status}.` }], details: {} };
 
       const signal = params.force ? "SIGKILL" : "SIGTERM";
-      const pid = task.process?.pid;
+      task.completionNotified = true;
       try {
-        if (pid) {
-          // Windows: use taskkill to kill entire process tree
-          spawn("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", windowsHide: true });
-        } else {
-          task.process?.kill(signal);
-        }
+        await sendTaskSignal(task, signal);
       }
-      catch (err) { return { content: [{ type: "text", text: `Failed to send ${signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} }; }
+      catch (err) {
+        task.completionNotified = false;
+        return { content: [{ type: "text", text: `Failed to send ${signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+      }
 
-      await new Promise((r) => setTimeout(r, 500));
-      if (!params.force && task.status === "running") await new Promise((r) => setTimeout(r, 2000));
+      await waitForTaskEnd(task, params.force ? 500 : 2500);
 
       const tail = params.tail_lines || 30;
       const stdout = await readTail(task.stdoutFile, tail);
       const stderr = await readTail(task.stderrFile, tail);
-      const parts = [`Killed "${task.name}" with ${signal}. Status: ${task.status}`];
+      const action = task.status === "running" ? `Sent ${signal} to` : "Stopped";
+      const parts = [`${action} "${task.name}". Status: ${task.status}`];
       if (stdout) parts.push(`\n── stdout (last ${tail}) ──\n${stdout}`);
       if (stderr) parts.push(`\n── stderr (last ${tail}) ──\n${stderr}`);
 
@@ -554,7 +703,7 @@ export default function (pi: ExtensionAPI) {
         if (l.includes("SIGKILL")) return theme.fg("error", l) || l;
         if (l.includes("SIGTERM")) return theme.fg("warning", l) || l;
         if (l.startsWith("── ") || l.startsWith("-- ")) return theme.fg("accent", l) || l;
-        return theme.fg("foreground", l) || l;
+        return theme.fg("toolOutput", l) || l;
       });
       return new Text(lines.join("\n"), 0, 0);
     },
@@ -579,10 +728,10 @@ export default function (pi: ExtensionAPI) {
         }
         const choice = await ctx.ui.select(
           "Kill which task?",
-          running.map(t => ({ value: t.id, label: `${t.id} ${t.name}` })),
+          running.map(t => `${t.id} ${t.name}`),
         );
         if (!choice) return;
-        args = choice;
+        args = choice.split(" ", 1)[0];
       }
 
       const task = tasks.get(args);
@@ -595,19 +744,17 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const pid = task.process?.pid;
-      if (pid) {
-        try {
-          spawn("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", windowsHide: true });
-        } catch {
-          task.process?.kill("SIGKILL");
-        }
-      } else {
-        task.process?.kill("SIGKILL");
+      task.completionNotified = true;
+      try {
+        await sendTaskSignal(task, "SIGKILL");
+      } catch (error) {
+        task.completionNotified = false;
+        ctx.ui.notify(`Failed to kill "${task.name}": ${error instanceof Error ? error.message : String(error)}`, "error");
+        return;
       }
 
-      await new Promise(r => setTimeout(r, 500));
-      ctx.ui.notify(`Killed "${task.name}" (${task.id})`, "info");
+      await waitForTaskEnd(task, 500);
+      ctx.ui.notify(`Stop requested for "${task.name}" (${task.id}); status: ${task.status}`, "info");
     },
   });
 }
