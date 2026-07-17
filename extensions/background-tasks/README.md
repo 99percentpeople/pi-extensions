@@ -37,11 +37,15 @@ bg_send id="<task-id>" input="<C-o>filename.txt<Enter>"
 bg_send id="<task-id>" input="<F10>"
 bg_send id="<task-id>" input="<Esc>iHello<Enter>"
 bg_send id="<task-id>" input="<Down*3><Enter>"
+bg_send id="<task-id>" input="<A-f><A-f><Space>"
 bg_send id="<task-id>" input="<C-d>"
 ```
 
-The input DSL supports Ctrl+A–Z, Ctrl punctuation combinations, arrows, Home/End,
-PageUp/PageDown, Insert/Delete, F1–F12, Enter, Escape, Tab, and Backspace.
+The input DSL supports Ctrl+A–Z, Ctrl punctuation combinations, Alt/Meta combinations,
+arrows, Home/End, PageUp/PageDown, Insert/Delete, F1–F12, Space, Enter, Escape,
+Tab, and Backspace. Alt/Meta accepts `<A-f>`, `<Alt-f>`, `<M-f>`, and `<Meta-f>`
+spellings and can also modify common navigation and function keys. Modifiers can be
+combined, for example `<C-A-d>` or `<S-A-Left>`.
 Plain characters are exact and never imply Enter. Terminal keys use `<...>` tokens;
 for example, Ctrl+D is `<C-d>`. Use `\<` for a literal `<` and `\\` for a literal
 backslash. Common Ctrl spellings are accepted inside key tokens.

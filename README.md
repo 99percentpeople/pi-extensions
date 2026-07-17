@@ -54,7 +54,7 @@ bg_start name="git-ui" command="lazygit" pty=true
 ```
 
 Terminal keys sent through `bg_send` use angle-bracket tokens such as
-`<C-c>`, `<Enter>`, `<Up>`, and `<F10>`. Escape a literal `<` as `\<`.
+`<C-c>`, `<A-f>`, `<Space>`, `<Up>`, and `<F10>`. Escape a literal `<` as `\<`.
 PTY snapshots are opt-in on status, wait, and kill results and are collapsed
 in Pi's TUI by default.
 

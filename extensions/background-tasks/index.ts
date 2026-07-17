@@ -1313,90 +1313,206 @@ export default function (pi: ExtensionAPI) {
 
   // ── bg_send ────────────────────────────────────────────────────────
 
-  const INPUT_KEYS = [
-    "ctrl+a", "ctrl+b", "ctrl+c", "ctrl+d", "ctrl+e", "ctrl+f", "ctrl+g",
-    "ctrl+h", "ctrl+i", "ctrl+j", "ctrl+k", "ctrl+l", "ctrl+m", "ctrl+n",
-    "ctrl+o", "ctrl+p", "ctrl+q", "ctrl+r", "ctrl+s", "ctrl+t", "ctrl+u",
-    "ctrl+v", "ctrl+w", "ctrl+x", "ctrl+y", "ctrl+z", "ctrl+@", "ctrl+space",
-    "ctrl+[", "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_", "ctrl+?",
-    "enter", "return", "escape", "esc", "tab", "shift+tab", "backspace",
-    "insert", "delete", "home", "end", "pageup", "pagedown",
-    "up", "down", "left", "right",
-    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
-    "eof",
-  ] as const;
-  type InputKey = (typeof INPUT_KEYS)[number];
   const MAX_INPUT_BYTES = 65_536;
   const MAX_KEY_REPEAT = 100;
 
-  const FIXED_KEY_SEQUENCES: Partial<Record<InputKey, Buffer>> = {
-    enter: Buffer.from("\r"), return: Buffer.from("\r"),
-    escape: Buffer.from("\x1b"), esc: Buffer.from("\x1b"),
-    tab: Buffer.from("\t"), "shift+tab": Buffer.from("\x1b[Z"),
-    backspace: Buffer.from([0x7f]), insert: Buffer.from("\x1b[2~"), delete: Buffer.from("\x1b[3~"),
-    pageup: Buffer.from("\x1b[5~"), pagedown: Buffer.from("\x1b[6~"),
-    f1: Buffer.from("\x1bOP"), f2: Buffer.from("\x1bOQ"),
-    f3: Buffer.from("\x1bOR"), f4: Buffer.from("\x1bOS"),
-    f5: Buffer.from("\x1b[15~"), f6: Buffer.from("\x1b[17~"),
-    f7: Buffer.from("\x1b[18~"), f8: Buffer.from("\x1b[19~"),
-    f9: Buffer.from("\x1b[20~"), f10: Buffer.from("\x1b[21~"),
-    f11: Buffer.from("\x1b[23~"), f12: Buffer.from("\x1b[24~"),
-    eof: Buffer.from([0x04]),
+  type KeyDefinition =
+    | { kind: "character"; value: string }
+    | { kind: "fixed"; sequence: string }
+    | { kind: "cursor"; final: string }
+    | { kind: "function"; final: string }
+    | { kind: "tilde"; code: number }
+    | { kind: "eof" };
+
+  const KEY_DEFINITIONS = {
+    space: { kind: "character", value: " " },
+    enter: { kind: "fixed", sequence: "\r" },
+    escape: { kind: "fixed", sequence: "\x1b" },
+    tab: { kind: "fixed", sequence: "\t" },
+    backspace: { kind: "fixed", sequence: "\x7f" },
+    insert: { kind: "tilde", code: 2 },
+    delete: { kind: "tilde", code: 3 },
+    pageup: { kind: "tilde", code: 5 },
+    pagedown: { kind: "tilde", code: 6 },
+    up: { kind: "cursor", final: "A" },
+    down: { kind: "cursor", final: "B" },
+    right: { kind: "cursor", final: "C" },
+    left: { kind: "cursor", final: "D" },
+    home: { kind: "cursor", final: "H" },
+    end: { kind: "cursor", final: "F" },
+    f1: { kind: "function", final: "P" },
+    f2: { kind: "function", final: "Q" },
+    f3: { kind: "function", final: "R" },
+    f4: { kind: "function", final: "S" },
+    f5: { kind: "tilde", code: 15 },
+    f6: { kind: "tilde", code: 17 },
+    f7: { kind: "tilde", code: 18 },
+    f8: { kind: "tilde", code: 19 },
+    f9: { kind: "tilde", code: 20 },
+    f10: { kind: "tilde", code: 21 },
+    f11: { kind: "tilde", code: 23 },
+    f12: { kind: "tilde", code: 24 },
+    eof: { kind: "eof" },
+  } as const satisfies Record<string, KeyDefinition>;
+  type NamedInputKey = keyof typeof KEY_DEFINITIONS;
+
+  const NAMED_KEY_ALIASES: Record<string, NamedInputKey> = {
+    space: "space", spc: "space",
+    esc: "escape", escape: "escape",
+    enter: "enter", return: "enter", cr: "enter",
+    tab: "tab", backtab: "tab",
+    bs: "backspace", backspace: "backspace",
+    ins: "insert", insert: "insert", del: "delete", delete: "delete",
+    home: "home", end: "end",
+    pageup: "pageup", pgup: "pageup", pagedown: "pagedown", pgdn: "pagedown",
+    up: "up", down: "down", left: "left", right: "right",
+    f1: "f1", f2: "f2", f3: "f3", f4: "f4", f5: "f5", f6: "f6",
+    f7: "f7", f8: "f8", f9: "f9", f10: "f10", f11: "f11", f12: "f12",
+    eof: "eof",
   };
 
-  function encodeInputKey(task: BgTask, inputKey: string): Buffer {
-    const key = inputKey.toLowerCase() as InputKey;
-    if (!INPUT_KEYS.includes(key)) throw new Error(`Unsupported key: ${inputKey}`);
+  const CHARACTER_ALIASES: Record<string, string> = {
+    lt: "<", gt: ">", backslash: "\\",
+  };
 
-    const ctrlLetter = /^ctrl\+([a-z])$/.exec(key)?.[1];
-    if (ctrlLetter) return Buffer.from([ctrlLetter.charCodeAt(0) - 96]);
-    switch (key) {
-      case "ctrl+@": case "ctrl+space": return Buffer.from([0x00]);
-      case "ctrl+[": return Buffer.from([0x1b]);
-      case "ctrl+\\": return Buffer.from([0x1c]);
-      case "ctrl+]": return Buffer.from([0x1d]);
-      case "ctrl+^": return Buffer.from([0x1e]);
-      case "ctrl+_": return Buffer.from([0x1f]);
-      case "ctrl+?": return Buffer.from([0x7f]);
-      case "up": case "down": case "left": case "right": case "home": case "end": {
-        const final = { up: "A", down: "B", right: "C", left: "D", home: "H", end: "F" }[key];
-        const prefix = task.ptyState?.terminal.modes.applicationCursorKeysMode ? "\x1bO" : "\x1b[";
-        return Buffer.from(`${prefix}${final}`);
-      }
-      default: {
-        const sequence = FIXED_KEY_SEQUENCES[key];
-        if (!sequence) throw new Error(`Unsupported key: ${inputKey}`);
-        return sequence;
-      }
-    }
+  const MODIFIER_ALIASES = {
+    c: "ctrl", ctrl: "ctrl", control: "ctrl",
+    a: "alt", alt: "alt", m: "alt", meta: "alt",
+    s: "shift", shift: "shift",
+  } as const;
+
+  const SHIFTED_CHARACTERS: Record<string, string> = {
+    "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^",
+    "7": "&", "8": "*", "9": "(", "0": ")", "-": "_", "=": "+",
+    "[": "{", "]": "}", "\\": "|", ";": ":", "'": "\"",
+    ",": "<", ".": ">", "/": "?", "`": "~",
+  };
+
+  const CONTROL_BYTES: Record<string, number> = {
+    "@": 0x00, " ": 0x00, "[": 0x1b, "\\": 0x1c,
+    "]": 0x1d, "^": 0x1e, "_": 0x1f, "?": 0x7f,
+  };
+
+  interface KeyModifiers {
+    ctrl: boolean;
+    alt: boolean;
+    shift: boolean;
   }
 
-  function normalizeInputToken(token: string): InputKey | "lt" | null {
-    const normalized = token.trim().toLowerCase().replace(/\s+/g, "");
-    const aliases: Record<string, InputKey | "lt"> = {
-      lt: "lt",
-      esc: "escape", escape: "escape",
-      enter: "enter", return: "enter", cr: "enter",
-      tab: "tab", "s-tab": "shift+tab", backtab: "shift+tab",
-      bs: "backspace", backspace: "backspace",
-      ins: "insert", insert: "insert", del: "delete", delete: "delete",
-      home: "home", end: "end",
-      pageup: "pageup", pgup: "pageup", pagedown: "pagedown", pgdn: "pagedown",
-      up: "up", down: "down", left: "left", right: "right",
-      eof: "eof",
-    };
-    if (aliases[normalized]) return aliases[normalized];
-    if (/^f(?:[1-9]|1[0-2])$/.test(normalized)) return normalized as InputKey;
+  type LogicalKey =
+    | { kind: "named"; name: NamedInputKey }
+    | { kind: "character"; value: string };
 
-    const control = /^(?:c|ctrl|control)[+-](.+)$/.exec(normalized)?.[1];
-    if (!control) return null;
-    if (/^[a-z]$/.test(control)) return `ctrl+${control}` as InputKey;
-    const controlAliases: Record<string, InputKey> = {
-      "@": "ctrl+@", space: "ctrl+space", "[": "ctrl+[",
-      "\\": "ctrl+\\", backslash: "ctrl+\\", "]": "ctrl+]",
-      "^": "ctrl+^", "_": "ctrl+_", "?": "ctrl+?",
-    };
-    return controlAliases[control] ?? null;
+  interface KeyStroke {
+    kind: "key";
+    key: LogicalKey;
+    modifiers: KeyModifiers;
+  }
+
+  type NormalizedInputToken = KeyStroke | { kind: "literal"; value: string };
+
+  function hasModifiers(modifiers: KeyModifiers): boolean {
+    return modifiers.ctrl || modifiers.alt || modifiers.shift;
+  }
+
+  function normalizeInputToken(token: string): NormalizedInputToken | null {
+    let remaining = token.trim().replace(/\s+/g, "");
+    const modifiers: KeyModifiers = { ctrl: false, alt: false, shift: false };
+
+    while (remaining.length > 0) {
+      const match = /^(c|ctrl|control|a|alt|m|meta|s|shift)[+-]/i.exec(remaining);
+      if (!match) break;
+      const modifier = MODIFIER_ALIASES[match[1].toLowerCase() as keyof typeof MODIFIER_ALIASES];
+      if (modifiers[modifier]) return null;
+      modifiers[modifier] = true;
+      remaining = remaining.slice(match[0].length);
+    }
+    if (remaining.length === 0) return null;
+
+    const lowerKey = remaining.toLowerCase();
+    if (lowerKey === "lt" && !hasModifiers(modifiers)) return { kind: "literal", value: "<" };
+    if (lowerKey === "backtab") modifiers.shift = true;
+
+    const namedKey = NAMED_KEY_ALIASES[lowerKey];
+    if (namedKey) return { kind: "key", key: { kind: "named", name: namedKey }, modifiers };
+
+    const aliasedCharacter = CHARACTER_ALIASES[lowerKey];
+    if (aliasedCharacter) {
+      return { kind: "key", key: { kind: "character", value: aliasedCharacter }, modifiers };
+    }
+
+    const characters = Array.from(remaining);
+    const codePoint = characters[0]?.codePointAt(0) ?? 0;
+    if (hasModifiers(modifiers) && characters.length === 1 && codePoint >= 0x21 && codePoint <= 0x7e) {
+      return { kind: "key", key: { kind: "character", value: remaining }, modifiers };
+    }
+    return null;
+  }
+
+  function modifierParameter(modifiers: KeyModifiers): number {
+    return 1 + (modifiers.shift ? 1 : 0) + (modifiers.alt ? 2 : 0) + (modifiers.ctrl ? 4 : 0);
+  }
+
+  function shiftCharacter(character: string): string {
+    if (/^[a-z]$/.test(character)) return character.toUpperCase();
+    return SHIFTED_CHARACTERS[character] ?? character;
+  }
+
+  function controlByte(character: string): number | null {
+    const lower = character.toLowerCase();
+    if (/^[a-z]$/.test(lower)) return lower.charCodeAt(0) - 96;
+    return CONTROL_BYTES[character] ?? null;
+  }
+
+  function encodeCharacter(character: string, modifiers: KeyModifiers): Buffer {
+    const byte = modifiers.ctrl ? controlByte(character) : null;
+    if (modifiers.ctrl && byte === null) throw new Error(`Unsupported Ctrl key: ${character}`);
+    const data = byte === null
+      ? Buffer.from(modifiers.shift ? shiftCharacter(character) : character)
+      : Buffer.from([byte]);
+    return modifiers.alt ? Buffer.concat([Buffer.from("\x1b"), data]) : data;
+  }
+
+  function encodeInputKey(task: BgTask, stroke: KeyStroke): Buffer {
+    if (stroke.key.kind === "character") return encodeCharacter(stroke.key.value, stroke.modifiers);
+
+    const definition = KEY_DEFINITIONS[stroke.key.name];
+    if (definition.kind === "character") return encodeCharacter(definition.value, stroke.modifiers);
+    if (definition.kind === "eof") {
+      if (hasModifiers(stroke.modifiers)) throw new Error("<EOF> does not accept modifiers.");
+      return Buffer.from([0x04]);
+    }
+    if (definition.kind === "fixed") {
+      const sequence = stroke.key.name === "tab" && stroke.modifiers.shift ? "\x1b[Z" : definition.sequence;
+      return stroke.modifiers.alt
+        ? Buffer.concat([Buffer.from("\x1b"), Buffer.from(sequence)])
+        : Buffer.from(sequence);
+    }
+
+    const parameter = modifierParameter(stroke.modifiers);
+    if (definition.kind === "cursor") {
+      if (parameter > 1) return Buffer.from(`\x1b[1;${parameter}${definition.final}`);
+      const prefix = task.ptyState?.terminal.modes.applicationCursorKeysMode ? "\x1bO" : "\x1b[";
+      return Buffer.from(`${prefix}${definition.final}`);
+    }
+    if (definition.kind === "function") {
+      return Buffer.from(parameter > 1
+        ? `\x1b[1;${parameter}${definition.final}`
+        : `\x1bO${definition.final}`);
+    }
+    return Buffer.from(parameter > 1
+      ? `\x1b[${definition.code};${parameter}~`
+      : `\x1b[${definition.code}~`);
+  }
+
+  function isNamedKey(stroke: KeyStroke, name: NamedInputKey): boolean {
+    return stroke.key.kind === "named" && stroke.key.name === name;
+  }
+
+  function isPipeEof(stroke: KeyStroke): boolean {
+    if (isNamedKey(stroke, "eof")) return !hasModifiers(stroke.modifiers);
+    return stroke.key.kind === "character" && stroke.key.value.toLowerCase() === "d" &&
+      stroke.modifiers.ctrl && !stroke.modifiers.alt;
   }
 
   interface ParsedInput {
@@ -1450,24 +1566,26 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Invalid repeat count in <${rawToken}> at offset ${tokenStart}; use 1-${MAX_KEY_REPEAT}.`);
       }
 
-      const key = normalizeInputToken(tokenName);
-      if (!key) throw new Error(`Unknown input token <${tokenName}> at offset ${tokenStart}.`);
+      const token = normalizeInputToken(tokenName);
+      if (!token) throw new Error(`Unknown input token <${tokenName}> at offset ${tokenStart}.`);
 
-      if (key === "lt") {
-        pushChunk(Buffer.from("<".repeat(repeat)), true);
+      if (token.kind === "literal") {
+        pushChunk(Buffer.from(token.value.repeat(repeat)), true);
       } else {
         keyTokens += repeat;
         if (task.mode === "pipe") {
-          if (key === "eof" || key === "ctrl+d") {
+          if (isPipeEof(token)) {
             if (repeat !== 1) throw new Error("Ctrl+D/<EOF> cannot be repeated for a pipe task.");
             eof = true;
-          } else if (key === "enter") {
+          } else if (isNamedKey(token, "enter") && !hasModifiers(token.modifiers)) {
             pushChunk(Buffer.from("\n".repeat(repeat)), false);
+          } else if (isNamedKey(token, "space") && !hasModifiers(token.modifiers)) {
+            pushChunk(Buffer.from(" ".repeat(repeat)), false);
           } else {
-            throw new Error(`Key token <${tokenName}> requires a PTY task; pipe tasks accept text, <Enter>, and <C-d>/<EOF>.`);
+            throw new Error(`Key token <${tokenName}> requires a PTY task; pipe tasks accept text, <Space>, <Enter>, and <C-d>/<EOF>.`);
           }
         } else {
-          const encoded = encodeInputKey(task, key);
+          const encoded = encodeInputKey(task, token);
           for (let index = 0; index < repeat; index++) pushChunk(encoded, false);
         }
       }
@@ -1493,13 +1611,13 @@ export default function (pi: ExtensionAPI) {
     description: "Send text and terminal keys using one compact input string, or send an OS signal to a running background task.",
     promptSnippet: "Send a compact text/key input string or an OS signal to a background task",
     promptGuidelines: [
-      "Provide exactly one of input or signal. Plain input is exact text; every terminal key must be inside an angle-bracket token such as <C-d>, <Enter>, or <Up>. Escape a literal '<' as \\<.",
+      "Provide exactly one of input or signal. Plain input is exact text; every terminal key must be inside an angle-bracket token such as <C-d>, <A-f>, <Space>, or <Up>. Escape a literal '<' as \\<.",
       "Terminal keys always use input. Use signal only when an OS process signal is explicitly intended.",
       "For pipe tasks, <C-d> or <EOF> closes stdin.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
-      input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter> or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
+      input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter>, <A-f>, or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
       signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "OS signal for the process group" })),
     }),
 

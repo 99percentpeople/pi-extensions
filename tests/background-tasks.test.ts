@@ -321,6 +321,16 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.match(pipeInput.content[0].text, /6 bytes \(1 key tokens\)/);
   assert.deepEqual(children[3].stdin.read(), Buffer.from("hello\n"));
 
+  const pipeSpaces = await bgSend.execute(
+    "send-pipe-spaces",
+    { id: ctrlTaskId, input: "<Space*2>" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(pipeSpaces.content[0].text, /2 bytes \(2 key tokens\)/);
+  assert.deepEqual(children[3].stdin.read(), Buffer.from("  "));
+
   const rejectedPipeKey = await bgSend.execute(
     "reject-pipe-key",
     { id: ctrlTaskId, input: "before<Up>" },
@@ -672,6 +682,26 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     await bgSend.execute(`pty-${input}`, { id, input }, undefined, undefined, ctx);
     assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from(expected), `${input} sequence`);
   }
+
+  const altKeyCases: Array<[string, string]> = [
+    ["<A-f>", "\x1bf"], ["<Alt+b>", "\x1bb"], ["<M-x>", "\x1bx"], ["<Meta+1>", "\x1b1"],
+    ["<A-Space>", "\x1b "], ["<Alt-Enter>", "\x1b\r"], ["<M-Tab>", "\x1b\t"],
+    ["<A-Up>", "\x1b[1;3A"], ["<Alt-Left>", "\x1b[1;3D"],
+    ["<M-Delete>", "\x1b[3;3~"], ["<Meta-F1>", "\x1b[1;3P"], ["<A-F10>", "\x1b[21;3~"],
+    ["<C-A-d>", "\x1b\x04"], ["<A-C-d>", "\x1b\x04"], ["<A-S-a>", "\x1bA"],
+    ["<C-A-Left>", "\x1b[1;7D"], ["<S-A-Left>", "\x1b[1;4D"],
+    ["<C-Right>", "\x1b[1;5C"], ["<S-F10>", "\x1b[21;2~"], ["<S-Tab>", "\x1b[Z"],
+  ];
+  for (const [input, expected] of altKeyCases) {
+    await bgSend.execute(`pty-${input}`, { id, input }, undefined, undefined, ctx);
+    assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from(expected), `${input} sequence`);
+  }
+
+  await bgSend.execute("pty-space", { id, input: "<Space*3>" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("   "));
+
+  await bgSend.execute("pty-alt-repeat", { id, input: "<A-Right*2>" }, undefined, undefined, ctx);
+  assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1b[1;3C\x1b[1;3C"));
 
   const combined = await bgSend.execute(
     "pty-sequence",
