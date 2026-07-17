@@ -1,7 +1,7 @@
 {
   "name": "@99percentpeople/pi-pwsh-adapter",
-  "version": "1.0.0",
-  "description": "Optional PowerShell 7 shell adapter for Pi on Windows",
+  "version": "1.0.1",
+  "description": "PowerShell 7 and Windows PowerShell 5.1 shell adapter for Pi",
   "type": "module",
   "os": [
     "win32"
@@ -25,6 +25,7 @@
     "coding-agent",
     "powershell",
     "pwsh",
+    "windows-powershell",
     "windows"
   ],
   "author": "99percentpeople",

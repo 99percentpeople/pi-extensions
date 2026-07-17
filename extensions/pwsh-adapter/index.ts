@@ -1,20 +1,11 @@
 import type { ExtensionAPI, BashOperations } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, type SpawnOptions, type ChildProcess } from "node:child_process";
-
-const bashSchema = Type.Object({
-  command: Type.String({
-    description:
-      "Command to execute. On this Windows environment, it is interpreted by PowerShell 7 pwsh, not GNU bash.",
-  }),
-  timeout: Type.Optional(
-    Type.Number({
-      description: "Timeout in seconds. Omit or set 0 for no timeout.",
-      minimum: 0,
-      maximum: 3600,
-    }),
-  ),
-});
+import {
+  spawn,
+  spawnSync,
+  type SpawnOptions,
+  type ChildProcess,
+} from "node:child_process";
 
 const UTF8_PRELUDE = `
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -22,6 +13,98 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = $utf8NoBom
 $OutputEncoding = $utf8NoBom
 `;
+
+const PWSH_EXECUTABLE = "pwsh.exe";
+const WINDOWS_POWERSHELL_EXECUTABLE = "powershell.exe";
+
+export interface PowerShellRuntime {
+  file: string;
+  kind: "powershell-7" | "windows-powershell";
+  version: string;
+  label: string;
+}
+
+type PowerShellProbe = (file: string) => string | null;
+
+function parseVersion(version: string): [major: number, minor: number] | null {
+  const match = /^(\d+)(?:\.(\d+))?/.exec(version.trim());
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2] ?? 0)];
+}
+
+function isAtLeast(version: string, major: number, minor = 0): boolean {
+  const parsed = parseVersion(version);
+  return !!parsed && (parsed[0] > major || (parsed[0] === major && parsed[1] >= minor));
+}
+
+function probePowerShell(file: string): string | null {
+  const result = spawnSync(
+    file,
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-NoLogo",
+      "-Command",
+      "[Console]::Out.Write($PSVersionTable.PSVersion.ToString())",
+    ],
+    {
+      encoding: "utf8",
+      timeout: 5_000,
+      windowsHide: true,
+    },
+  );
+  if (result.error || result.status !== 0) return null;
+  const version = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  return parseVersion(version) ? version : null;
+}
+
+export function selectPowerShellRuntime(
+  probe: PowerShellProbe = probePowerShell,
+): PowerShellRuntime {
+  const pwshVersion = probe(PWSH_EXECUTABLE);
+  if (pwshVersion && isAtLeast(pwshVersion, 7)) {
+    return {
+      file: PWSH_EXECUTABLE,
+      kind: "powershell-7",
+      version: pwshVersion,
+      label: `PowerShell ${pwshVersion}`,
+    };
+  }
+
+  const windowsPowerShellVersion = probe(WINDOWS_POWERSHELL_EXECUTABLE);
+  if (windowsPowerShellVersion && isAtLeast(windowsPowerShellVersion, 5, 1)) {
+    return {
+      file: WINDOWS_POWERSHELL_EXECUTABLE,
+      kind: "windows-powershell",
+      version: windowsPowerShellVersion,
+      label: `Windows PowerShell ${windowsPowerShellVersion}`,
+    };
+  }
+
+  const detected = [
+    pwshVersion && `${PWSH_EXECUTABLE} ${pwshVersion}`,
+    windowsPowerShellVersion && `${WINDOWS_POWERSHELL_EXECUTABLE} ${windowsPowerShellVersion}`,
+  ].filter(Boolean);
+  throw new Error(
+    "No supported PowerShell runtime was found. Install PowerShell 7 or enable Windows PowerShell 5.1." +
+      (detected.length ? ` Detected: ${detected.join(", ")}.` : ""),
+  );
+}
+
+function createBashSchema(runtime: PowerShellRuntime) {
+  return Type.Object({
+    command: Type.String({
+      description: `Command to execute with ${runtime.label}, not GNU bash.`,
+    }),
+    timeout: Type.Optional(
+      Type.Number({
+        description: "Timeout in seconds. Omit or set 0 for no timeout.",
+        minimum: 0,
+        maximum: 3600,
+      }),
+    ),
+  });
+}
 
 function killProcessTree(pid?: number) {
   if (!pid) return;
@@ -38,7 +121,7 @@ function killProcessTree(pid?: number) {
   }
 }
 
-function createPwshBashOperations(): BashOperations {
+function createPwshBashOperations(runtime: PowerShellRuntime): BashOperations {
   return {
     exec(command, cwd, { onData, signal, timeout, env }) {
       return new Promise((resolve, reject) => {
@@ -46,7 +129,7 @@ function createPwshBashOperations(): BashOperations {
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
         const child = spawn(
-          "pwsh",
+          runtime.file,
           [
             "-NoProfile",
             "-NonInteractive",
@@ -98,7 +181,7 @@ function createPwshBashOperations(): BashOperations {
           if (error.code === "ENOENT") {
             reject(
               new Error(
-                "`pwsh` was not found. Please install PowerShell 7 or make sure pwsh is available in PATH.",
+                `${runtime.label} executable \`${runtime.file}\` was not found.`,
               ),
             );
             return;
@@ -130,9 +213,9 @@ function createPwshBashOperations(): BashOperations {
 /**
  * Wrapper around spawn that intercepts shell invocations from background-tasks.
  * When bg_start calls `spawn('/bin/sh', ['-c', cmd], opts)`,
- * this rewrites it to `spawn('pwsh', ['-Command', UTF8_PRELUDE + cmd], opts)`.
+ * this rewrites it to the selected PowerShell executable.
  */
-function createBgSpawnWrapper() {
+function createBgSpawnWrapper(runtime: PowerShellRuntime) {
   const SHELLS = new Set(["/bin/sh", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash", "sh", "bash"]);
 
   return function pwshSpawn(
@@ -141,10 +224,10 @@ function createBgSpawnWrapper() {
     options?: SpawnOptions,
   ): ChildProcess {
     if (SHELLS.has(command) && args?.[0] === "-c" && args.length >= 2) {
-      // Rewrite: /bin/sh -c <cmd>  →  pwsh -Command <cmd>
+      // Rewrite: /bin/sh -c <cmd>  →  PowerShell -Command <cmd>
       const userCommand = args.slice(1).join(" ");
       return spawn(
-        "pwsh",
+        runtime.file,
         ["-NoProfile", "-NonInteractive", "-NoLogo", "-Command", `${UTF8_PRELUDE}\n${userCommand}`],
         { ...options, windowsHide: true },
       );
@@ -154,9 +237,9 @@ function createBgSpawnWrapper() {
   };
 }
 
-function createBgShellResolver() {
+export function createBgShellResolver(runtime: PowerShellRuntime) {
   return (command: string, interactive: boolean) => ({
-    file: "pwsh",
+    file: runtime.file,
     args: [
       "-NoProfile",
       ...(interactive ? [] : ["-NonInteractive"]),
@@ -176,18 +259,20 @@ export default function (pi: ExtensionAPI) {
   // This package is Windows-only. Keep accidental local loads on Unix as a no-op.
   if (process.platform !== "win32") return;
 
-  const pwshOps = createPwshBashOperations();
-  const bgSpawn = createBgSpawnWrapper();
-  const bgShell = createBgShellResolver();
+  const runtime = selectPowerShellRuntime();
+  const bashSchema = createBashSchema(runtime);
+  const pwshOps = createPwshBashOperations(runtime);
+  const bgSpawn = createBgSpawnWrapper(runtime);
+  const bgShell = createBgShellResolver(runtime);
 
-  // Adapt background-tasks extension to use pwsh instead of /bin/sh
+  // Adapt background-tasks to use the selected PowerShell instead of /bin/sh.
   pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
 
   // Re-register on session start in case bg extension loads after us
   pi.on("session_start", async (_event, ctx) => {
     pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
     ctx.ui.notify(
-      "bash tool loaded. AI bash calls and user !/!! commands now run through pwsh. background-tasks adapted.",
+      `bash tool loaded through ${runtime.label} (${runtime.file}). background-tasks adapted.`,
       "info",
     );
   });
@@ -196,12 +281,14 @@ export default function (pi: ExtensionAPI) {
     name: "bash",
     label: "bash",
     description:
-      "Execute a shell command in the current working directory. This tool is named bash for compatibility, but on Windows it runs commands through PowerShell 7 pwsh.",
+      `Execute a shell command in the current working directory through ${runtime.label}. The tool is named bash for compatibility.`,
     promptSnippet:
-      "Run shell commands. On Windows, use PowerShell/pwsh syntax rather than GNU bash syntax.",
+      `Run shell commands with ${runtime.label} on Windows.`,
     promptGuidelines: [
-      "This tool is named bash for compatibility, but it runs through PowerShell 7 pwsh on Windows.",
-      "Use PowerShell syntax when appropriate: Get-ChildItem, Select-String, Where-Object, $env:NAME, and ; for command separation.",
+      `This tool runs through ${runtime.label} (${runtime.file}), despite being named bash.`,
+      runtime.kind === "powershell-7"
+        ? "Use PowerShell 7 syntax."
+        : "Use Windows PowerShell 5.1 syntax and avoid PowerShell 7-only features.",
       "Do not rely on GNU bash-only features unless explicitly invoking bash yourself.",
     ],
     parameters: bashSchema,

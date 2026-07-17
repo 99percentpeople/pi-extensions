@@ -31,7 +31,7 @@
     },
     "extensions/pwsh-adapter": {
       "name": "@99percentpeople/pi-pwsh-adapter",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "typebox": "*",

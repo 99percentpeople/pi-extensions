@@ -1,13 +1,24 @@
 # @99percentpeople/pi-pwsh-adapter
 
-Optional PowerShell 7 shell adapter for the [Pi coding agent] on Windows.
+PowerShell shell adapter for the [Pi coding agent] on Windows.
 
-It replaces Pi's `bash` compatibility tool and user `!`/`!!` commands with `pwsh`, configures UTF-8 input/output, and adapts `@99percentpeople/pi-background-tasks` to use PowerShell when both packages are installed.
+It replaces Pi's `bash` compatibility tool and user `!`/`!!` commands with
+PowerShell, configures UTF-8 input/output, and adapts
+`@99percentpeople/pi-background-tasks` to use the same runtime when both
+packages are installed.
+
+At startup it selects PowerShell once for the whole session:
+
+1. PowerShell 7 or newer through `pwsh.exe` when available.
+2. Otherwise Windows PowerShell 5.1 through `powershell.exe`.
+
+The selected executable is explicit, so both pipe and PTY background tasks work
+without relying on Windows `PATHEXT` expansion.
 
 ## Requirements
 
 - Windows
-- PowerShell 7 with `pwsh` available in `PATH`
+- PowerShell 7 in `PATH`, or Windows PowerShell 5.1
 
 ## Install
 

@@ -6,7 +6,7 @@ Two independently published TypeScript extensions for the
 | Extension | npm package | Purpose |
 | --- | --- | --- |
 | background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Background commands, explicit waits, logs, signals, and optional PTY/TUI interaction |
-| pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | Optional PowerShell 7 shell adapter for Pi on Windows |
+| pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
 
 The packages have separate versions and releases. Installing background-tasks
 does not install or enable the Windows-only PowerShell adapter.
@@ -20,7 +20,7 @@ pi install npm:@99percentpeople/pi-background-tasks
 ```
 
 On Windows, install the optional adapter when both Pi's `bash` tool and
-`bg_start` should use PowerShell 7 syntax:
+`bg_start` should use PowerShell syntax:
 
 ```powershell
 pi install npm:@99percentpeople/pi-pwsh-adapter
@@ -67,12 +67,15 @@ for details.
 
 The adapter is a Windows-only package that:
 
-- replaces Pi's Bash execution backend with PowerShell 7;
+- prefers PowerShell 7 (`pwsh.exe`) and falls back to Windows PowerShell 5.1
+  (`powershell.exe`);
+- replaces Pi's Bash execution backend with the selected runtime;
 - configures UTF-8 input and output;
 - makes background-tasks use the same PowerShell syntax;
 - keeps PTY tasks interactive.
 
-PowerShell 7 must be installed and `pwsh` must be available on `PATH`.
+The startup notification and tool prompt identify the selected version so the
+model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 
 ## Development
 
