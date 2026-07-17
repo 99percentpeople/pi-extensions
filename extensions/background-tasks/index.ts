@@ -28,7 +28,14 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { stripVTControlCharacters } from "node:util";
-import { keyText, type AgentToolResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  getShellConfig,
+  keyText,
+  SettingsManager,
+  type AgentToolResult,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, type Component } from "@earendil-works/pi-tui";
@@ -75,9 +82,15 @@ interface ShellLaunch {
   file: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  initialStdin?: string;
 }
 
-type ShellResolver = (command: string, interactive: boolean) => ShellLaunch;
+interface ShellResolverContext {
+  cwd: string;
+  projectTrusted: boolean;
+}
+
+type ShellResolver = (command: string, interactive: boolean, context?: ShellResolverContext) => ShellLaunch;
 
 interface BgTask {
   id: string;
@@ -116,17 +129,36 @@ interface LatestLog {
 let spawnFn: typeof spawn = spawn;
 let ptySpawnFn: typeof nodePty.spawn = nodePty.spawn;
 
-function defaultShellResolver(command: string): ShellLaunch {
-  if (process.platform === "win32") {
+function defaultShellResolver(
+  command: string,
+  interactive: boolean,
+  context?: ShellResolverContext,
+): ShellLaunch {
+  const settings = context
+    ? SettingsManager.create(context.cwd, undefined, { projectTrusted: context.projectTrusted })
+    : undefined;
+  const prefix = settings?.getShellCommandPrefix();
+  const resolvedCommand = prefix ? `${prefix}\n${command}` : command;
+  const shell = getShellConfig(settings?.getShellPath());
+
+  if (shell.commandTransport === "stdin") {
+    if (interactive) {
+      throw new Error(
+        "The configured legacy WSL bash transport cannot start PTY background tasks. " +
+        "Use pipe mode or configure a modern Git Bash, Cygwin, or MSYS2 bash executable.",
+      );
+    }
     return {
-      file: process.env.ComSpec || "cmd.exe",
-      args: ["/d", "/s", "/c", command],
+      file: shell.shell,
+      args: [...shell.args],
       env: { ...process.env },
+      initialStdin: resolvedCommand,
     };
   }
+
   return {
-    file: process.env.SHELL || "/bin/sh",
-    args: ["-c", command],
+    file: shell.shell,
+    args: [...shell.args, resolvedCommand],
     env: { ...process.env },
   };
 }
@@ -746,7 +778,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_start",
     label: "BG Start",
-    description: "Start a background task. The command runs asynchronously in a shell.",
+    description: "Start a background task asynchronously using the same configured shell syntax as Pi's bash tool.",
     promptSnippet: "Start a long-running command in the background",
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
@@ -770,7 +802,10 @@ export default function (pi: ExtensionAPI) {
       const stdoutFile = join(dir, `${id}.stdout`);
       const stderrFile = join(dir, `${id}.stderr`);
       const mode = params.pty ? "pty" : "pipe";
-      const shell = resolveShell(params.command, mode === "pty");
+      const shell = resolveShell(params.command, mode === "pty", {
+        cwd: ctx.cwd,
+        projectTrusted: ctx.isProjectTrusted(),
+      });
       const cwd = params.cwd || ctx.cwd;
       const cols = Math.min(500, Math.max(20, Math.floor(params.cols ?? process.stdout.columns ?? 120)));
       const rows = Math.min(200, Math.max(5, Math.floor(params.rows ?? process.stdout.rows ?? 30)));
@@ -853,6 +888,9 @@ export default function (pi: ExtensionAPI) {
         child.on("close", (code, signal) => {
           finishTask(task, code, signal, Boolean(spawnError));
         });
+        if (shell.initialStdin !== undefined) {
+          child.stdin?.end(shell.initialStdin);
+        }
       }
 
       uiCtx = ctx;

@@ -52,6 +52,11 @@ PTY output combines stdout and stderr. `bg_logs` returns the parsed terminal buf
 Snapshots are collapsed in Pi's TUI by default and can be expanded with the standard tool
 expand key. Pipe tasks continue to include their ordinary latest stdout/stderr log line.
 
+`bg_start` follows Pi's configured Bash resolution and command prefix, so commands use the
+same syntax as Pi's built-in `bash` tool. On Windows this means `shellPath`, Git Bash, or a
+`bash.exe` found on `PATH`, rather than `cmd.exe`. Installing `pi-pwsh-adapter` explicitly
+switches both tools to PowerShell syntax.
+
 ## Native dependency
 
 PTY support uses `node-pty`. If a compatible binary is unavailable, installation may require Python and a native C/C++ build toolchain. On macOS this generally means Xcode command-line tools; Windows builds may require Visual Studio C++ and the Windows SDK.

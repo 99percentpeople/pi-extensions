@@ -125,6 +125,7 @@ function createHarness() {
   const ctx = {
     cwd: process.cwd(),
     hasUI: false,
+    isProjectTrusted: () => true,
     ui: {
       setWidget: (key: string, widget: unknown) => {
         if (widget === undefined) widgets.delete(key);
@@ -146,9 +147,39 @@ function createHarness() {
       ptys.push(pty);
       return pty as unknown as IPty;
     },
+    resolveShell: (command: string) => ({
+      file: "test-bash",
+      args: ["-c", command],
+      env: { ...process.env },
+    }),
   });
-  return { tools, commands, lifecycle, messages, children, ptys, widgets, ctx };
+  return { tools, commands, lifecycle, eventBus, messages, children, ptys, widgets, ctx };
 }
+
+test("background tasks can pass commands through Pi's stdin shell transport", async () => {
+  const { tools, eventBus, children, ctx } = createHarness();
+  eventBus.emit("bg:register", {
+    resolveShell: (command: string) => ({
+      file: "legacy-wsl-bash",
+      args: ["-s"],
+      env: { ...process.env },
+      initialStdin: command,
+    }),
+  });
+
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+  await bgStart.execute(
+    "start-stdin-shell",
+    { name: "stdin-shell", command: "echo $HOME" },
+    undefined,
+    undefined,
+    ctx,
+  );
+
+  assert.deepEqual(children[0].stdin.read(), Buffer.from("echo $HOME"));
+  assert.equal(children[0].stdin.writableEnded, true);
+});
 
 test("background tasks wait explicitly, discourage polling, and expose the latest log", async () => {
   const { tools, commands, lifecycle, messages, children, ctx } = createHarness();
