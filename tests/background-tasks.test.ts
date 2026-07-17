@@ -267,7 +267,18 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.equal(firstStatus.details.status, "running");
   assert.ok(Date.now() - firstStatusStartedAt < 500, "the first status snapshot should not be throttled");
   const abortController = new AbortController();
-  const waitPromise = bgWait.execute("wait-cancel", { id: longRunningId, timeout: 5 }, abortController.signal, undefined, ctx);
+  const waitUpdates: unknown[] = [];
+  const waitPromise = bgWait.execute(
+    "wait-cancel",
+    { id: longRunningId, timeout: 5 },
+    abortController.signal,
+    (update: unknown) => waitUpdates.push(update),
+    ctx,
+  );
+  assert.deepEqual(waitUpdates, [{
+    content: [],
+    details: { id: longRunningId, name: "cancel-status", status: "running" },
+  }]);
   setTimeout(() => abortController.abort(new Error("cancelled by test")), 30);
   await assert.rejects(waitPromise, /cancelled by test/);
 

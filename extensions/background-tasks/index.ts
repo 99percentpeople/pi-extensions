@@ -1010,13 +1010,17 @@ export default function (pi: ExtensionAPI) {
 
     executionMode: "parallel",
 
-    async execute(_toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
+    async execute(_toolCallId, params, signal, onUpdate): Promise<AgentToolResult<Record<string, unknown>>> {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
       const timeoutSeconds = params.timeout ?? 300;
       const timeoutMs = timeoutSeconds * 1000;
       if (task.status === "running") {
+        onUpdate?.({
+          content: [],
+          details: { id: task.id, name: task.name, status: task.status },
+        });
         await waitUntilAllowed(timeoutMs, [task.done.signal], signal);
       }
       await flushPty(task);
