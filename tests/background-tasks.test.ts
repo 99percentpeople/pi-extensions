@@ -108,6 +108,7 @@ function createHarness() {
   const children: FakeChildProcess[] = [];
   const ptys: FakePty[] = [];
   const widgets = new Map<string, any>();
+  const widgetUpdates: Array<{ key: string; widget: unknown; options?: unknown }> = [];
 
   const pi = {
     events: {
@@ -125,9 +126,11 @@ function createHarness() {
   const ctx = {
     cwd: process.cwd(),
     hasUI: false,
+    mode: "tui",
     isProjectTrusted: () => true,
     ui: {
-      setWidget: (key: string, widget: unknown) => {
+      setWidget: (key: string, widget: unknown, options?: unknown) => {
+        widgetUpdates.push({ key, widget, options });
         if (widget === undefined) widgets.delete(key);
         else widgets.set(key, widget);
       },
@@ -153,11 +156,11 @@ function createHarness() {
       env: { ...process.env },
     }),
   });
-  return { tools, commands, lifecycle, eventBus, messages, children, ptys, widgets, ctx };
+  return { tools, commands, lifecycle, eventBus, messages, children, ptys, widgets, widgetUpdates, ctx };
 }
 
 test("background tasks can pass commands through Pi's stdin shell transport", async () => {
-  const { tools, eventBus, children, ctx } = createHarness();
+  const { tools, lifecycle, eventBus, children, ctx } = createHarness();
   eventBus.emit("bg:register", {
     resolveShell: (command: string) => ({
       file: "legacy-wsl-bash",
@@ -179,6 +182,9 @@ test("background tasks can pass commands through Pi's stdin shell transport", as
 
   assert.deepEqual(children[0].stdin.read(), Buffer.from("echo $HOME"));
   assert.equal(children[0].stdin.writableEnded, true);
+  children[0].finish(0, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
 test("background tasks wait explicitly, discourage polling, and expose the latest log", async () => {
@@ -256,6 +262,10 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     ctx,
   );
   const longRunningId = longRunning.details.id as string;
+  const firstStatusStartedAt = Date.now();
+  const firstStatus = await bgStatus.execute("status-first", { id: longRunningId }, undefined, undefined, ctx);
+  assert.equal(firstStatus.details.status, "running");
+  assert.ok(Date.now() - firstStatusStartedAt < 500, "the first status snapshot should not be throttled");
   const abortController = new AbortController();
   const waitPromise = bgWait.execute("wait-cancel", { id: longRunningId, timeout: 5 }, abortController.signal, undefined, ctx);
   setTimeout(() => abortController.abort(new Error("cancelled by test")), 30);
@@ -455,8 +465,58 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
-test("background task widget renders running tasks as a tree", async () => {
-  const { tools, lifecycle, ptys, widgets, ctx } = createHarness();
+test("bg_wait renderer shows elapsed time while waiting", async () => {
+  const { tools } = createHarness();
+  const bgWait = tools.get("bg_wait");
+  assert.ok(bgWait?.renderCall && bgWait.renderResult);
+
+  const originalDateNow = Date.now;
+  let now = 10_000;
+  let invalidations = 0;
+  const state: Record<string, unknown> = {};
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+  try {
+    Date.now = () => now;
+    bgWait.renderCall(
+      { id: "wait-render", timeout: 30 },
+      plainTheme,
+      { state, executionStarted: true, lastComponent: undefined, expanded: false },
+    );
+    const partialResult = { content: [{ type: "text", text: "" }], details: {} };
+    const partial = bgWait.renderResult(
+      partialResult,
+      { expanded: false, isPartial: true },
+      plainTheme,
+      { state, lastComponent: undefined, isError: false, invalidate: () => { invalidations += 1; } },
+    );
+    assert.match(partial.render(120).map((line: string) => line.trimEnd()).join("\n"), /Elapsed 0\.0s/);
+
+    now += 2200;
+    await new Promise<void>((resolve) => setTimeout(resolve, 1050));
+    assert.ok(invalidations >= 1);
+    const updated = bgWait.renderResult(
+      partialResult,
+      { expanded: false, isPartial: true },
+      plainTheme,
+      { state, lastComponent: partial, isError: false, invalidate: () => { invalidations += 1; } },
+    );
+    assert.match(updated.render(120).map((line: string) => line.trimEnd()).join("\n"), /Elapsed 2\.2s/);
+
+    bgWait.renderResult(
+      { content: [{ type: "text", text: "done" }], details: { status: "completed" } },
+      { expanded: false, isPartial: false },
+      plainTheme,
+      { state, lastComponent: updated, isError: false, invalidate: () => { invalidations += 1; } },
+    );
+    assert.equal(state.interval, undefined);
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
+test("background task widget renders live state without re-registering every tick", async () => {
+  const { tools, lifecycle, children, ptys, widgets, widgetUpdates, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   assert.ok(bgStart);
 
@@ -470,8 +530,8 @@ test("background task widget renders running tasks as a tree", async () => {
     widgetCtx,
   );
   await bgStart.execute(
-    "widget-pty-con",
-    { name: "pi-debate-con", command: "fake con", pty: true, cols: 100, rows: 25 },
+    "widget-pipe-build",
+    { name: "pi-build", command: "fake build" },
     undefined,
     undefined,
     widgetCtx,
@@ -480,15 +540,71 @@ test("background task widget renders running tasks as a tree", async () => {
   const widgetFactory = widgets.get("bg-tasks-widget");
   assert.ok(widgetFactory);
   const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-  const lines = widgetFactory({}, plainTheme).render(200).map((line: string) => line.trimEnd());
+  let renderRequests = 0;
+  const component = widgetFactory({ requestRender: () => { renderRequests += 1; } }, plainTheme);
+  const lines = component.render(200).map((line: string) => line.trimEnd());
   assert.equal(lines[0], "2 background tasks");
-  assert.match(lines[1], /^├─ pi-debate-pro \([a-z0-9]+\) \d+ms pty:100x25$/);
-  assert.match(lines[2], /^└─ pi-debate-con \([a-z0-9]+\) \d+ms pty:100x25$/);
+  assert.match(lines[1], /^├─ pi-debate-pro \([a-z0-9]+\) 0s pty:100x25$/);
+  assert.match(lines[2], /^└─ pi-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
+  assert.equal(widgetUpdates.length, 1, "the TUI widget should be registered once");
+
+  children[0].stdout.write("first\nsecond\n");
+  children[0].stderr.write("warning\n");
+  assert.match(component.render(200)[2], / stdout:2 stderr:1$/);
+  assert.equal(widgetUpdates.length, 1, "output changes should not replace the widget component");
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 1050));
+  assert.ok(renderRequests >= 1, "the one-second ticker should request a render");
+  assert.equal(widgetUpdates.length, 1, "ticker refreshes should not replace the widget component");
+  assert.match(component.render(200)[1], / \d+s pty:100x25$/);
 
   ptys[0].finish(0);
-  ptys[1].finish(0);
+  children[0].finish(0, null);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(widgets.has("bg-tasks-widget"), false);
+  assert.equal(widgetUpdates.length, 2, "the widget should be cleared after the last task exits");
+  const rendersAfterExit = renderRequests;
+  await new Promise<void>((resolve) => setTimeout(resolve, 1050));
+  assert.equal(renderRequests, rendersAfterExit, "the ticker should stop after the last task exits");
   await lifecycle.get("session_shutdown")?.({}, widgetCtx);
+});
+
+test("background task widget uses serializable lines in RPC mode", async () => {
+  const { tools, lifecycle, children, widgets, widgetUpdates, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  const rpcCtx = { ...ctx, hasUI: true, mode: "rpc" } as ExtensionContext;
+  await lifecycle.get("session_start")?.({}, rpcCtx);
+  const originalDateNow = Date.now;
+  const startedAt = originalDateNow();
+  try {
+    Date.now = () => startedAt;
+    await bgStart.execute(
+      "widget-rpc",
+      { name: "rpc-build", command: "fake rpc build" },
+      undefined,
+      undefined,
+      rpcCtx,
+    );
+
+    const widgetLines = widgets.get("bg-tasks-widget");
+    assert.ok(Array.isArray(widgetLines));
+    assert.equal(widgetLines[0], "1 background task");
+    assert.match(widgetLines[1], /^└─ rpc-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
+    assert.deepEqual(widgetUpdates.at(-1)?.options, { placement: "belowEditor" });
+
+    Date.now = () => startedAt + 3_725_000;
+    await lifecycle.get("tool_execution_end")?.({ toolName: "bg_status" }, rpcCtx);
+    assert.match(widgets.get("bg-tasks-widget")[1], / 1h02m05s stdout:0 stderr:0$/);
+  } finally {
+    Date.now = originalDateNow;
+  }
+
+  children[0].finish(0, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(widgets.has("bg-tasks-widget"), false);
+  await lifecycle.get("session_shutdown")?.({}, rpcCtx);
 });
 
 test("pipe tasks attach to live output without replaying historical logs", async () => {
@@ -899,7 +1015,13 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     { tool: bgKill, args: { id: snapshotKillStarted.details.id, force: true, terminal_snapshot: true }, result: snapshotKilled },
   ];
   for (const { tool, args, result } of renderCases) {
-    const collapsedCall = tool.renderCall?.(args, plainTheme, { lastComponent: undefined, expanded: false });
+    const renderState = {};
+    const collapsedCall = tool.renderCall?.(args, plainTheme, {
+      lastComponent: undefined,
+      expanded: false,
+      executionStarted: false,
+      state: renderState,
+    });
     assert.ok(collapsedCall);
     assert.match(stripVTControlCharacters(collapsedCall.render(120).join("\n")), /to expand/);
 
@@ -907,7 +1029,7 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
       result,
       { expanded: false, isPartial: false },
       plainTheme,
-      { lastComponent: undefined },
+      { lastComponent: undefined, state: renderState, isError: false, invalidate: () => {} },
     );
     assert.ok(collapsedResult);
     assert.doesNotMatch(stripVTControlCharacters(collapsedResult.render(120).join("\n")), /terminal snapshot/);
@@ -916,7 +1038,7 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
       result,
       { expanded: true, isPartial: false },
       plainTheme,
-      { lastComponent: collapsedResult },
+      { lastComponent: collapsedResult, state: renderState, isError: false, invalidate: () => {} },
     );
     assert.ok(expandedResult);
     assert.match(stripVTControlCharacters(expandedResult.render(120).join("\n")), /terminal snapshot/);

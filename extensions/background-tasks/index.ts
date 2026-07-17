@@ -14,7 +14,7 @@
  *   - Detachable PTY interaction or live pipe output via /bg-attach (Ctrl+] to detach)
  *   - Explicit completion waits with timeout (no polling required)
  *   - Auto-throttle via AbortController
- *   - Widget with real-time refresh (100ms)
+ *   - Live widget with one-second duration updates
  *   - Extensible spawn backend via pi.events
  *
  * Usage:
@@ -35,10 +35,11 @@ import {
   type AgentToolResult,
   type ExtensionAPI,
   type ExtensionContext,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Text, type Component } from "@earendil-works/pi-tui";
+import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import * as nodePty from "node-pty";
 import type { Terminal as XtermTerminal } from "@xterm/headless";
 import type { SerializeAddon as XtermSerializeAddon } from "@xterm/addon-serialize";
@@ -124,6 +125,11 @@ interface LatestLog {
   at: number;
 }
 
+interface BgWaitRenderState {
+  startedAt?: number;
+  interval?: ReturnType<typeof setInterval>;
+}
+
 // ── Execution Backend ─────────────────────────────────────────────────
 
 let spawnFn: typeof spawn = spawn;
@@ -169,6 +175,7 @@ let resolveShell: ShellResolver = defaultShellResolver;
 
 let taskDir: string;
 const tasks = new Map<string, BgTask>();
+const runningTasks = new Set<BgTask>();
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -216,6 +223,10 @@ function formatDuration(ms: number): string {
   const min = Math.floor(ms / 60_000);
   const sec = Math.floor((ms % 60_000) / 1000);
   return `${min}m${sec}s`;
+}
+
+function formatElapsedSeconds(ms: number): string {
+  return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
 }
 
 const MAX_STORED_LOG_CHARS = 500;
@@ -444,6 +455,7 @@ function finishTask(task: BgTask, code: number | null, signal: string | null, fa
       : signal
         ? "stopped"
         : code === 0 ? "completed" : "failed";
+  runningTasks.delete(task);
   task.done.abort();
   task.attachment.detach?.("exited");
   updateWidget();
@@ -684,11 +696,14 @@ async function attachTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
 // ── Widget ─────────────────────────────────────────────────────────────
 
 const WIDGET_KEY = "bg-tasks-widget";
+const WIDGET_REFRESH_INTERVAL_MS = 1000;
 let uiCtx: ExtensionContext | null = null;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let widgetTui: TUI | null = null;
+let widgetRegistered = false;
 
 function getRunningTasks(): BgTask[] {
-  return Array.from(tasks.values()).filter((t) => t.status === "running");
+  return Array.from(runningTasks);
 }
 
 function stopRefreshTimer() {
@@ -696,39 +711,82 @@ function stopRefreshTimer() {
 }
 
 function startRefreshTimer() {
-  stopRefreshTimer();
-  refreshTimer = setInterval(() => {
-    if (getRunningTasks().length === 0) stopRefreshTimer();
-    updateWidget();
-  }, 100);
+  if (refreshTimer) return;
+  refreshTimer = setInterval(updateWidget, WIDGET_REFRESH_INTERVAL_MS);
+  refreshTimer.unref?.();
 }
 
-function updateWidget() {
-  if (!uiCtx?.hasUI) return;
+function formatWidgetDuration(ms: number): string {
+  const totalSeconds = Math.floor(Math.max(0, ms) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}h${String(minutes).padStart(2, "0")}m${String(seconds).padStart(2, "0")}s`;
+  }
+  if (minutes > 0) return `${minutes}m${String(seconds).padStart(2, "0")}s`;
+  return `${seconds}s`;
+}
+
+function renderWidgetLines(theme?: Theme): string[] {
   const running = getRunningTasks();
-  if (running.length === 0) {
+  const now = Date.now();
+  const lines = running.map((task, index) => {
+    const duration = formatWidgetDuration(now - task.startedAt);
+    const output = task.mode === "pty"
+      ? `pty:${task.ptyState?.terminal.cols ?? "?"}x${task.ptyState?.terminal.rows ?? "?"}`
+      : `stdout:${task.stdoutLines} stderr:${task.stderrLines}`;
+    const branch = index === running.length - 1 ? "└─" : "├─";
+    if (!theme) return `${branch} ${task.name} (${task.id}) ${duration} ${output}`;
+    return `${theme.fg("dim", branch)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg("muted", duration)} ${theme.fg("dim", output)}`;
+  });
+  const header = `${running.length} background task${running.length > 1 ? "s" : ""}`;
+  return [theme ? theme.fg("warning", header) : header, ...lines];
+}
+
+function clearWidget(): void {
+  stopRefreshTimer();
+  if (widgetRegistered && uiCtx?.hasUI) uiCtx.ui.setWidget(WIDGET_KEY, undefined);
+  widgetTui = null;
+  widgetRegistered = false;
+}
+
+function updateWidget(): void {
+  if (!uiCtx?.hasUI) {
     stopRefreshTimer();
-    uiCtx.ui.setWidget(WIDGET_KEY, undefined);
     return;
   }
-  uiCtx.ui.setWidget(
-    WIDGET_KEY,
-    (_tui, theme) => {
-      const now = Date.now();
-      const lines = running.map((t, index) => {
-        const dur = formatDuration(now - t.startedAt);
-        const output = t.mode === "pty"
-          ? `pty:${t.ptyState?.terminal.cols ?? "?"}x${t.ptyState?.terminal.rows ?? "?"}`
-          : `stdout:${t.stdoutLines} stderr:${t.stderrLines}`;
-        const branch = index === running.length - 1 ? "└─" : "├─";
-        return `${theme.fg("dim", branch)} ${theme.bold(theme.fg("accent", t.name))} ${theme.fg("dim", `(${t.id})`)} ${theme.fg("muted", dur)} ${theme.fg("dim", output)}`;
-      });
-      const header = theme.fg("warning", `${running.length} background task${running.length > 1 ? "s" : ""}`);
-      return new Text([header, ...lines].join("\n"), 0, 0);
-    },
-    { placement: "belowEditor" },
-  );
-  if (!refreshTimer) startRefreshTimer();
+  const running = getRunningTasks();
+  if (running.length === 0) {
+    clearWidget();
+    return;
+  }
+
+  if (uiCtx.mode === "tui") {
+    if (!widgetRegistered) {
+      uiCtx.ui.setWidget(
+        WIDGET_KEY,
+        (tui, theme) => {
+          widgetTui = tui;
+          return {
+            render: () => renderWidgetLines(theme),
+            invalidate: () => {},
+            dispose: () => {
+              if (widgetTui === tui) widgetTui = null;
+            },
+          };
+        },
+        { placement: "belowEditor" },
+      );
+      widgetRegistered = true;
+    } else {
+      widgetTui?.requestRender();
+    }
+  } else {
+    uiCtx.ui.setWidget(WIDGET_KEY, renderWidgetLines(), { placement: "belowEditor" });
+    widgetRegistered = true;
+  }
+  startRefreshTimer();
 }
 
 // ── Extension ──────────────────────────────────────────────────────────
@@ -747,15 +805,19 @@ export default function (pi: ExtensionAPI) {
     if (ops.resolveShell) resolveShell = ops.resolveShell;
   });
 
-  pi.on("session_start", async (_event, ctx) => { uiCtx = ctx; });
+  pi.on("session_start", async (_event, ctx) => {
+    clearWidget();
+    uiCtx = ctx;
+    updateWidget();
+  });
 
   pi.on("tool_execution_end", async (event, ctx) => {
     if (event.toolName.startsWith("bg_")) { uiCtx = ctx; updateWidget(); }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    stopRefreshTimer();
-    if (ctx?.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
+    clearWidget();
+    if (ctx?.hasUI && ctx !== uiCtx) ctx.ui.setWidget(WIDGET_KEY, undefined);
     uiCtx = null;
     for (const task of tasks.values()) task.attachment.detach?.("shutdown");
     await Promise.all(Array.from(tasks.values()).map(async (task) => {
@@ -852,12 +914,13 @@ export default function (pi: ExtensionAPI) {
         exitCode: null, signal: null,
         startedAt: Date.now(), endedAt: null,
         stdoutFile, stderrFile, stdoutLines: 0, stderrLines: 0,
-        wait: params.wait ?? 5, nextCheckAt: Date.now() + (params.wait ?? 5) * 1000,
+        wait: params.wait ?? 5, nextCheckAt: 0,
         done: new AbortController(),
         latestLog: null, stdoutPending: "", stderrPending: "",
         requestedStopSignal: null,
       };
       tasks.set(id, task);
+      runningTasks.add(task);
 
       if (taskProcess.kind === "pty") {
         taskProcess.pty.onData((data) => recordPtyData(task, data));
@@ -1001,6 +1064,10 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderCall(args, theme, context) {
+      const state = context.state as BgWaitRenderState;
+      if (context.executionStarted && state.startedAt === undefined) {
+        state.startedAt = Date.now();
+      }
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const task = tasks.get(args.id);
       const name = task ? theme.fg("accent", task.name) : theme.fg("muted", args.id);
@@ -1012,8 +1079,26 @@ export default function (pi: ExtensionAPI) {
       return text;
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Waiting..."), 0, 0);
+    renderResult(result, { expanded, isPartial }, theme, context) {
+      const state = context.state as BgWaitRenderState;
+      if (state.startedAt !== undefined && isPartial && !state.interval) {
+        state.interval = setInterval(() => context.invalidate(), 1000);
+        state.interval.unref?.();
+      }
+      if (!isPartial || context.isError) {
+        if (state.interval) {
+          clearInterval(state.interval);
+          state.interval = undefined;
+        }
+      }
+      if (isPartial) {
+        const elapsed = state.startedAt === undefined
+          ? "0.0s"
+          : formatElapsedSeconds(Date.now() - state.startedAt);
+        const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+        text.setText(`${theme.fg("muted", `Elapsed ${elapsed}`)}`);
+        return text;
+      }
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
       const visibleContent = renderContentWithoutCollapsedSnapshots(content, Boolean(expanded));
       const details = result.details as { status?: BgTask["status"]; timedOut?: boolean } | undefined;
