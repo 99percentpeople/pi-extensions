@@ -150,16 +150,10 @@ tests/
 ## Automated npm releases
 
 The [publish workflow](.github/workflows/publish.yml) uses npm Trusted
-Publishing with GitHub Actions OIDC. Established packages do not require an
-`NPM_TOKEN` GitHub secret.
+Publishing with GitHub Actions OIDC. It does not require an `NPM_TOKEN` GitHub
+secret.
 
-npm requires a package to exist before a Trusted Publisher can be configured.
-For a brand-new package, temporarily add a granular `NPM_TOKEN` repository
-secret and manually dispatch `publish.yml` with the existing release tag. Delete
-the secret immediately after the first publish, then configure the Trusted
-Publisher before future releases.
-
-Configure a Trusted Publisher separately
+Before the first automated release, configure a Trusted Publisher separately
 for all three npm packages:
 
 - Provider: GitHub Actions
@@ -190,12 +184,7 @@ git push origin master background-tasks-v1.0.4
 ```
 
 The workflow rejects a tag whose version does not exactly match the selected
-package's `package.json`. A failed tag publish can be retried without moving the
-tag:
-
-```bash
-gh workflow run publish.yml -f release_tag=todo-v1.0.0
-```
+package's `package.json`.
 
 ## Uninstall
 
