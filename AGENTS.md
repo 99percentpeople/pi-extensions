@@ -64,6 +64,6 @@ pi -e ./extensions/my-extension/index.ts
 
 ## Resources
 
-- [Pi Extensions Documentation](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md)
-- [Pi Examples](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/examples/extensions)
-- [Extension API Reference](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md#extensionapi-methods)
+- [Pi Extensions Documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)
+- [Pi Examples](https://github.com/earendil-works/pi/tree/main/packages/coding-agent/examples/extensions)
+- [Extension API Reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#extensionapi-methods)

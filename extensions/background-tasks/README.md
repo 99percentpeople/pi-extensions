@@ -1,6 +1,6 @@
 # @99percentpeople/pi-background-tasks
 
-Background task tools for the [Pi coding agent](https://github.com/badlogic/pi-mono), including explicit completion waits, log inspection, process signals, and optional PTY-backed TUI interaction.
+Background task tools for the [Pi coding agent](https://pi.dev/), including explicit completion waits, log inspection, process signals, and optional PTY-backed TUI interaction.
 
 ## Install
 
@@ -54,7 +54,8 @@ expand key. Pipe tasks continue to include their ordinary latest stdout/stderr l
 
 `bg_start` follows Pi's configured Bash resolution and command prefix, so commands use the
 same syntax as Pi's built-in `bash` tool. On Windows this means `shellPath`, Git Bash, or a
-`bash.exe` found on `PATH`, rather than `cmd.exe`. Installing `pi-pwsh-adapter` explicitly
+`bash.exe` found on `PATH`, rather than `cmd.exe`. Installing
+`@99percentpeople/pi-pwsh-adapter` explicitly
 switches both tools to PowerShell syntax.
 
 ## Native dependency

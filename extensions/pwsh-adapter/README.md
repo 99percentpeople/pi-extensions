@@ -24,7 +24,7 @@ pi install npm:@99percentpeople/pi-pwsh-adapter
 
 The extension is a no-op when loaded directly on a non-Windows platform.
 
-[Pi coding agent]: https://github.com/badlogic/pi-mono
+[Pi coding agent]: https://pi.dev/
 
 ## License
 

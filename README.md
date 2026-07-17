@@ -1,226 +1,150 @@
 # Pi Extensions
 
-A collection of custom extensions for the [Pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
+Two independently published TypeScript extensions for the
+[Pi coding agent](https://pi.dev/).
 
-## Extensions
+| Extension | npm package | Purpose |
+| --- | --- | --- |
+| background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Background commands, explicit waits, logs, signals, and optional PTY/TUI interaction |
+| pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | Optional PowerShell 7 shell adapter for Pi on Windows |
 
-| Extension | npm package | Description |
-|-----------|-------------|-------------|
-| **background-tasks** | `@99percentpeople/pi-background-tasks` | Cross-platform background tasks with PTY/TUI support |
-| **pwsh-adapter** | `@99percentpeople/pi-pwsh-adapter` | Optional PowerShell 7 adapter for Windows |
+The packages have separate versions and releases. Installing background-tasks
+does not install or enable the Windows-only PowerShell adapter.
 
 ## Installation
 
-### From npm (Recommended)
+Install background task support on Linux, macOS, or Windows:
 
 ```bash
-# Cross-platform background task tools
 pi install npm:@99percentpeople/pi-background-tasks
+```
 
-# Optional: Windows PowerShell 7 integration
+On Windows, install the optional adapter when both Pi's `bash` tool and
+`bg_start` should use PowerShell 7 syntax:
+
+```powershell
 pi install npm:@99percentpeople/pi-pwsh-adapter
 ```
 
-The extensions are published independently. Installing background-tasks does
-not install or enable the Windows-only PowerShell adapter.
+Without the adapter, `bg_start` follows Pi's configured Bash resolution and
+command prefix, including Git Bash on Windows.
 
-The theme, skill, and prompt examples remain repository-local resources and
-are not included in either extension package.
+## background-tasks
 
-### From Source (For Development)
+Tools:
 
-```bash
-# Clone the repository
-git clone https://github.com/99percentpeople/pi-extensions.git
-cd pi-extensions
+- `bg_start` starts a pipe or PTY background task.
+- `bg_wait` waits once for a finite task to finish or time out.
+- `bg_status` inspects one task or lists known tasks.
+- `bg_logs` reads pipe output or a parsed PTY terminal snapshot.
+- `bg_send` sends text, terminal keys, or supported process signals.
+- `bg_kill` terminates a task.
 
-# Install dependencies
-bun install
+Commands:
 
-# Install background-tasks globally (Windows)
-.\scripts\install.ps1 -Global
+- `/bg-attach <id>` attaches to a PTY or streams new pipe output. Press
+  `Ctrl+]` to detach.
+- `/bg-kill` selects and terminates a running task.
 
-# Also install the optional PowerShell adapter
-.\scripts\install.ps1 -Global -WithPwsh
-
-# Install globally (Linux/macOS)
-./scripts/install.sh --global
-
-# Or install one package directly from the checkout
-pi install ./extensions/background-tasks
-```
-
-### Quick Test Without Installing
-
-```bash
-# Test all extensions
-.\scripts\install.ps1 -Test  # Windows
-./scripts/install.sh --test   # Linux/macOS
-
-# Test a specific extension
-pi -e ./extensions/background-tasks/index.ts
-```
-
-## Verify Installation
-
-After installing, start Pi and confirm the expected tools or commands are
-available. The PowerShell adapter is inactive on non-Windows platforms.
-
-### Example Configuration
-
-See [examples/settings.json](examples/settings.json) for a complete configuration example.
-
-## Extensions Reference
-
-### background-tasks
-
-Run long-running commands in the background with real-time monitoring.
-
-**Tools:**
-- `bg_start` - Start a background task
-- `bg_wait` - Wait once for a finite task to finish or time out
-- `bg_status` - Check status / list tasks
-- `bg_logs` - Read stdout/stderr output or a PTY screen snapshot
-- `bg_send` - Send text/keys through a compact single-string DSL, or send OS signals
-- `bg_kill` - Terminate unresponsive processes
-
-**Commands:**
-- `/bg-attach <id>` - Attach to an interactive PTY or stream new pipe output; press `Ctrl+]` to detach
-- `/bg-kill` - Kill a background task by ID
-
-**Features:**
-- Optional pseudoterminals for interactive commands and full-screen TUIs
-- Detachable, resizable terminal sessions backed by `node-pty` and xterm headless
-- Live stdout/stderr attachment for pipe tasks without replaying historical logs
-- Single-string PTY input DSL with Ctrl chords, navigation keys, F1-F12, repetition, and atomic validation
-- Explicit completion waits with timeout via `bg_wait` (no polling or AI follow-up notifications)
-- Auto-throttle via AbortController for explicit status checks
-- Latest stdout/stderr line included for pipe tasks; PTY snapshots are opt-in with `terminal_snapshot=true` and collapsed by default
-- ANSI-safe `bg_logs` output, collapsed by default with dynamic standard-key expand/collapse hints
-- Widget with real-time refresh (100ms)
-- Extensible spawn backend via pi.events
-
-Start an interactive task with `pty=true`, then attach from Pi:
+Example:
 
 ```text
 bg_start name="git-ui" command="lazygit" pty=true
 /bg-attach <task-id>
 ```
 
-PTY output combines stdout and stderr. For PTY tasks, `bg_logs` returns the
-current terminal buffer instead of raw escape sequences. Linux installations
-may need Python, `make`, and a C/C++ compiler when `node-pty` must be built from
-source.
+Terminal keys sent through `bg_send` use angle-bracket tokens such as
+`<C-c>`, `<Enter>`, `<Up>`, and `<F10>`. Escape a literal `<` as `\<`.
+PTY snapshots are opt-in on status, wait, and kill results and are collapsed
+in Pi's TUI by default.
 
-### pwsh-adapter
+PTY support uses `node-pty`. If no compatible native binary is available,
+installation may require a C/C++ toolchain. See the
+[background-tasks package documentation](extensions/background-tasks/README.md)
+for details.
 
-PowerShell 7 adapter for Windows environments.
+## pwsh-adapter
 
-**Features:**
-- Replaces default bash tool with PowerShell 7
-- Adapts background-tasks to use pwsh
-- Uses interactive PowerShell mode for PTY tasks
-- UTF-8 encoding support
-- Process tree cleanup on Windows
+The adapter is a Windows-only package that:
 
-## Creating Your Own Extensions Repository
+- replaces Pi's Bash execution backend with PowerShell 7;
+- configures UTF-8 input and output;
+- makes background-tasks use the same PowerShell syntax;
+- keeps PTY tasks interactive.
 
-Use this repository as a template to create your own Pi extensions collection:
-
-```bash
-# Clone this repository
-git clone https://github.com/YOUR_USERNAME/pi-extensions.git
-cd pi-extensions
-
-# Initialize a new project (Windows)
-.\scripts\init.ps1 -Name my-pi-extensions
-
-# Initialize a new project (Linux/macOS)
-./scripts/init.sh my-pi-extensions
-```
-
-This will:
-1. Create a new project directory
-2. Copy all template files
-3. Update package.json with your project name
-4. Initialize a git repository
+PowerShell 7 must be installed and `pwsh` must be available on `PATH`.
 
 ## Development
 
-This repository uses Bun 1.3.14 for dependency management. Run `bun install`
-after cloning and commit `bun.lock` whenever dependencies change.
-
-### Project Structure
-
-```
-pi-extensions/
-├── extensions/           # TypeScript extensions
-│   ├── background-tasks/
-│   │   ├── package.json  # Independently published npm package
-│   │   ├── README.md
-│   │   └── index.ts
-│   └── pwsh-adapter/
-│       ├── package.json  # Independently published npm package
-│       ├── README.md
-│       └── index.ts
-├── themes/               # Color themes
-│   └── midnight.json
-├── skills/               # Markdown skills
-│   └── git-workflow/
-│       └── SKILL.md
-├── prompts/              # Prompt templates
-│   └── code-review.md
-├── package.json          # Private Bun workspace configuration
-├── tsconfig.json         # TypeScript configuration
-├── README.md             # This file
-├── AGENTS.md             # AI agent configuration
-├── CHANGELOG.md          # Version history
-├── CONTRIBUTING.md       # Contribution guidelines
-├── LICENSE               # MIT License
-└── .gitignore            # Git ignore rules
-```
-
-### Adding New Extensions
-
-1. Create a new package directory under `extensions/`:
-   ```
-   extensions/
-   └── my-extension/
-       ├── index.ts
-       ├── package.json
-       ├── README.md
-       └── LICENSE
-   ```
-
-2. Implement the extension following the [Pi Extensions Guide](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md)
-
-3. Declare the extension in its own `extensions/my-extension/package.json`:
-   ```json
-   {
-     "name": "@your-scope/pi-my-extension",
-     "version": "1.0.0",
-     "type": "module",
-     "pi": {
-       "extensions": ["./index.ts"]
-     }
-   }
-   ```
-
-4. Add the package path to the root `workspaces` array and update this README.
-
-### Testing
+The repository is a private Bun 1.3.14 workspace. Each extension directory is
+an independently publishable npm package.
 
 ```bash
-# Type checking
-bun run lint
-
-# Test specific extension
-pi -e ./extensions/my-extension/index.ts
-
-# Or use Makefile (Linux/macOS)
-make test
-make test-ext EXT=background-tasks
+bun install --frozen-lockfile
+bun run check
+bun run pack:check
 ```
+
+Load an extension directly while developing:
+
+```bash
+pi -e ./extensions/background-tasks/index.ts
+```
+
+Repository layout:
+
+```text
+extensions/
+├── background-tasks/
+│   ├── index.ts
+│   ├── package.json
+│   └── README.md
+└── pwsh-adapter/
+    ├── index.ts
+    ├── package.json
+    └── README.md
+tests/
+├── background-tasks.test.ts
+└── packages.test.ts
+```
+
+## Automated npm releases
+
+The [publish workflow](.github/workflows/publish.yml) uses npm Trusted
+Publishing with GitHub Actions OIDC. It does not require an `NPM_TOKEN` GitHub
+secret.
+
+Before the first automated release, configure a Trusted Publisher separately
+for both npm packages:
+
+- Provider: GitHub Actions
+- Organization or user: `99percentpeople`
+- Repository: `pi-extensions`
+- Workflow filename: `publish.yml`
+- Allowed action: `npm publish`
+
+Release tags are package-specific because the packages are versioned
+independently:
+
+| Package | Tag format | Example |
+| --- | --- | --- |
+| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.0.3` |
+| pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
+
+To publish a release:
+
+1. Update the selected package's `version` in `package.json` and update its
+   package README when needed.
+2. Run `bun run pack:check` and commit the release changes.
+3. Push the commit, then create and push the matching tag:
+
+```bash
+git tag background-tasks-v1.0.3
+git push origin master background-tasks-v1.0.3
+```
+
+The workflow rejects a tag whose version does not exactly match the selected
+package's `package.json`.
 
 ## Uninstall
 
@@ -228,36 +152,6 @@ make test-ext EXT=background-tasks
 pi remove npm:@99percentpeople/pi-background-tasks
 pi remove npm:@99percentpeople/pi-pwsh-adapter
 ```
-
-## Publishing
-
-### To npm
-
-Each extension is versioned and published from its own directory. The root
-workspace is private and cannot be published accidentally.
-
-```bash
-# Validate every package
-bun run pack:check
-
-# Publish background-tasks
-cd extensions/background-tasks
-bun publish --access public
-
-# Publish the Windows adapter separately
-cd ../pwsh-adapter
-bun publish --access public
-```
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Documentation
-
-- [Getting Started Guide](docs/getting-started.md) - How to create and use extensions
-- [Project Overview](PROJECT_OVERVIEW.md) - Detailed project structure
-- [Changelog](CHANGELOG.md) - Version history
 
 ## License
 
