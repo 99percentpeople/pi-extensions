@@ -1,0 +1,48 @@
+{
+  "name": "@99percentpeople/pi-todo",
+  "version": "1.0.0",
+  "description": "A minimal atomic todo tool with dependencies, branch-aware persistence, and a read-only above-editor list for Pi",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "state.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepublishOnly": "bun run --cwd ../.. check"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "todo",
+    "task-planning"
+  ],
+  "author": "99percentpeople",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/99percentpeople/pi-extensions.git",
+    "directory": "extensions/todo"
+  },
+  "bugs": {
+    "url": "https://github.com/99percentpeople/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/99percentpeople/pi-extensions#todo",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

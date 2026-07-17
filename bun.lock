@@ -16,7 +16,7 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.0.1",
+      "version": "1.0.4",
       "dependencies": {
         "@xterm/addon-serialize": "0.14.0",
         "@xterm/headless": "6.0.0",
@@ -37,6 +37,16 @@
         "typebox": "*",
       },
     },
+    "extensions/todo": {
+      "name": "@99percentpeople/pi-todo",
+      "version": "1.0.0",
+      "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+        "typebox": "*",
+      },
+    },
   },
   "trustedDependencies": [
     "node-pty",
@@ -45,6 +55,8 @@
     "@99percentpeople/pi-background-tasks": ["@99percentpeople/pi-background-tasks@workspace:extensions/background-tasks"],
 
     "@99percentpeople/pi-pwsh-adapter": ["@99percentpeople/pi-pwsh-adapter@workspace:extensions/pwsh-adapter"],
+
+    "@99percentpeople/pi-todo": ["@99percentpeople/pi-todo@workspace:extensions/todo"],
 
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.91.1", "", { "dependencies": { "json-schema-to-ts": "^3.1.1" }, "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" }, "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-LAmu761tSN9r66ixvmciswUj/ZC+1Q4iAfpedTfSVLeswRwnY3n2Nb6Tsk+cLPP28aLOPWeMgIuTuCcMC6W/iw=="],
 

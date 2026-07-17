@@ -5,6 +5,7 @@ on:
     tags:
       - "background-tasks-v*"
       - "pwsh-adapter-v*"
+      - "todo-v*"
 
 permissions:
   contents: read
@@ -51,6 +52,7 @@ jobs:
           const releases = [
             { prefix: "background-tasks-v", directory: "extensions/background-tasks" },
             { prefix: "pwsh-adapter-v", directory: "extensions/pwsh-adapter" },
+            { prefix: "todo-v", directory: "extensions/todo" },
           ];
           const release = releases.find(({ prefix }) => tag.startsWith(prefix));
           if (!release) throw new Error(`Unsupported release tag: ${tag}`);

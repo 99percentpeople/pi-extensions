@@ -1,15 +1,16 @@
 # Pi Extensions
 
-Two independently published TypeScript extensions for the
+Three independently published TypeScript extensions for the
 [Pi coding agent](https://pi.dev/).
 
 | Extension | npm package | Purpose |
 | --- | --- | --- |
 | background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Background commands, explicit waits, logs, signals, and optional PTY/TUI interaction |
 | pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
+| todo | [`@99percentpeople/pi-todo`](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Minimal atomic whole-plan todo writes with dependencies and a read-only list above the input |
 
-The packages have separate versions and releases. Installing background-tasks
-does not install or enable the Windows-only PowerShell adapter.
+The packages have separate versions and releases. Installing one extension does
+not install or enable either of the others.
 
 ## Installation
 
@@ -28,6 +29,14 @@ pi install npm:@99percentpeople/pi-pwsh-adapter
 
 Without the adapter, `bg_start` follows Pi's configured Bash resolution and
 command prefix, including Git Bash on Windows.
+
+Install the snapshot-based todo extension after removing another extension that
+registers the same `todo` tool:
+
+```bash
+pi remove npm:@juicesharp/rpiv-todo
+pi install npm:@99percentpeople/pi-todo
+```
 
 ## background-tasks
 
@@ -77,6 +86,26 @@ The adapter is a Windows-only package that:
 The startup notification and tool prompt identify the selected version so the
 model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 
+## todo
+
+The `todo` tool replaces per-task CRUD calls with one atomic `tasks[]` snapshot.
+Stable task keys allow dependencies to reference tasks created in the same call.
+Updates include the complete current key list but may omit unchanged fields, so
+one compact call can complete the current task and start the next. Omitted keys
+are archived, stale revisions can be rejected, and invalid dependency graphs do
+not partially mutate state.
+
+The extension deliberately registers no slash commands or interactive manager.
+A read-only widget above the input shows the current task when collapsed and the
+complete visible list when expanded with Pi's standard `Ctrl+O` binding. Task
+keys stay model-only, so user-facing rows contain only a status glyph and task
+name. The tool call itself remains a compact progress confirmation. Completed
+tasks stay visible for the current response, then are automatically archived
+before the next response unless unfinished work still depends on them. Tool
+results and automatic checkpoints both follow Pi session branches and survive
+reloads. See the [todo package documentation](extensions/todo/README.md) for the
+schema.
+
 ## Development
 
 The repository is a private Bun 1.3.14 workspace. Each extension directory is
@@ -92,6 +121,7 @@ Load an extension directly while developing:
 
 ```bash
 pi -e ./extensions/background-tasks/index.ts
+pi -e ./extensions/todo/index.ts
 ```
 
 Repository layout:
@@ -102,12 +132,18 @@ extensions/
 │   ├── index.ts
 │   ├── package.json
 │   └── README.md
-└── pwsh-adapter/
+├── pwsh-adapter/
+│   ├── index.ts
+│   ├── package.json
+│   └── README.md
+└── todo/
     ├── index.ts
+    ├── state.ts
     ├── package.json
     └── README.md
 tests/
 ├── background-tasks.test.ts
+├── todo.test.ts
 └── packages.test.ts
 ```
 
@@ -118,7 +154,7 @@ Publishing with GitHub Actions OIDC. It does not require an `NPM_TOKEN` GitHub
 secret.
 
 Before the first automated release, configure a Trusted Publisher separately
-for both npm packages:
+for all three npm packages:
 
 - Provider: GitHub Actions
 - Organization or user: `99percentpeople`
@@ -133,6 +169,7 @@ independently:
 | --- | --- | --- |
 | background-tasks | `background-tasks-v<version>` | `background-tasks-v1.0.4` |
 | pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
+| todo | `todo-v<version>` | `todo-v1.0.0` |
 
 To publish a release:
 
@@ -154,6 +191,7 @@ package's `package.json`.
 ```bash
 pi remove npm:@99percentpeople/pi-background-tasks
 pi remove npm:@99percentpeople/pi-pwsh-adapter
+pi remove npm:@99percentpeople/pi-todo
 ```
 
 ## License

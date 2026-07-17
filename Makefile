@@ -12,7 +12,7 @@ help:
 	@echo "  make test       - Run unit tests"
 	@echo "  make check      - Run type checking and unit tests"
 	@echo "  make clean      - Clean build artifacts"
-	@echo "  make pack       - Validate both npm package tarballs"
+	@echo "  make pack       - Validate all npm package tarballs"
 	@echo "  make help       - Show this help"
 	@echo ""
 

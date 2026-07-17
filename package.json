@@ -7,15 +7,17 @@
   "type": "module",
   "workspaces": [
     "extensions/background-tasks",
-    "extensions/pwsh-adapter"
+    "extensions/pwsh-adapter",
+    "extensions/todo"
   ],
   "scripts": {
-    "test": "node --import tsx --test tests/background-tasks.test.ts tests/packages.test.ts",
+    "test": "node --import tsx --test tests/background-tasks.test.ts tests/todo.test.ts tests/packages.test.ts",
     "lint": "tsc --noEmit",
     "check": "bun run lint && bun run test",
     "pack:background-tasks": "bun pm pack --dry-run --cwd extensions/background-tasks",
     "pack:pwsh-adapter": "bun pm pack --dry-run --cwd extensions/pwsh-adapter",
-    "pack:check": "bun run check && bun run pack:background-tasks && bun run pack:pwsh-adapter"
+    "pack:todo": "bun pm pack --dry-run --cwd extensions/todo",
+    "pack:check": "bun run check && bun run pack:background-tasks && bun run pack:pwsh-adapter && bun run pack:todo"
   },
   "author": "99percentpeople",
   "license": "MIT",

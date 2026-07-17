@@ -16,6 +16,7 @@ test("extensions are independently publishable workspace packages", async () => 
     "../extensions/background-tasks/package.json",
   );
   const pwsh = await readPackage("../extensions/pwsh-adapter/package.json");
+  const todo = await readPackage("../extensions/todo/package.json");
 
   assert.equal(
     root.private,
@@ -30,6 +31,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.deepEqual(root.workspaces, [
     "extensions/background-tasks",
     "extensions/pwsh-adapter",
+    "extensions/todo",
   ]);
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
@@ -48,6 +50,18 @@ test("extensions are independently publishable workspace packages", async () => 
     undefined,
   );
   assert.equal(pwsh.publishConfig?.access, "public");
+
+  assert.equal(todo.name, "@99percentpeople/pi-todo");
+  assert.equal(todo.version, "1.0.0");
+  assert.deepEqual(todo.pi?.extensions, ["./index.ts"]);
+  assert.deepEqual(todo.files, [
+    "index.ts",
+    "state.ts",
+    "README.md",
+    "LICENSE",
+  ]);
+  assert.equal(todo.publishConfig?.access, "public");
+  assert.equal(todo.dependencies, undefined);
 });
 
 test("PowerShell runtime prefers version 7 and falls back to Windows PowerShell 5.1", () => {
