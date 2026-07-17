@@ -131,7 +131,7 @@ independently:
 
 | Package | Tag format | Example |
 | --- | --- | --- |
-| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.0.3` |
+| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.0.4` |
 | pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
 
 To publish a release:
@@ -142,8 +142,8 @@ To publish a release:
 3. Push the commit, then create and push the matching tag:
 
 ```bash
-git tag background-tasks-v1.0.3
-git push origin master background-tasks-v1.0.3
+git tag background-tasks-v1.0.4
+git push origin master background-tasks-v1.0.4
 ```
 
 The workflow rejects a tag whose version does not exactly match the selected
