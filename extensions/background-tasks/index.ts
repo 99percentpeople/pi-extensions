@@ -13,7 +13,7 @@
  *   - Optional PTY sessions for interactive commands and full-screen TUIs
  *   - Detachable PTY interaction or live pipe output via /bg-attach (Ctrl+] to detach)
  *   - Explicit completion waits with timeout (no polling required)
- *   - Auto-throttle via AbortController
+ *   - Abortable completion waits
  *   - Live widget with one-second duration updates
  *   - Extensible spawn backend via pi.events
  *
@@ -110,8 +110,6 @@ interface BgTask {
   stderrFile: string;
   stdoutLines: number;
   stderrLines: number;
-  wait: number;
-  nextCheckAt: number;
   done: AbortController;
   latestLog: LatestLog | null;
   stdoutPending: string;
@@ -852,7 +850,6 @@ export default function (pi: ExtensionAPI) {
       name: Type.String({ description: "A short descriptive name for the task" }),
       command: Type.String({ description: "The shell command to run" }),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to current)" })),
-      wait: Type.Optional(Type.Number({ description: "Minimum seconds between status checks (default: 5)", minimum: 1, maximum: 3600 })),
       pty: Type.Optional(Type.Boolean({ description: "Run in a pseudoterminal for interactive/TUI programs (default: false)" })),
       cols: Type.Optional(Type.Number({ description: "Initial PTY columns (default: current terminal or 120)", minimum: 20, maximum: 500 })),
       rows: Type.Optional(Type.Number({ description: "Initial PTY rows (default: current terminal or 30)", minimum: 5, maximum: 200 })),
@@ -914,7 +911,6 @@ export default function (pi: ExtensionAPI) {
         exitCode: null, signal: null,
         startedAt: Date.now(), endedAt: null,
         stdoutFile, stderrFile, stdoutLines: 0, stderrLines: 0,
-        wait: params.wait ?? 5, nextCheckAt: 0,
         done: new AbortController(),
         latestLog: null, stdoutPending: "", stderrPending: "",
         requestedStopSignal: null,
@@ -961,7 +957,7 @@ export default function (pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to stream live output)`}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
-        details: { id, name: params.name, command: params.command, pid: taskProcess.pid, wait: task.wait, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
+        details: { id, name: params.name, command: params.command, pid: taskProcess.pid, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
       };
     },
 
@@ -971,9 +967,8 @@ export default function (pi: ExtensionAPI) {
       const cmd = args.command
         ? theme.fg("muted", `$ ${args.command}`)
         : theme.fg("toolOutput", "...");
-      const wait = args.wait ? theme.fg("dim", ` (wait ${args.wait}s)`) : "";
       const mode = args.pty ? theme.fg("dim", " [pty]") : "";
-      text.setText(theme.fg("toolTitle", theme.bold(`bg_start `)) + name + ` ${cmd}` + wait + mode);
+      text.setText(theme.fg("toolTitle", theme.bold(`bg_start `)) + name + ` ${cmd}` + mode);
       return text;
     },
 
@@ -1137,17 +1132,10 @@ export default function (pi: ExtensionAPI) {
 
     executionMode: "sequential",
 
-    async execute(_toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
+    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!params.id) {
         const entries = Array.from(tasks.values());
         if (entries.length === 0) return { content: [{ type: "text", text: "No background tasks." }], details: { tasks: [] } };
-        const running = entries.filter((task) => task.status === "running");
-        const remaining = Math.max(0, ...running.map((task) => task.nextCheckAt - Date.now()));
-        await waitUntilAllowed(remaining, running.map((task) => task.done.signal), signal);
-        const nextCheckBase = Date.now();
-        for (const task of running) {
-          if (task.status === "running") task.nextCheckAt = nextCheckBase + task.wait * 1000;
-        }
         await Promise.all(entries.map((task) => flushPty(task)));
         const lines = entries.map((t) => {
           const dur = t.endedAt ? formatDuration(t.endedAt - t.startedAt) : formatDuration(Date.now() - t.startedAt);
@@ -1170,14 +1158,6 @@ export default function (pi: ExtensionAPI) {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
-      // Throttle
-      if (task.status === "running" && task.nextCheckAt > 0) {
-        const remaining = task.nextCheckAt - Date.now();
-        if (remaining > 0) {
-          await waitUntilAllowed(remaining, [task.done.signal], signal);
-        }
-      }
-      if (task.status === "running") task.nextCheckAt = Date.now() + task.wait * 1000;
       await flushPty(task);
 
       const duration = task.endedAt ? formatDuration(task.endedAt - task.startedAt) : formatDuration(Date.now() - task.startedAt);
@@ -1195,7 +1175,7 @@ export default function (pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, wait: task.wait, latestLog: task.mode === "pipe" ? task.latestLog : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
+        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, latestLog: task.mode === "pipe" ? task.latestLog : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
       };
     },
 

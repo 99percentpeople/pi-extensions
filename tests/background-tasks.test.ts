@@ -209,8 +209,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status\/bg_logs/i);
   assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /independent waits execute in parallel/i);
   assert.match(bgSend.promptGuidelines?.join("\n") ?? "", /Terminal keys always use input/i);
-  assert.equal(bgStart.parameters.properties?.wait.minimum, 1);
-  assert.equal(bgStart.parameters.properties?.wait.maximum, 3600);
+  assert.equal(bgStart.parameters.properties?.wait, undefined);
   assert.equal(bgWait.parameters.properties?.timeout.minimum, 1);
   assert.equal(bgWait.parameters.properties?.timeout.maximum, 3600);
   assert.ok(bgWait.parameters.properties?.terminal_snapshot);
@@ -229,7 +228,6 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     {
       name: "latest-log",
       command: "fake latest-log command",
-      wait: 1,
     },
     undefined,
     undefined,
@@ -256,7 +254,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
 
   const longRunning = await bgStart.execute(
     "start-2",
-    { name: "cancel-status", command: "fake long-running command", wait: 5 },
+    { name: "cancel-status", command: "fake long-running command" },
     undefined,
     undefined,
     ctx,
@@ -265,7 +263,11 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   const firstStatusStartedAt = Date.now();
   const firstStatus = await bgStatus.execute("status-first", { id: longRunningId }, undefined, undefined, ctx);
   assert.equal(firstStatus.details.status, "running");
-  assert.ok(Date.now() - firstStatusStartedAt < 500, "the first status snapshot should not be throttled");
+  assert.ok(Date.now() - firstStatusStartedAt < 500, "status snapshots should return immediately");
+  const repeatedStatusStartedAt = Date.now();
+  const repeatedStatus = await bgStatus.execute("status-repeated", { id: longRunningId }, undefined, undefined, ctx);
+  assert.equal(repeatedStatus.details.status, "running");
+  assert.ok(Date.now() - repeatedStatusStartedAt < 500, "repeated status snapshots should not be throttled");
   const abortController = new AbortController();
   const waitUpdates: unknown[] = [];
   const waitPromise = bgWait.execute(
