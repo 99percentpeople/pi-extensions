@@ -215,6 +215,7 @@ interface RegisteredTool {
   promptGuidelines?: string[];
   parameters: { properties?: Record<string, unknown> };
   execute: (...args: any[]) => Promise<any>;
+  renderCall?: (...args: any[]) => any;
   renderResult?: (...args: any[]) => any;
 }
 
@@ -298,6 +299,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     "a turn with no archivable completion must not create a checkpoint",
   );
 
+  assert.ok(tool.renderCall);
   assert.ok(tool.renderResult);
   initTheme("dark", false);
   const theme = {
@@ -305,19 +307,102 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     bold: (text: string) => text,
     strikethrough: (text: string) => text,
   };
+  const initialDraft = tool.renderCall(
+    {
+      tasks: [
+        { key: "schema", subject: "Design the database schema", status: "completed" },
+      ],
+    },
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: false },
+  );
+  assert.match(initialDraft.render(160).join("\n"), /✓ Design the database schema/);
+
+  const updatedDraft = tool.renderCall(
+    {
+      tasks: [
+        { key: "schema", subject: "Design the database schema", status: "completed" },
+        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed" },
+        { key: "auth", subject: "Implement user authentication", status: "in_progress" },
+        { key: "core-api", subject: "Implement the core API", status: "pending" },
+        { key: "system-verify", subject: "Verify the completed system", status: "pending" },
+      ],
+    },
+    theme,
+    { lastComponent: initialDraft, expanded: false, argsComplete: false },
+  );
+  assert.strictEqual(updatedDraft, initialDraft, "streamed arguments should update the existing component");
+  const updatedDraftText = updatedDraft.render(160).join("\n");
+  assert.match(updatedDraftText, /todo 5 tasks.*to expand/);
+  assert.match(updatedDraftText, /Initialize the project scaffold/);
+  assert.match(updatedDraftText, /Implement user authentication/);
+  assert.match(updatedDraftText, /Implement the core API/);
+  assert.doesNotMatch(updatedDraftText, /Design the database schema|Verify the completed system/);
+  assert.doesNotMatch(
+    updatedDraftText,
+    /(?:schema|scaffold|auth|core-api|system-verify):/,
+    "draft keys should not be user-visible",
+  );
+
+  const expandedDraft = tool.renderCall(
+    {
+      tasks: [
+        { key: "schema", subject: "Design the database schema", status: "completed" },
+        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed" },
+        { key: "auth", subject: "Implement user authentication", status: "in_progress" },
+        { key: "core-api", subject: "Implement the core API", status: "pending" },
+        { key: "system-verify", subject: "Verify the completed system", status: "pending" },
+      ],
+    },
+    theme,
+    { lastComponent: updatedDraft, expanded: true, argsComplete: false },
+  );
+  assert.strictEqual(expandedDraft, updatedDraft);
+  const expandedDraftText = expandedDraft.render(160).join("\n");
+  assert.match(expandedDraftText, /to collapse/);
+  assert.match(expandedDraftText, /Design the database schema/);
+  assert.match(expandedDraftText, /Verify the completed system/);
+
+  const sparseDraft = tool.renderCall(
+    {
+      tasks: [
+        { key: "inspect", status: "completed" },
+        { key: "design", status: "in_progress" },
+        { key: "verify" },
+      ],
+    },
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: false },
+  );
+  const sparseDraftText = sparseDraft.render(160).join("\n");
+  assert.match(sparseDraftText, /✓ Inspect the existing extension/);
+  assert.match(sparseDraftText, /◐ Design the snapshot protocol/);
+  assert.match(sparseDraftText, /○ Verify the implementation/);
+  assert.doesNotMatch(sparseDraftText, /Writing task/);
+
+  const emptyDraft = tool.renderCall(
+    {},
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: false },
+  );
+  assert.match(emptyDraft.render(160).join("\n"), /Writing task list…/);
+
   const toolResult = tool.renderResult(
     result,
     { expanded: false, isPartial: false },
     theme,
-    { lastComponent: undefined },
+    { lastComponent: undefined, isError: false },
   );
   const toolResultText = toolResult.render(160).join("\n");
-  assert.match(toolResultText, /Inspect the existing extension/);
-  assert.match(toolResultText, /Design the snapshot protocol/);
-  assert.match(toolResultText, /Verify the implementation/);
-  assert.doesNotMatch(toolResultText, /completed · rev/, "tool call should not repeat the summary header");
-  assert.doesNotMatch(toolResultText, /Review the current architecture and constraints/, "descriptions should remain model-only");
-  assert.doesNotMatch(toolResultText, /\binspect\b|\bdesign\b|\bverify\b|dependsOn|←/, "stable keys and deps should not be user-visible");
+  assert.equal(toolResultText, "", "a successful result should not repeat the list already rendered by the call");
+
+  const failedResult = tool.renderResult(
+    { content: [{ type: "text", text: "tasks[0].dependsOn references missing task setup-database" }] },
+    { expanded: false, isPartial: false },
+    theme,
+    { lastComponent: undefined, isError: true },
+  );
+  assert.match(failedResult.render(160).join("\n"), /dependsOn references missing task setup-database/);
 
   const widgetFactory = widgets.get("pi-todo-widget") as ((tui: unknown, theme: unknown) => { render(width: number): string[] });
   assert.ok(widgetFactory);
@@ -325,9 +410,15 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   const collapsedText = widget.render(160).join("\n");
   assert.match(collapsedText, /Todo 0\/3 completed · rev 1/);
   assert.match(collapsedText, /Inspect the existing extension/);
-  assert.doesNotMatch(collapsedText, /Design the snapshot protocol|Verify the implementation/);
+  assert.match(collapsedText, /Design the snapshot protocol/);
+  assert.match(collapsedText, /Verify the implementation/);
   assert.doesNotMatch(collapsedText, /\binspect\b/, "stable keys should not be user-visible");
-  assert.match(collapsedText, /expand/);
+  assert.doesNotMatch(collapsedText, /expand/);
+  assert.ok(
+    collapsedText.indexOf("Inspect the existing extension") < collapsedText.indexOf("Design the snapshot protocol") &&
+      collapsedText.indexOf("Design the snapshot protocol") < collapsedText.indexOf("Verify the implementation"),
+    "collapsed tasks should keep their plan order",
+  );
 
   setToolsExpanded(true);
   const expandedText = widget.render(160).join("\n");
@@ -335,7 +426,56 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.match(expandedText, /Design the snapshot protocol/);
   assert.match(expandedText, /Verify the implementation/);
   assert.doesNotMatch(expandedText, /\binspect\b|\bdesign\b|\bverify\b|dependsOn|←/);
-  assert.match(expandedText, /collapse/);
+  assert.doesNotMatch(expandedText, /collapse/);
+
+  setToolsExpanded(false);
+  await tool.execute(
+    "todo-overflow",
+    {
+      tasks: [
+        { key: "schema", subject: "Design the database schema", status: "completed" },
+        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed" },
+        { key: "auth", subject: "Implement user authentication", status: "in_progress" },
+        { key: "core-api", subject: "Implement the core API", status: "pending" },
+        { key: "system-verify", subject: "Verify the completed system", status: "pending" },
+      ],
+      baseRevision: 1,
+    },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const overflowCollapsed = widget.render(160).join("\n");
+  assert.match(overflowCollapsed, /Todo 2\/5 completed · rev 2.*to expand/);
+  assert.match(overflowCollapsed, /Initialize the project scaffold/);
+  assert.match(overflowCollapsed, /Implement user authentication/);
+  assert.match(overflowCollapsed, /Implement the core API/);
+  assert.doesNotMatch(overflowCollapsed, /Design the database schema|Verify the completed system/);
+  assert.ok(
+    overflowCollapsed.indexOf("Initialize the project scaffold") < overflowCollapsed.indexOf("Implement user authentication") &&
+      overflowCollapsed.indexOf("Implement user authentication") < overflowCollapsed.indexOf("Implement the core API"),
+    "the collapsed preview should keep the active task centered without reordering",
+  );
+
+  setToolsExpanded(true);
+  const overflowExpanded = widget.render(160).join("\n");
+  assert.match(overflowExpanded, /to collapse/);
+  const orderedSubjects = [
+    "Design the database schema",
+    "Initialize the project scaffold",
+    "Implement user authentication",
+    "Implement the core API",
+    "Verify the completed system",
+  ];
+  for (const subject of orderedSubjects) {
+    assert.match(overflowExpanded, new RegExp(subject));
+  }
+  for (let index = 1; index < orderedSubjects.length; index++) {
+    assert.ok(
+      overflowExpanded.indexOf(orderedSubjects[index - 1]) < overflowExpanded.indexOf(orderedSubjects[index]),
+      "expanded tasks should keep their plan order",
+    );
+  }
 });
 
 test("todo archives previous-turn completions atomically and replays them across reload and tree changes", async () => {

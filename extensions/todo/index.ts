@@ -14,10 +14,17 @@ import {
   replayTodoState,
   type TodoDetails,
   type TodoState,
+  type TodoStatus,
   writeTodoSnapshot,
 } from "./state.ts";
 
 const WIDGET_KEY = "pi-todo-widget";
+const COLLAPSED_TASK_LIMIT = 3;
+
+interface TodoDisplayTask {
+  subject: string;
+  status: TodoStatus;
+}
 
 const TodoTaskSchema = Type.Object({
   key: Type.String({
@@ -66,7 +73,7 @@ function formatChange(details: TodoDetails): string {
   return `Todo plan revision ${details.revision}:\n${lines.join("\n")}`;
 }
 
-function renderTaskLine(task: TodoDetails["tasks"][number], theme: Theme): string {
+function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
   const glyph = task.status === "completed" ? "✓" : task.status === "in_progress" ? "◐" : task.status === "cancelled" ? "×" : "○";
   const color = task.status === "completed" ? "success" : task.status === "in_progress" ? "warning" : task.status === "cancelled" ? "muted" : "dim";
   let subject = theme.fg(task.status === "completed" || task.status === "cancelled" ? "dim" : "text", task.subject);
@@ -74,32 +81,53 @@ function renderTaskLine(task: TodoDetails["tasks"][number], theme: Theme): strin
   return `${theme.fg(color, glyph)} ${subject}`;
 }
 
+function getCollapsedTodoTasks<T extends TodoDisplayTask>(tasks: readonly T[]): T[] {
+  if (tasks.length <= COLLAPSED_TASK_LIMIT) return [...tasks];
+  const activeIndex = tasks.findIndex((task) => task.status === "in_progress");
+  if (activeIndex <= 0) return tasks.slice(0, COLLAPSED_TASK_LIMIT);
+  return tasks.slice(activeIndex - 1, activeIndex + 2);
+}
+
+function isTodoStatus(value: unknown): value is TodoStatus {
+  return value === "pending" || value === "in_progress" || value === "completed" || value === "cancelled";
+}
+
+function resolveDraftTodoTasks(rawTasks: unknown, state: TodoState): TodoDisplayTask[] {
+  if (!Array.isArray(rawTasks)) return [];
+  const currentByKey = new Map(getVisibleTasks(state).map((task) => [task.key, task]));
+
+  return rawTasks.map((rawTask, index) => {
+    const draft = rawTask && typeof rawTask === "object"
+      ? rawTask as { key?: unknown; subject?: unknown; status?: unknown }
+      : {};
+    const key = typeof draft.key === "string" ? draft.key.trim() : "";
+    const current = key ? currentByKey.get(key) : undefined;
+    const streamedSubject = typeof draft.subject === "string" ? draft.subject.trim() : "";
+
+    return {
+      subject: streamedSubject || current?.subject || `Writing task ${index + 1}…`,
+      status: isTodoStatus(draft.status) ? draft.status : current?.status ?? "pending",
+    };
+  });
+}
+
 function renderTodoWidget(state: TodoState, width: number, expanded: boolean, theme: Theme): string[] {
   const tasks = getVisibleTasks(state);
   if (tasks.length === 0) return [];
   const completed = tasks.filter((task) => task.status === "completed").length;
-  const current = tasks.filter((task) => task.status === "in_progress");
-  const hint = keyHint("app.tools.expand", expanded ? "to collapse" : "to expand");
+  const displayed = expanded ? tasks : getCollapsedTodoTasks(tasks);
+  const canExpand = tasks.length > COLLAPSED_TASK_LIMIT;
+  const hint = canExpand
+    ? theme.fg("muted", ` · ${keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")}`)
+    : "";
   const lines = [
     theme.fg("accent", theme.bold(`Todo ${completed}/${tasks.length} completed`)) +
-      theme.fg("muted", ` · rev ${state.revision} · ${hint}`)
+      theme.fg("muted", ` · rev ${state.revision}`) + hint,
   ];
 
-  if (expanded) {
-    lines.push(...tasks.map((task) => renderTaskLine(task, theme)));
-  } else if (current.length > 0) {
-    lines.push(...current.map((task) => renderTaskLine(task, theme)));
-  } else if (tasks.length > 0 && completed !== tasks.length) {
-    lines.push(theme.fg("dim", "○ No task in progress"));
-  }
+  lines.push(...displayed.map((task) => renderTaskLine(task, theme)));
 
   return lines.map((line) => truncateToWidth(line, width, "…"));
-}
-
-function renderTaskLines(state: TodoState, theme: Theme): string[] {
-  const tasks = getVisibleTasks(state);
-  if (tasks.length === 0) return [];
-  return tasks.map((task) => renderTaskLine(task, theme));
 }
 
 export default function todoExtension(pi: ExtensionAPI): void {
@@ -171,11 +199,23 @@ export default function todoExtension(pi: ExtensionAPI): void {
 
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const count = args.tasks?.length ?? 0;
-      text.setText(
+      const tasks = resolveDraftTodoTasks(args.tasks, state);
+      const count = tasks.length;
+      const canExpand = count > COLLAPSED_TASK_LIMIT;
+      const displayed = context.expanded ? tasks : getCollapsedTodoTasks(tasks);
+      const hint = canExpand
+        ? theme.fg("muted", ` · ${keyHint("app.tools.expand", context.expanded ? "to collapse" : "to expand")}`)
+        : "";
+      const lines = [
         theme.fg("toolTitle", theme.bold("todo ")) +
-        theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`),
-      );
+          theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`) + hint,
+      ];
+      if (displayed.length > 0) {
+        lines.push(...displayed.map((task) => renderTaskLine(task, theme)));
+      } else if (!context.argsComplete) {
+        lines.push(theme.fg("muted", "Writing task list…"));
+      }
+      text.setText(lines.join("\n"));
       return text;
     },
 
@@ -185,13 +225,17 @@ export default function todoExtension(pi: ExtensionAPI): void {
         text.setText(theme.fg("warning", "Validating todo plan..."));
         return text;
       }
-      const details = result.details as TodoDetails | undefined;
-      if (!details) {
-        text.setText(theme.fg("success", "✓"));
+      if (!result.details) {
+        const output = result.content
+          .filter((item): item is { type: "text"; text: string } => item.type === "text")
+          .map((item) => item.text)
+          .join("\n");
+        text.setText(output ? theme.fg(context.isError ? "error" : "toolOutput", output) : "");
         return text;
       }
-      const taskLines = renderTaskLines(details, theme);
-      text.setText(taskLines.join("\n"));
+      // The completed call remains visible above this result and already contains
+      // the final task list. Keep successful results empty to avoid rendering it twice.
+      text.setText("");
       return text;
     },
   });

@@ -122,13 +122,27 @@ stale tool history.
 The task list is rendered in a read-only widget above Pi's input box. It follows
 Pi's standard tool-output expansion state (`Ctrl+O` by default):
 
-- collapsed: overall progress and the current `in_progress` task;
+- collapsed: overall progress and up to three tasks;
 - expanded: the complete visible todo list with a status glyph and task name only.
 
+While the model is streaming a `todo` call, the tool row updates in place and
+shows each task name as it is written instead of only showing a task count.
+Sparse updates reuse the current task name and status until their changed fields
+arrive. This live preview also shows up to three tasks when collapsed and all
+tasks when expanded. After a successful write, the result renderer stays empty
+because the completed tool call already contains the final list; validation
+errors are still displayed below the attempted list.
+
+Tasks always keep their plan order. When collapsed, the widget prefers a
+three-task window containing the item before the first `in_progress` task, the
+active task itself, and the following item. If no task is active, it shows the
+first three tasks. The expand/collapse hint is shown only when more than three
+tasks are visible.
+
 The model-facing result includes keys, dependencies, and descriptions so task
-goals survive sparse updates and automatic checkpoints. The user-facing tool
-result and widget show only status glyphs and task names. The shortcut respects
-the user's `app.tools.expand` keybinding.
+goals survive sparse updates and automatic checkpoints. The user-facing live
+tool call and widget show only status glyphs and task names. The shortcut
+respects the user's `app.tools.expand` keybinding.
 
 ## Persistence
 
