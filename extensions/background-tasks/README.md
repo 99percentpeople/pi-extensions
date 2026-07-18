@@ -157,7 +157,9 @@ The extension exposes a compact set of model-facing operations: start, wait,
 status, logs, send, and kill. They cover process launch, one-shot completion
 waiting, output inspection, text/key/signal delivery, and termination. Users can
 usually describe the desired outcome in natural language instead of calling
-these operations manually.
+these operations manually. While a tool call is streaming, fields appear only
+after the model writes them; missing arguments are omitted rather than rendered
+as placeholders.
 
 ## Shell and platform behavior
 

@@ -210,6 +210,65 @@ test("background tasks can pass commands through Pi's stdin shell transport", as
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
+test("background tool calls never render undefined while arguments stream", () => {
+  const { tools } = createHarness();
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const names = ["bg_start", "bg_wait", "bg_status", "bg_logs", "bg_send", "bg_kill"];
+
+  for (const name of names) {
+    const tool = tools.get(name);
+    assert.ok(tool?.renderCall);
+    const initial = tool.renderCall(
+      {},
+      plainTheme,
+      {
+        lastComponent: undefined,
+        expanded: false,
+        argsComplete: false,
+        executionStarted: false,
+        state: {},
+      },
+    );
+    const initialText = stripVTControlCharacters(initial.render(160).join("\n"));
+    assert.doesNotMatch(initialText, /undefined|null/, `${name} should hide missing streamed arguments`);
+    assert.doesNotMatch(initialText, /\.\.\./, `${name} should omit missing streamed arguments`);
+
+    const partialArgs = name === "bg_start" ? { name: "streamed-task" } : { id: "draft-id" };
+    const updated = tool.renderCall(
+      partialArgs,
+      plainTheme,
+      {
+        lastComponent: initial,
+        expanded: false,
+        argsComplete: false,
+        executionStarted: false,
+        state: {},
+      },
+    );
+    assert.strictEqual(updated, initial, `${name} should update its existing streamed component`);
+    assert.doesNotMatch(
+      stripVTControlCharacters(updated.render(160).join("\n")),
+      /undefined|null/,
+      `${name} should remain safe after a sparse argument update`,
+    );
+  }
+
+  const status = tools.get("bg_status");
+  assert.ok(status?.renderCall);
+  const completeList = status.renderCall(
+    {},
+    plainTheme,
+    {
+      lastComponent: undefined,
+      expanded: false,
+      argsComplete: true,
+      executionStarted: false,
+      state: {},
+    },
+  );
+  assert.match(stripVTControlCharacters(completeList.render(160).join("\n")), /bg_status all/);
+});
+
 test("background tasks wait explicitly, discourage polling, and expose the latest log", async () => {
   const { tools, commands, lifecycle, messages, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");

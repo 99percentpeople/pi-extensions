@@ -281,6 +281,13 @@ function truncateText(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
 }
 
+function renderTaskCallLabel(id: unknown, theme: Theme): string {
+  const taskId = typeof id === "string" ? id.trim() : "";
+  if (!taskId) return "";
+  const task = tasks.get(taskId);
+  return task ? theme.fg("accent", task.name) : theme.fg("muted", taskId);
+}
+
 function updateLatestLog(task: BgTask, stream: "stdout" | "stderr", data: Buffer): void {
   const pendingKey = stream === "stdout" ? "stdoutPending" : "stderrPending";
   const combined = task[pendingKey] + data.toString("utf-8");
@@ -1343,12 +1350,11 @@ export default function (pi: ExtensionAPI) {
 
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const name = args.name ? theme.fg("accent", args.name) : theme.fg("toolOutput", "...");
-      const cmd = args.command
-        ? theme.fg("muted", `$ ${args.command}`)
-        : theme.fg("toolOutput", "...");
-      const mode = args.pty ? theme.fg("dim", " [pty]") : "";
-      text.setText(theme.fg("toolTitle", theme.bold(`bg_start `)) + name + ` ${cmd}` + mode);
+      const parts = [theme.fg("toolTitle", theme.bold("bg_start"))];
+      if (typeof args.name === "string" && args.name) parts.push(theme.fg("accent", args.name));
+      if (typeof args.command === "string" && args.command) parts.push(theme.fg("muted", `$ ${args.command}`));
+      if (args.pty) parts.push(theme.fg("dim", "[pty]"));
+      text.setText(parts.join(" "));
       return text;
     },
 
@@ -1448,13 +1454,12 @@ export default function (pi: ExtensionAPI) {
         state.startedAt = Date.now();
       }
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const task = tasks.get(args.id);
-      const name = task ? theme.fg("accent", task.name) : theme.fg("muted", args.id);
-      const timeout = theme.fg("dim", ` timeout=${args.timeout ?? 300}s`);
+      const name = renderTaskCallLabel(args.id, theme);
+      const timeout = typeof args.timeout === "number" ? theme.fg("dim", `timeout=${args.timeout}s`) : "";
       const snapshot = args.terminal_snapshot
-        ? theme.fg("dim", ` snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
+        ? theme.fg("dim", `snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
         : "";
-      text.setText(theme.fg("toolTitle", theme.bold("bg_wait ")) + name + timeout + snapshot);
+      text.setText([theme.fg("toolTitle", theme.bold("bg_wait")), name, timeout, snapshot].filter(Boolean).join(" "));
       return text;
     },
 
@@ -1572,12 +1577,14 @@ export default function (pi: ExtensionAPI) {
 
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const t = args.id ? tasks.get(args.id) : undefined;
-      const label = t ? theme.fg("accent", t.name) : args.id ? theme.fg("muted", args.id) : theme.fg("toolOutput", "all");
+      const hasTaskId = typeof args.id === "string" && args.id.trim().length > 0;
+      const label = hasTaskId
+        ? renderTaskCallLabel(args.id, theme)
+        : context.argsComplete ? theme.fg("toolOutput", "all") : "";
       const snapshot = args.terminal_snapshot
-        ? theme.fg("dim", ` snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
+        ? theme.fg("dim", `snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
         : "";
-      text.setText(theme.fg("toolTitle", theme.bold("bg_status ")) + label + snapshot);
+      text.setText([theme.fg("toolTitle", theme.bold("bg_status")), label, snapshot].filter(Boolean).join(" "));
       return text;
     },
 
@@ -1723,23 +1730,19 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme, context) {
       const text =
         (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const t = tasks.get(args.id);
-      const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
+      const name = renderTaskCallLabel(args.id, theme);
       const extras: string[] = [];
       if (args.tail) extras.push(`tail=${args.tail}`);
       if (args.stream && args.stream !== "both") extras.push(args.stream);
       const extra = extras.length
-        ? theme.fg("dim", ` ${extras.join(" ")}`)
+        ? theme.fg("dim", extras.join(" "))
         : "";
       const toggleHint = theme.fg(
         "dim",
         ` (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`,
       );
       text.setText(
-        theme.fg("toolTitle", theme.bold("bg_logs ")) +
-          name +
-          extra +
-          toggleHint,
+        [theme.fg("toolTitle", theme.bold("bg_logs")), name, extra, toggleHint].filter(Boolean).join(" "),
       );
       return text;
     },
@@ -2135,11 +2138,10 @@ export default function (pi: ExtensionAPI) {
 
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const t = tasks.get(args.id);
-      const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
+      const name = renderTaskCallLabel(args.id, theme);
       const value = args.signal ?? (args.input !== undefined ? truncateText(JSON.stringify(args.input), 80) : undefined);
-      const input = value ? theme.fg("dim", ` → ${value}`) : "";
-      text.setText(theme.fg("toolTitle", theme.bold("bg_send ")) + name + input);
+      const input = value !== undefined ? theme.fg("dim", `→ ${value}`) : "";
+      text.setText([theme.fg("toolTitle", theme.bold("bg_send")), name, input].filter(Boolean).join(" "));
       return text;
     },
 
@@ -2200,13 +2202,12 @@ export default function (pi: ExtensionAPI) {
 
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      const t = tasks.get(args.id);
-      const name = t ? theme.fg("accent", t.name) : theme.fg("muted", args.id);
-      const sig = args.force ? theme.fg("error", " SIGKILL") : "";
+      const name = renderTaskCallLabel(args.id, theme);
+      const sig = args.force ? theme.fg("error", "SIGKILL") : "";
       const snapshot = args.terminal_snapshot
-        ? theme.fg("dim", ` snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
+        ? theme.fg("dim", `snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
         : "";
-      text.setText(theme.fg("toolTitle", theme.bold("bg_kill ")) + name + sig + snapshot);
+      text.setText([theme.fg("toolTitle", theme.bold("bg_kill")), name, sig, snapshot].filter(Boolean).join(" "));
       return text;
     },
 
