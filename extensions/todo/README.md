@@ -136,8 +136,9 @@ errors are still displayed below the attempted list.
 Tasks always keep their plan order. When collapsed, the widget prefers a
 three-task window containing the item before the first `in_progress` task, the
 active task itself, and the following item. If no task is active, it shows the
-first three tasks. The expand/collapse hint is shown only when more than three
-tasks are visible.
+first three tasks. Once every visible task is completed, it shows the last three
+tasks instead so the most recently finished work remains visible. The
+expand/collapse hint is shown only when more than three tasks are visible.
 
 The model-facing result includes keys, dependencies, and descriptions so task
 goals survive sparse updates and automatic checkpoints. The user-facing live

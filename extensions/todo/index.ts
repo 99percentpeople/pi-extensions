@@ -83,6 +83,9 @@ function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
 
 function getCollapsedTodoTasks<T extends TodoDisplayTask>(tasks: readonly T[]): T[] {
   if (tasks.length <= COLLAPSED_TASK_LIMIT) return [...tasks];
+  if (tasks.every((task) => task.status === "completed")) {
+    return tasks.slice(-COLLAPSED_TASK_LIMIT);
+  }
   const activeIndex = tasks.findIndex((task) => task.status === "in_progress");
   if (activeIndex <= 0) return tasks.slice(0, COLLAPSED_TASK_LIMIT);
   return tasks.slice(activeIndex - 1, activeIndex + 2);

@@ -363,6 +363,25 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.match(expandedDraftText, /Design the database schema/);
   assert.match(expandedDraftText, /Verify the completed system/);
 
+  const completedDraft = tool.renderCall(
+    {
+      tasks: [
+        { key: "schema", subject: "Design the database schema", status: "completed" },
+        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed" },
+        { key: "auth", subject: "Implement user authentication", status: "completed" },
+        { key: "core-api", subject: "Implement the core API", status: "completed" },
+        { key: "system-verify", subject: "Verify the completed system", status: "completed" },
+      ],
+    },
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: true },
+  );
+  const completedDraftText = completedDraft.render(160).join("\n");
+  assert.match(completedDraftText, /Implement user authentication/);
+  assert.match(completedDraftText, /Implement the core API/);
+  assert.match(completedDraftText, /Verify the completed system/);
+  assert.doesNotMatch(completedDraftText, /Design the database schema|Initialize the project scaffold/);
+
   const sparseDraft = tool.renderCall(
     {
       tasks: [
@@ -476,6 +495,35 @@ test("todo extension renders a collapsible read-only list above the editor", asy
       "expanded tasks should keep their plan order",
     );
   }
+
+  setToolsExpanded(false);
+  await tool.execute(
+    "todo-all-completed",
+    {
+      tasks: [
+        { key: "schema" },
+        { key: "scaffold" },
+        { key: "auth", status: "completed" },
+        { key: "core-api", status: "completed" },
+        { key: "system-verify", status: "completed" },
+      ],
+      baseRevision: 2,
+    },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const completedCollapsed = widget.render(160).join("\n");
+  assert.match(completedCollapsed, /Todo 5\/5 completed · rev 3.*to expand/);
+  assert.match(completedCollapsed, /Implement user authentication/);
+  assert.match(completedCollapsed, /Implement the core API/);
+  assert.match(completedCollapsed, /Verify the completed system/);
+  assert.doesNotMatch(completedCollapsed, /Design the database schema|Initialize the project scaffold/);
+  assert.ok(
+    completedCollapsed.indexOf("Implement user authentication") < completedCollapsed.indexOf("Implement the core API") &&
+      completedCollapsed.indexOf("Implement the core API") < completedCollapsed.indexOf("Verify the completed system"),
+    "the completed preview should show the last three tasks without reordering",
+  );
 });
 
 test("todo archives previous-turn completions atomically and replays them across reload and tree changes", async () => {
