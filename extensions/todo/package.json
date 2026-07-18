@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-todo",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A minimal atomic todo tool with dependencies, branch-aware persistence, and a read-only above-editor list for Pi",
   "type": "module",
   "files": [
