@@ -52,7 +52,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.0.1");
+  assert.equal(todo.version, "1.0.2");
   assert.deepEqual(todo.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(todo.files, [
     "index.ts",
