@@ -31,6 +31,10 @@ pipe mode appends a completion hint, while PTY mode overlays the hint in the
 bottom-right corner. These hints are written only to the user's physical terminal
 and are not included in retained output, terminal snapshots, or `bg_logs`.
 
+The background-task widget shows at most three task entries while collapsed and
+prioritizes running tasks in that preview. When more tasks exist, it shows Pi's
+standard expand hint; expanding reveals the complete task list.
+
 Start and attach to a TUI:
 
 ```text

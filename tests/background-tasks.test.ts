@@ -109,6 +109,7 @@ function createHarness() {
   const ptys: FakePty[] = [];
   const widgets = new Map<string, any>();
   const widgetUpdates: Array<{ key: string; widget: unknown; options?: unknown }> = [];
+  let toolsExpanded = false;
 
   const pi = {
     events: {
@@ -135,6 +136,7 @@ function createHarness() {
         else widgets.set(key, widget);
       },
       notify: () => {},
+      getToolsExpanded: () => toolsExpanded,
     },
   } as unknown as ExtensionContext;
 
@@ -156,7 +158,19 @@ function createHarness() {
       env: { ...process.env },
     }),
   });
-  return { tools, commands, lifecycle, eventBus, messages, children, ptys, widgets, widgetUpdates, ctx };
+  return {
+    tools,
+    commands,
+    lifecycle,
+    eventBus,
+    messages,
+    children,
+    ptys,
+    widgets,
+    widgetUpdates,
+    ctx,
+    setToolsExpanded: (value: boolean) => { toolsExpanded = value; },
+  };
 }
 
 test("background tasks can pass commands through Pi's stdin shell transport", async () => {
@@ -666,6 +680,63 @@ test("background task widget renders live state without re-registering every tic
   );
   assert.deepEqual(discardedWait.details, {});
   assert.match(discardedWait.content[0].text, /Task not found/);
+  await lifecycle.get("session_shutdown")?.({}, widgetCtx);
+});
+
+test("background task widget previews three items and prioritizes running tasks", async () => {
+  const { tools, lifecycle, children, widgets, ctx, setToolsExpanded } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  const widgetCtx = { ...ctx, hasUI: true } as ExtensionContext;
+  await lifecycle.get("session_start")?.({}, widgetCtx);
+  for (const name of ["finished-one", "finished-two", "finished-three", "running-four", "running-five"]) {
+    await bgStart.execute(
+      `start-${name}`,
+      { name, command: `fake ${name}` },
+      undefined,
+      undefined,
+      widgetCtx,
+    );
+  }
+
+  for (let index = 0; index < 3; index++) {
+    children[index].stdout.write(`OUTPUT ${index + 1}\n`);
+    children[index].finish(0, null);
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const widgetFactory = widgets.get("bg-tasks-widget");
+  assert.ok(widgetFactory);
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const component = widgetFactory({ requestRender: () => {} }, plainTheme);
+  const collapsed = component.render(200).join("\n");
+  assert.match(collapsed, /5 background tasks · 2 running · 3 finished.*to expand/);
+  assert.match(collapsed, /running-four/);
+  assert.match(collapsed, /running-five/);
+  assert.match(collapsed, /finished-one/);
+  assert.doesNotMatch(collapsed, /finished-two|finished-three/);
+  assert.ok(collapsed.indexOf("running-four") < collapsed.indexOf("finished-one"));
+
+  const colorTheme = {
+    fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+    bold: (text: string) => `<bold>${text}</bold>`,
+  };
+  const coloredHeader = widgetFactory({ requestRender: () => {} }, colorTheme).render(300)[0];
+  assert.match(coloredHeader, /<accent><bold>5 background tasks<\/bold><\/accent>/);
+  assert.match(coloredHeader, /<warning>2 running<\/warning>/);
+  assert.match(coloredHeader, /<muted> · 3 finished/);
+  assert.doesNotMatch(coloredHeader, /<warning>5 background tasks|3 finished<\/warning>/);
+
+  setToolsExpanded(true);
+  const expanded = component.render(200).join("\n");
+  assert.match(expanded, /to collapse/);
+  for (const name of ["finished-one", "finished-two", "finished-three", "running-four", "running-five"]) {
+    assert.match(expanded, new RegExp(name));
+  }
+
+  children[3].finish(0, null);
+  children[4].finish(0, null);
   await lifecycle.get("session_shutdown")?.({}, widgetCtx);
 });
 

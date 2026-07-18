@@ -989,6 +989,7 @@ async function attachTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
 
 const WIDGET_KEY = "bg-tasks-widget";
 const WIDGET_REFRESH_INTERVAL_MS = 1000;
+const COLLAPSED_WIDGET_TASK_LIMIT = 3;
 let uiCtx: ExtensionContext | null = null;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let widgetTui: TUI | null = null;
@@ -1000,6 +1001,14 @@ function getRunningTasks(): BgTask[] {
 
 function getVisibleTasks(): BgTask[] {
   return Array.from(tasks.values());
+}
+
+function getBackgroundWidgetTasks(visible: BgTask[], expanded: boolean): BgTask[] {
+  if (expanded || visible.length <= COLLAPSED_WIDGET_TASK_LIMIT) return visible;
+  return [
+    ...visible.filter((task) => task.status === "running"),
+    ...visible.filter((task) => task.status !== "running"),
+  ].slice(0, COLLAPSED_WIDGET_TASK_LIMIT);
 }
 
 async function discardExpiredFinishedTasks(): Promise<boolean> {
@@ -1042,15 +1051,16 @@ function formatWidgetDuration(ms: number): string {
   return `${seconds}s`;
 }
 
-function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS): string[] {
+function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expanded = false): string[] {
   const visible = getVisibleTasks();
+  const displayed = getBackgroundWidgetTasks(visible, expanded);
   const runningCount = getRunningTasks().length;
   const finishedCount = visible.length - runningCount;
   const now = Date.now();
   const lines: string[] = [];
 
-  for (const [index, task] of visible.entries()) {
-    const isLast = index === visible.length - 1;
+  for (const [index, task] of displayed.entries()) {
+    const isLast = index === displayed.length - 1;
     const branch = isLast ? "└─" : "├─";
     const duration = formatWidgetDuration((task.endedAt ?? now) - task.startedAt);
     if (task.status === "running") {
@@ -1081,8 +1091,18 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS): string
       : `${outputBranch} ${output}`);
   }
 
-  const header = `${visible.length} background task${visible.length === 1 ? "" : "s"} · ${runningCount} running · ${finishedCount} finished`;
-  const rendered = [theme ? theme.fg(runningCount > 0 ? "warning" : "accent", header) : header, ...lines];
+  const canExpand = visible.length > COLLAPSED_WIDGET_TASK_LIMIT;
+  const hint = canExpand
+    ? ` · ${keyText("app.tools.expand")} ${expanded ? "to collapse" : "to expand"}`
+    : "";
+  const title = `${visible.length} background task${visible.length === 1 ? "" : "s"}`;
+  const header = theme
+    ? theme.fg("accent", theme.bold(title)) +
+      theme.fg("muted", " · ") +
+      theme.fg(runningCount > 0 ? "warning" : "muted", `${runningCount} running`) +
+      theme.fg("muted", ` · ${finishedCount} finished${hint}`)
+    : `${title} · ${runningCount} running · ${finishedCount} finished${hint}`;
+  const rendered = [header, ...lines];
   return rendered.map((line) => truncateToWidth(line, width, "…"));
 }
 
@@ -1111,7 +1131,11 @@ function updateWidget(): void {
         (tui, theme) => {
           widgetTui = tui;
           return {
-            render: (width: number) => renderWidgetLines(theme, width),
+            render: (width: number) => renderWidgetLines(
+              theme,
+              width,
+              uiCtx?.ui.getToolsExpanded() ?? false,
+            ),
             invalidate: () => {},
             dispose: () => {
               if (widgetTui === tui) widgetTui = null;
@@ -1125,7 +1149,11 @@ function updateWidget(): void {
       widgetTui?.requestRender();
     }
   } else {
-    uiCtx.ui.setWidget(WIDGET_KEY, renderWidgetLines(), { placement: "belowEditor" });
+    uiCtx.ui.setWidget(
+      WIDGET_KEY,
+      renderWidgetLines(undefined, MAX_DISPLAY_LOG_CHARS, uiCtx.ui.getToolsExpanded()),
+      { placement: "belowEditor" },
+    );
     widgetRegistered = true;
   }
   if (runningTasks.size > 0) startRefreshTimer();
