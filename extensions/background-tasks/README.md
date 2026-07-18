@@ -26,12 +26,17 @@ bg_start name="git-ui" command="lazygit" pty=true
 /bg-attach <task-id>
 ```
 
-For pipe tasks, `/bg-attach` first replays the retained terminal buffer and then
-continues with new output without a gap. The attach view combines stdout and stderr
-in arrival order, like a PTY terminal; `bg_logs` still keeps them separately for
-inspection. A per-task ConsoleSession keeps consuming both child streams while the
-snapshot is prepared, buffering only the attach catch-up output instead of pausing
-the child process. Keyboard input is not forwarded; use `bg_send` for stdin.
+For both pipe and PTY tasks, `/bg-attach` first replays the retained terminal buffer
+and then continues with new output without a gap. A per-task ConsoleSession keeps
+consuming output while the snapshot is prepared, buffering only the attach catch-up
+output instead of pausing the child process or PTY. PTY resize events are debounced
+before being forwarded to the virtual terminal and child process. PTY attach also
+restores extended mouse encodings such as SGR and SGR pixel mode, then resets mouse
+tracking, encoding, and focus modes when detached so they do not leak back into Pi.
+
+The pipe attach view combines stdout and stderr in arrival order, like a PTY
+terminal; `bg_logs` still keeps them separately for inspection. Keyboard input is
+not forwarded for pipe tasks; use `bg_send` for stdin.
 
 Send text and terminal keys with one input string:
 

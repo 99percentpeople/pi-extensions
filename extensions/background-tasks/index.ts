@@ -64,12 +64,16 @@ interface PtyTaskProcess {
 
 type BackgroundProcess = PipeTaskProcess | PtyTaskProcess;
 
+type ConsoleData = string | Buffer;
+type MouseEncodingMode = "default" | "utf8" | "sgr" | "urxvt" | "sgr-pixels";
+
 interface ConsoleSession {
   terminal: XtermTerminal;
   serializer: XtermSerializeAddon;
   parsed: Promise<void>;
-  catchUpBuffer: Buffer[] | null;
-  subscriber?: (data: string | Buffer) => void;
+  catchUpBuffer: ConsoleData[] | null;
+  mouseEncodingMode: MouseEncodingMode;
+  subscriber?: (data: ConsoleData) => void;
 }
 
 type AttachmentReason = "detached" | "exited" | "shutdown";
@@ -201,7 +205,33 @@ function createConsoleSession(cols: number, rows: number, mode: "pipe" | "pty"):
   });
   const serializer = new SerializeAddon();
   terminal.loadAddon(serializer);
-  return { terminal, serializer, parsed: Promise.resolve(), catchUpBuffer: null };
+  const session: ConsoleSession = {
+    terminal,
+    serializer,
+    parsed: Promise.resolve(),
+    catchUpBuffer: null,
+    mouseEncodingMode: "default",
+  };
+
+  const trackMouseEncoding = (enabled: boolean) => (params: (number | number[])[]) => {
+    for (const param of params) {
+      if (typeof param !== "number") continue;
+      if (!enabled && (param === 1005 || param === 1006 || param === 1015 || param === 1016)) {
+        session.mouseEncodingMode = "default";
+        continue;
+      }
+      if (!enabled) continue;
+      if (param === 1005) session.mouseEncodingMode = "utf8";
+      else if (param === 1006) session.mouseEncodingMode = "sgr";
+      else if (param === 1015) session.mouseEncodingMode = "urxvt";
+      else if (param === 1016) session.mouseEncodingMode = "sgr-pixels";
+    }
+    // Keep xterm's built-in mode handler active.
+    return false;
+  };
+  terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, trackMouseEncoding(true));
+  terminal.parser.registerCsiHandler({ prefix: "?", final: "l" }, trackMouseEncoding(false));
+  return session;
 }
 
 async function appendToFile(filePath: string, data: Buffer | string): Promise<void> {
@@ -304,17 +334,27 @@ function updatePtyLatestLog(task: BgTask): void {
   };
 }
 
-function recordPtyData(task: BgTask, data: string): void {
-  const state = task.console;
-  task.stdoutLines += data.split("\n").length - 1;
-  appendToFile(task.stdoutFile, data).catch(() => {});
-  state.parsed = new Promise<void>((resolve) => {
-    state.terminal.write(data, () => {
-      updatePtyLatestLog(task);
+function writeConsoleData(task: BgTask, data: ConsoleData): void {
+  const session = task.console;
+  session.parsed = new Promise<void>((resolve) => {
+    session.terminal.write(data, () => {
+      if (task.mode === "pty") updatePtyLatestLog(task);
       resolve();
     });
   });
-  state.subscriber?.(data);
+}
+
+function recordPtyData(task: BgTask, data: string): void {
+  task.stdoutLines += data.split("\n").length - 1;
+  appendToFile(task.stdoutFile, data).catch(() => {});
+
+  const session = task.console;
+  if (session.catchUpBuffer !== null) {
+    session.catchUpBuffer.push(data);
+    return;
+  }
+  writeConsoleData(task, data);
+  session.subscriber?.(data);
 }
 
 function recordPipeData(task: BgTask, stream: "stdout" | "stderr", data: Buffer): void {
@@ -328,26 +368,24 @@ function recordPipeData(task: BgTask, stream: "stdout" | "stderr", data: Buffer)
     session.catchUpBuffer.push(data);
     return;
   }
-  session.parsed = new Promise<void>((resolve) => session.terminal.write(data, resolve));
+  writeConsoleData(task, data);
   session.subscriber?.(data);
 }
 
-function beginPipeCatchUp(task: BgTask): Buffer[] {
+function beginConsoleCatchUp(task: BgTask): ConsoleData[] {
   const session = task.console;
   if (session.catchUpBuffer !== null) throw new Error(`Task "${task.name}" already has an attach catch-up in progress.`);
-  const buffer: Buffer[] = [];
+  const buffer: ConsoleData[] = [];
   session.catchUpBuffer = buffer;
   return buffer;
 }
 
-function releasePipeCatchUp(task: BgTask, buffer: Buffer[]): void {
+function releaseConsoleCatchUp(task: BgTask, buffer: ConsoleData[]): void {
   const session = task.console;
   if (session.catchUpBuffer !== buffer) return;
   session.catchUpBuffer = null;
 
-  for (const data of buffer) {
-    session.parsed = new Promise<void>((resolve) => session.terminal.write(data, resolve));
-  }
+  for (const data of buffer) writeConsoleData(task, data);
   const writer = session.subscriber;
   if (writer) {
     for (const data of buffer) writer(data);
@@ -507,11 +545,26 @@ function finishTask(task: BgTask, code: number | null, signal: string | null, fa
 }
 
 const ATTACH_DETACH_KEY = "\x1d";
+const ATTACH_RESIZE_DEBOUNCE_MS = 40;
+const MIN_TERMINAL_COLS = 20;
+const MAX_TERMINAL_COLS = 500;
+const MIN_TERMINAL_ROWS = 5;
+const MAX_TERMINAL_ROWS = 200;
 const TERMINAL_RESET = [
-  "\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l",
+  "\x1b[?9l", "\x1b[?1000l", "\x1b[?1001l", "\x1b[?1002l", "\x1b[?1003l",
+  "\x1b[?1004l", "\x1b[?1005l", "\x1b[?1006l", "\x1b[?1007l",
+  "\x1b[?1015l", "\x1b[?1016l",
   "\x1b[?2004l", "\x1b[?1049l", "\x1b[0m", "\x1b[?25h", "\x1b[2J", "\x1b[H",
 ].join("");
 const ATTACH_STATUS_GRACE_MS = 100;
+
+function serializeMouseEncodingMode(mode: MouseEncodingMode): string {
+  if (mode === "utf8") return "\x1b[?1005h";
+  if (mode === "sgr") return "\x1b[?1006h";
+  if (mode === "urxvt") return "\x1b[?1015h";
+  if (mode === "sgr-pixels") return "\x1b[?1016h";
+  return "";
+}
 
 async function notifyAttachmentResult(
   task: BgTask,
@@ -569,9 +622,10 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
     let cleaned = false;
     let terminalStarted = false;
     let rawBeforeAttach = false;
-    let ptyPaused = false;
+    let catchUpBuffer: ConsoleData[] | null = null;
     let inputHandler: ((data: string | Buffer) => void) | undefined;
     let resizeHandler: (() => void) | undefined;
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
 
     const cleanup = (result: AttachmentReason) => {
       if (cleaned) return;
@@ -580,9 +634,13 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
       task.attachment.detach = undefined;
       if (inputHandler) process.stdin.removeListener("data", inputHandler);
       if (resizeHandler) process.stdout.removeListener("resize", resizeHandler);
-      if (ptyPaused) {
-        try { taskProcess.pty.resume(); } catch {}
-        ptyPaused = false;
+      if (resizeTimer) {
+        clearTimeout(resizeTimer);
+        resizeTimer = undefined;
+      }
+      if (catchUpBuffer) {
+        releaseConsoleCatchUp(task, catchUpBuffer);
+        catchUpBuffer = null;
       }
       if (terminalStarted) {
         process.stdin.pause();
@@ -616,25 +674,39 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
           }
           taskProcess.pty.write(data);
         };
-        resizeHandler = () => {
-          const cols = Math.max(20, process.stdout.columns || state.terminal.cols || 80);
-          const rows = Math.max(5, process.stdout.rows || state.terminal.rows || 24);
+        const applyResize = () => {
+          const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
+            MIN_TERMINAL_COLS,
+            Math.floor(process.stdout.columns || state.terminal.cols || 80),
+          ));
+          const rows = Math.min(MAX_TERMINAL_ROWS, Math.max(
+            MIN_TERMINAL_ROWS,
+            Math.floor(process.stdout.rows || state.terminal.rows || 24),
+          ));
           state.terminal.resize(cols, rows);
           if (task.process?.kind === "pty") task.process.pty.resize(cols, rows);
+        };
+        resizeHandler = () => {
+          if (resizeTimer) clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(() => {
+            resizeTimer = undefined;
+            applyResize();
+          }, ATTACH_RESIZE_DEBOUNCE_MS);
         };
 
         process.stdin.on("data", inputHandler);
         process.stdout.on("resize", resizeHandler);
-        taskProcess.pty.pause();
-        ptyPaused = true;
+        catchUpBuffer = beginConsoleCatchUp(task);
         await flushConsole(task);
         if (cleaned) return;
-        resizeHandler();
+        applyResize();
         process.stdout.write("\x1b[2J\x1b[H");
         process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
+        const mouseEncodingSequence = serializeMouseEncodingMode(state.mouseEncodingMode);
+        if (mouseEncodingSequence) process.stdout.write(mouseEncodingSequence);
         state.subscriber = (data) => process.stdout.write(data);
-        taskProcess.pty.resume();
-        ptyPaused = false;
+        releaseConsoleCatchUp(task, catchUpBuffer);
+        catchUpBuffer = null;
       } catch (error) {
         attachError = error instanceof Error ? error.message : String(error);
         cleanup("detached");
@@ -676,7 +748,7 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
     let cleaned = false;
     let terminalStarted = false;
     let rawBeforeAttach = false;
-    let catchUpBuffer: Buffer[] | null = null;
+    let catchUpBuffer: ConsoleData[] | null = null;
     let inputHandler: ((data: string | Buffer) => void) | undefined;
 
     const cleanup = (result: AttachmentReason) => {
@@ -686,7 +758,7 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
       task.attachment.detach = undefined;
       if (inputHandler) process.stdin.removeListener("data", inputHandler);
       if (catchUpBuffer) {
-        releasePipeCatchUp(task, catchUpBuffer);
+        releaseConsoleCatchUp(task, catchUpBuffer);
         catchUpBuffer = null;
       }
       if (terminalStarted) {
@@ -717,17 +789,23 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
         };
 
         process.stdin.on("data", inputHandler);
-        catchUpBuffer = beginPipeCatchUp(task);
+        catchUpBuffer = beginConsoleCatchUp(task);
         await flushConsole(task);
         if (cleaned) return;
 
-        const cols = Math.max(20, process.stdout.columns || state.terminal.cols || 80);
-        const rows = Math.max(5, process.stdout.rows || state.terminal.rows || 24);
+        const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
+          MIN_TERMINAL_COLS,
+          Math.floor(process.stdout.columns || state.terminal.cols || 80),
+        ));
+        const rows = Math.min(MAX_TERMINAL_ROWS, Math.max(
+          MIN_TERMINAL_ROWS,
+          Math.floor(process.stdout.rows || state.terminal.rows || 24),
+        ));
         state.terminal.resize(cols, rows);
         process.stdout.write("\x1b[2J\x1b[H");
         process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
         state.subscriber = (data) => process.stdout.write(data);
-        releasePipeCatchUp(task, catchUpBuffer);
+        releaseConsoleCatchUp(task, catchUpBuffer);
         catchUpBuffer = null;
       } catch (error) {
         attachError = error instanceof Error ? error.message : String(error);
@@ -925,8 +1003,14 @@ export default function (pi: ExtensionAPI) {
         projectTrusted: ctx.isProjectTrusted(),
       });
       const cwd = params.cwd || ctx.cwd;
-      const cols = Math.min(500, Math.max(20, Math.floor(params.cols ?? process.stdout.columns ?? 120)));
-      const rows = Math.min(200, Math.max(5, Math.floor(params.rows ?? process.stdout.rows ?? 30)));
+      const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
+        MIN_TERMINAL_COLS,
+        Math.floor(params.cols ?? process.stdout.columns ?? 120),
+      ));
+      const rows = Math.min(MAX_TERMINAL_ROWS, Math.max(
+        MIN_TERMINAL_ROWS,
+        Math.floor(params.rows ?? process.stdout.rows ?? 30),
+      ));
       let taskProcess: BackgroundProcess;
       const console = createConsoleSession(cols, rows, mode);
 

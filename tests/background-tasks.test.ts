@@ -904,6 +904,9 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   await bgLogs.execute("pty-flush-application-mode", { id, stream: "terminal" }, undefined, undefined, ctx);
   await bgSend.execute("pty-application-up", { id, input: "<Up>" }, undefined, undefined, ctx);
   assert.deepEqual(Buffer.from(ptys[0].writes.at(-1) as Buffer), Buffer.from("\x1bOA"));
+  ptys[0].emitData("\x1b[?1002h\x1b[?100");
+  ptys[0].emitData("6h");
+  await bgLogs.execute("pty-flush-mouse-mode", { id, stream: "terminal" }, undefined, undefined, ctx);
 
   const attachOrder: string[] = [];
   const attachNotifications: string[] = [];
@@ -926,6 +929,9 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
     if (text === "\x1b[2J\x1b[H") attachOrder.push("clear");
     else if (text.includes("PTY_READY")) attachOrder.push("snapshot");
+    else if (text === "\x1b[?1006h") attachOrder.push("mouse-sgr");
+    else if (text.includes("DURING_ATTACH")) attachOrder.push("catchup");
+    else if (text.includes("\x1b[?1016l")) attachOrder.push("mouse-reset");
     return true;
   };
 
@@ -939,7 +945,17 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
       custom: (factory: any) => new Promise((resolve) => {
         const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
         const component = factory(tui, {}, {}, resolve);
-        setTimeout(() => component.dispose(), 10);
+        queueMicrotask(() => pty.emitData("DURING_ATTACH\r\n"));
+        setTimeout(() => {
+          process.stdin.emit("data", "\x1b[<0;12;8M");
+          Object.defineProperty(stdout, "columns", { configurable: true, value: 90 });
+          Object.defineProperty(stdout, "rows", { configurable: true, value: 28 });
+          stdout.emit("resize");
+          Object.defineProperty(stdout, "columns", { configurable: true, value: 1000 });
+          Object.defineProperty(stdout, "rows", { configurable: true, value: 1 });
+          stdout.emit("resize");
+        }, 5);
+        setTimeout(() => component.dispose(), 70);
       }),
     },
   } as unknown as ExtensionContext;
@@ -954,10 +970,22 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     else delete (stdout as any).rows;
   }
 
-  assert.deepEqual(attachOrder, ["pause", "resize:80x24", "clear", "snapshot", "resume"]);
+  assert.deepEqual(attachOrder, [
+    "resize:80x24",
+    "clear",
+    "snapshot",
+    "mouse-sgr",
+    "catchup",
+    "resize:500x5",
+    "mouse-reset",
+  ]);
+  assert.equal(attachOrder.filter((event) => event === "catchup").length, 1);
+  assert.ok(!attachOrder.includes("pause"), "PTY attach must not pause the background task");
+  assert.ok(!attachOrder.includes("resume"), "PTY attach must not resume a task it did not pause");
   assert.deepEqual(attachNotifications, ['Detached from "pty-demo".']);
-  assert.equal(pty.cols, 80);
-  assert.equal(pty.rows, 24);
+  assert.equal(pty.cols, 500);
+  assert.equal(pty.rows, 5);
+  assert.equal(pty.writes.at(-1), "\x1b[<0;12;8M", "PTY attach must forward SGR mouse input unchanged");
 
   const stderr = await bgLogs.execute(
     "pty-stderr",
