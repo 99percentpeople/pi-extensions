@@ -1,6 +1,24 @@
 # @99percentpeople/pi-background-tasks
 
-Background task tools for the [Pi coding agent](https://pi.dev/), including explicit completion waits, log inspection, process signals, and optional PTY-backed TUI interaction.
+Run long-lived commands alongside the [Pi coding agent](https://pi.dev/) without
+blocking the current conversation. The extension supports ordinary background
+processes as well as full PTY-backed terminal applications, with live status,
+retained output, interactive attach, and completion-aware cleanup.
+
+## Features
+
+- Run builds, servers, watchers, tests, and terminal applications in the background
+- Choose lightweight `pipe` mode or a real pseudo-terminal with `pty` mode
+- Keep consuming and retaining output even when no user is attached
+- Attach without pausing or redirecting the child process
+- Replay earlier output before switching seamlessly to live output
+- Interact with PTY applications using keyboard, mouse, focus, and resize events
+- Inspect separate stdout/stderr logs for pipe tasks or a parsed terminal screen for PTY tasks
+- Wait explicitly for task completion without repeated polling
+- Keep final output available long enough for both the user and model to inspect it
+- Track task status, duration, and recent output in a compact expandable widget
+- Send text, terminal keys, stdin data, and process signals to running tasks
+- Use the same shell resolution and command syntax as Pi's built-in `bash` tool
 
 ## Install
 
@@ -8,87 +26,156 @@ Background task tools for the [Pi coding agent](https://pi.dev/), including expl
 pi install npm:@99percentpeople/pi-background-tasks
 ```
 
-## Tools and commands
+During local development:
 
-- `bg_start` starts pipe or PTY-backed tasks.
-- `bg_wait` waits once for completion or timeout without polling.
-- `bg_status` inspects task state.
-- `bg_logs` reads pipe output or a parsed terminal snapshot.
-- `bg_send` sends a compact text/key input string or an OS process signal.
-- `bg_kill` terminates a task.
-- `/bg-attach <id>` attaches to a live task or opens a read-only final snapshot after it exits; press `Ctrl+]` to detach.
-- `/bg-kill` terminates a task by ID.
+```bash
+pi -e ./extensions/background-tasks/index.ts
+```
 
-When a task exits, the widget keeps its final status, duration, and latest output
-visible for the rest of the current agent turn. A task that was still running when
-the agent became idle and then exits is also kept through the next agent turn, so
-the model can inspect its result. At the following turn boundary it is discarded,
-and its old ID is no longer available through `/bg-attach`, `bg_status`, `bg_logs`,
-or `bg_wait`. Before that boundary, `/bg-attach` can reopen the task's final
-virtual-terminal snapshot in read-only mode. If a task exits while attached, the
-view remains open until `Ctrl+]`:
-pipe mode appends a completion hint, while PTY mode overlays the hint in the
-bottom-right corner. These hints are written only to the user's physical terminal
-and are not included in retained output, terminal snapshots, or `bg_logs`.
+## Typical workflow
 
-The background-task widget shows at most three task entries while collapsed and
-prioritizes running tasks in that preview. When more tasks exist, it shows Pi's
-standard expand hint; expanding reveals the complete task list.
-
-Start and attach to a TUI:
+Ask Pi to start a command in the background, then continue working while it
+runs. For example:
 
 ```text
-bg_start name="git-ui" command="lazygit" pty=true
+Run the development server in the background and tell me when it is ready.
+Start lazygit in a background PTY so I can attach to it.
+Run the test suite in the background and inspect the failures when it exits.
+```
+
+The model can start, wait for, inspect, signal, and stop tasks. Users normally
+only need the two interactive commands:
+
+```text
 /bg-attach <task-id>
+/bg-kill <task-id>
 ```
 
-For both pipe and PTY tasks, `/bg-attach` first replays the retained terminal buffer
-and then continues with new output without a gap. A per-task ConsoleSession keeps
-consuming output while the snapshot is prepared, buffering only the attach catch-up
-output instead of pausing the child process or PTY. PTY resize events are debounced
-before being forwarded to the virtual terminal and child process. PTY attach also
-restores extended mouse encodings such as SGR and SGR pixel mode, then resets mouse
-tracking, encoding, and focus modes when detached so they do not leak back into Pi.
+Omit the task ID to choose from an interactive list. Press `Ctrl+]` to leave an
+attached console without stopping its task.
 
-The pipe attach view combines stdout and stderr in arrival order, like a PTY
-terminal; `bg_logs` still keeps them separately for inspection. Keyboard input is
-not forwarded for pipe tasks; use `bg_send` for stdin.
+## Pipe and PTY modes
 
-Send text and terminal keys with one input string:
+| | Pipe mode | PTY mode |
+| --- | --- | --- |
+| Best for | Builds, servers, scripts, tests, and watchers | TUIs, REPLs, debuggers, and terminal-aware programs |
+| Output model | Separate stdout and stderr logs | One terminal screen with ANSI control sequences interpreted |
+| Attached view | Combined stdout/stderr in arrival order | Live virtual terminal |
+| Direct attached input | Read-only; send stdin through Pi | Keyboard and mouse input are forwarded |
+| Resize behavior | Local console reflow only | Debounced terminal and child-process resize |
+
+Pipe mode is the simpler default for commands that only need reliable logs.
+PTY mode sets up a real pseudo-terminal, so programs can detect terminal
+capabilities, redraw their screen, request mouse tracking, and respond to window
+size changes as they would in a standalone terminal.
+
+## Live attach and final snapshots
+
+Each task owns a virtual console from the moment it starts. Output is processed
+continuously whether attached or not. When `/bg-attach` opens the console, it
+first renders the retained terminal buffer and buffers only the small amount of
+output arriving during that replay. The child process is never paused and its
+stdout or stderr is never reconnected to the physical terminal.
+
+For PTY applications, attach forwards keyboard input and terminal resize events.
+Extended mouse encodings, including SGR and SGR pixel mode, are restored when
+the application enables them. Mouse tracking, encodings, and focus modes are
+reset on detach so terminal state does not leak back into Pi.
+
+If a task exits while attached, the console stays open until `Ctrl+]`:
+
+- pipe mode appends a completion message;
+- PTY mode overlays the message in the bottom-right corner without changing the
+  application's final screen.
+
+The completion message exists only on the user's physical terminal. It is not
+written into retained logs, `bg_logs`, or the final virtual-terminal snapshot.
+A finished task can be attached again in read-only mode while its snapshot is
+still retained.
+
+## Status widget
+
+Pi displays background tasks below the editor with their status, duration, and
+latest output. The collapsed widget shows at most three task entries and
+prioritizes running tasks. When more tasks exist, Pi's standard tool expansion
+shortcut (`Ctrl+O` by default) reveals the complete list.
+
+The header uses separate colors for the total, running, and finished counts so
+active work stands out without making the whole widget look like a warning.
+Running durations and recent output refresh without repeatedly registering a
+new widget.
+
+## Output retention and cleanup
+
+When a task exits during an agent turn, its final status, duration, latest log,
+and terminal snapshot remain available for the rest of that turn. A task that
+was still running when the agent became idle is retained through the following
+turn if it finishes while idle, giving the model a chance to inspect the result.
+The snapshot is discarded at the next turn boundary after that opportunity.
+
+Once discarded, the old task ID is no longer available through attach, status,
+logs, or wait operations. Retention is intentionally short-lived and stored in
+memory; it is not persistent job management. When the Pi session shuts down,
+the extension detaches consoles, terminates remaining processes, flushes their
+output, and disposes the virtual terminals so it does not leave orphaned tasks.
+
+## Sending input and keys
+
+Pi can send ordinary text, terminal keys, or signals without opening an attached
+console. Text is exact and never implies Enter. Special keys use `<...>` tokens:
 
 ```text
-bg_send id="<task-id>" input="<C-o>filename.txt<Enter>"
-bg_send id="<task-id>" input="<F10>"
-bg_send id="<task-id>" input="<Esc>iHello<Enter>"
-bg_send id="<task-id>" input="<Down*3><Enter>"
-bg_send id="<task-id>" input="<A-f><A-f><Space>"
-bg_send id="<task-id>" input="<C-d>"
+<C-o>filename.txt<Enter>
+<Esc>iHello<Enter>
+<Down*3><Enter>
 ```
 
-The input DSL supports Ctrl+A–Z, Ctrl punctuation combinations, Alt/Meta combinations,
-arrows, Home/End, PageUp/PageDown, Insert/Delete, F1–F12, Space, Enter, Escape,
-Tab, and Backspace. Alt/Meta accepts `<A-f>`, `<Alt-f>`, `<M-f>`, and `<Meta-f>`
-spellings and can also modify common navigation and function keys. Modifiers can be
-combined, for example `<C-A-d>` or `<S-A-Left>`.
-Plain characters are exact and never imply Enter. Terminal keys use `<...>` tokens;
-for example, Ctrl+D is `<C-d>`. Use `\<` for a literal `<` and `\\` for a literal
-backslash. Common Ctrl spellings are accepted inside key tokens.
+The input syntax supports Ctrl+A-Z and Ctrl punctuation, Alt/Meta combinations,
+arrows, navigation keys, Insert/Delete, F1-F12, Space, Enter, Escape, Tab, and
+Backspace. Modifiers can be combined, such as `<C-A-d>` or `<S-A-Left>`, and
+key repetition uses forms such as `<Down*3>`. Use `\<` for a literal `<` and
+`\\` for a literal backslash.
 
-PTY output combines stdout and stderr. `bg_logs` returns the parsed terminal buffer rather than raw control sequences.
-`bg_wait`, `bg_status`, and `bg_kill` omit PTY screen output by default; pass
-`terminal_snapshot=true` when the current or final terminal screen is needed in the same result.
-Snapshots are collapsed in Pi's TUI by default and can be expanded with the standard tool
-expand key. Pipe tasks continue to include their ordinary latest stdout/stderr log line.
+Pipe attachments do not forward keyboard input directly, but Pi can still send
+stdin through the background task interface. PTY attachments forward input
+interactively and the same key syntax remains available for model-driven input.
 
-`bg_start` follows Pi's configured Bash resolution and command prefix, so commands use the
-same syntax as Pi's built-in `bash` tool. On Windows this means `shellPath`, Git Bash, or a
-`bash.exe` found on `PATH`, rather than `cmd.exe`. Installing
-`@99percentpeople/pi-pwsh-adapter` explicitly
-switches both tools to PowerShell syntax.
+## Output inspection
+
+Pipe tasks retain stdout and stderr separately for inspection, while their
+attached console combines both streams in arrival order. PTY tasks expose the
+parsed terminal buffer rather than raw ANSI escape sequences, which makes
+full-screen application output readable to the model.
+
+Normal status and completion checks keep PTY output compact. Pi requests a
+terminal snapshot only when the current or final screen is useful; snapshots
+follow the standard collapsed/expanded tool-output behavior.
+
+## Pi capabilities
+
+The extension exposes a compact set of model-facing operations: start, wait,
+status, logs, send, and kill. They cover process launch, one-shot completion
+waiting, output inspection, text/key/signal delivery, and termination. Users can
+usually describe the desired outcome in natural language instead of calling
+these operations manually.
+
+## Shell and platform behavior
+
+Background commands follow Pi's configured Bash resolution and command prefix,
+so they use the same syntax as the built-in `bash` tool. On Windows this means
+Pi's configured `shellPath`, Git Bash, or a `bash.exe` found on `PATH`, rather
+than `cmd.exe`.
+
+Installing `@99percentpeople/pi-pwsh-adapter` explicitly switches both Pi's
+built-in shell tool and background tasks to PowerShell syntax.
 
 ## Native dependency
 
-PTY support uses `node-pty`. If a compatible binary is unavailable, installation may require Python and a native C/C++ build toolchain. On macOS this generally means Xcode command-line tools; Windows builds may require Visual Studio C++ and the Windows SDK.
+PTY support uses `node-pty`. If a compatible prebuilt binary is unavailable,
+installation may require Python and a native C/C++ build toolchain. On macOS
+this generally means Xcode command-line tools; Windows builds may require Visual
+Studio C++ and the Windows SDK. Pipe mode does not require a pseudo-terminal at
+runtime, but `node-pty` is still installed as a package dependency.
 
 ## License
 
