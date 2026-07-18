@@ -404,7 +404,26 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     theme,
     { lastComponent: undefined, expanded: false, argsComplete: false },
   );
-  assert.match(emptyDraft.render(160).join("\n"), /Writing task list…/);
+  const emptyDraftText = emptyDraft.render(160).join("\n").trim();
+  assert.equal(emptyDraftText, "todo");
+
+  const missingSubjectDraft = tool.renderCall(
+    { tasks: [{ key: "new-task" }] },
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: false },
+  );
+  const missingSubjectText = missingSubjectDraft.render(160).join("\n");
+  assert.match(missingSubjectText, /todo 1 task/);
+  assert.doesNotMatch(missingSubjectText, /new-task|Writing task|undefined|null|○|◐|✓|×/);
+
+  const missingStatusDraft = tool.renderCall(
+    { tasks: [{ key: "new-task", subject: "Implement the streamed task" }] },
+    theme,
+    { lastComponent: missingSubjectDraft, expanded: false, argsComplete: false },
+  );
+  const missingStatusText = missingStatusDraft.render(160).join("\n");
+  assert.match(missingStatusText, /Implement the streamed task/);
+  assert.doesNotMatch(missingStatusText, /undefined|null|○|◐|✓|×/);
 
   const toolResult = tool.renderResult(
     result,

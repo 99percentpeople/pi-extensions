@@ -128,10 +128,12 @@ Pi's standard tool-output expansion state (`Ctrl+O` by default):
 While the model is streaming a `todo` call, the tool row updates in place and
 shows each task name as it is written instead of only showing a task count.
 Sparse updates reuse the current task name and status until their changed fields
-arrive. This live preview also shows up to three tasks when collapsed and all
-tasks when expanded. After a successful write, the result renderer stays empty
-because the completed tool call already contains the final list; validation
-errors are still displayed below the attempted list.
+arrive. Fields that are not yet known are omitted: a new task appears after its
+subject is written, and its status glyph appears only after its status is
+available. This live preview also shows up to three tasks when collapsed and
+all tasks when expanded. After a successful write, the result renderer stays
+empty because the completed tool call already contains the final list;
+validation errors are still displayed below the attempted list.
 
 Tasks always keep their plan order. When collapsed, the widget prefers a
 three-task window containing the item before the first `in_progress` task, the

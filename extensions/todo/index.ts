@@ -23,7 +23,7 @@ const COLLAPSED_TASK_LIMIT = 3;
 
 interface TodoDisplayTask {
   subject: string;
-  status: TodoStatus;
+  status?: TodoStatus;
 }
 
 const TodoTaskSchema = Type.Object({
@@ -74,6 +74,7 @@ function formatChange(details: TodoDetails): string {
 }
 
 function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
+  if (!task.status) return theme.fg("text", task.subject);
   const glyph = task.status === "completed" ? "✓" : task.status === "in_progress" ? "◐" : task.status === "cancelled" ? "×" : "○";
   const color = task.status === "completed" ? "success" : task.status === "in_progress" ? "warning" : task.status === "cancelled" ? "muted" : "dim";
   let subject = theme.fg(task.status === "completed" || task.status === "cancelled" ? "dim" : "text", task.subject);
@@ -99,7 +100,7 @@ function resolveDraftTodoTasks(rawTasks: unknown, state: TodoState): TodoDisplay
   if (!Array.isArray(rawTasks)) return [];
   const currentByKey = new Map(getVisibleTasks(state).map((task) => [task.key, task]));
 
-  return rawTasks.map((rawTask, index) => {
+  return rawTasks.flatMap((rawTask) => {
     const draft = rawTask && typeof rawTask === "object"
       ? rawTask as { key?: unknown; subject?: unknown; status?: unknown }
       : {};
@@ -107,10 +108,12 @@ function resolveDraftTodoTasks(rawTasks: unknown, state: TodoState): TodoDisplay
     const current = key ? currentByKey.get(key) : undefined;
     const streamedSubject = typeof draft.subject === "string" ? draft.subject.trim() : "";
 
-    return {
-      subject: streamedSubject || current?.subject || `Writing task ${index + 1}…`,
-      status: isTodoStatus(draft.status) ? draft.status : current?.status ?? "pending",
-    };
+    const subject = streamedSubject || current?.subject;
+    if (!subject) return [];
+    return [{
+      subject,
+      status: isTodoStatus(draft.status) ? draft.status : current?.status,
+    }];
   });
 }
 
@@ -203,20 +206,17 @@ export default function todoExtension(pi: ExtensionAPI): void {
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const tasks = resolveDraftTodoTasks(args.tasks, state);
-      const count = tasks.length;
-      const canExpand = count > COLLAPSED_TASK_LIMIT;
+      const hasTaskList = Array.isArray(args.tasks);
+      const count = hasTaskList ? args.tasks.length : 0;
+      const canExpand = tasks.length > COLLAPSED_TASK_LIMIT;
       const displayed = context.expanded ? tasks : getCollapsedTodoTasks(tasks);
       const hint = canExpand
         ? theme.fg("muted", ` · ${keyHint("app.tools.expand", context.expanded ? "to collapse" : "to expand")}`)
         : "";
-      const lines = [
-        theme.fg("toolTitle", theme.bold("todo ")) +
-          theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`) + hint,
-      ];
+      const summary = hasTaskList ? theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`) : "";
+      const lines = [[theme.fg("toolTitle", theme.bold("todo")), summary].filter(Boolean).join(" ") + hint];
       if (displayed.length > 0) {
         lines.push(...displayed.map((task) => renderTaskLine(task, theme)));
-      } else if (!context.argsComplete) {
-        lines.push(theme.fg("muted", "Writing task list…"));
       }
       text.setText(lines.join("\n"));
       return text;
