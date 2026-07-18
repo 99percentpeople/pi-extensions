@@ -339,12 +339,14 @@ function updatePtyLatestLog(task: BgTask): void {
 
 function writeConsoleData(task: BgTask, data: ConsoleData): void {
   const session = task.console;
-  session.parsed = new Promise<void>((resolve) => {
-    session.terminal.write(data, () => {
-      if (task.mode === "pty") updatePtyLatestLog(task);
-      resolve();
-    });
-  });
+  session.parsed = session.parsed.then(() =>
+    new Promise<void>((resolve) => {
+      session.terminal.write(data, () => {
+        if (task.mode === "pty") updatePtyLatestLog(task);
+        resolve();
+      });
+    }),
+  );
 }
 
 function recordPtyData(task: BgTask, data: string): void {

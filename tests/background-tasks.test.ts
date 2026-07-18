@@ -173,6 +173,15 @@ function createHarness() {
   };
 }
 
+async function waitForRenderedText(chunks: string[], pattern: RegExp, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pattern.test(chunks.join(""))) return true;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  return false;
+}
+
 test("background tasks can pass commands through Pi's stdin shell transport", async () => {
   const { tools, lifecycle, eventBus, children, ctx } = createHarness();
   eventBus.emit("bg:register", {
@@ -896,10 +905,14 @@ test("pipe tasks replay retained output before continuing with live output", asy
         const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
         const component = factory(tui, {}, {}, resolve);
         queueMicrotask(() => {
-          process.stdin.emit("data", "IGNORED_INPUT");
-          children[0].stdout.write("LIVE_STDOUT\n");
-          children[0].stderr.write("LIVE_STDERR\n");
-          setImmediate(() => component.dispose());
+          void (async () => {
+            await waitForRenderedText(stdoutChunks, /BEFORE_ATTACH_STDERR/);
+            process.stdin.emit("data", "IGNORED_INPUT");
+            children[0].stdout.write("LIVE_STDOUT\n");
+            children[0].stderr.write("LIVE_STDERR\n");
+            await waitForRenderedText(stdoutChunks, /LIVE_STDERR/);
+            component.dispose();
+          })();
         });
       }),
     },
@@ -935,11 +948,13 @@ test("pipe tasks replay retained output before continuing with live output", asy
         const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
         const component = factory(tui, {}, {}, resolve);
         queueMicrotask(() => {
-          children[0].stdout.write("AFTER_REATTACH\n");
-          setImmediate(() => {
+          void (async () => {
+            await waitForRenderedText(reattachedChunks, /LIVE_STDERR/);
+            children[0].stdout.write("AFTER_REATTACH\n");
+            await waitForRenderedText(reattachedChunks, /AFTER_REATTACH/);
             component.dispose();
             queueMicrotask(() => children[0].finish(0, null));
-          });
+          })();
         });
       }),
     },
