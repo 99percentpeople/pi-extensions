@@ -16,8 +16,20 @@ pi install npm:@99percentpeople/pi-background-tasks
 - `bg_logs` reads pipe output or a parsed terminal snapshot.
 - `bg_send` sends a compact text/key input string or an OS process signal.
 - `bg_kill` terminates a task.
-- `/bg-attach <id>` attaches to an interactive PTY or replays and follows pipe output; press `Ctrl+]` to detach.
+- `/bg-attach <id>` attaches to a live task or opens a read-only final snapshot after it exits; press `Ctrl+]` to detach.
 - `/bg-kill` terminates a task by ID.
+
+When a task exits, the widget keeps its final status, duration, and latest output
+visible for the rest of the current agent turn. A task that was still running when
+the agent became idle and then exits is also kept through the next agent turn, so
+the model can inspect its result. At the following turn boundary it is discarded,
+and its old ID is no longer available through `/bg-attach`, `bg_status`, `bg_logs`,
+or `bg_wait`. Before that boundary, `/bg-attach` can reopen the task's final
+virtual-terminal snapshot in read-only mode. If a task exits while attached, the
+view remains open until `Ctrl+]`:
+pipe mode appends a completion hint, while PTY mode overlays the hint in the
+bottom-right corner. These hints are written only to the user's physical terminal
+and are not included in retained output, terminal snapshots, or `bg_logs`.
 
 Start and attach to a TUI:
 

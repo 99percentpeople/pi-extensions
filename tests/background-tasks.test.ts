@@ -531,18 +531,21 @@ test("bg_wait renderer shows elapsed time while waiting", async () => {
 test("background task widget renders live state without re-registering every tick", async () => {
   const { tools, lifecycle, children, ptys, widgets, widgetUpdates, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
-  assert.ok(bgStart);
+  const bgStatus = tools.get("bg_status");
+  const bgLogs = tools.get("bg_logs");
+  const bgWait = tools.get("bg_wait");
+  assert.ok(bgStart && bgStatus && bgLogs && bgWait);
 
   const widgetCtx = { ...ctx, hasUI: true } as ExtensionContext;
   await lifecycle.get("session_start")?.({}, widgetCtx);
-  await bgStart.execute(
+  const ptyStarted = await bgStart.execute(
     "widget-pty-pro",
     { name: "pi-debate-pro", command: "fake pro", pty: true, cols: 100, rows: 25 },
     undefined,
     undefined,
     widgetCtx,
   );
-  await bgStart.execute(
+  const pipeStarted = await bgStart.execute(
     "widget-pipe-build",
     { name: "pi-build", command: "fake build" },
     undefined,
@@ -556,9 +559,9 @@ test("background task widget renders live state without re-registering every tic
   let renderRequests = 0;
   const component = widgetFactory({ requestRender: () => { renderRequests += 1; } }, plainTheme);
   const lines = component.render(200).map((line: string) => line.trimEnd());
-  assert.equal(lines[0], "2 background tasks");
-  assert.match(lines[1], /^├─ pi-debate-pro \([a-z0-9]+\) 0s pty:100x25$/);
-  assert.match(lines[2], /^└─ pi-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
+  assert.equal(lines[0], "2 background tasks · 2 running · 0 finished");
+  assert.match(lines[1], /^├─ ◐ pi-debate-pro \([a-z0-9]+\) 0s pty:100x25$/);
+  assert.match(lines[2], /^└─ ◐ pi-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
   assert.equal(widgetUpdates.length, 1, "the TUI widget should be registered once");
 
   children[0].stdout.write("first\nsecond\n");
@@ -571,15 +574,161 @@ test("background task widget renders live state without re-registering every tic
   assert.equal(widgetUpdates.length, 1, "ticker refreshes should not replace the widget component");
   assert.match(component.render(200)[1], / \d+s pty:100x25$/);
 
+  ptys[0].emitData("PTY FINAL\r\n");
   ptys[0].finish(0);
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  const mixedLines = component.render(200).map((line: string) => line.trimEnd());
+  assert.equal(mixedLines[0], "2 background tasks · 1 running · 1 finished");
+  assert.match(mixedLines[1], /^├─ ✓ pi-debate-pro \([a-z0-9]+\) completed \d+s exit=0$/);
+  assert.equal(mixedLines[2], "│  └─ [terminal] PTY FINAL");
+  assert.match(mixedLines[3], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
+
+  await lifecycle.get("before_agent_start")?.({}, widgetCtx);
+  const nextTurnLines = component.render(200).map((line: string) => line.trimEnd());
+  assert.equal(nextTurnLines[0], "1 background task · 1 running · 0 finished");
+  assert.match(nextTurnLines[1], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
+
   children[0].finish(0, null);
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(widgets.has("bg-tasks-widget"), false);
-  assert.equal(widgetUpdates.length, 2, "the widget should be cleared after the last task exits");
+  assert.equal(widgets.has("bg-tasks-widget"), true, "the final task result should remain visible for this turn");
+  const finishedLines = component.render(200).map((line: string) => line.trimEnd());
+  assert.equal(finishedLines[0], "1 background task · 0 running · 1 finished");
+  assert.match(finishedLines[1], /^└─ ✓ pi-build \([a-z0-9]+\) completed \d+s exit=0$/);
+  assert.equal(finishedLines[2], "   └─ [stderr] warning");
+  assert.equal(widgetUpdates.length, 1, "finishing should update the existing TUI component");
+
   const rendersAfterExit = renderRequests;
   await new Promise<void>((resolve) => setTimeout(resolve, 1050));
   assert.equal(renderRequests, rendersAfterExit, "the ticker should stop after the last task exits");
+
+  await lifecycle.get("session_start")?.({ reason: "reload" }, widgetCtx);
+  const restoredFactory = widgets.get("bg-tasks-widget");
+  assert.ok(restoredFactory, "session_start within the same runtime must not archive final output");
+  const restoredComponent = restoredFactory({ requestRender: () => {} }, plainTheme);
+  assert.match(restoredComponent.render(200).join("\n"), /\[stderr\] warning/);
+
+  const currentList = await bgStatus.execute("status-current", {}, undefined, undefined, widgetCtx);
+  assert.equal(currentList.details.tasks.length, 1);
+  assert.equal(currentList.details.tasks[0].id, pipeStarted.details.id);
+
+  const retainedLogs = await bgLogs.execute(
+    "logs-retained-id",
+    { id: pipeStarted.details.id, stream: "both" },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  assert.match(retainedLogs.content[0].text, /first\nsecond/);
+  assert.match(retainedLogs.content[0].text, /warning/);
+
+  const retainedWait = await bgWait.execute(
+    "wait-retained-id",
+    { id: pipeStarted.details.id, timeout: 1 },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  assert.equal(retainedWait.details.status, "completed");
+
+  await lifecycle.get("before_agent_start")?.({}, widgetCtx);
+  assert.equal(widgets.has("bg-tasks-widget"), false, "the next turn should discard the retained final result");
+
+  const emptyList = await bgStatus.execute("status-empty", {}, undefined, undefined, widgetCtx);
+  assert.deepEqual(emptyList.details.tasks, []);
+  assert.equal(emptyList.content[0].text, "No background tasks.");
+
+  const discardedStatus = await bgStatus.execute(
+    "status-discarded-id",
+    { id: ptyStarted.details.id },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  assert.deepEqual(discardedStatus.details, {});
+  assert.match(discardedStatus.content[0].text, /Task not found/);
+
+  const discardedLogs = await bgLogs.execute(
+    "logs-discarded-id",
+    { id: pipeStarted.details.id, stream: "both" },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  assert.deepEqual(discardedLogs.details, {});
+  assert.match(discardedLogs.content[0].text, /Task not found/);
+
+  const discardedWait = await bgWait.execute(
+    "wait-discarded-id",
+    { id: pipeStarted.details.id, timeout: 1 },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  assert.deepEqual(discardedWait.details, {});
+  assert.match(discardedWait.content[0].text, /Task not found/);
   await lifecycle.get("session_shutdown")?.({}, widgetCtx);
+});
+
+test("tasks finishing while the agent is idle survive the next inspection turn", async () => {
+  const { tools, lifecycle, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgStatus = tools.get("bg_status");
+  const bgLogs = tools.get("bg_logs");
+  assert.ok(bgStart && bgStatus && bgLogs);
+
+  const idleStarted = await bgStart.execute(
+    "idle-finish-start",
+    { name: "idle-finish", command: "fake idle completion" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const activeStarted = await bgStart.execute(
+    "active-finish-start",
+    { name: "active-finish", command: "fake active completion" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const idleId = idleStarted.details.id as string;
+  const activeId = activeStarted.details.id as string;
+
+  await lifecycle.get("agent_settled")?.({}, ctx);
+  children[0].stdout.write("FINISHED WHILE IDLE\n");
+  children[0].finish(0, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const inspectionList = await bgStatus.execute("idle-inspection-list", {}, undefined, undefined, ctx);
+  assert.equal(inspectionList.details.tasks.length, 2);
+  assert.equal(
+    inspectionList.details.tasks.find((task: { id: string }) => task.id === idleId)?.status,
+    "completed",
+  );
+  assert.equal(
+    inspectionList.details.tasks.find((task: { id: string }) => task.id === activeId)?.status,
+    "running",
+  );
+
+  const idleLogs = await bgLogs.execute(
+    "idle-inspection-logs",
+    { id: idleId, stream: "both" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(idleLogs.content[0].text, /FINISHED WHILE IDLE/);
+
+  children[1].stdout.write("FINISHED DURING INSPECTION TURN\n");
+  children[1].finish(0, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await lifecycle.get("agent_settled")?.({}, ctx);
+
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const expiredList = await bgStatus.execute("idle-expired-list", {}, undefined, undefined, ctx);
+  assert.deepEqual(expiredList.details.tasks, []);
+  assert.equal(expiredList.content[0].text, "No background tasks.");
+  await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
 test("background task widget uses serializable lines in RPC mode", async () => {
@@ -603,8 +752,8 @@ test("background task widget uses serializable lines in RPC mode", async () => {
 
     const widgetLines = widgets.get("bg-tasks-widget");
     assert.ok(Array.isArray(widgetLines));
-    assert.equal(widgetLines[0], "1 background task");
-    assert.match(widgetLines[1], /^└─ rpc-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
+    assert.equal(widgetLines[0], "1 background task · 1 running · 0 finished");
+    assert.match(widgetLines[1], /^└─ ◐ rpc-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
     assert.deepEqual(widgetUpdates.at(-1)?.options, { placement: "belowEditor" });
 
     Date.now = () => startedAt + 3_725_000;
@@ -614,8 +763,15 @@ test("background task widget uses serializable lines in RPC mode", async () => {
     Date.now = originalDateNow;
   }
 
-  children[0].finish(0, null);
+  children[0].stderr.write("RPC FINAL ERROR\n");
+  children[0].finish(2, null);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(widgets.has("bg-tasks-widget"), true);
+  const finishedWidget = widgets.get("bg-tasks-widget");
+  assert.equal(finishedWidget[0], "1 background task · 0 running · 1 finished");
+  assert.match(finishedWidget[1], /^└─ × rpc-build \([a-z0-9]+\) failed \d+s exit=2$/);
+  assert.equal(finishedWidget[2], "   └─ [stderr] RPC FINAL ERROR");
+  await lifecycle.get("before_agent_start")?.({}, rpcCtx);
   assert.equal(widgets.has("bg-tasks-widget"), false);
   await lifecycle.get("session_shutdown")?.({}, rpcCtx);
 });
@@ -735,6 +891,222 @@ test("pipe tasks replay retained output before continuing with live output", asy
     'Detached from "pipe-attach".',
     'Pipe task "pipe-attach" completed (exit code 0).',
   ]);
+
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("finished tasks expose a read-only attach snapshot until the next turn", async () => {
+  const { tools, commands, lifecycle, children, ptys, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgLogs = tools.get("bg_logs");
+  assert.ok(bgStart && bgLogs);
+
+  const pipeStarted = await bgStart.execute(
+    "finished-pipe-start",
+    { name: "finished-pipe", command: "fake finished pipe" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const ptyStarted = await bgStart.execute(
+    "finished-pty-start",
+    { name: "finished-pty", command: "fake finished pty", pty: true, cols: 60, rows: 10 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const pipeId = pipeStarted.details.id as string;
+  const ptyId = ptyStarted.details.id as string;
+
+  children[0].stdout.write("PIPE FINAL SNAPSHOT\n");
+  ptys[0].emitData("\x1b[2J\x1b[HPTY FINAL SNAPSHOT\r\n");
+  children[0].finish(0, null);
+  ptys[0].finish(0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const attachCommand = commands.get("bg-attach");
+  assert.match(attachCommand.description, /read-only final snapshot/);
+  const completions = attachCommand.getArgumentCompletions("");
+  assert.ok(completions.some((item: { value: string; label: string }) =>
+    item.value === pipeId && item.label.includes("(completed)")));
+  assert.ok(completions.some((item: { value: string; label: string }) =>
+    item.value === ptyId && item.label.includes("(completed)")));
+
+  const cases = [
+    { id: pipeId, mode: "Pipe", name: "finished-pipe", expected: /PIPE FINAL SNAPSHOT/ },
+    { id: ptyId, mode: "PTY", name: "finished-pty", expected: /PTY FINAL SNAPSHOT/ },
+  ];
+  for (const attachCase of cases) {
+    const stdoutChunks: string[] = [];
+    const notifications: string[] = [];
+    const stdout = process.stdout as NodeJS.WriteStream;
+    const originalStdoutWrite = stdout.write;
+    (stdout as any).write = (chunk: string | Uint8Array) => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    const attachCtx = {
+      ...ctx,
+      hasUI: true,
+      mode: "tui",
+      ui: {
+        setWidget: () => {},
+        notify: (message: string) => notifications.push(message),
+        custom: (factory: any) => new Promise((resolve) => {
+          const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
+          factory(tui, {}, {}, resolve);
+          setImmediate(() => process.stdin.emit("data", "\x1d"));
+        }),
+      },
+    } as unknown as ExtensionContext;
+
+    try {
+      await attachCommand.handler(attachCase.id, attachCtx);
+    } finally {
+      (stdout as any).write = originalStdoutWrite;
+    }
+
+    const attachedOutput = stdoutChunks.join("");
+    assert.match(attachedOutput, attachCase.expected);
+    assert.match(attachedOutput, /Task finished - Ctrl\+\] to return/);
+    assert.deepEqual(notifications, [
+      `${attachCase.mode} task "${attachCase.name}" completed (exit code 0).`,
+    ]);
+
+    const retainedOutput = await bgLogs.execute(
+      `logs-${attachCase.id}`,
+      { id: attachCase.id, stream: attachCase.mode === "PTY" ? "terminal" : "both" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.doesNotMatch(retainedOutput.content[0].text, /Task finished - Ctrl\+\] to return/);
+  }
+
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const discardedCompletions = attachCommand.getArgumentCompletions("");
+  assert.ok(!discardedCompletions.some((item: { value: string }) => item.value === pipeId || item.value === ptyId));
+
+  const missingNotifications: string[] = [];
+  const missingCtx = {
+    ...ctx,
+    ui: { ...ctx.ui, notify: (message: string) => missingNotifications.push(message) },
+  } as ExtensionContext;
+  await attachCommand.handler(pipeId, missingCtx);
+  assert.deepEqual(missingNotifications, [`Task not found: ${pipeId}`]);
+
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("attached tasks stay open and show a user-only hint after they exit", async () => {
+  const { tools, commands, lifecycle, children, ptys, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgLogs = tools.get("bg_logs");
+  assert.ok(bgStart && bgLogs);
+
+  const pipeStarted = await bgStart.execute(
+    "attached-exit-pipe-start",
+    { name: "attached-exit-pipe", command: "fake attached pipe" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const ptyStarted = await bgStart.execute(
+    "attached-exit-pty-start",
+    { name: "attached-exit-pty", command: "fake attached pty", pty: true, cols: 60, rows: 10 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const pipeId = pipeStarted.details.id as string;
+  const ptyId = ptyStarted.details.id as string;
+  const attachCommand = commands.get("bg-attach");
+
+  const cases = [
+    {
+      id: pipeId,
+      mode: "Pipe",
+      name: "attached-exit-pipe",
+      finish: () => {
+        children[0].stdout.write("PIPE OUTPUT AT EXIT\n");
+        children[0].finish(0, null);
+      },
+      output: /PIPE OUTPUT AT EXIT/,
+    },
+    {
+      id: ptyId,
+      mode: "PTY",
+      name: "attached-exit-pty",
+      finish: () => {
+        ptys[0].emitData("\x1b[2J\x1b[HPTY OUTPUT AT EXIT\r\n");
+        ptys[0].finish(0);
+      },
+      output: /PTY OUTPUT AT EXIT/,
+    },
+  ];
+
+  for (const attachCase of cases) {
+    const stdoutChunks: string[] = [];
+    const notifications: string[] = [];
+    let detachSent = false;
+    const stdout = process.stdout as NodeJS.WriteStream;
+    const originalStdoutWrite = stdout.write;
+    (stdout as any).write = (chunk: string | Uint8Array) => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    const attachCtx = {
+      ...ctx,
+      hasUI: true,
+      mode: "tui",
+      ui: {
+        setWidget: () => {},
+        notify: (message: string) => notifications.push(message),
+        custom: (factory: any) => new Promise((resolve) => {
+          const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
+          factory(tui, {}, {}, resolve);
+          setImmediate(() => {
+            attachCase.finish();
+            setTimeout(() => {
+              process.stdin.emit("data", "IGNORED AFTER EXIT");
+              detachSent = true;
+              process.stdin.emit("data", "\x1d");
+            }, 30);
+          });
+        }),
+      },
+    } as unknown as ExtensionContext;
+
+    try {
+      await attachCommand.handler(attachCase.id, attachCtx);
+    } finally {
+      (stdout as any).write = originalStdoutWrite;
+    }
+
+    assert.equal(detachSent, true, "task exit must not resolve the attachment before Ctrl+]");
+    const attachedOutput = stdoutChunks.join("");
+    assert.match(attachedOutput, attachCase.output);
+    assert.match(attachedOutput, /Task finished - Ctrl\+\] to return/);
+    if (attachCase.mode === "Pipe") {
+      assert.match(attachedOutput, /\r\n\[Task finished - Ctrl\+\] to return\]\r\n/);
+    } else {
+      assert.match(attachedOutput, /\x1b\[\d+;\d+H\x1b\[7m Task finished - Ctrl\+\] to return /);
+      assert.ok(!ptys[0].writes.some((write) => Buffer.from(write).toString("utf8").includes("IGNORED AFTER EXIT")));
+    }
+    assert.deepEqual(notifications, [
+      `${attachCase.mode} task "${attachCase.name}" completed (exit code 0).`,
+    ]);
+
+    const retainedOutput = await bgLogs.execute(
+      `logs-${attachCase.id}`,
+      { id: attachCase.id, stream: attachCase.mode === "PTY" ? "terminal" : "both" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(retainedOutput.content[0].text, attachCase.output);
+    assert.doesNotMatch(retainedOutput.content[0].text, /Task finished - Ctrl\+\] to return/);
+  }
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
