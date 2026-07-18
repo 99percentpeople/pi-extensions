@@ -620,7 +620,7 @@ test("background task widget uses serializable lines in RPC mode", async () => {
   await lifecycle.get("session_shutdown")?.({}, rpcCtx);
 });
 
-test("pipe tasks attach to live output without replaying historical logs", async () => {
+test("pipe tasks replay retained output before continuing with live output", async () => {
   const { tools, commands, lifecycle, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   assert.ok(bgStart);
@@ -634,25 +634,27 @@ test("pipe tasks attach to live output without replaying historical logs", async
   );
   const id = started.details.id as string;
   assert.match(started.content[0].text, new RegExp(`/bg-attach ${id}`));
-  children[0].stdout.write("BEFORE_ATTACH\n");
+  children[0].stdout.write("BEFORE_ATTACH_STDOUT_A\nBEFORE_ATTACH_STDOUT_B\n");
+  children[0].stderr.write("BEFORE_ATTACH_STDERR\n");
 
   const completions = commands.get("bg-attach").getArgumentCompletions("");
   assert.ok(completions.some((item: { value: string; label: string }) => item.value === id && item.label.includes("[pipe]")));
 
   await new Promise<void>((resolve) => setImmediate(resolve));
+  let childStreamPauseCalls = 0;
+  for (const stream of [children[0].stdout, children[0].stderr]) {
+    const originalPause = stream.pause.bind(stream);
+    (stream as any).pause = () => {
+      childStreamPauseCalls += 1;
+      return originalPause();
+    };
+  }
   const stdoutChunks: string[] = [];
-  const stderrChunks: string[] = [];
   const notifications: string[] = [];
   const stdout = process.stdout as NodeJS.WriteStream;
-  const stderr = process.stderr as NodeJS.WriteStream;
   const originalStdoutWrite = stdout.write;
-  const originalStderrWrite = stderr.write;
   (stdout as any).write = (chunk: string | Uint8Array) => {
     stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-    return true;
-  };
-  (stderr as any).write = (chunk: string | Uint8Array) => {
-    stderrChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
     return true;
   };
 
@@ -670,6 +672,43 @@ test("pipe tasks attach to live output without replaying historical logs", async
           process.stdin.emit("data", "IGNORED_INPUT");
           children[0].stdout.write("LIVE_STDOUT\n");
           children[0].stderr.write("LIVE_STDERR\n");
+          setImmediate(() => component.dispose());
+        });
+      }),
+    },
+  } as unknown as ExtensionContext;
+
+  try {
+    await commands.get("bg-attach").handler(id, attachCtx);
+  } finally {
+    (stdout as any).write = originalStdoutWrite;
+  }
+
+  const attachedStdout = stdoutChunks.join("");
+  assert.match(attachedStdout, /BEFORE_ATTACH_STDOUT_A\r\nBEFORE_ATTACH_STDOUT_B/);
+  assert.match(attachedStdout, /BEFORE_ATTACH_STDERR/);
+  assert.match(attachedStdout, /LIVE_STDOUT/);
+  assert.match(attachedStdout, /LIVE_STDERR/);
+  assert.ok(attachedStdout.indexOf("BEFORE_ATTACH_STDERR") < attachedStdout.indexOf("LIVE_STDOUT"));
+  assert.equal(attachedStdout.match(/LIVE_STDOUT/g)?.length, 1);
+  assert.equal(attachedStdout.match(/LIVE_STDERR/g)?.length, 1);
+  assert.equal(children[0].stdin.read(), null, "pipe attachment must not forward keyboard input");
+  assert.deepEqual(notifications, ['Detached from "pipe-attach".']);
+
+  const reattachedChunks: string[] = [];
+  (stdout as any).write = (chunk: string | Uint8Array) => {
+    reattachedChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  };
+  const reattachCtx = {
+    ...attachCtx,
+    ui: {
+      ...attachCtx.ui,
+      custom: (factory: any) => new Promise((resolve) => {
+        const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
+        const component = factory(tui, {}, {}, resolve);
+        queueMicrotask(() => {
+          children[0].stdout.write("AFTER_REATTACH\n");
           setImmediate(() => {
             component.dispose();
             queueMicrotask(() => children[0].finish(0, null));
@@ -680,20 +719,22 @@ test("pipe tasks attach to live output without replaying historical logs", async
   } as unknown as ExtensionContext;
 
   try {
-    await commands.get("bg-attach").handler(id, attachCtx);
+    await commands.get("bg-attach").handler(id, reattachCtx);
   } finally {
     (stdout as any).write = originalStdoutWrite;
-    (stderr as any).write = originalStderrWrite;
   }
 
-  const attachedStdout = stdoutChunks.join("");
-  const attachedStderr = stderrChunks.join("");
-  assert.match(attachedStdout, /Streaming new output/);
-  assert.match(attachedStdout, /LIVE_STDOUT/);
-  assert.doesNotMatch(attachedStdout, /BEFORE_ATTACH/);
-  assert.match(attachedStderr, /LIVE_STDERR/);
-  assert.equal(children[0].stdin.read(), null, "pipe attachment must not forward keyboard input");
-  assert.deepEqual(notifications, ['Pipe task "pipe-attach" completed (exit code 0).']);
+  const reattachedStdout = reattachedChunks.join("");
+  assert.match(reattachedStdout, /LIVE_STDOUT/);
+  assert.match(reattachedStdout, /LIVE_STDERR/);
+  assert.match(reattachedStdout, /AFTER_REATTACH/);
+  assert.ok(reattachedStdout.indexOf("LIVE_STDERR") < reattachedStdout.indexOf("AFTER_REATTACH"));
+  assert.equal(reattachedStdout.match(/AFTER_REATTACH/g)?.length, 1);
+  assert.equal(childStreamPauseCalls, 0, "pipe attach must keep draining the child streams");
+  assert.deepEqual(notifications, [
+    'Detached from "pipe-attach".',
+    'Pipe task "pipe-attach" completed (exit code 0).',
+  ]);
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });

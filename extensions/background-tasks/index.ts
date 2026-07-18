@@ -11,7 +11,7 @@
  *
  * Features:
  *   - Optional PTY sessions for interactive commands and full-screen TUIs
- *   - Detachable PTY interaction or live pipe output via /bg-attach (Ctrl+] to detach)
+ *   - Per-task console sessions with detachable PTY interaction or retained/live pipe output
  *   - Explicit completion waits with timeout (no polling required)
  *   - Abortable completion waits
  *   - Live widget with one-second duration updates
@@ -64,18 +64,17 @@ interface PtyTaskProcess {
 
 type BackgroundProcess = PipeTaskProcess | PtyTaskProcess;
 
-interface PtyState {
+interface ConsoleSession {
   terminal: XtermTerminal;
   serializer: XtermSerializeAddon;
   parsed: Promise<void>;
+  catchUpBuffer: Buffer[] | null;
+  subscriber?: (data: string | Buffer) => void;
 }
 
 type AttachmentReason = "detached" | "exited" | "shutdown";
 
 interface AttachmentState {
-  terminalWriter?: (data: string) => void;
-  stdoutWriter?: (data: Buffer) => void;
-  stderrWriter?: (data: Buffer) => void;
   detach?: (reason: AttachmentReason) => void;
 }
 
@@ -99,7 +98,7 @@ interface BgTask {
   command: string;
   mode: "pipe" | "pty";
   process: BackgroundProcess | null;
-  ptyState: PtyState | null;
+  console: ConsoleSession;
   attachment: AttachmentState;
   status: "running" | "completed" | "failed" | "stopped";
   exitCode: number | null;
@@ -190,6 +189,21 @@ async function ensureTaskDir(): Promise<string> {
   return taskDir;
 }
 
+function createConsoleSession(cols: number, rows: number, mode: "pipe" | "pty"): ConsoleSession {
+  const terminal = new HeadlessTerminal({
+    cols,
+    rows,
+    scrollback: 2000,
+    allowProposedApi: true,
+    // Pipe output commonly uses LF without CR. Treat LF as a new line so the
+    // retained snapshot matches how ordinary stdout is displayed by a TTY.
+    convertEol: mode === "pipe",
+  });
+  const serializer = new SerializeAddon();
+  terminal.loadAddon(serializer);
+  return { terminal, serializer, parsed: Promise.resolve(), catchUpBuffer: null };
+}
+
 async function appendToFile(filePath: string, data: Buffer | string): Promise<void> {
   try { await appendFile(filePath, data); }
   catch { await writeFile(filePath, data); }
@@ -252,10 +266,8 @@ function updateLatestLog(task: BgTask, stream: "stdout" | "stderr", data: Buffer
   };
 }
 
-function getPtySnapshotLines(task: BgTask): string[] {
-  const terminal = task.ptyState?.terminal;
-  if (!terminal) return [];
-
+function getTerminalSnapshotLines(task: BgTask): string[] {
+  const terminal = task.console.terminal;
   const lines: string[] = [];
   const buffer = terminal.buffer.active;
   for (let index = 0; index < buffer.length; index++) {
@@ -269,8 +281,8 @@ function getPtySnapshotLines(task: BgTask): string[] {
 const TERMINAL_SNAPSHOT_HEADER = "── terminal snapshot";
 
 function formatPtyScreenSnapshot(task: BgTask, label?: string): string {
-  const rows = task.ptyState?.terminal.rows ?? 30;
-  const snapshot = getPtySnapshotLines(task).slice(-rows).join("\n");
+  const rows = task.console.terminal.rows;
+  const snapshot = getTerminalSnapshotLines(task).slice(-rows).join("\n");
   const header = label ? `${TERMINAL_SNAPSHOT_HEADER}: ${label} ──` : `${TERMINAL_SNAPSHOT_HEADER} ──`;
   return `${header}\n${snapshot || "(no terminal output yet)"}`;
 }
@@ -283,7 +295,7 @@ function renderContentWithoutCollapsedSnapshots(content: string, expanded: boole
 }
 
 function updatePtyLatestLog(task: BgTask): void {
-  const latestText = getPtySnapshotLines(task).findLast((line) => line.trim().length > 0)?.trim();
+  const latestText = getTerminalSnapshotLines(task).findLast((line) => line.trim().length > 0)?.trim();
   if (!latestText) return;
   task.latestLog = {
     stream: "terminal",
@@ -293,9 +305,7 @@ function updatePtyLatestLog(task: BgTask): void {
 }
 
 function recordPtyData(task: BgTask, data: string): void {
-  const state = task.ptyState;
-  if (!state) return;
-
+  const state = task.console;
   task.stdoutLines += data.split("\n").length - 1;
   appendToFile(task.stdoutFile, data).catch(() => {});
   state.parsed = new Promise<void>((resolve) => {
@@ -304,20 +314,57 @@ function recordPtyData(task: BgTask, data: string): void {
       resolve();
     });
   });
-  task.attachment.terminalWriter?.(data);
+  state.subscriber?.(data);
 }
 
-async function flushPty(task: BgTask): Promise<void> {
-  await task.ptyState?.parsed;
+function recordPipeData(task: BgTask, stream: "stdout" | "stderr", data: Buffer): void {
+  if (stream === "stdout") task.stdoutLines += data.toString().split("\n").length - 1;
+  else task.stderrLines += data.toString().split("\n").length - 1;
+  updateLatestLog(task, stream, data);
+  appendToFile(stream === "stdout" ? task.stdoutFile : task.stderrFile, data).catch(() => {});
+
+  const session = task.console;
+  if (session.catchUpBuffer !== null) {
+    session.catchUpBuffer.push(data);
+    return;
+  }
+  session.parsed = new Promise<void>((resolve) => session.terminal.write(data, resolve));
+  session.subscriber?.(data);
+}
+
+function beginPipeCatchUp(task: BgTask): Buffer[] {
+  const session = task.console;
+  if (session.catchUpBuffer !== null) throw new Error(`Task "${task.name}" already has an attach catch-up in progress.`);
+  const buffer: Buffer[] = [];
+  session.catchUpBuffer = buffer;
+  return buffer;
+}
+
+function releasePipeCatchUp(task: BgTask, buffer: Buffer[]): void {
+  const session = task.console;
+  if (session.catchUpBuffer !== buffer) return;
+  session.catchUpBuffer = null;
+
+  for (const data of buffer) {
+    session.parsed = new Promise<void>((resolve) => session.terminal.write(data, resolve));
+  }
+  const writer = session.subscriber;
+  if (writer) {
+    for (const data of buffer) writer(data);
+  }
+}
+
+async function flushConsole(task: BgTask): Promise<void> {
+  await task.console.parsed;
 }
 
 function formatTaskOutputStats(task: BgTask): string[] {
   if (task.mode === "pty") {
-    const terminal = task.ptyState?.terminal;
-    const dimensions = terminal ? ` (${terminal.cols}x${terminal.rows})` : "";
+    const terminal = task.console.terminal;
+    const dimensions = ` (${terminal.cols}x${terminal.rows})`;
     return [
       `  Mode:       pty${dimensions}`,
-      `  Terminal:   ${getPtySnapshotLines(task).length} rows`,
+      `  Terminal:   ${getTerminalSnapshotLines(task).length} rows`,
     ];
   }
   return [
@@ -498,9 +545,9 @@ async function notifyAttachmentResult(
 }
 
 async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
-  const state = task.ptyState;
+  const state = task.console;
   const taskProcess = task.process;
-  if (!state || task.mode !== "pty") {
+  if (task.mode !== "pty") {
     ctx.ui.notify(`Task "${task.name}" is not a PTY task.`, "warning");
     return;
   }
@@ -529,7 +576,7 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
     const cleanup = (result: AttachmentReason) => {
       if (cleaned) return;
       cleaned = true;
-      task.attachment.terminalWriter = undefined;
+      state.subscriber = undefined;
       task.attachment.detach = undefined;
       if (inputHandler) process.stdin.removeListener("data", inputHandler);
       if (resizeHandler) process.stdout.removeListener("resize", resizeHandler);
@@ -580,12 +627,12 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
         process.stdout.on("resize", resizeHandler);
         taskProcess.pty.pause();
         ptyPaused = true;
-        await flushPty(task);
+        await flushConsole(task);
         if (cleaned) return;
         resizeHandler();
         process.stdout.write("\x1b[2J\x1b[H");
         process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
-        task.attachment.terminalWriter = (data) => process.stdout.write(data);
+        state.subscriber = (data) => process.stdout.write(data);
         taskProcess.pty.resume();
         ptyPaused = false;
       } catch (error) {
@@ -606,6 +653,7 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
 
 async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
   const taskProcess = task.process;
+  const state = task.console;
   if (task.mode !== "pipe") {
     ctx.ui.notify(`Task "${task.name}" is not a pipe task.`, "warning");
     return;
@@ -628,15 +676,19 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
     let cleaned = false;
     let terminalStarted = false;
     let rawBeforeAttach = false;
+    let catchUpBuffer: Buffer[] | null = null;
     let inputHandler: ((data: string | Buffer) => void) | undefined;
 
     const cleanup = (result: AttachmentReason) => {
       if (cleaned) return;
       cleaned = true;
-      task.attachment.stdoutWriter = undefined;
-      task.attachment.stderrWriter = undefined;
+      state.subscriber = undefined;
       task.attachment.detach = undefined;
       if (inputHandler) process.stdin.removeListener("data", inputHandler);
+      if (catchUpBuffer) {
+        releasePipeCatchUp(task, catchUpBuffer);
+        catchUpBuffer = null;
+      }
       if (terminalStarted) {
         process.stdin.pause();
         process.stdin.setRawMode?.(rawBeforeAttach);
@@ -649,7 +701,7 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
 
     task.attachment.detach = cleanup;
 
-    queueMicrotask(() => {
+    queueMicrotask(async () => {
       try {
         if (cleaned) return;
         tui.stop();
@@ -665,11 +717,18 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
         };
 
         process.stdin.on("data", inputHandler);
+        catchUpBuffer = beginPipeCatchUp(task);
+        await flushConsole(task);
+        if (cleaned) return;
+
+        const cols = Math.max(20, process.stdout.columns || state.terminal.cols || 80);
+        const rows = Math.max(5, process.stdout.rows || state.terminal.rows || 24);
+        state.terminal.resize(cols, rows);
         process.stdout.write("\x1b[2J\x1b[H");
-        const displayName = truncateText(sanitizeLogOutput(task.name).replace(/\n/g, " "), 80);
-        process.stdout.write(`Attached to pipe task "${displayName}". Streaming new output; press Ctrl+] to detach.\r\n\r\n`);
-        task.attachment.stdoutWriter = (data) => process.stdout.write(data);
-        task.attachment.stderrWriter = (data) => process.stderr.write(data);
+        process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
+        state.subscriber = (data) => process.stdout.write(data);
+        releasePipeCatchUp(task, catchUpBuffer);
+        catchUpBuffer = null;
       } catch (error) {
         attachError = error instanceof Error ? error.message : String(error);
         cleanup("detached");
@@ -732,7 +791,7 @@ function renderWidgetLines(theme?: Theme): string[] {
   const lines = running.map((task, index) => {
     const duration = formatWidgetDuration(now - task.startedAt);
     const output = task.mode === "pty"
-      ? `pty:${task.ptyState?.terminal.cols ?? "?"}x${task.ptyState?.terminal.rows ?? "?"}`
+      ? `pty:${task.console.terminal.cols}x${task.console.terminal.rows}`
       : `stdout:${task.stdoutLines} stderr:${task.stderrLines}`;
     const branch = index === running.length - 1 ? "└─" : "├─";
     if (!theme) return `${branch} ${task.name} (${task.id}) ${duration} ${output}`;
@@ -869,19 +928,11 @@ export default function (pi: ExtensionAPI) {
       const cols = Math.min(500, Math.max(20, Math.floor(params.cols ?? process.stdout.columns ?? 120)));
       const rows = Math.min(200, Math.max(5, Math.floor(params.rows ?? process.stdout.rows ?? 30)));
       let taskProcess: BackgroundProcess;
-      let ptyState: PtyState | null = null;
+      const console = createConsoleSession(cols, rows, mode);
 
-      if (mode === "pty") {
-        const terminal = new HeadlessTerminal({
-          cols,
-          rows,
-          scrollback: 2000,
-          allowProposedApi: true,
-        });
-        const serializer = new SerializeAddon();
-        terminal.loadAddon(serializer);
-        let ptyProcess: nodePty.IPty;
-        try {
+      try {
+        if (mode === "pty") {
+          let ptyProcess: nodePty.IPty;
           ptyProcess = ptySpawnFn(shell.file, shell.args, {
             name: shell.env.TERM || "xterm-256color",
             cols,
@@ -889,25 +940,24 @@ export default function (pi: ExtensionAPI) {
             cwd,
             env: { ...shell.env, TERM: shell.env.TERM || "xterm-256color" },
           });
-        } catch (error) {
-          terminal.dispose();
-          throw error;
+          taskProcess = { kind: "pty", pid: ptyProcess.pid, pty: ptyProcess };
+        } else {
+          const child = spawnFn(shell.file, shell.args, {
+            cwd,
+            stdio: ["pipe", "pipe", "pipe"],
+            env: shell.env,
+            detached: process.platform !== "win32",
+          });
+          taskProcess = { kind: "pipe", pid: child.pid ?? 0, child };
         }
-        taskProcess = { kind: "pty", pid: ptyProcess.pid, pty: ptyProcess };
-        ptyState = { terminal, serializer, parsed: Promise.resolve() };
-      } else {
-        const child = spawnFn(shell.file, shell.args, {
-          cwd,
-          stdio: ["pipe", "pipe", "pipe"],
-          env: shell.env,
-          detached: process.platform !== "win32",
-        });
-        taskProcess = { kind: "pipe", pid: child.pid ?? 0, child };
+      } catch (error) {
+        console.terminal.dispose();
+        throw error;
       }
 
       const task: BgTask = {
         id, name: params.name, command: params.command, mode,
-        process: taskProcess, ptyState, attachment: {}, status: "running",
+        process: taskProcess, console, attachment: {}, status: "running",
         exitCode: null, signal: null,
         startedAt: Date.now(), endedAt: null,
         stdoutFile, stderrFile, stdoutLines: 0, stderrLines: 0,
@@ -925,24 +975,13 @@ export default function (pi: ExtensionAPI) {
         });
       } else {
         const child = taskProcess.child;
-        child.stdout?.on("data", (d: Buffer) => {
-          task.stdoutLines += d.toString().split("\n").length - 1;
-          updateLatestLog(task, "stdout", d);
-          appendToFile(stdoutFile, d).catch(() => {});
-          task.attachment.stdoutWriter?.(d);
-        });
-        child.stderr?.on("data", (d: Buffer) => {
-          task.stderrLines += d.toString().split("\n").length - 1;
-          updateLatestLog(task, "stderr", d);
-          appendToFile(stderrFile, d).catch(() => {});
-          task.attachment.stderrWriter?.(d);
-        });
+        child.stdout?.on("data", (d: Buffer) => recordPipeData(task, "stdout", d));
+        child.stderr?.on("data", (d: Buffer) => recordPipeData(task, "stderr", d));
         let spawnError: Error | null = null;
         child.on("error", (err) => {
           spawnError = err;
           const errorLine = `[error: ${err.message}]`;
-          updateLatestLog(task, "stderr", Buffer.from(`${errorLine}\n`));
-          appendToFile(stderrFile, `\n${errorLine}\n`).catch(() => {});
+          recordPipeData(task, "stderr", Buffer.from(`\n${errorLine}\n`));
         });
         child.on("close", (code, signal) => {
           finishTask(task, code, signal, Boolean(spawnError));
@@ -956,7 +995,7 @@ export default function (pi: ExtensionAPI) {
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to stream live output)`}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
         details: { id, name: params.name, command: params.command, pid: taskProcess.pid, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
       };
     },
@@ -1018,7 +1057,7 @@ export default function (pi: ExtensionAPI) {
         });
         await waitUntilAllowed(timeoutMs, [task.done.signal], signal);
       }
-      await flushPty(task);
+      await flushConsole(task);
 
       const timedOut = task.status === "running";
       const duration = task.endedAt
@@ -1136,7 +1175,7 @@ export default function (pi: ExtensionAPI) {
       if (!params.id) {
         const entries = Array.from(tasks.values());
         if (entries.length === 0) return { content: [{ type: "text", text: "No background tasks." }], details: { tasks: [] } };
-        await Promise.all(entries.map((task) => flushPty(task)));
+        await Promise.all(entries.map((task) => flushConsole(task)));
         const lines = entries.map((t) => {
           const dur = t.endedAt ? formatDuration(t.endedAt - t.startedAt) : formatDuration(Date.now() - t.startedAt);
           const exit = t.exitCode !== null ? ` exit=${t.exitCode}` : "";
@@ -1158,7 +1197,7 @@ export default function (pi: ExtensionAPI) {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
-      await flushPty(task);
+      await flushConsole(task);
 
       const duration = task.endedAt ? formatDuration(task.endedAt - task.startedAt) : formatDuration(Date.now() - task.startedAt);
       const parts: string[] = [
@@ -1260,14 +1299,14 @@ export default function (pi: ExtensionAPI) {
         stderr = "";
 
       if (task.mode === "pty") {
-        await flushPty(task);
+        await flushConsole(task);
         if (stream === "stderr") {
           return {
             content: [{ type: "text", text: "(PTY output combines stdout and stderr; use stream=terminal)" }],
             details: { id: task.id, name: task.name, status: task.status, mode: task.mode },
           };
         }
-        const snapshotLines = getPtySnapshotLines(task);
+        const snapshotLines = getTerminalSnapshotLines(task);
         const selected = params.from_line !== undefined
           ? snapshotLines.slice(params.from_line, params.from_line + maxLines)
           : snapshotLines.slice(-lines);
@@ -1280,8 +1319,8 @@ export default function (pi: ExtensionAPI) {
             status: task.status,
             mode: task.mode,
             terminalRows: snapshotLines.length,
-            cols: task.ptyState?.terminal.cols,
-            rows: task.ptyState?.terminal.rows,
+            cols: task.console.terminal.cols,
+            rows: task.console.terminal.rows,
           },
         };
       }
@@ -1561,7 +1600,7 @@ export default function (pi: ExtensionAPI) {
     const parameter = modifierParameter(stroke.modifiers);
     if (definition.kind === "cursor") {
       if (parameter > 1) return Buffer.from(`\x1b[1;${parameter}${definition.final}`);
-      const prefix = task.ptyState?.terminal.modes.applicationCursorKeysMode ? "\x1bO" : "\x1b[";
+      const prefix = task.console.terminal.modes.applicationCursorKeysMode ? "\x1bO" : "\x1b[";
       return Buffer.from(`${prefix}${definition.final}`);
     }
     if (definition.kind === "function") {
@@ -1795,7 +1834,7 @@ export default function (pi: ExtensionAPI) {
       const action = task.status === "running" ? `Sent ${signal} to` : "Terminated";
       const parts = [`${action} "${task.name}". Status: ${task.status}`];
       if (task.mode === "pty") {
-        await flushPty(task);
+        await flushConsole(task);
         if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
       } else {
         parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
@@ -1836,7 +1875,7 @@ export default function (pi: ExtensionAPI) {
   // ── /bg-attach command ─────────────────────────────────────────────
 
   pi.registerCommand("bg-attach", {
-    description: "Attach to a running task (interactive PTY or live pipe output; Ctrl+] to detach)",
+    description: "Attach to a running task (interactive PTY or retained/live pipe output; Ctrl+] to detach)",
     getArgumentCompletions: (prefix: string) => {
       const items = Array.from(tasks.values())
         .filter((task) => task.status === "running")
