@@ -16,7 +16,7 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "dependencies": {
         "@xterm/addon-serialize": "0.14.0",
         "@xterm/headless": "6.0.0",
