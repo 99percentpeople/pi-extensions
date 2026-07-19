@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { IPty } from "node-pty";
-import backgroundTasks from "../extensions/background-tasks/index.ts";
+import backgroundTasks, { MemoryLogStore } from "../extensions/background-tasks/index.ts";
 
 interface RegisteredTool {
   name: string;
@@ -38,9 +38,15 @@ class FakeChildProcess extends EventEmitter {
   finish(code: number | null, signal: NodeJS.Signals | null): void {
     if (this.closed) return;
     this.closed = true;
+    let endedStreams = 0;
+    const emitClose = () => {
+      endedStreams += 1;
+      if (endedStreams === 2) this.emit("close", code, signal);
+    };
+    this.stdout.once("end", emitClose);
+    this.stderr.once("end", emitClose);
     this.stdout.end();
     this.stderr.end();
-    queueMicrotask(() => this.emit("close", code, signal));
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
@@ -99,6 +105,45 @@ class FakePty {
   }
 }
 
+class FakeTerminalInput extends EventEmitter {
+  isRaw = false;
+
+  setRawMode(value: boolean): this {
+    this.isRaw = value;
+    return this;
+  }
+
+  setEncoding(): this {
+    return this;
+  }
+
+  pause(): this {
+    return this;
+  }
+
+  resume(): this {
+    return this;
+  }
+}
+
+class FakeTerminalOutput extends EventEmitter {
+  columns = process.stdout.columns;
+  rows = process.stdout.rows;
+  writeHandler: (chunk: string | Uint8Array) => boolean = () => true;
+
+  write(chunk: string | Uint8Array): boolean {
+    return this.writeHandler(chunk);
+  }
+}
+
+const harnessCleanups = new Set<() => Promise<void>>();
+
+afterEach(async () => {
+  const cleanups = Array.from(harnessCleanups).reverse();
+  harnessCleanups.clear();
+  await Promise.all(cleanups.map((cleanup) => cleanup()));
+});
+
 function createHarness() {
   const tools = new Map<string, RegisteredTool>();
   const commands = new Map<string, any>();
@@ -109,6 +154,8 @@ function createHarness() {
   const ptys: FakePty[] = [];
   const widgets = new Map<string, any>();
   const widgetUpdates: Array<{ key: string; widget: unknown; options?: unknown }> = [];
+  const terminalInput = new FakeTerminalInput();
+  const terminalOutput = new FakeTerminalOutput();
   let toolsExpanded = false;
 
   const pi = {
@@ -157,7 +204,22 @@ function createHarness() {
       args: ["-c", command],
       env: { ...process.env },
     }),
+    terminalInput: terminalInput as unknown as NodeJS.ReadStream,
+    terminalOutput: terminalOutput as unknown as NodeJS.WriteStream,
   });
+  const registeredShutdown = lifecycle.get("session_shutdown");
+  let cleaned = false;
+  const cleanupAfterTest = async () => {
+    await cleanup({}, ctx);
+  };
+  const cleanup = async (event: unknown = {}, shutdownCtx: ExtensionContext = ctx) => {
+    if (cleaned) return;
+    cleaned = true;
+    harnessCleanups.delete(cleanupAfterTest);
+    await registeredShutdown?.(event, shutdownCtx);
+  };
+  lifecycle.set("session_shutdown", cleanup);
+  harnessCleanups.add(cleanupAfterTest);
   return {
     tools,
     commands,
@@ -168,19 +230,68 @@ function createHarness() {
     ptys,
     widgets,
     widgetUpdates,
+    terminalInput,
+    terminalOutput,
     ctx,
+    cleanup: cleanupAfterTest,
     setToolsExpanded: (value: boolean) => { toolsExpanded = value; },
   };
 }
 
-async function waitForRenderedText(chunks: string[], pattern: RegExp, timeoutMs = 2_000): Promise<boolean> {
+async function waitForCondition(
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 2_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (pattern.test(chunks.join(""))) return true;
+    if (predicate()) return;
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
-  return false;
+  throw new Error(`Timed out waiting for ${description}`);
 }
+
+async function waitForRenderedText(chunks: string[], pattern: RegExp, timeoutMs = 2_000): Promise<void> {
+  await waitForCondition(
+    () => pattern.test(chunks.join("")),
+    `rendered output matching ${pattern}; received ${JSON.stringify(chunks.join(""))}`,
+    timeoutMs,
+  );
+}
+
+function createAttachCustom(
+  drive: (component: { dispose(): void }) => Promise<void> | void,
+): (factory: any) => Promise<unknown> {
+  return (factory: any) => new Promise((resolve, reject) => {
+    const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
+    const component = factory(tui, {}, {}, resolve);
+    queueMicrotask(async () => {
+      try {
+        await drive(component);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+test("memory log store retains only its configured capacity", () => {
+  const logStore = new MemoryLogStore(12);
+  const key = "task:stdout";
+
+  logStore.append(key, "one\ntwo\n");
+  logStore.append(key, Buffer.from("three\n"));
+  assert.equal(logStore.size(key), 12);
+  assert.equal(logStore.read(key), "e\ntwo\nthree\n");
+
+  logStore.append(key, "abcdefghijklmnop");
+  assert.equal(logStore.size(key), 12);
+  assert.equal(logStore.read(key), "efghijklmnop");
+
+  logStore.delete(key);
+  assert.equal(logStore.read(key), "");
+  assert.throws(() => new MemoryLogStore(0), /positive integer/);
+});
 
 test("background tasks can pass commands through Pi's stdin shell transport", async () => {
   const { tools, lifecycle, eventBus, children, ctx } = createHarness();
@@ -317,14 +428,17 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   );
   const firstId = first.details.id as string;
   assert.match(first.content[0].text, /Use bg_wait once/i);
-  setTimeout(() => {
-    children[0].stdout.write("first\nlast\n");
-    children[0].finish(0, null);
-  }, 40);
-
-  const startedAt = Date.now();
-  const waitResult = await bgWait.execute("wait-1", { id: firstId, timeout: 1 }, undefined, undefined, ctx);
-  assert.ok(Date.now() - startedAt >= 20, "bg_wait should wait until the task finishes");
+  let firstWaitSettled = false;
+  const firstWait = bgWait.execute("wait-1", { id: firstId, timeout: 1 }, undefined, undefined, ctx)
+    .then((result) => {
+      firstWaitSettled = true;
+      return result;
+    });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(firstWaitSettled, false, "bg_wait should remain pending while the task is running");
+  children[0].stdout.write("first\nlast\n");
+  children[0].finish(0, null);
+  const waitResult = await firstWait;
   assert.match(waitResult.content[0].text, /completed/);
   assert.match(waitResult.content[0].text, /Latest log: \[stdout\] last/);
   assert.equal(waitResult.details.timedOut, false);
@@ -342,14 +456,10 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     ctx,
   );
   const longRunningId = longRunning.details.id as string;
-  const firstStatusStartedAt = Date.now();
   const firstStatus = await bgStatus.execute("status-first", { id: longRunningId }, undefined, undefined, ctx);
   assert.equal(firstStatus.details.status, "running");
-  assert.ok(Date.now() - firstStatusStartedAt < 500, "status snapshots should return immediately");
-  const repeatedStatusStartedAt = Date.now();
   const repeatedStatus = await bgStatus.execute("status-repeated", { id: longRunningId }, undefined, undefined, ctx);
   assert.equal(repeatedStatus.details.status, "running");
-  assert.ok(Date.now() - repeatedStatusStartedAt < 500, "repeated status snapshots should not be throttled");
   const abortController = new AbortController();
   const waitUpdates: unknown[] = [];
   const waitPromise = bgWait.execute(
@@ -363,12 +473,11 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     content: [],
     details: { id: longRunningId, name: "cancel-status", status: "running" },
   }]);
-  setTimeout(() => abortController.abort(new Error("cancelled by test")), 30);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  abortController.abort(new Error("cancelled by test"));
   await assert.rejects(waitPromise, /cancelled by test/);
 
-  const timeoutStartedAt = Date.now();
   const timeoutResult = await bgWait.execute("wait-timeout", { id: longRunningId, timeout: 0.02 }, undefined, undefined, ctx);
-  assert.ok(Date.now() - timeoutStartedAt >= 10, "bg_wait should wait until its timeout");
   assert.match(timeoutResult.content[0].text, /Timed out/);
   assert.match(timeoutResult.content[0].text, /timeout did not stop it/);
   assert.equal(timeoutResult.details.timedOut, true);
@@ -501,6 +610,15 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   );
   assert.equal(logsResult.content[0].text, "── stdout ──\nout\n── stderr ──\nerr");
   assert.doesNotMatch(logsResult.content[0].text, /\x1b/);
+
+  const rangeResult = await bgLogs.execute(
+    "logs-formatted-range",
+    { id: logTaskId, stream: "stdout", from_line: 0, max_lines: 1 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(rangeResult.content[0].text, "out");
 
   const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   const collapsedCall = bgLogs.renderCall?.(
@@ -658,7 +776,16 @@ test("background task widget renders live state without re-registering every tic
 
   ptys[0].emitData("PTY FINAL\r\n");
   ptys[0].finish(0);
-  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  await waitForCondition(
+    () => {
+      const rendered = component.render(200);
+      return Boolean(
+        rendered[0]?.includes("1 running · 1 finished") &&
+        rendered.some((line: string) => line.includes("[terminal] PTY FINAL")),
+      );
+    },
+    "PTY task completion and final terminal log in the widget",
+  );
   const mixedLines = component.render(200).map((line: string) => line.trimEnd());
   assert.equal(mixedLines[0], "2 background tasks · 1 running · 1 finished");
   assert.match(mixedLines[1], /^├─ ✓ pi-debate-pro \([a-z0-9]+\) completed \d+s exit=0$/);
@@ -671,7 +798,10 @@ test("background task widget renders live state without re-registering every tic
   assert.match(nextTurnLines[1], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
 
   children[0].finish(0, null);
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await waitForCondition(
+    () => component.render(200)[0]?.includes("0 running · 1 finished") ?? false,
+    "pipe task completion in the widget",
+  );
   assert.equal(widgets.has("bg-tasks-widget"), true, "the final task result should remain visible for this turn");
   const finishedLines = component.render(200).map((line: string) => line.trimEnd());
   assert.equal(finishedLines[0], "1 background task · 0 running · 1 finished");
@@ -916,7 +1046,7 @@ test("background task widget uses serializable lines in RPC mode", async () => {
 });
 
 test("pipe tasks replay retained output before continuing with live output", async () => {
-  const { tools, commands, lifecycle, children, ctx } = createHarness();
+  const { tools, commands, lifecycle, children, terminalInput, terminalOutput, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   assert.ok(bgStart);
 
@@ -946,9 +1076,8 @@ test("pipe tasks replay retained output before continuing with live output", asy
   }
   const stdoutChunks: string[] = [];
   const notifications: string[] = [];
-  const stdout = process.stdout as NodeJS.WriteStream;
-  const originalStdoutWrite = stdout.write;
-  (stdout as any).write = (chunk: string | Uint8Array) => {
+  const originalWriteHandler = terminalOutput.writeHandler;
+  terminalOutput.writeHandler = (chunk: string | Uint8Array) => {
     stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
     return true;
   };
@@ -960,19 +1089,13 @@ test("pipe tasks replay retained output before continuing with live output", asy
     ui: {
       setWidget: () => {},
       notify: (message: string) => notifications.push(message),
-      custom: (factory: any) => new Promise((resolve) => {
-        const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
-        const component = factory(tui, {}, {}, resolve);
-        queueMicrotask(() => {
-          void (async () => {
-            await waitForRenderedText(stdoutChunks, /BEFORE_ATTACH_STDERR/);
-            process.stdin.emit("data", "IGNORED_INPUT");
-            children[0].stdout.write("LIVE_STDOUT\n");
-            children[0].stderr.write("LIVE_STDERR\n");
-            await waitForRenderedText(stdoutChunks, /LIVE_STDERR/);
-            component.dispose();
-          })();
-        });
+      custom: createAttachCustom(async (component) => {
+        await waitForRenderedText(stdoutChunks, /BEFORE_ATTACH_STDERR/);
+        terminalInput.emit("data", "IGNORED_INPUT");
+        children[0].stdout.write("LIVE_STDOUT\n");
+        children[0].stderr.write("LIVE_STDERR\n");
+        await waitForRenderedText(stdoutChunks, /LIVE_STDERR/);
+        component.dispose();
       }),
     },
   } as unknown as ExtensionContext;
@@ -980,7 +1103,7 @@ test("pipe tasks replay retained output before continuing with live output", asy
   try {
     await commands.get("bg-attach").handler(id, attachCtx);
   } finally {
-    (stdout as any).write = originalStdoutWrite;
+    terminalOutput.writeHandler = originalWriteHandler;
   }
 
   const attachedStdout = stdoutChunks.join("");
@@ -995,7 +1118,7 @@ test("pipe tasks replay retained output before continuing with live output", asy
   assert.deepEqual(notifications, ['Detached from "pipe-attach".']);
 
   const reattachedChunks: string[] = [];
-  (stdout as any).write = (chunk: string | Uint8Array) => {
+  terminalOutput.writeHandler = (chunk: string | Uint8Array) => {
     reattachedChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
     return true;
   };
@@ -1003,18 +1126,12 @@ test("pipe tasks replay retained output before continuing with live output", asy
     ...attachCtx,
     ui: {
       ...attachCtx.ui,
-      custom: (factory: any) => new Promise((resolve) => {
-        const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
-        const component = factory(tui, {}, {}, resolve);
-        queueMicrotask(() => {
-          void (async () => {
-            await waitForRenderedText(reattachedChunks, /LIVE_STDERR/);
-            children[0].stdout.write("AFTER_REATTACH\n");
-            await waitForRenderedText(reattachedChunks, /AFTER_REATTACH/);
-            component.dispose();
-            queueMicrotask(() => children[0].finish(0, null));
-          })();
-        });
+      custom: createAttachCustom(async (component) => {
+        await waitForRenderedText(reattachedChunks, /LIVE_STDERR/);
+        children[0].stdout.write("AFTER_REATTACH\n");
+        await waitForRenderedText(reattachedChunks, /AFTER_REATTACH/);
+        component.dispose();
+        children[0].finish(0, null);
       }),
     },
   } as unknown as ExtensionContext;
@@ -1022,7 +1139,7 @@ test("pipe tasks replay retained output before continuing with live output", asy
   try {
     await commands.get("bg-attach").handler(id, reattachCtx);
   } finally {
-    (stdout as any).write = originalStdoutWrite;
+    terminalOutput.writeHandler = originalWriteHandler;
   }
 
   const reattachedStdout = reattachedChunks.join("");
@@ -1041,7 +1158,7 @@ test("pipe tasks replay retained output before continuing with live output", asy
 });
 
 test("finished tasks expose a read-only attach snapshot until the next turn", async () => {
-  const { tools, commands, lifecycle, children, ptys, ctx } = createHarness();
+  const { tools, commands, lifecycle, children, ptys, terminalInput, terminalOutput, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgLogs = tools.get("bg_logs");
   assert.ok(bgStart && bgLogs);
@@ -1084,9 +1201,8 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
   for (const attachCase of cases) {
     const stdoutChunks: string[] = [];
     const notifications: string[] = [];
-    const stdout = process.stdout as NodeJS.WriteStream;
-    const originalStdoutWrite = stdout.write;
-    (stdout as any).write = (chunk: string | Uint8Array) => {
+    const originalWriteHandler = terminalOutput.writeHandler;
+    terminalOutput.writeHandler = (chunk: string | Uint8Array) => {
       stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
       return true;
     };
@@ -1097,10 +1213,9 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
       ui: {
         setWidget: () => {},
         notify: (message: string) => notifications.push(message),
-        custom: (factory: any) => new Promise((resolve) => {
-          const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
-          factory(tui, {}, {}, resolve);
-          setImmediate(() => process.stdin.emit("data", "\x1d"));
+        custom: createAttachCustom(async () => {
+          await waitForRenderedText(stdoutChunks, /Task finished - Ctrl\+\] to return/);
+          terminalInput.emit("data", "\x1d");
         }),
       },
     } as unknown as ExtensionContext;
@@ -1108,7 +1223,7 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
     try {
       await attachCommand.handler(attachCase.id, attachCtx);
     } finally {
-      (stdout as any).write = originalStdoutWrite;
+      terminalOutput.writeHandler = originalWriteHandler;
     }
 
     const attachedOutput = stdoutChunks.join("");
@@ -1144,7 +1259,7 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
 });
 
 test("attached tasks stay open and show a user-only hint after they exit", async () => {
-  const { tools, commands, lifecycle, children, ptys, ctx } = createHarness();
+  const { tools, commands, lifecycle, children, ptys, terminalInput, terminalOutput, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgLogs = tools.get("bg_logs");
   assert.ok(bgStart && bgLogs);
@@ -1194,9 +1309,8 @@ test("attached tasks stay open and show a user-only hint after they exit", async
     const stdoutChunks: string[] = [];
     const notifications: string[] = [];
     let detachSent = false;
-    const stdout = process.stdout as NodeJS.WriteStream;
-    const originalStdoutWrite = stdout.write;
-    (stdout as any).write = (chunk: string | Uint8Array) => {
+    const originalWriteHandler = terminalOutput.writeHandler;
+    terminalOutput.writeHandler = (chunk: string | Uint8Array) => {
       stdoutChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
       return true;
     };
@@ -1207,17 +1321,13 @@ test("attached tasks stay open and show a user-only hint after they exit", async
       ui: {
         setWidget: () => {},
         notify: (message: string) => notifications.push(message),
-        custom: (factory: any) => new Promise((resolve) => {
-          const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
-          factory(tui, {}, {}, resolve);
-          setImmediate(() => {
-            attachCase.finish();
-            setTimeout(() => {
-              process.stdin.emit("data", "IGNORED AFTER EXIT");
-              detachSent = true;
-              process.stdin.emit("data", "\x1d");
-            }, 30);
-          });
+        custom: createAttachCustom(async () => {
+          await waitForRenderedText(stdoutChunks, /\x1b\[2J\x1b\[H/);
+          attachCase.finish();
+          await waitForRenderedText(stdoutChunks, /Task finished - Ctrl\+\] to return/);
+          terminalInput.emit("data", "IGNORED AFTER EXIT");
+          detachSent = true;
+          terminalInput.emit("data", "\x1d");
         }),
       },
     } as unknown as ExtensionContext;
@@ -1225,7 +1335,7 @@ test("attached tasks stay open and show a user-only hint after they exit", async
     try {
       await attachCommand.handler(attachCase.id, attachCtx);
     } finally {
-      (stdout as any).write = originalStdoutWrite;
+      terminalOutput.writeHandler = originalWriteHandler;
     }
 
     assert.equal(detachSent, true, "task exit must not resolve the attachment before Ctrl+]");
@@ -1257,7 +1367,7 @@ test("attached tasks stay open and show a user-only hint after they exit", async
 });
 
 test("PTY tasks preserve terminal state and use terminal input semantics", async () => {
-  const { tools, commands, lifecycle, ptys, ctx } = createHarness();
+  const { tools, commands, lifecycle, ptys, terminalInput, terminalOutput, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgWait = tools.get("bg_wait");
   const bgStatus = tools.get("bg_status");
@@ -1436,13 +1546,12 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   };
   pty.resume = () => attachOrder.push("resume");
 
-  const stdout = process.stdout as NodeJS.WriteStream;
-  const originalWrite = stdout.write;
-  const columnsDescriptor = Object.getOwnPropertyDescriptor(stdout, "columns");
-  const rowsDescriptor = Object.getOwnPropertyDescriptor(stdout, "rows");
-  Object.defineProperty(stdout, "columns", { configurable: true, value: 80 });
-  Object.defineProperty(stdout, "rows", { configurable: true, value: 24 });
-  (stdout as any).write = (chunk: string | Uint8Array) => {
+  const originalWriteHandler = terminalOutput.writeHandler;
+  const originalColumns = terminalOutput.columns;
+  const originalRows = terminalOutput.rows;
+  terminalOutput.columns = 80;
+  terminalOutput.rows = 24;
+  terminalOutput.writeHandler = (chunk: string | Uint8Array) => {
     const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
     if (text === "\x1b[2J\x1b[H") attachOrder.push("clear");
     else if (text.includes("PTY_READY")) attachOrder.push("snapshot");
@@ -1459,20 +1568,24 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     ui: {
       setWidget: () => {},
       notify: (message: string) => attachNotifications.push(message),
-      custom: (factory: any) => new Promise((resolve) => {
-        const tui = { stop: () => {}, start: () => {}, requestRender: () => {} };
-        const component = factory(tui, {}, {}, resolve);
-        queueMicrotask(() => pty.emitData("DURING_ATTACH\r\n"));
-        setTimeout(() => {
-          process.stdin.emit("data", "\x1b[<0;12;8M");
-          Object.defineProperty(stdout, "columns", { configurable: true, value: 90 });
-          Object.defineProperty(stdout, "rows", { configurable: true, value: 28 });
-          stdout.emit("resize");
-          Object.defineProperty(stdout, "columns", { configurable: true, value: 1000 });
-          Object.defineProperty(stdout, "rows", { configurable: true, value: 1 });
-          stdout.emit("resize");
-        }, 5);
-        setTimeout(() => component.dispose(), 70);
+      custom: createAttachCustom(async (component) => {
+        pty.emitData("DURING_ATTACH\r\n");
+        await waitForCondition(
+          () => attachOrder.includes("catchup") && attachOrder.includes("mouse-sgr"),
+          "PTY attach snapshot, mouse mode, and catch-up output",
+        );
+        terminalInput.emit("data", "\x1b[<0;12;8M");
+        terminalOutput.columns = 90;
+        terminalOutput.rows = 28;
+        terminalOutput.emit("resize");
+        terminalOutput.columns = 1000;
+        terminalOutput.rows = 1;
+        terminalOutput.emit("resize");
+        await waitForCondition(
+          () => attachOrder.includes("resize:500x5"),
+          "debounced PTY resize",
+        );
+        component.dispose();
       }),
     },
   } as unknown as ExtensionContext;
@@ -1480,11 +1593,9 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   try {
     await commands.get("bg-attach").handler(id, attachCtx);
   } finally {
-    (stdout as any).write = originalWrite;
-    if (columnsDescriptor) Object.defineProperty(stdout, "columns", columnsDescriptor);
-    else delete (stdout as any).columns;
-    if (rowsDescriptor) Object.defineProperty(stdout, "rows", rowsDescriptor);
-    else delete (stdout as any).rows;
+    terminalOutput.writeHandler = originalWriteHandler;
+    terminalOutput.columns = originalColumns;
+    terminalOutput.rows = originalRows;
   }
 
   assert.deepEqual(attachOrder, [

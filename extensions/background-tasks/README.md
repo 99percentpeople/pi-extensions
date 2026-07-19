@@ -115,9 +115,12 @@ The snapshot is discarded at the next turn boundary after that opportunity.
 
 Once discarded, the old task ID is no longer available through attach, status,
 logs, or wait operations. Retention is intentionally short-lived and stored in
-memory; it is not persistent job management. When the Pi session shuts down,
-the extension detaches consoles, terminates remaining processes, flushes their
-output, and disposes the virtual terminals so it does not leave orphaned tasks.
+an in-memory log store; no task output is written to a temporary disk directory.
+Pipe stdout and stderr are capped at 4 MiB each, with the oldest bytes discarded
+when that limit is reached. This is not persistent job
+management. When the Pi session shuts down, the extension detaches consoles,
+terminates remaining processes, clears retained output, and disposes the
+virtual terminals so it does not leave orphaned tasks.
 
 ## Sending input and keys
 

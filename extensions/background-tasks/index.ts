@@ -23,10 +23,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { stripVTControlCharacters } from "node:util";
 import {
   getShellConfig,
@@ -110,8 +107,8 @@ interface BgTask {
   signal: string | null;
   startedAt: number;
   endedAt: number | null;
-  stdoutFile: string;
-  stderrFile: string;
+  stdoutLogKey: string;
+  stderrLogKey: string;
   stdoutLines: number;
   stderrLines: number;
   done: AbortController;
@@ -134,10 +131,79 @@ interface BgWaitRenderState {
   interval?: ReturnType<typeof setInterval>;
 }
 
+interface StoredLog {
+  chunks: Buffer[];
+  firstChunk: number;
+  size: number;
+}
+
+export class MemoryLogStore {
+  private readonly logs = new Map<string, StoredLog>();
+
+  constructor(readonly maxLogBytes = 4 * 1024 * 1024) {
+    if (!Number.isInteger(maxLogBytes) || maxLogBytes < 1) {
+      throw new Error("Log capacity must be a positive integer");
+    }
+  }
+
+  append(key: string, data: Buffer | string): void {
+    const chunk = Buffer.isBuffer(data) ? Buffer.from(data) : Buffer.from(data, "utf8");
+    if (chunk.length === 0) return;
+
+    const log = this.logs.get(key) ?? { chunks: [], firstChunk: 0, size: 0 };
+    log.chunks.push(chunk);
+    log.size += chunk.length;
+    this.trim(log);
+    this.logs.set(key, log);
+  }
+
+  read(key: string): string {
+    const log = this.logs.get(key);
+    if (!log || log.size === 0) return "";
+    return Buffer.concat(log.chunks.slice(log.firstChunk), log.size).toString("utf8");
+  }
+
+  delete(key: string): void {
+    this.logs.delete(key);
+  }
+
+  clear(): void {
+    this.logs.clear();
+  }
+
+  size(key: string): number {
+    return this.logs.get(key)?.size ?? 0;
+  }
+
+  private trim(log: StoredLog): void {
+    let excess = log.size - this.maxLogBytes;
+    while (excess > 0) {
+      const first = log.chunks[log.firstChunk];
+      if (!first) break;
+      if (first.length <= excess) {
+        log.firstChunk += 1;
+        log.size -= first.length;
+        excess -= first.length;
+        continue;
+      }
+      log.chunks[log.firstChunk] = Buffer.from(first.subarray(excess));
+      log.size -= excess;
+      excess = 0;
+    }
+
+    if (log.firstChunk >= 1024 && log.firstChunk * 2 >= log.chunks.length) {
+      log.chunks = log.chunks.slice(log.firstChunk);
+      log.firstChunk = 0;
+    }
+  }
+}
+
 // ── Execution Backend ─────────────────────────────────────────────────
 
 let spawnFn: typeof spawn = spawn;
 let ptySpawnFn: typeof nodePty.spawn = nodePty.spawn;
+let terminalInput: NodeJS.ReadStream = process.stdin;
+let terminalOutput: NodeJS.WriteStream = process.stdout;
 
 function defaultShellResolver(
   command: string,
@@ -177,9 +243,9 @@ let resolveShell: ShellResolver = defaultShellResolver;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-let taskDir: string;
 const tasks = new Map<string, BgTask>();
 const runningTasks = new Set<BgTask>();
+const outputLogStore = new MemoryLogStore();
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -188,12 +254,8 @@ function generateId(): string {
   return id;
 }
 
-async function ensureTaskDir(): Promise<string> {
-  if (!taskDir) {
-    taskDir = join(tmpdir(), "pi-bg-tasks", process.pid.toString());
-    await mkdir(taskDir, { recursive: true });
-  }
-  return taskDir;
+function taskLogKey(id: string, stream: "stdout" | "stderr"): string {
+  return `${id}:${stream}`;
 }
 
 function createConsoleSession(cols: number, rows: number, mode: "pipe" | "pty"): ConsoleSession {
@@ -237,11 +299,6 @@ function createConsoleSession(cols: number, rows: number, mode: "pipe" | "pty"):
   return session;
 }
 
-async function appendToFile(filePath: string, data: Buffer | string): Promise<void> {
-  try { await appendFile(filePath, data); }
-  catch { await writeFile(filePath, data); }
-}
-
 function sanitizeLogOutput(text: string): string {
   return stripVTControlCharacters(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
@@ -252,14 +309,12 @@ function splitLogLines(text: string): string[] {
   return lines;
 }
 
-async function readTail(filePath: string, lines: number): Promise<string> {
-  try { return splitLogLines(await readFile(filePath, "utf-8")).slice(-lines).join("\n"); }
-  catch { return ""; }
+function readTail(logKey: string, lines: number): string {
+  return splitLogLines(outputLogStore.read(logKey)).slice(-lines).join("\n");
 }
 
-async function readRange(filePath: string, fromLine: number, maxLines: number): Promise<string> {
-  try { return splitLogLines(await readFile(filePath, "utf-8")).slice(fromLine, fromLine + maxLines).join("\n"); }
-  catch { return ""; }
+function readRange(logKey: string, fromLine: number, maxLines: number): string {
+  return splitLogLines(outputLogStore.read(logKey)).slice(fromLine, fromLine + maxLines).join("\n");
 }
 
 function formatDuration(ms: number): string {
@@ -356,9 +411,12 @@ function writeConsoleData(task: BgTask, data: ConsoleData): void {
   );
 }
 
+function appendTaskLog(logKey: string, data: Buffer | string): void {
+  outputLogStore.append(logKey, data);
+}
+
 function recordPtyData(task: BgTask, data: string): void {
   task.stdoutLines += data.split("\n").length - 1;
-  appendToFile(task.stdoutFile, data).catch(() => {});
 
   const session = task.console;
   if (session.catchUpBuffer !== null) {
@@ -373,7 +431,7 @@ function recordPipeData(task: BgTask, stream: "stdout" | "stderr", data: Buffer)
   if (stream === "stdout") task.stdoutLines += data.toString().split("\n").length - 1;
   else task.stderrLines += data.toString().split("\n").length - 1;
   updateLatestLog(task, stream, data);
-  appendToFile(stream === "stdout" ? task.stdoutFile : task.stderrFile, data).catch(() => {});
+  appendTaskLog(stream === "stdout" ? task.stdoutLogKey : task.stderrLogKey, data);
 
   const session = task.console;
   if (session.catchUpBuffer !== null) {
@@ -406,6 +464,11 @@ function releaseConsoleCatchUp(task: BgTask, buffer: ConsoleData[]): void {
 
 async function flushConsole(task: BgTask): Promise<void> {
   await task.console.parsed;
+}
+
+function deleteTaskLogs(task: BgTask): void {
+  outputLogStore.delete(task.stdoutLogKey);
+  outputLogStore.delete(task.stderrLogKey);
 }
 
 function formatTaskOutputStats(task: BgTask): string[] {
@@ -579,20 +642,20 @@ const TERMINAL_RESET = [
 const ATTACH_STATUS_GRACE_MS = 100;
 
 function writePipeFinishedHint(): void {
-  process.stdout.write(TERMINAL_INPUT_MODE_RESET);
-  process.stdout.write(`\r\n[${FINISHED_ATTACH_HINT}]\r\n`);
+  terminalOutput.write(TERMINAL_INPUT_MODE_RESET);
+  terminalOutput.write(`\r\n[${FINISHED_ATTACH_HINT}]\r\n`);
 }
 
 function writePtyFinishedView(task: BgTask): void {
-  const cols = Math.max(1, Math.floor(process.stdout.columns || task.console.terminal.cols || 80));
-  const rows = Math.max(1, Math.floor(process.stdout.rows || task.console.terminal.rows || 24));
+  const cols = Math.max(1, Math.floor(terminalOutput.columns || task.console.terminal.cols || 80));
+  const rows = Math.max(1, Math.floor(terminalOutput.rows || task.console.terminal.rows || 24));
   const hint = ` ${FINISHED_ATTACH_HINT} `.slice(0, cols);
   const column = Math.max(1, cols - hint.length + 1);
 
-  process.stdout.write("\x1b[2J\x1b[H");
-  process.stdout.write(task.console.serializer.serialize({ scrollback: 200 }));
-  process.stdout.write(TERMINAL_INPUT_MODE_RESET);
-  process.stdout.write(`\x1b7\x1b[${rows};${column}H\x1b[7m${hint}\x1b[0m\x1b8`);
+  terminalOutput.write("\x1b[2J\x1b[H");
+  terminalOutput.write(task.console.serializer.serialize({ scrollback: 200 }));
+  terminalOutput.write(TERMINAL_INPUT_MODE_RESET);
+  terminalOutput.write(`\x1b7\x1b[${rows};${column}H\x1b[7m${hint}\x1b[0m\x1b8`);
 }
 
 function serializeMouseEncodingMode(mode: MouseEncodingMode): string {
@@ -660,11 +723,11 @@ async function attachFinishedTaskSnapshot(
       cleaned = true;
       task.attachment.detach = undefined;
       task.attachment.taskExited = undefined;
-      if (inputHandler) process.stdin.removeListener("data", inputHandler);
+      if (inputHandler) terminalInput.removeListener("data", inputHandler);
       if (terminalStarted) {
-        process.stdin.pause();
-        process.stdin.setRawMode?.(rawBeforeAttach);
-        process.stdout.write(TERMINAL_RESET);
+        terminalInput.pause();
+        terminalInput.setRawMode?.(rawBeforeAttach);
+        terminalOutput.write(TERMINAL_RESET);
         tui.start();
         tui.requestRender(true);
       }
@@ -678,24 +741,24 @@ async function attachFinishedTaskSnapshot(
         if (cleaned) return;
         tui.stop();
         terminalStarted = true;
-        rawBeforeAttach = process.stdin.isRaw || false;
-        process.stdin.setRawMode?.(true);
-        process.stdin.setEncoding("utf8");
-        process.stdin.resume();
+        rawBeforeAttach = terminalInput.isRaw || false;
+        terminalInput.setRawMode?.(true);
+        terminalInput.setEncoding("utf8");
+        terminalInput.resume();
 
         inputHandler = (chunk) => {
           const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
           if (data.includes(ATTACH_DETACH_KEY)) cleanup("detached");
         };
-        process.stdin.on("data", inputHandler);
+        terminalInput.on("data", inputHandler);
 
         await flushConsole(task);
         if (cleaned) return;
         if (modeLabel === "PTY") {
           writePtyFinishedView(task);
         } else {
-          process.stdout.write("\x1b[2J\x1b[H");
-          process.stdout.write(task.console.serializer.serialize({ scrollback: 200 }));
+          terminalOutput.write("\x1b[2J\x1b[H");
+          terminalOutput.write(task.console.serializer.serialize({ scrollback: 200 }));
           writePipeFinishedHint();
         }
       } catch (error) {
@@ -757,8 +820,8 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
       state.subscriber = undefined;
       task.attachment.detach = undefined;
       task.attachment.taskExited = undefined;
-      if (inputHandler) process.stdin.removeListener("data", inputHandler);
-      if (resizeHandler) process.stdout.removeListener("resize", resizeHandler);
+      if (inputHandler) terminalInput.removeListener("data", inputHandler);
+      if (resizeHandler) terminalOutput.removeListener("resize", resizeHandler);
       if (resizeTimer) {
         clearTimeout(resizeTimer);
         resizeTimer = undefined;
@@ -768,9 +831,9 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
         catchUpBuffer = null;
       }
       if (terminalStarted) {
-        process.stdin.pause();
-        process.stdin.setRawMode?.(rawBeforeAttach);
-        process.stdout.write(TERMINAL_RESET);
+        terminalInput.pause();
+        terminalInput.setRawMode?.(rawBeforeAttach);
+        terminalOutput.write(TERMINAL_RESET);
         tui.start();
         tui.requestRender(true);
       }
@@ -799,10 +862,10 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
         if (cleaned) return;
         tui.stop();
         terminalStarted = true;
-        rawBeforeAttach = process.stdin.isRaw || false;
-        process.stdin.setRawMode?.(true);
-        process.stdin.setEncoding("utf8");
-        process.stdin.resume();
+        rawBeforeAttach = terminalInput.isRaw || false;
+        terminalInput.setRawMode?.(true);
+        terminalInput.setEncoding("utf8");
+        terminalInput.resume();
 
         inputHandler = (chunk) => {
           const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
@@ -817,11 +880,11 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
         const applyResize = () => {
           const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
             MIN_TERMINAL_COLS,
-            Math.floor(process.stdout.columns || state.terminal.cols || 80),
+            Math.floor(terminalOutput.columns || state.terminal.cols || 80),
           ));
           const rows = Math.min(MAX_TERMINAL_ROWS, Math.max(
             MIN_TERMINAL_ROWS,
-            Math.floor(process.stdout.rows || state.terminal.rows || 24),
+            Math.floor(terminalOutput.rows || state.terminal.rows || 24),
           ));
           state.terminal.resize(cols, rows);
           if (task.process?.kind === "pty") task.process.pty.resize(cols, rows);
@@ -835,17 +898,17 @@ async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void>
           }, ATTACH_RESIZE_DEBOUNCE_MS);
         };
 
-        process.stdin.on("data", inputHandler);
-        process.stdout.on("resize", resizeHandler);
+        terminalInput.on("data", inputHandler);
+        terminalOutput.on("resize", resizeHandler);
         catchUpBuffer = beginConsoleCatchUp(task);
         await flushConsole(task);
         if (cleaned) return;
         applyResize();
-        process.stdout.write("\x1b[2J\x1b[H");
-        process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
+        terminalOutput.write("\x1b[2J\x1b[H");
+        terminalOutput.write(state.serializer.serialize({ scrollback: 200 }));
         const mouseEncodingSequence = serializeMouseEncodingMode(state.mouseEncodingMode);
-        if (mouseEncodingSequence) process.stdout.write(mouseEncodingSequence);
-        state.subscriber = (data) => process.stdout.write(data);
+        if (mouseEncodingSequence) terminalOutput.write(mouseEncodingSequence);
+        state.subscriber = (data) => terminalOutput.write(data);
         releaseConsoleCatchUp(task, catchUpBuffer);
         catchUpBuffer = null;
         attachmentReady = true;
@@ -906,15 +969,15 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
       state.subscriber = undefined;
       task.attachment.detach = undefined;
       task.attachment.taskExited = undefined;
-      if (inputHandler) process.stdin.removeListener("data", inputHandler);
+      if (inputHandler) terminalInput.removeListener("data", inputHandler);
       if (catchUpBuffer) {
         releaseConsoleCatchUp(task, catchUpBuffer);
         catchUpBuffer = null;
       }
       if (terminalStarted) {
-        process.stdin.pause();
-        process.stdin.setRawMode?.(rawBeforeAttach);
-        process.stdout.write(TERMINAL_RESET);
+        terminalInput.pause();
+        terminalInput.setRawMode?.(rawBeforeAttach);
+        terminalOutput.write(TERMINAL_RESET);
         tui.start();
         tui.requestRender(true);
       }
@@ -942,33 +1005,33 @@ async function attachPipeTask(task: BgTask, ctx: ExtensionContext): Promise<void
         if (cleaned) return;
         tui.stop();
         terminalStarted = true;
-        rawBeforeAttach = process.stdin.isRaw || false;
-        process.stdin.setRawMode?.(true);
-        process.stdin.setEncoding("utf8");
-        process.stdin.resume();
+        rawBeforeAttach = terminalInput.isRaw || false;
+        terminalInput.setRawMode?.(true);
+        terminalInput.setEncoding("utf8");
+        terminalInput.resume();
 
         inputHandler = (chunk) => {
           const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
           if (data.includes(ATTACH_DETACH_KEY)) cleanup("detached");
         };
 
-        process.stdin.on("data", inputHandler);
+        terminalInput.on("data", inputHandler);
         catchUpBuffer = beginConsoleCatchUp(task);
         await flushConsole(task);
         if (cleaned) return;
 
         const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
           MIN_TERMINAL_COLS,
-          Math.floor(process.stdout.columns || state.terminal.cols || 80),
+          Math.floor(terminalOutput.columns || state.terminal.cols || 80),
         ));
         const rows = Math.min(MAX_TERMINAL_ROWS, Math.max(
           MIN_TERMINAL_ROWS,
-          Math.floor(process.stdout.rows || state.terminal.rows || 24),
+          Math.floor(terminalOutput.rows || state.terminal.rows || 24),
         ));
         state.terminal.resize(cols, rows);
-        process.stdout.write("\x1b[2J\x1b[H");
-        process.stdout.write(state.serializer.serialize({ scrollback: 200 }));
-        state.subscriber = (data) => process.stdout.write(data);
+        terminalOutput.write("\x1b[2J\x1b[H");
+        terminalOutput.write(state.serializer.serialize({ scrollback: 200 }));
+        state.subscriber = (data) => terminalOutput.write(data);
         releaseConsoleCatchUp(task, catchUpBuffer);
         catchUpBuffer = null;
         attachmentReady = true;
@@ -1029,6 +1092,7 @@ async function discardExpiredFinishedTasks(): Promise<boolean> {
   await Promise.all(expired.map(async (task) => {
     await flushConsole(task);
     task.console.terminal.dispose();
+    deleteTaskLogs(task);
   }));
   return expired.length > 0;
 }
@@ -1172,17 +1236,19 @@ function updateWidget(): void {
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  ensureTaskDir();
-
   pi.events.on("bg:register", (data: unknown) => {
     const ops = data as {
       spawn?: typeof spawn;
       ptySpawn?: typeof nodePty.spawn;
       resolveShell?: ShellResolver;
+      terminalInput?: NodeJS.ReadStream;
+      terminalOutput?: NodeJS.WriteStream;
     };
     if (ops.spawn) spawnFn = ops.spawn;
     if (ops.ptySpawn) ptySpawnFn = ops.ptySpawn;
     if (ops.resolveShell) resolveShell = ops.resolveShell;
+    if (ops.terminalInput) terminalInput = ops.terminalInput;
+    if (ops.terminalOutput) terminalOutput = ops.terminalOutput;
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1230,6 +1296,7 @@ export default function (pi: ExtensionAPI) {
     for (const task of tasks.values()) task.console.terminal.dispose();
     tasks.clear();
     runningTasks.clear();
+    outputLogStore.clear();
   });
 
   // ── bg_start ───────────────────────────────────────────────────────
@@ -1255,10 +1322,9 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
-      const dir = await ensureTaskDir();
       const id = generateId();
-      const stdoutFile = join(dir, `${id}.stdout`);
-      const stderrFile = join(dir, `${id}.stderr`);
+      const stdoutLogKey = taskLogKey(id, "stdout");
+      const stderrLogKey = taskLogKey(id, "stderr");
       const mode = params.pty ? "pty" : "pipe";
       const shell = resolveShell(params.command, mode === "pty", {
         cwd: ctx.cwd,
@@ -1267,11 +1333,11 @@ export default function (pi: ExtensionAPI) {
       const cwd = params.cwd || ctx.cwd;
       const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
         MIN_TERMINAL_COLS,
-        Math.floor(params.cols ?? process.stdout.columns ?? 120),
+        Math.floor(params.cols ?? terminalOutput.columns ?? 120),
       ));
       const rows = Math.min(MAX_TERMINAL_ROWS, Math.max(
         MIN_TERMINAL_ROWS,
-        Math.floor(params.rows ?? process.stdout.rows ?? 30),
+        Math.floor(params.rows ?? terminalOutput.rows ?? 30),
       ));
       let taskProcess: BackgroundProcess;
       const console = createConsoleSession(cols, rows, mode);
@@ -1306,7 +1372,7 @@ export default function (pi: ExtensionAPI) {
         process: taskProcess, console, attachment: {}, status: "running",
         exitCode: null, signal: null,
         startedAt: Date.now(), endedAt: null,
-        stdoutFile, stderrFile, stdoutLines: 0, stderrLines: 0,
+        stdoutLogKey, stderrLogKey, stdoutLines: 0, stderrLines: 0,
         done: new AbortController(),
         latestLog: null, finalLog: undefined,
         retainForNextAgentTurn: false,
@@ -1694,13 +1760,13 @@ export default function (pi: ExtensionAPI) {
       if (stream === "stdout" || stream === "both")
         stdout =
           params.from_line !== undefined
-            ? await readRange(task.stdoutFile, params.from_line, maxLines)
-            : await readTail(task.stdoutFile, lines);
+            ? await readRange(task.stdoutLogKey, params.from_line, maxLines)
+            : await readTail(task.stdoutLogKey, lines);
       if (stream === "stderr" || stream === "both")
         stderr =
           params.from_line !== undefined
-            ? await readRange(task.stderrFile, params.from_line, maxLines)
-            : await readTail(task.stderrFile, lines);
+            ? await readRange(task.stderrLogKey, params.from_line, maxLines)
+            : await readTail(task.stderrLogKey, lines);
 
       const parts: string[] = [];
       if (stream === "both") {

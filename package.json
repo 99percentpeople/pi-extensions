@@ -11,7 +11,7 @@
     "extensions/todo"
   ],
   "scripts": {
-    "test": "node --import tsx --test tests/background-tasks.test.ts tests/todo.test.ts tests/packages.test.ts",
+    "test": "node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/todo.test.ts tests/packages.test.ts",
     "lint": "tsc --noEmit",
     "check": "bun run lint && bun run test",
     "pack:background-tasks": "bun pm pack --dry-run --cwd extensions/background-tasks",
