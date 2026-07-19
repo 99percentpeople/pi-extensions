@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { constants as osConstants } from "node:os";
 import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
@@ -12,7 +13,7 @@ interface RegisteredTool {
   name: string;
   promptGuidelines?: string[];
   parameters: {
-    properties?: Record<string, { minimum?: number; maximum?: number }>;
+    properties?: Record<string, { minimum?: number; maximum?: number; enum?: string[] }>;
   };
   executionMode?: string;
   execute: (...args: any[]) => Promise<any>;
@@ -409,6 +410,11 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.ok(bgStatus.parameters.properties?.terminal_snapshot);
   assert.ok(bgKill.parameters.properties?.terminal_snapshot);
   assert.ok(bgSend.parameters.properties?.input);
+  assert.deepEqual(
+    bgSend.parameters.properties?.signal.enum,
+    Object.keys(osConstants.signals).sort(),
+    "bg_send should expose every named signal available on the current platform",
+  );
   assert.equal(bgSend.parameters.properties?.text, undefined);
   assert.equal(bgSend.parameters.properties?.key, undefined);
   assert.equal(bgSend.parameters.properties?.sequence, undefined);

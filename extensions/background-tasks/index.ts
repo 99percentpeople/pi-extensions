@@ -24,6 +24,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
+import { constants as osConstants } from "node:os";
 import { stripVTControlCharacters } from "node:util";
 import {
   getShellConfig,
@@ -2125,7 +2126,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   const STOP_SIGNALS = new Set<NodeJS.Signals>(["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]);
-  const SEND_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP", "SIGCONT", "SIGUSR1", "SIGUSR2"] as const;
+  const SEND_SIGNALS = (Object.keys(osConstants.signals) as NodeJS.Signals[]).sort();
 
   pi.registerTool({
     name: "bg_send",
@@ -2140,7 +2141,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
       input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter>, <A-f>, or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
-      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "OS signal for the process group" })),
+      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "Named OS signal supported by the current platform, sent to the process group" })),
     }),
 
     async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {

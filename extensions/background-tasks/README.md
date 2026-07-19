@@ -143,6 +143,12 @@ Pipe attachments do not forward keyboard input directly, but Pi can still send
 stdin through the background task interface. PTY attachments forward input
 interactively and the same key syntax remains available for model-driven input.
 
+The signal input accepts every named signal exposed by Node.js for the current
+operating system and sends it to the task's process group on Unix. Signal
+availability and behavior remain platform-specific; Windows processes and
+Windows PTYs support a smaller set of effective signal behaviors. Use the
+dedicated kill operation when the goal is reliable process-tree termination.
+
 ## Output inspection
 
 Pipe tasks retain stdout and stderr separately for inspection, while their
