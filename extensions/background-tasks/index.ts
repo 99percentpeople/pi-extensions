@@ -113,7 +113,6 @@ interface BgTask {
   stderrLines: number;
   done: AbortController;
   latestLog: LatestLog | null;
-  finalLog?: LatestLog | null;
   retainForNextAgentTurn: boolean;
   stdoutPending: string;
   stderrPending: string;
@@ -618,7 +617,6 @@ function finishTask(task: BgTask, code: number | null, signal: string | null, fa
   task.attachment.taskExited?.();
   updateWidget();
   void flushConsole(task).then(() => {
-    task.finalLog = task.latestLog ? { ...task.latestLog } : null;
     updateWidget();
   });
 }
@@ -1097,11 +1095,6 @@ async function discardExpiredFinishedTasks(): Promise<boolean> {
   return expired.length > 0;
 }
 
-function getTaskDisplayLog(task: BgTask): LatestLog | null {
-  if (task.status === "running" || task.finalLog === undefined) return task.latestLog;
-  return task.finalLog;
-}
-
 function stopRefreshTimer() {
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
 }
@@ -1154,7 +1147,7 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
       ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}`
       : `${branch} ${glyph} ${task.name} (${task.id}) ${task.status} ${duration}${exit}${signal}`);
 
-    const latestLog = getTaskDisplayLog(task);
+    const latestLog = task.latestLog;
     const output = latestLog
       ? `[${latestLog.stream}] ${truncateText(latestLog.text, MAX_DISPLAY_LOG_CHARS)}`
       : "(no output)";
@@ -1374,7 +1367,7 @@ export default function (pi: ExtensionAPI) {
         startedAt: Date.now(), endedAt: null,
         stdoutLogKey, stderrLogKey, stdoutLines: 0, stderrLines: 0,
         done: new AbortController(),
-        latestLog: null, finalLog: undefined,
+        latestLog: null,
         retainForNextAgentTurn: false,
         stdoutPending: "", stderrPending: "",
         requestedStopSignal: null,
@@ -1489,7 +1482,7 @@ export default function (pi: ExtensionAPI) {
       if (task.exitCode !== null) parts.push(`  Exit code:  ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:     ${task.signal}`);
       parts.push(...formatTaskOutputStats(task));
-      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(getTaskDisplayLog(task))}`);
+      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
       else if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
       if (task.mode === "pipe" && !timedOut && task.exitCode === 0 && task.stderrLines > 0) {
         parts.push("  Note: the task exited with code 0 but wrote output to stderr.");
@@ -1508,7 +1501,7 @@ export default function (pi: ExtensionAPI) {
           mode: task.mode,
           stdoutLines: task.stdoutLines,
           stderrLines: task.stderrLines,
-          latestLog: task.mode === "pipe" ? getTaskDisplayLog(task) : null,
+          latestLog: task.mode === "pipe" ? task.latestLog : null,
           terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot),
         },
       };
@@ -1594,7 +1587,7 @@ export default function (pi: ExtensionAPI) {
           const dur = t.endedAt ? formatDuration(t.endedAt - t.startedAt) : formatDuration(Date.now() - t.startedAt);
           const exit = t.exitCode !== null ? ` exit=${t.exitCode}` : "";
           const summary = `[${t.id}] "${t.name}" ${t.status} ${t.mode} (${dur})${exit}`;
-          if (t.mode === "pipe") return `${summary}\n  Latest log: ${formatLatestLog(getTaskDisplayLog(t))}`;
+          if (t.mode === "pipe") return `${summary}\n  Latest log: ${formatLatestLog(t.latestLog)}`;
           return summary;
         });
         if (params.terminal_snapshot) {
@@ -1610,7 +1603,7 @@ export default function (pi: ExtensionAPI) {
               name: t.name,
               status: t.status,
               mode: t.mode,
-              latestLog: t.mode === "pipe" ? getTaskDisplayLog(t) : null,
+              latestLog: t.mode === "pipe" ? t.latestLog : null,
               terminalSnapshot: t.mode === "pty" && Boolean(params.terminal_snapshot),
             })),
           },
@@ -1631,13 +1624,13 @@ export default function (pi: ExtensionAPI) {
       if (task.signal) parts.push(`  Signal:    ${task.signal}`);
       if (task.process?.pid) parts.push(`  PID:       ${task.process.pid}`);
       parts.push(...formatTaskOutputStats(task));
-      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(getTaskDisplayLog(task))}`);
+      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
       else if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
       if (task.status === "running") parts.push("  Use bg_wait to await completion; do not poll bg_status.");
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, latestLog: task.mode === "pipe" ? getTaskDisplayLog(task) : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
+        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, latestLog: task.mode === "pipe" ? task.latestLog : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
       };
     },
 
