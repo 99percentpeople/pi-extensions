@@ -109,20 +109,21 @@ model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 The `todo` tool replaces per-task CRUD calls with one atomic `tasks[]` snapshot.
 Stable task keys allow dependencies to reference tasks created in the same call.
 Updates include the complete current key list but may omit unchanged fields, so
-one compact call can complete the current task and start the next. Omitted keys
-are archived, stale revisions can be rejected, and invalid dependency graphs do
-not partially mutate state.
+one compact call can complete the current task and start the next. The list is
+authoritative: omitted keys are deleted directly, stale revisions can be
+rejected, and invalid dependency graphs do not partially mutate state. Deleted
+tasks leave no cancelled status or archived record.
 
 The extension deliberately registers no slash commands or interactive manager.
 A read-only widget above the input shows the current task when collapsed and the
-complete visible list when expanded with Pi's standard `Ctrl+O` binding. Task
-keys stay model-only, so user-facing rows contain only a status glyph and task
-name. The tool call itself remains a compact progress confirmation. Completed
-tasks stay visible for the current response, then are automatically archived
-before the next response unless unfinished work still depends on them. Tool
-results and automatic checkpoints both follow Pi session branches and survive
-reloads. See the [todo package documentation](extensions/todo/README.md) for the
-schema.
+complete list when expanded with Pi's standard `Ctrl+O` binding. Task keys stay
+model-only, so user-facing rows contain only a status glyph and task name. The
+tool call itself remains a compact progress confirmation. Completed tasks stay
+visible for the current response, then are automatically removed before the
+next response unless unfinished work still depends on them. Exact state follows
+Pi session branches, survives reloads, and is checkpointed back into model
+context after compaction. See the [todo package documentation](extensions/todo/README.md)
+for the schema.
 
 ## Development
 
@@ -187,7 +188,7 @@ independently:
 | --- | --- | --- |
 | background-tasks | `background-tasks-v<version>` | `background-tasks-v1.1.3` |
 | pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
-| todo | `todo-v<version>` | `todo-v1.0.2` |
+| todo | `todo-v<version>` | `todo-v1.1.0` |
 
 To publish a release:
 

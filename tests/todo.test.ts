@@ -5,10 +5,11 @@ import todoExtension from "../extensions/todo/index.ts";
 import {
   TODO_SCHEMA_VERSION,
   TodoValidationError,
-  archiveCompletedTasks,
   cloneTodoState,
   createEmptyTodoState,
-  getVisibleTasks,
+  getTodoTasks,
+  needsTodoContextCheckpoint,
+  removeCompletedTasks,
   replayTodoState,
   type TodoState,
   type TodoTaskInput,
@@ -44,17 +45,14 @@ test("todo writes a complete dependency plan atomically and hands work off in on
   const first = writeTodoSnapshot(createEmptyTodoState(), { tasks: initialPlan, baseRevision: 0 });
   assert.equal(first.schemaVersion, TODO_SCHEMA_VERSION);
   assert.equal(first.revision, 1);
-  assert.equal(first.nextId, 4);
   assert.deepEqual(first.change, {
     added: ["inspect", "design", "verify"],
     updated: [],
-    archived: [],
+    removed: [],
   });
-  assert.deepEqual(getVisibleTasks(first).map((task) => [task.id, task.key]), [
-    [1, "inspect"],
-    [2, "design"],
-    [3, "verify"],
-  ]);
+  assert.deepEqual(getTodoTasks(first).map((task) => task.key), ["inspect", "design", "verify"]);
+  assert.equal("nextId" in first, false);
+  assert.equal(first.tasks.some((task) => "id" in task || "archived" in task), false);
 
   const handoff: TodoTaskInput[] = [
     { key: "inspect", status: "completed" },
@@ -67,11 +65,10 @@ test("todo writes a complete dependency plan atomically and hands work off in on
   const second = writeTodoSnapshot(asState(first), { tasks: handoff, baseRevision: 1 });
   assert.equal(second.revision, 2);
   assert.deepEqual(second.change.updated, ["inspect", "design"]);
-  assert.deepEqual(getVisibleTasks(second).map((task) => task.status), ["completed", "in_progress", "pending"]);
-  assert.deepEqual(getVisibleTasks(second).map((task) => task.subject), initialPlan.map((task) => task.subject));
-  assert.equal(getVisibleTasks(second)[0].description, "Review the current architecture and constraints");
-  assert.deepEqual(getVisibleTasks(second).map((task) => task.dependsOn), [undefined, ["inspect"], ["design"]]);
-  assert.deepEqual(getVisibleTasks(second).map((task) => task.id), [1, 2, 3], "stable keys must preserve ids");
+  assert.deepEqual(getTodoTasks(second).map((task) => task.status), ["completed", "in_progress", "pending"]);
+  assert.deepEqual(getTodoTasks(second).map((task) => task.subject), initialPlan.map((task) => task.subject));
+  assert.equal(getTodoTasks(second)[0].description, "Review the current architecture and constraints");
+  assert.deepEqual(getTodoTasks(second).map((task) => task.dependsOn), [undefined, ["inspect"], ["design"]]);
 });
 
 test("todo sparse snapshots preserve omitted fields, support explicit clears, and reject incomplete new keys", () => {
@@ -88,24 +85,24 @@ test("todo sparse snapshots preserve omitted fields, support explicit clears, an
     baseRevision: 1,
   });
   assert.equal(noOp.revision, 1);
-  assert.deepEqual(noOp.change, { added: [], updated: [], archived: [] });
-  assert.equal(getVisibleTasks(noOp)[0].description, "Keep this");
-  assert.deepEqual(getVisibleTasks(noOp)[1].dependsOn, ["root"]);
+  assert.deepEqual(noOp.change, { added: [], updated: [], removed: [] });
+  assert.equal(getTodoTasks(noOp)[0].description, "Keep this");
+  assert.deepEqual(getTodoTasks(noOp)[1].dependsOn, ["root"]);
 
   const cleared = writeTodoSnapshot(asState(noOp), {
     tasks: [{ key: "root", description: "" }, { key: "child", dependsOn: [] }],
     baseRevision: 1,
   });
   assert.equal(cleared.revision, 2);
-  assert.equal(getVisibleTasks(cleared)[0].description, undefined);
-  assert.equal(getVisibleTasks(cleared)[1].dependsOn, undefined);
+  assert.equal(getTodoTasks(cleared)[0].description, undefined);
+  assert.equal(getTodoTasks(cleared)[1].dependsOn, undefined);
 
   const reordered = writeTodoSnapshot(asState(cleared), {
     tasks: [{ key: "child" }, { key: "root" }],
     baseRevision: 2,
   });
-  assert.equal(reordered.revision, 3, "changing visible order is a state change");
-  assert.deepEqual(getVisibleTasks(reordered).map((task) => task.key), ["child", "root"]);
+  assert.equal(reordered.revision, 3, "changing task order is a state change");
+  assert.deepEqual(getTodoTasks(reordered).map((task) => task.key), ["child", "root"]);
 
   const stable = asState(reordered);
   assert.throws(
@@ -146,26 +143,60 @@ test("todo rejects stale, partial, cyclic, and dependency-inconsistent snapshots
   assert.deepEqual(state, before, "failed validation must not mutate the input state");
 });
 
-test("todo archives omitted tasks and reuses their stable ids when restored", () => {
+test("todo deletes omitted tasks without cancelled or archived state", () => {
   const first = writeTodoSnapshot(createEmptyTodoState(), { tasks: initialPlan });
   const removed = writeTodoSnapshot(asState(first), { tasks: [initialPlan[0]] });
-  assert.equal(removed.revision, 2);
-  assert.deepEqual(removed.change.archived, ["design", "verify"]);
-  assert.deepEqual(getVisibleTasks(removed).map((task) => task.key), ["inspect"]);
-  assert.equal(removed.tasks.find((task) => task.key === "design")?.status, "cancelled");
-  assert.equal(removed.tasks.find((task) => task.key === "design")?.archived, true);
 
-  const restored = writeTodoSnapshot(asState(removed), {
-    tasks: [
-      initialPlan[0],
-      { key: "design", subject: "Design again", status: "pending", dependsOn: ["inspect"] },
-    ],
-  });
-  assert.equal(restored.tasks.find((task) => task.key === "design")?.id, 2);
-  assert.equal(restored.tasks.find((task) => task.key === "design")?.archived, false);
+  assert.equal(removed.revision, 2);
+  assert.deepEqual(removed.change.removed, ["design", "verify"]);
+  assert.deepEqual(getTodoTasks(removed).map((task) => task.key), ["inspect"]);
+  assert.equal(removed.tasks.some((task) => task.key === "design" || task.key === "verify"), false);
+  assert.equal(JSON.stringify(removed).includes("cancelled"), false);
+  assert.equal(JSON.stringify(removed).includes("archived"), false);
 });
 
-test("todo auto-archives only unneeded completions and cleans surviving dependencies", () => {
+test("todo prunes completed soft dependencies but preserves unfinished hard dependencies", () => {
+  const completed = writeTodoSnapshot(createEmptyTodoState(), {
+    tasks: [
+      { key: "prerequisite", subject: "Complete prerequisite", status: "completed" },
+      {
+        key: "finished",
+        subject: "Finish dependent work",
+        status: "completed",
+        dependsOn: ["prerequisite"],
+      },
+    ],
+  });
+  const pruned = writeTodoSnapshot(asState(completed), { tasks: [{ key: "finished" }] });
+  assert.deepEqual(pruned.change, {
+    added: [],
+    updated: ["finished"],
+    removed: ["prerequisite"],
+  });
+  assert.deepEqual(getTodoTasks(pruned), [{
+    key: "finished",
+    subject: "Finish dependent work",
+    status: "completed",
+  }]);
+
+  const unfinished = writeTodoSnapshot(createEmptyTodoState(), {
+    tasks: [
+      { key: "prerequisite", subject: "Complete prerequisite", status: "completed" },
+      {
+        key: "remaining",
+        subject: "Continue dependent work",
+        status: "pending",
+        dependsOn: ["prerequisite"],
+      },
+    ],
+  });
+  assert.throws(
+    () => writeTodoSnapshot(asState(unfinished), { tasks: [{ key: "remaining" }] }),
+    /dependsOn references missing task prerequisite/,
+  );
+});
+
+test("todo auto-removes only unneeded completions and cleans surviving dependencies", () => {
   const current = writeTodoSnapshot(createEmptyTodoState(), {
     tasks: [
       { key: "step-a", subject: "Step A", status: "completed" },
@@ -174,19 +205,19 @@ test("todo auto-archives only unneeded completions and cleans surviving dependen
     ],
   });
   const before = cloneTodoState(current);
-  const archived = archiveCompletedTasks(before);
-  assert.ok(archived);
-  assert.equal(archived.revision, 2);
-  assert.deepEqual(archived.change, {
+  const removed = removeCompletedTasks(before);
+  assert.ok(removed);
+  assert.equal(removed.revision, 2);
+  assert.deepEqual(removed.change, {
     added: [],
     updated: ["step-b"],
-    archived: ["step-a"],
+    removed: ["step-a"],
   });
-  assert.deepEqual(getVisibleTasks(archived).map((task) => [task.key, task.dependsOn]), [
+  assert.deepEqual(getTodoTasks(removed).map((task) => [task.key, task.dependsOn]), [
     ["step-b", undefined],
     ["step-c", ["step-b"]],
   ]);
-  assert.deepEqual(before, cloneTodoState(current), "auto-archive must not mutate its input state");
+  assert.deepEqual(before, cloneTodoState(current), "automatic removal must not mutate its input state");
 });
 
 test("todo replay restores persisted tool results and drops removed fields", () => {
@@ -205,8 +236,99 @@ test("todo replay restores persisted tool results and drops removed fields", () 
     },
   });
   assert.equal(replayed.revision, current.revision);
-  assert.deepEqual(getVisibleTasks(replayed).map((task) => task.key), ["modern"]);
-  assert.equal("activeForm" in getVisibleTasks(replayed)[0], false, "replay should discard removed activeForm data");
+  assert.deepEqual(getTodoTasks(replayed).map((task) => task.key), ["modern"]);
+  assert.equal("activeForm" in getTodoTasks(replayed)[0], false, "replay should discard removed activeForm data");
+});
+
+test("todo replay ignores malformed current-schema checkpoints", () => {
+  const valid = writeTodoSnapshot(createEmptyTodoState(), {
+    tasks: [{ key: "valid", subject: "Keep valid state", status: "pending" }],
+  });
+  const replayed = replayTodoState({
+    sessionManager: {
+      getBranch: () => [
+        { type: "message", message: { role: "toolResult", toolName: "todo", details: valid } },
+        {
+          type: "custom",
+          customType: "pi-todo-state",
+          data: {
+            schemaVersion: TODO_SCHEMA_VERSION,
+            revision: 99,
+            tasks: [{ key: "broken", subject: "Broken state", status: "completed", dependsOn: ["missing"] }],
+          },
+        },
+      ],
+    },
+  });
+
+  assert.equal(replayed.revision, 1);
+  assert.deepEqual(getTodoTasks(replayed).map((task) => task.key), ["valid"]);
+});
+
+test("todo replay migrates v1 state and drops archived and cancelled tasks", () => {
+  const replayed = replayTodoState({
+    sessionManager: {
+      getBranch: () => [{
+        type: "custom",
+        customType: "pi-todo-state",
+        data: {
+          schemaVersion: 1,
+          revision: 7,
+          nextId: 4,
+          tasks: [
+            { id: 1, key: "done", subject: "Old completion", status: "completed", archived: true },
+            { id: 2, key: "cancel", subject: "Cancelled work", status: "cancelled", archived: false },
+            {
+              id: 3,
+              key: "survivor",
+              subject: "Continue useful work",
+              status: "pending",
+              archived: false,
+              dependsOn: ["done", "cancel"],
+            },
+          ],
+        },
+      }],
+    },
+  });
+
+  assert.equal(replayed.schemaVersion, TODO_SCHEMA_VERSION);
+  assert.equal(replayed.revision, 7);
+  assert.deepEqual(getTodoTasks(replayed), [{
+    key: "survivor",
+    subject: "Continue useful work",
+    status: "pending",
+  }]);
+});
+
+test("todo detects when compaction requires a fresh model-facing checkpoint", () => {
+  const state = writeTodoSnapshot(createEmptyTodoState(), { tasks: initialPlan });
+  const result = { type: "message", message: { role: "toolResult", toolName: "todo", details: state } };
+  const compact = { type: "compaction" };
+  const legacy = {
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "todo",
+      details: {
+        schemaVersion: 1,
+        revision: 1,
+        nextId: 2,
+        tasks: [{ id: 1, key: "legacy", subject: "Migrate legacy task", status: "pending", archived: false }],
+      },
+    },
+  };
+  const checkpoint = {
+    type: "custom_message",
+    customType: "pi-todo-state",
+    details: cloneTodoState(state),
+  };
+
+  assert.equal(needsTodoContextCheckpoint([result]), false);
+  assert.equal(needsTodoContextCheckpoint([legacy]), true);
+  assert.equal(needsTodoContextCheckpoint([legacy, result]), false);
+  assert.equal(needsTodoContextCheckpoint([result, compact]), true);
+  assert.equal(needsTodoContextCheckpoint([result, compact, checkpoint]), false);
 });
 
 interface RegisteredTool {
@@ -224,7 +346,9 @@ function createHarness(initialBranch: unknown[] = []) {
   const commands = new Map<string, unknown>();
   const handlers = new Map<string, (...args: any[]) => any>();
   const widgets = new Map<string, unknown>();
+  const sentMessages: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }> = [];
   let toolsExpanded = false;
+  let pendingMessages = false;
   let branch = [...initialBranch];
 
   const pi = {
@@ -234,6 +358,9 @@ function createHarness(initialBranch: unknown[] = []) {
     appendEntry: (customType: string, data: unknown) => {
       branch.push({ type: "custom", customType, data });
     },
+    sendMessage: (message: Record<string, unknown>, options?: Record<string, unknown>) => {
+      sentMessages.push({ message, options });
+    },
   } as unknown as ExtensionAPI;
 
   const ctx = {
@@ -241,6 +368,7 @@ function createHarness(initialBranch: unknown[] = []) {
     mode: "tui",
     hasUI: true,
     sessionManager: { getBranch: () => branch },
+    hasPendingMessages: () => pendingMessages,
     ui: {
       setWidget: (key: string, widget: unknown) => {
         if (widget === undefined) widgets.delete(key);
@@ -256,6 +384,7 @@ function createHarness(initialBranch: unknown[] = []) {
     commands,
     handlers,
     widgets,
+    sentMessages,
     ctx,
     getBranch: () => [...branch],
     setBranch: (entries: unknown[]) => { branch = [...entries]; },
@@ -268,7 +397,9 @@ function createHarness(initialBranch: unknown[] = []) {
     appendCustomMessage: (message: Record<string, unknown>) => {
       branch.push({ type: "custom_message", ...message });
     },
+    appendRawEntry: (entry: unknown) => { branch.push(entry); },
     setToolsExpanded: (value: boolean) => { toolsExpanded = value; },
+    setPendingMessages: (value: boolean) => { pendingMessages = value; },
   };
 }
 
@@ -283,10 +414,19 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   };
   assert.deepEqual(tasksSchema.items?.required, ["key"], "only key should be schema-required for each sparse task entry");
   assert.equal(tasksSchema.items?.properties?.activeForm, undefined, "activeForm must be removed from the tool schema");
+  assert.deepEqual(Object.keys(tool.parameters.properties ?? {}).sort(), ["baseRevision", "tasks"]);
   assert.equal(tool.parameters.properties?.action, undefined);
+  assert.doesNotMatch(JSON.stringify(tool.parameters), /cancelled/);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /complete plan in one todo call/i);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /omitted existing keys are permanently deleted/i);
   assert.equal(commands.size, 0, "the extension should not register a user-facing todo interface");
-  assert.deepEqual([...handlers.keys()].sort(), ["before_agent_start", "session_shutdown", "session_start", "session_tree"]);
+  assert.deepEqual([...handlers.keys()].sort(), [
+    "before_agent_start",
+    "session_compact",
+    "session_shutdown",
+    "session_start",
+    "session_tree",
+  ]);
 
   await handlers.get("session_start")?.({}, ctx);
   const result = await tool.execute("todo-1", { tasks: initialPlan, baseRevision: 0 }, undefined, undefined, ctx);
@@ -296,7 +436,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.equal(
     await handlers.get("before_agent_start")?.({ prompt: "continue", images: [], systemPrompt: "base" }, ctx),
     undefined,
-    "a turn with no archivable completion must not create a checkpoint",
+    "a turn with no removable completion must not create a checkpoint",
   );
 
   assert.ok(tool.renderCall);
@@ -425,6 +565,18 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.match(missingStatusText, /Implement the streamed task/);
   assert.doesNotMatch(missingStatusText, /undefined|null|○|◐|✓|×/);
 
+  const removalDraft = tool.renderCall(
+    {
+      tasks: [{ key: "inspect" }, { key: "design" }],
+    },
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: true },
+  );
+  const removalDraftText = removalDraft.render(160).join("\n");
+  assert.match(removalDraftText, /todo 2 tasks/);
+  assert.doesNotMatch(removalDraftText, /removed/);
+  assert.doesNotMatch(removalDraftText, /\bverify\b/);
+
   const toolResult = tool.renderResult(
     result,
     { expanded: false, isPartial: false },
@@ -545,7 +697,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   );
 });
 
-test("todo archives previous-turn completions atomically and replays them across reload and tree changes", async () => {
+test("todo removes previous-turn completions atomically and replays them across reload and tree changes", async () => {
   const {
     tools,
     handlers,
@@ -594,32 +746,32 @@ test("todo archives previous-turn completions atomically and replays them across
   appendToolResult(partial);
   assert.match(renderWidget(), /Todo 2\/3 completed/);
 
-  // Reloading within the same turn must not archive newly completed work.
+  // Reloading within the same turn must not remove newly completed work.
   await sessionStart({ reason: "reload" }, ctx);
   assert.match(renderWidget(), /Todo 2\/3 completed/);
-  const branchBeforeArchive = getBranch();
+  const branchBeforeRemoval = getBranch();
 
-  const archived = await beforeAgentStart({ prompt: "next", images: [], systemPrompt: "base" }, ctx);
-  assert.ok(archived?.message);
-  assert.equal(archived.message.display, false);
-  assert.match(String(archived.message.content), /Todo plan revision 2/);
-  const archivedState = archived.message.details as TodoState;
-  assert.deepEqual(getVisibleTasks(archivedState).map((task) => [task.key, task.status, task.dependsOn]), [
+  const removed = await beforeAgentStart({ prompt: "next", images: [], systemPrompt: "base" }, ctx);
+  assert.ok(removed?.message);
+  assert.equal(removed.message.display, false);
+  assert.match(String(removed.message.content), /Todo plan revision 2/);
+  const removedState = removed.message.details as TodoState;
+  assert.deepEqual(getTodoTasks(removedState).map((task) => [task.key, task.status, task.dependsOn]), [
     ["step-b", "completed", undefined],
     ["step-c", "in_progress", ["step-b"]],
   ]);
-  appendCustomMessage(archived.message);
+  appendCustomMessage(removed.message);
   assert.match(renderWidget(), /Todo 1\/2 completed/);
 
   await sessionStart({ reason: "reload" }, ctx);
   assert.match(renderWidget(), /Todo 1\/2 completed/);
 
-  // Tree navigation before and after the auto-archive checkpoint must replay branch-local state.
-  const branchAfterArchive = getBranch();
-  setBranch(branchBeforeArchive);
+  // Tree navigation before and after the automatic-removal checkpoint must replay branch-local state.
+  const branchAfterRemoval = getBranch();
+  setBranch(branchBeforeRemoval);
   await sessionTree({}, ctx);
   assert.match(renderWidget(), /Todo 2\/3 completed/);
-  setBranch(branchAfterArchive);
+  setBranch(branchAfterRemoval);
   await sessionTree({}, ctx);
   assert.match(renderWidget(), /Todo 1\/2 completed/);
 
@@ -639,12 +791,96 @@ test("todo archives previous-turn completions atomically and replays them across
   const cleared = await beforeAgentStart({ prompt: "next again", images: [], systemPrompt: "base" }, ctx);
   assert.ok(cleared?.message);
   assert.match(String(cleared.message.content), /Todo plan cleared \(revision 4\)/);
-  assert.deepEqual(getVisibleTasks(cleared.message.details as TodoState), []);
+  assert.deepEqual(getTodoTasks(cleared.message.details as TodoState), []);
   appendCustomMessage(cleared.message);
   assert.equal(widgets.has("pi-todo-widget"), false);
 
   await sessionStart({ reason: "reload" }, ctx);
   assert.equal(widgets.has("pi-todo-widget"), false);
+});
+
+test("todo persists and injects exact state after compaction without triggering an extra turn", async () => {
+  const harness = createHarness();
+  const tool = harness.tools.get("todo");
+  const sessionStart = harness.handlers.get("session_start");
+  const sessionCompact = harness.handlers.get("session_compact");
+  const beforeAgentStart = harness.handlers.get("before_agent_start");
+  assert.ok(tool);
+  assert.ok(sessionStart);
+  assert.ok(sessionCompact);
+  assert.ok(beforeAgentStart);
+
+  await sessionStart({ reason: "startup" }, harness.ctx);
+  const result = await tool.execute(
+    "todo-before-compact",
+    { tasks: initialPlan, baseRevision: 0 },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  harness.appendToolResult(result);
+  harness.appendRawEntry({ type: "compaction", firstKeptEntryId: "kept" });
+  await sessionCompact({ reason: "manual", willRetry: false }, harness.ctx);
+
+  const persisted = harness.getBranch().at(-1) as { type?: string; customType?: string; data?: TodoState };
+  assert.equal(persisted.type, "custom");
+  assert.equal(persisted.customType, "pi-todo-state");
+  assert.equal(persisted.data?.schemaVersion, TODO_SCHEMA_VERSION);
+  assert.deepEqual(getTodoTasks(persisted.data as TodoState).map((task) => task.key), ["inspect", "design", "verify"]);
+  assert.equal(harness.sentMessages.length, 0, "manual compaction must not steer or trigger the model");
+
+  // A reload between compaction and the next prompt must retain the pending context checkpoint.
+  await sessionStart({ reason: "reload" }, harness.ctx);
+  const checkpoint = await beforeAgentStart({ prompt: "continue", images: [], systemPrompt: "base" }, harness.ctx);
+  assert.ok(checkpoint?.message);
+  assert.equal(checkpoint.message.display, false);
+  assert.match(String(checkpoint.message.content), /Todo plan revision 1/);
+  assert.match(String(checkpoint.message.content), /design: Design the snapshot protocol.*← inspect/);
+  harness.appendCustomMessage(checkpoint.message);
+
+  await sessionStart({ reason: "reload" }, harness.ctx);
+  assert.equal(
+    await beforeAgentStart({ prompt: "continue again", images: [], systemPrompt: "base" }, harness.ctx),
+    undefined,
+    "a current-schema model-facing checkpoint should satisfy the compaction requirement",
+  );
+
+  harness.setPendingMessages(true);
+  harness.appendRawEntry({ type: "compaction", firstKeptEntryId: "kept-again" });
+  await sessionCompact({ reason: "threshold", willRetry: false }, harness.ctx);
+  assert.equal(harness.sentMessages.length, 1, "queued continuations need an immediate checkpoint after compaction");
+  assert.deepEqual(harness.sentMessages[0]?.options, { deliverAs: "steer" });
+  harness.setPendingMessages(false);
+
+  const retryHarness = createHarness();
+  const retryTool = retryHarness.tools.get("todo");
+  const retryStart = retryHarness.handlers.get("session_start");
+  const retryCompact = retryHarness.handlers.get("session_compact");
+  const retryBeforeStart = retryHarness.handlers.get("before_agent_start");
+  assert.ok(retryTool);
+  assert.ok(retryStart);
+  assert.ok(retryCompact);
+  assert.ok(retryBeforeStart);
+
+  await retryStart({ reason: "startup" }, retryHarness.ctx);
+  const retryState = await retryTool.execute(
+    "todo-before-overflow",
+    { tasks: initialPlan, baseRevision: 0 },
+    undefined,
+    undefined,
+    retryHarness.ctx,
+  );
+  retryHarness.appendToolResult(retryState);
+  retryHarness.appendRawEntry({ type: "compaction", firstKeptEntryId: "kept" });
+  await retryCompact({ reason: "overflow", willRetry: true }, retryHarness.ctx);
+  assert.equal(retryHarness.sentMessages.length, 1);
+  assert.deepEqual(retryHarness.sentMessages[0]?.options, { deliverAs: "steer" });
+  assert.match(String(retryHarness.sentMessages[0]?.message.content), /Todo plan revision 1/);
+  assert.equal(
+    await retryBeforeStart({ prompt: "unused", images: [], systemPrompt: "base" }, retryHarness.ctx),
+    undefined,
+    "overflow retry already receives the steered checkpoint",
+  );
 });
 
 test("todo rejects completed work whose dependency is still pending", () => {

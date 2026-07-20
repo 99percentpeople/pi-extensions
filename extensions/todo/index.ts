@@ -7,12 +7,12 @@ import {
   TODO_SCHEMA_VERSION,
   TODO_STATE_CUSTOM_TYPE,
   TODO_TOOL_NAME,
-  archiveCompletedTasks,
   cloneTodoState,
   createEmptyTodoState,
-  getVisibleTasks,
+  getTodoTasks,
+  needsTodoContextCheckpoint,
+  removeCompletedTasks,
   replayTodoState,
-  type TodoDetails,
   type TodoState,
   type TodoStatus,
   writeTodoSnapshot,
@@ -26,13 +26,15 @@ interface TodoDisplayTask {
   status?: TodoStatus;
 }
 
+const TodoKeySchema = Type.String({
+  description: "Stable 1-40 character lowercase task key, e.g. inspect-api or write-tests",
+  minLength: 1,
+  maxLength: 40,
+  pattern: "^[a-z0-9][a-z0-9._-]*$",
+});
+
 const TodoTaskSchema = Type.Object({
-  key: Type.String({
-    description: "Stable 1-40 character lowercase task key, e.g. inspect-api or write-tests",
-    minLength: 1,
-    maxLength: 40,
-    pattern: "^[a-z0-9][a-z0-9._-]*$",
-  }),
+  key: TodoKeySchema,
   subject: Type.Optional(Type.String({
     description: "Short imperative task subject; required for a new key, omitted to preserve an existing value",
     minLength: 1,
@@ -42,7 +44,7 @@ const TodoTaskSchema = Type.Object({
     description: "Long-form task description; omitted to preserve, empty string to clear",
     maxLength: 2_000,
   })),
-  status: Type.Optional(StringEnum(["pending", "in_progress", "completed", "cancelled"] as const, {
+  status: Type.Optional(StringEnum(["pending", "in_progress", "completed"] as const, {
     description: "Current task status; required for a new key, omitted to preserve an existing value",
   })),
   dependsOn: Type.Optional(Type.Array(Type.String(), {
@@ -53,7 +55,7 @@ const TodoTaskSchema = Type.Object({
 
 const TodoParamsSchema = Type.Object({
   tasks: Type.Array(TodoTaskSchema, {
-    description: "Complete authoritative task-key list; existing tasks may omit unchanged fields, new keys require subject and status",
+    description: "Complete authoritative list of tasks to retain; omitted current keys are deleted, existing tasks may omit unchanged fields, and new keys require subject and status",
     maxItems: MAX_TODO_TASKS,
   }),
   baseRevision: Type.Optional(Type.Integer({
@@ -62,8 +64,8 @@ const TodoParamsSchema = Type.Object({
   })),
 });
 
-function formatChange(details: TodoDetails): string {
-  const visible = getVisibleTasks(details);
+function formatChange(details: TodoState): string {
+  const visible = getTodoTasks(details);
   if (visible.length === 0) return `Todo plan cleared (revision ${details.revision}).`;
   const lines = visible.map((task) => {
     const description = task.description ? ` — ${task.description}` : "";
@@ -75,10 +77,10 @@ function formatChange(details: TodoDetails): string {
 
 function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
   if (!task.status) return theme.fg("text", task.subject);
-  const glyph = task.status === "completed" ? "✓" : task.status === "in_progress" ? "◐" : task.status === "cancelled" ? "×" : "○";
-  const color = task.status === "completed" ? "success" : task.status === "in_progress" ? "warning" : task.status === "cancelled" ? "muted" : "dim";
-  let subject = theme.fg(task.status === "completed" || task.status === "cancelled" ? "dim" : "text", task.subject);
-  if (task.status === "completed" || task.status === "cancelled") subject = theme.strikethrough(subject);
+  const glyph = task.status === "completed" ? "✓" : task.status === "in_progress" ? "◐" : "○";
+  const color = task.status === "completed" ? "success" : task.status === "in_progress" ? "warning" : "dim";
+  let subject = theme.fg(task.status === "completed" ? "dim" : "text", task.subject);
+  if (task.status === "completed") subject = theme.strikethrough(subject);
   return `${theme.fg(color, glyph)} ${subject}`;
 }
 
@@ -93,12 +95,12 @@ function getCollapsedTodoTasks<T extends TodoDisplayTask>(tasks: readonly T[]): 
 }
 
 function isTodoStatus(value: unknown): value is TodoStatus {
-  return value === "pending" || value === "in_progress" || value === "completed" || value === "cancelled";
+  return value === "pending" || value === "in_progress" || value === "completed";
 }
 
 function resolveDraftTodoTasks(rawTasks: unknown, state: TodoState): TodoDisplayTask[] {
   if (!Array.isArray(rawTasks)) return [];
-  const currentByKey = new Map(getVisibleTasks(state).map((task) => [task.key, task]));
+  const currentByKey = new Map(getTodoTasks(state).map((task) => [task.key, task]));
 
   return rawTasks.flatMap((rawTask) => {
     const draft = rawTask && typeof rawTask === "object"
@@ -118,7 +120,7 @@ function resolveDraftTodoTasks(rawTasks: unknown, state: TodoState): TodoDisplay
 }
 
 function renderTodoWidget(state: TodoState, width: number, expanded: boolean, theme: Theme): string[] {
-  const tasks = getVisibleTasks(state);
+  const tasks = getTodoTasks(state);
   if (tasks.length === 0) return [];
   const completed = tasks.filter((task) => task.status === "completed").length;
   const displayed = expanded ? tasks : getCollapsedTodoTasks(tasks);
@@ -141,6 +143,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
   let uiContext: ExtensionContext | undefined;
   let widgetRegistered = false;
   let widgetTui: TUI | undefined;
+  let contextCheckpointNeeded = false;
 
   const clearWidget = (): void => {
     if (widgetRegistered && uiContext?.hasUI) {
@@ -153,7 +156,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
   const updateWidget = (ctx?: ExtensionContext): void => {
     if (ctx) uiContext = ctx;
     if (!uiContext?.hasUI || uiContext.mode !== "tui") return;
-    if (getVisibleTasks(state).length === 0) {
+    if (getTodoTasks(state).length === 0) {
       clearWidget();
       return;
     }
@@ -180,14 +183,16 @@ export default function todoExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TODO_TOOL_NAME,
     label: "Todo",
-    description: `Atomically replace the complete todo plan with up to ${MAX_TODO_TASKS} tasks. Include every current task key; existing tasks may omit unchanged fields, while new keys require subject and status. Omitted tasks are archived. An empty tasks array clears the visible plan.`,
-    promptSnippet: "Atomically write or sparsely update the complete task plan",
+    description: `Atomically replace the complete todo plan with up to ${MAX_TODO_TASKS} retained tasks. Include every task key that should remain; omitted current keys are deleted. Existing tasks may omit unchanged fields, while new keys require subject and status. An empty tasks array clears the plan.`,
+    promptSnippet: "Atomically write or sparsely update fields in the complete task plan",
     promptGuidelines: [
       "Use todo for complex work with 3+ steps or when the user gives a task list; write the complete plan in one todo call rather than one create call per task.",
-      "Every todo call must include the complete current key list from the latest result or checkpoint. For existing keys, omit unchanged fields; for new keys, provide subject and status. Omitted keys are archived.",
-      "Keep stable todo task keys, do not reintroduce auto-archived keys, and include baseRevision when a revision is shown.",
+      "Every todo call must include every current key that should remain in the plan. Omitted existing keys are permanently deleted; use an empty tasks array to clear the plan.",
+      "For retained todo tasks, omit unchanged fields; for new keys, provide subject and status. To cancel work, omit its key from the complete plan instead of retaining a cancelled task.",
+      "Keep stable todo task keys while work remains active, and include baseRevision when a revision is shown.",
       "Do not mark todo work completed while tests fail, implementation is partial, or blockers remain.",
-      "Use dependsOn task keys for real prerequisites. A task cannot be in_progress or completed until all of its dependencies are completed. Completed tasks are automatically archived on the next agent turn unless they are still blocking a pending or in_progress task.",
+      "Use dependsOn task keys for real prerequisites. A task cannot be in_progress or completed until all of its dependencies are completed. If an omitted completed task is referenced only by completed work, todo removes that historical dependency automatically; unfinished tasks cannot depend on omitted keys.",
+      "Completed tasks are automatically removed on the next agent turn unless they still block a pending or in_progress task.",
     ],
     parameters: TodoParamsSchema,
     executionMode: "sequential",
@@ -245,30 +250,52 @@ export default function todoExtension(pi: ExtensionAPI): void {
 
   const restore = (ctx: ExtensionContext): void => {
     clearWidget();
-    state = replayTodoState(ctx);
+    const branch = [...ctx.sessionManager.getBranch()];
+    state = replayTodoState({ sessionManager: { getBranch: () => branch } });
+    contextCheckpointNeeded = needsTodoContextCheckpoint(branch);
     uiContext = ctx;
     updateWidget(ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => restore(ctx));
   pi.on("session_tree", async (_event, ctx) => restore(ctx));
+  pi.on("session_compact", async (event, ctx) => {
+    const checkpoint = cloneTodoState(state);
+    pi.appendEntry(TODO_STATE_CUSTOM_TYPE, checkpoint);
+    if (event.willRetry || ctx.hasPendingMessages()) {
+      contextCheckpointNeeded = false;
+      pi.sendMessage({
+        customType: TODO_STATE_CUSTOM_TYPE,
+        content: formatChange(checkpoint),
+        display: false,
+        details: checkpoint,
+      }, { deliverAs: "steer" });
+    } else {
+      contextCheckpointNeeded = true;
+    }
+  });
   pi.on("session_shutdown", async () => {
     clearWidget();
     uiContext = undefined;
+    contextCheckpointNeeded = false;
   });
 
   pi.on("before_agent_start", async () => {
-    const details = archiveCompletedTasks(state);
-    if (!details) return;
+    const details = removeCompletedTasks(state);
+    if (details) {
+      state = cloneTodoState(details);
+      updateWidget();
+    }
+    if (!details && !contextCheckpointNeeded) return;
 
-    state = cloneTodoState(details);
-    updateWidget();
+    contextCheckpointNeeded = false;
+    const checkpoint = details ?? cloneTodoState(state);
     return {
       message: {
         customType: TODO_STATE_CUSTOM_TYPE,
-        content: formatChange(details),
+        content: formatChange(checkpoint),
         display: false,
-        details,
+        details: checkpoint,
       },
     };
   });

@@ -12,9 +12,10 @@ is rendered above Pi's input box.
 
 - One-call creation of a complete plan
 - One-call completion and handoff to the next task
+- Omission-based deletion without retained cancelled or archived tasks
 - Stable task keys and key-based dependencies
 - Atomic validation with optional optimistic revisions
-- Branch-aware state that survives `/reload` and `/tree`
+- Branch- and compaction-aware state that survives `/reload` and `/tree`
 - Read-only collapsible list above the input box
 
 ## Install
@@ -35,8 +36,9 @@ pi -e ./extensions/todo/index.ts
 
 ## Tool schema
 
-The `todo` tool accepts the complete authoritative task-key list. Existing
-tasks may omit unchanged fields; a new key requires `subject` and `status`:
+The `todo` tool accepts the complete authoritative list of tasks to retain.
+Existing tasks may omit unchanged fields; a new key requires `subject` and
+`status`. Any current key omitted from `tasks` is permanently deleted:
 
 ```ts
 todo({
@@ -45,7 +47,7 @@ todo({
     key: string,
     subject?: string,
     description?: string,
-    status?: "pending" | "in_progress" | "completed" | "cancelled",
+    status?: "pending" | "in_progress" | "completed",
     dependsOn?: string[],
   }>,
 })
@@ -94,28 +96,54 @@ To hand work off, include every current key but only send changed fields:
 Subjects and dependencies are inherited from the previous snapshot. Both status
 changes commit atomically.
 
+To cancel or otherwise delete work, omit its key from the next complete plan:
+
+```json
+{
+  "baseRevision": 2,
+  "tasks": [
+    { "key": "inspect" },
+    { "key": "implement" }
+  ]
+}
+```
+
+Deletion is permanent state removal. The extension stores no `cancelled` status
+or archived task record. A completed task may retain a dependency only as
+history: when its completed prerequisite is omitted, that soft reference is
+automatically removed. A pending or in-progress task cannot retain a dependency
+on an omitted key.
+
 ## Semantics
 
-- `key` is stable across updates and preserves the internal numeric ID.
+- `key` is the task identity while that task remains in the plan.
 - Existing keys inherit omitted fields from their previous state.
 - New keys require `subject` and `status`.
 - `description: ""` and `dependsOn: []` explicitly clear those fields.
-- Omitted keys are archived. Reintroducing the same key restores its prior ID.
+- Every key present in `tasks` remains in the plan; omitted current keys are
+  permanently deleted.
 - Completed tasks remain visible for the current turn, then are automatically
-archived on the next turn. Tasks that are still blocking a pending or
-in_progress task are preserved.
-- `tasks: []` clears the visible plan.
+  removed on the next turn. Completed tasks that still block pending or
+  in-progress work are preserved.
+- `tasks: []` clears the plan.
 - `baseRevision`, when provided, rejects stale writes.
-- Every dependency must refer to another key in the merged snapshot.
+- Every dependency must refer to another key in the resulting snapshot, except
+  completed-to-completed references are automatically pruned when the target is
+  deleted.
 - Dependency cycles are rejected.
 - An `in_progress` or `completed` task requires all dependencies to be completed.
 - Validation is all-or-nothing; failed writes do not mutate state.
 - Multiple independent tasks may be `in_progress` concurrently.
 
-Each successful result includes the current revision and complete visible plan.
+Each successful result includes the current revision and complete retained plan.
 When next-turn cleanup changes the plan, the extension emits one hidden custom
 message containing the new revision and snapshot so the model never works from
 stale tool history.
+
+State schema v2 removes internal numeric IDs, archived records, and the
+`cancelled` status. Valid v1 session state is migrated on replay; archived and
+cancelled legacy tasks are discarded, and one hidden v2 checkpoint updates the
+model on the next prompt.
 
 ## Rendering
 
@@ -123,7 +151,7 @@ The task list is rendered in a read-only widget above Pi's input box. It follows
 Pi's standard tool-output expansion state (`Ctrl+O` by default):
 
 - collapsed: overall progress and up to three tasks;
-- expanded: the complete visible todo list with a status glyph and task name only.
+- expanded: the complete todo list with a status glyph and task name only.
 
 While the model is streaming a `todo` call, the tool row updates in place and
 shows each task name as it is written instead of only showing a task count.
@@ -138,22 +166,27 @@ validation errors are still displayed below the attempted list.
 Tasks always keep their plan order. When collapsed, the widget prefers a
 three-task window containing the item before the first `in_progress` task, the
 active task itself, and the following item. If no task is active, it shows the
-first three tasks. Once every visible task is completed, it shows the last three
-tasks instead so the most recently finished work remains visible. The
-expand/collapse hint is shown only when more than three tasks are visible.
+first three tasks. Once every task is completed, it shows the last three tasks
+instead so the most recently finished work remains visible. The expand/collapse
+hint is shown only when more than three tasks are visible.
 
-The model-facing result includes keys, dependencies, and descriptions so task
-goals survive sparse updates and automatic checkpoints. The user-facing live
-tool call and widget show only status glyphs and task names. The shortcut
-respects the user's `app.tools.expand` keybinding.
+The model-facing result includes keys, dependencies, and descriptions. The
+user-facing live tool call and widget show only status glyphs and task names.
+The shortcut respects the user's `app.tools.expand` keybinding.
 
 ## Persistence
 
-Normal writes are stored in tool-result `details`. Automatic next-turn archives
+Normal writes are stored in tool-result `details`. Automatic next-turn removals
 are stored in hidden custom-message `details`; the same message also tells the
 model which snapshot and revision are current. On `session_start`, `/reload`,
 and `/tree` navigation, the extension restores the latest valid state entry from
 the active branch.
+
+After compaction, the extension stores an exact schema-v2 checkpoint outside the
+model context. It injects that snapshot as one hidden model-facing message on
+the next prompt, or immediately as steering context when overflow recovery or an
+already queued continuation proceeds without a new prompt. This preserves exact
+keys, dependencies, and revision numbers without triggering an extra model turn.
 
 ## License
 
