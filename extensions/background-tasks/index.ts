@@ -106,6 +106,7 @@ interface BgTask {
   status: "running" | "completed" | "failed" | "stopped";
   exitCode: number | null;
   signal: string | null;
+  order: number;
   startedAt: number;
   endedAt: number | null;
   stdoutLogKey: string;
@@ -125,6 +126,45 @@ interface LatestLog {
   text: string;
   at: number;
 }
+
+type FinishedTaskStatus = Exclude<BgTask["status"], "running">;
+
+interface PersistedFinishedTask {
+  id: string;
+  name: string;
+  command: string;
+  mode: BgTask["mode"];
+  status: FinishedTaskStatus;
+  exitCode: number | null;
+  signal: string | null;
+  order: number;
+  startedAt: number;
+  endedAt: number;
+  stdoutLines: number;
+  stderrLines: number;
+  latestLog: LatestLog | null;
+  retainForNextAgentTurn: boolean;
+  cols: number;
+  rows: number;
+  consoleSnapshot: string;
+  stdout?: string;
+  stderr?: string;
+}
+
+interface PersistedTaskUpsert {
+  schemaVersion: 1;
+  action: "upsert";
+  task: PersistedFinishedTask;
+}
+
+interface PersistedTaskReconcile {
+  schemaVersion: 1;
+  action: "reconcile";
+  removed: string[];
+  clearedRetention: string[];
+}
+
+type PersistedTaskEvent = PersistedTaskUpsert | PersistedTaskReconcile;
 
 interface BgWaitRenderState {
   startedAt?: number;
@@ -246,6 +286,15 @@ let resolveShell: ShellResolver = defaultShellResolver;
 const tasks = new Map<string, BgTask>();
 const runningTasks = new Set<BgTask>();
 const outputLogStore = new MemoryLogStore();
+const TASK_SNAPSHOT_CUSTOM_TYPE = "pi-background-task-snapshots";
+const TASK_SNAPSHOT_SCHEMA_VERSION = 1 as const;
+const PERSISTED_CONSOLE_SCROLLBACK = 200;
+const PERSISTED_LOG_LINES = 500;
+const MAX_PERSISTED_LOG_BYTES = 256 * 1024;
+const MAX_PERSISTED_CONSOLE_BYTES = 512 * 1024;
+let appendTaskSnapshotEntry: ((event: PersistedTaskEvent) => void) | null = null;
+let snapshotPersistenceQueue: Promise<void> = Promise.resolve();
+let nextTaskOrder = 0;
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -466,6 +515,234 @@ async function flushConsole(task: BgTask): Promise<void> {
   await task.console.parsed;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
+}
+
+function tailUtf8(value: string, maxBytes: number): string {
+  const data = Buffer.from(value, "utf8");
+  if (data.length <= maxBytes) return value;
+  return data.subarray(data.length - maxBytes).toString("utf8").replace(/^\uFFFD+/, "");
+}
+
+function serializeConsoleSnapshot(task: BgTask): string {
+  const serialized = task.console.serializer.serialize({ scrollback: PERSISTED_CONSOLE_SCROLLBACK });
+  if (Buffer.byteLength(serialized, "utf8") <= MAX_PERSISTED_CONSOLE_BYTES) return serialized;
+  const plainSnapshot = getTerminalSnapshotLines(task)
+    .slice(-(PERSISTED_CONSOLE_SCROLLBACK + task.console.terminal.rows))
+    .join("\r\n");
+  return tailUtf8(plainSnapshot, MAX_PERSISTED_CONSOLE_BYTES);
+}
+
+function serializeFinishedTask(task: BgTask): PersistedFinishedTask {
+  if (task.status === "running" || task.endedAt === null) {
+    throw new Error(`Task "${task.name}" is not ready for snapshot persistence.`);
+  }
+  return {
+    id: task.id,
+    name: task.name,
+    command: task.command,
+    mode: task.mode,
+    status: task.status,
+    exitCode: task.exitCode,
+    signal: task.signal,
+    order: task.order,
+    startedAt: task.startedAt,
+    endedAt: task.endedAt,
+    stdoutLines: task.stdoutLines,
+    stderrLines: task.stderrLines,
+    latestLog: task.latestLog ? { ...task.latestLog } : null,
+    retainForNextAgentTurn: task.retainForNextAgentTurn,
+    cols: task.console.terminal.cols,
+    rows: task.console.terminal.rows,
+    consoleSnapshot: serializeConsoleSnapshot(task),
+    ...(task.mode === "pipe"
+      ? {
+          stdout: tailUtf8(readTail(task.stdoutLogKey, PERSISTED_LOG_LINES), MAX_PERSISTED_LOG_BYTES),
+          stderr: tailUtf8(readTail(task.stderrLogKey, PERSISTED_LOG_LINES), MAX_PERSISTED_LOG_BYTES),
+        }
+      : {}),
+  };
+}
+
+function readLatestLog(value: unknown): LatestLog | null {
+  if (value === null) return null;
+  if (!isRecord(value)) return null;
+  if (
+    value.stream !== "stdout" &&
+    value.stream !== "stderr" &&
+    value.stream !== "terminal"
+  ) return null;
+  if (typeof value.text !== "string" || typeof value.at !== "number" || !Number.isFinite(value.at)) return null;
+  return {
+    stream: value.stream,
+    text: truncateText(value.text, MAX_STORED_LOG_CHARS),
+    at: value.at,
+  };
+}
+
+function readPersistedFinishedTask(value: unknown): PersistedFinishedTask | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    typeof value.id !== "string" ||
+    typeof value.name !== "string" ||
+    typeof value.command !== "string" ||
+    (value.mode !== "pipe" && value.mode !== "pty") ||
+    (value.status !== "completed" && value.status !== "failed" && value.status !== "stopped") ||
+    (value.exitCode !== null && typeof value.exitCode !== "number") ||
+    (value.signal !== null && typeof value.signal !== "string") ||
+    typeof value.order !== "number" ||
+    typeof value.startedAt !== "number" ||
+    typeof value.endedAt !== "number" ||
+    typeof value.stdoutLines !== "number" ||
+    typeof value.stderrLines !== "number" ||
+    typeof value.retainForNextAgentTurn !== "boolean" ||
+    typeof value.cols !== "number" ||
+    typeof value.rows !== "number" ||
+    typeof value.consoleSnapshot !== "string"
+  ) return undefined;
+
+  return {
+    id: value.id,
+    name: value.name,
+    command: value.command,
+    mode: value.mode,
+    status: value.status,
+    exitCode: value.exitCode,
+    signal: value.signal,
+    order: Math.max(0, Math.floor(value.order)),
+    startedAt: value.startedAt,
+    endedAt: value.endedAt,
+    stdoutLines: Math.max(0, Math.floor(value.stdoutLines)),
+    stderrLines: Math.max(0, Math.floor(value.stderrLines)),
+    latestLog: readLatestLog(value.latestLog),
+    retainForNextAgentTurn: value.retainForNextAgentTurn,
+    cols: Math.min(MAX_TERMINAL_COLS, Math.max(MIN_TERMINAL_COLS, Math.floor(value.cols))),
+    rows: Math.min(MAX_TERMINAL_ROWS, Math.max(MIN_TERMINAL_ROWS, Math.floor(value.rows))),
+    consoleSnapshot: tailUtf8(value.consoleSnapshot, MAX_PERSISTED_CONSOLE_BYTES),
+    ...(value.mode === "pipe"
+      ? {
+          stdout: typeof value.stdout === "string" ? tailUtf8(value.stdout, MAX_PERSISTED_LOG_BYTES) : "",
+          stderr: typeof value.stderr === "string" ? tailUtf8(value.stderr, MAX_PERSISTED_LOG_BYTES) : "",
+        }
+      : {}),
+  };
+}
+
+function replayFinishedTaskSnapshots(ctx: ExtensionContext): PersistedFinishedTask[] {
+  const replayed = new Map<string, PersistedFinishedTask>();
+  for (const rawEntry of ctx.sessionManager.getBranch()) {
+    if (!isRecord(rawEntry) || rawEntry.type !== "custom" || rawEntry.customType !== TASK_SNAPSHOT_CUSTOM_TYPE) {
+      continue;
+    }
+    const data = rawEntry.data;
+    if (!isRecord(data) || data.schemaVersion !== TASK_SNAPSHOT_SCHEMA_VERSION) continue;
+    if (data.action === "upsert") {
+      const task = readPersistedFinishedTask(data.task);
+      if (task) replayed.set(task.id, task);
+      continue;
+    }
+    if (data.action !== "reconcile") continue;
+    const removed = Array.isArray(data.removed)
+      ? data.removed.filter((id): id is string => typeof id === "string")
+      : [];
+    const clearedRetention = Array.isArray(data.clearedRetention)
+      ? data.clearedRetention.filter((id): id is string => typeof id === "string")
+      : [];
+    for (const id of removed) replayed.delete(id);
+    for (const id of clearedRetention) {
+      const task = replayed.get(id);
+      if (task) replayed.set(id, { ...task, retainForNextAgentTurn: false });
+    }
+  }
+  return Array.from(replayed.values()).sort((a, b) => a.order - b.order);
+}
+
+function enqueueSnapshotPersistence(operation: () => Promise<void> | void): Promise<void> {
+  const pending = snapshotPersistenceQueue.then(operation, operation);
+  snapshotPersistenceQueue = pending.catch(() => {});
+  return pending;
+}
+
+function persistFinishedTaskSnapshot(task: BgTask): Promise<void> {
+  return enqueueSnapshotPersistence(async () => {
+    if (!appendTaskSnapshotEntry || task.status === "running") return;
+    await flushConsole(task);
+    if (!appendTaskSnapshotEntry || !tasks.has(task.id)) return;
+    appendTaskSnapshotEntry({
+      schemaVersion: TASK_SNAPSHOT_SCHEMA_VERSION,
+      action: "upsert",
+      task: serializeFinishedTask(task),
+    });
+  });
+}
+
+function persistTaskReconciliation(removed: string[], clearedRetention: string[]): Promise<void> {
+  if (removed.length === 0 && clearedRetention.length === 0) return snapshotPersistenceQueue;
+  return enqueueSnapshotPersistence(() => {
+    appendTaskSnapshotEntry?.({
+      schemaVersion: TASK_SNAPSHOT_SCHEMA_VERSION,
+      action: "reconcile",
+      removed,
+      clearedRetention,
+    });
+  });
+}
+
+async function restoreFinishedTaskSnapshots(ctx: ExtensionContext): Promise<void> {
+  await snapshotPersistenceQueue;
+  const snapshots = replayFinishedTaskSnapshots(ctx);
+  const finished = Array.from(tasks.values()).filter((task) => task.status !== "running");
+  for (const task of finished) {
+    await flushConsole(task);
+    tasks.delete(task.id);
+    task.console.terminal.dispose();
+    deleteTaskLogs(task);
+  }
+
+  for (const snapshot of snapshots) {
+    if (tasks.has(snapshot.id)) continue;
+    const console = createConsoleSession(snapshot.cols, snapshot.rows, snapshot.mode);
+    const task: BgTask = {
+      id: snapshot.id,
+      name: snapshot.name,
+      command: snapshot.command,
+      mode: snapshot.mode,
+      process: null,
+      console,
+      attachment: {},
+      status: snapshot.status,
+      exitCode: snapshot.exitCode,
+      signal: snapshot.signal,
+      order: snapshot.order,
+      startedAt: snapshot.startedAt,
+      endedAt: snapshot.endedAt,
+      stdoutLogKey: taskLogKey(snapshot.id, "stdout"),
+      stderrLogKey: taskLogKey(snapshot.id, "stderr"),
+      stdoutLines: snapshot.stdoutLines,
+      stderrLines: snapshot.stderrLines,
+      done: new AbortController(),
+      latestLog: snapshot.latestLog ? { ...snapshot.latestLog } : null,
+      retainForNextAgentTurn: snapshot.retainForNextAgentTurn,
+      stdoutPending: "",
+      stderrPending: "",
+      requestedStopSignal: null,
+    };
+    task.done.abort();
+    tasks.set(task.id, task);
+    if (snapshot.stdout) appendTaskLog(task.stdoutLogKey, snapshot.stdout);
+    if (snapshot.stderr) appendTaskLog(task.stderrLogKey, snapshot.stderr);
+    if (snapshot.consoleSnapshot) writeConsoleData(task, snapshot.consoleSnapshot);
+    await flushConsole(task);
+    task.latestLog = snapshot.latestLog ? { ...snapshot.latestLog } : null;
+  }
+
+  const ordered = Array.from(tasks.values()).sort((a, b) => a.order - b.order);
+  tasks.clear();
+  for (const task of ordered) tasks.set(task.id, task);
+  nextTaskOrder = Math.max(nextTaskOrder, ...ordered.map((task) => task.order + 1), 0);
+}
+
 function deleteTaskLogs(task: BgTask): void {
   outputLogStore.delete(task.stdoutLogKey);
   outputLogStore.delete(task.stderrLogKey);
@@ -617,9 +894,9 @@ function finishTask(task: BgTask, code: number | null, signal: string | null, fa
   task.done.abort();
   task.attachment.taskExited?.();
   updateWidget();
-  void flushConsole(task).then(() => {
-    updateWidget();
-  });
+  void persistFinishedTaskSnapshot(task)
+    .catch(() => {})
+    .then(() => updateWidget());
 }
 
 const ATTACH_DETACH_KEY = "\x1d";
@@ -671,12 +948,13 @@ async function notifyAttachmentResult(
   reason: AttachmentReason,
   attachError: string | undefined,
   ctx: ExtensionContext,
+  reportTaskOutcome = true,
 ): Promise<void> {
   if (attachError) {
     ctx.ui.notify(`${modeLabel} attachment failed: ${attachError}`, "error");
     return;
   }
-  if (reason === "shutdown") return;
+  if (reason === "shutdown" || !reportTaskOutcome) return;
 
   if (reason === "detached" && task.status === "running") {
     await waitForTaskEnd(task, ATTACH_STATUS_GRACE_MS);
@@ -773,7 +1051,7 @@ async function attachFinishedTaskSnapshot(
     } satisfies Component & { dispose(): void };
   });
 
-  await notifyAttachmentResult(task, modeLabel, reason, attachError, ctx);
+  await notifyAttachmentResult(task, modeLabel, reason, attachError, ctx, false);
 }
 
 async function attachPtyTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
@@ -1060,7 +1338,6 @@ async function attachTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
 
 const WIDGET_KEY = "bg-tasks-widget";
 const WIDGET_REFRESH_INTERVAL_MS = 1000;
-const COLLAPSED_WIDGET_TASK_LIMIT = 3;
 let uiCtx: ExtensionContext | null = null;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let widgetTui: TUI | null = null;
@@ -1074,26 +1351,28 @@ function getVisibleTasks(): BgTask[] {
   return Array.from(tasks.values());
 }
 
-function getBackgroundWidgetTasks(visible: BgTask[], expanded: boolean): BgTask[] {
-  if (expanded || visible.length <= COLLAPSED_WIDGET_TASK_LIMIT) return visible;
-  return [
-    ...visible.filter((task) => task.status === "running"),
-    ...visible.filter((task) => task.status !== "running"),
-  ].slice(0, COLLAPSED_WIDGET_TASK_LIMIT);
+interface TaskReconciliation {
+  removed: string[];
+  clearedRetention: string[];
 }
 
-async function discardExpiredFinishedTasks(): Promise<boolean> {
+async function discardExpiredFinishedTasks(): Promise<TaskReconciliation> {
   const expired = Array.from(tasks.values()).filter(
     (task) => task.status !== "running" && !task.retainForNextAgentTurn,
   );
-  for (const task of tasks.values()) task.retainForNextAgentTurn = false;
+  const clearedRetention: string[] = [];
+  for (const task of tasks.values()) {
+    if (!task.retainForNextAgentTurn) continue;
+    task.retainForNextAgentTurn = false;
+    if (task.status !== "running") clearedRetention.push(task.id);
+  }
   for (const task of expired) tasks.delete(task.id);
   await Promise.all(expired.map(async (task) => {
     await flushConsole(task);
     task.console.terminal.dispose();
     deleteTaskLogs(task);
   }));
-  return expired.length > 0;
+  return { removed: expired.map((task) => task.id), clearedRetention };
 }
 
 function stopRefreshTimer() {
@@ -1120,7 +1399,7 @@ function formatWidgetDuration(ms: number): string {
 
 function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expanded = false): string[] {
   const visible = getVisibleTasks();
-  const displayed = getBackgroundWidgetTasks(visible, expanded);
+  const displayed = expanded ? visible : [];
   const runningCount = getRunningTasks().length;
   const finishedCount = visible.length - runningCount;
   const now = Date.now();
@@ -1148,27 +1427,31 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
       ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}`
       : `${branch} ${glyph} ${task.name} (${task.id}) ${task.status} ${duration}${exit}${signal}`);
 
-    const latestLog = task.latestLog;
-    const output = latestLog
-      ? `[${latestLog.stream}] ${truncateText(latestLog.text, MAX_DISPLAY_LOG_CHARS)}`
-      : "(no output)";
-    const outputBranch = isLast ? "   └─" : "│  └─";
-    lines.push(theme
-      ? `${theme.fg("dim", outputBranch)} ${theme.fg("muted", output)}`
-      : `${outputBranch} ${output}`);
+    if (task.mode === "pipe") {
+      const latestLog = task.latestLog;
+      const output = latestLog
+        ? `[${latestLog.stream}] ${truncateText(latestLog.text, MAX_DISPLAY_LOG_CHARS)}`
+        : "(no output)";
+      const outputBranch = isLast ? "   └─" : "│  └─";
+      lines.push(theme
+        ? `${theme.fg("dim", outputBranch)} ${theme.fg("muted", output)}`
+        : `${outputBranch} ${output}`);
+    }
   }
 
-  const canExpand = visible.length > COLLAPSED_WIDGET_TASK_LIMIT;
-  const hint = canExpand
+  const hint = visible.length > 0
     ? ` · ${keyText("app.tools.expand")} ${expanded ? "to collapse" : "to expand"}`
     : "";
   const title = `${visible.length} background task${visible.length === 1 ? "" : "s"}`;
+  const statusParts = [
+    ...(runningCount > 0 ? [{ color: "warning" as const, text: `${runningCount} running` }] : []),
+    ...(finishedCount > 0 ? [{ color: "muted" as const, text: `${finishedCount} finished` }] : []),
+  ];
   const header = theme
     ? theme.fg("accent", theme.bold(title)) +
-      theme.fg("muted", " · ") +
-      theme.fg(runningCount > 0 ? "warning" : "muted", `${runningCount} running`) +
-      theme.fg("muted", ` · ${finishedCount} finished${hint}`)
-    : `${title} · ${runningCount} running · ${finishedCount} finished${hint}`;
+      statusParts.map(({ color, text }) => theme.fg("muted", " · ") + theme.fg(color, text)).join("") +
+      theme.fg("muted", hint)
+    : [title, ...statusParts.map(({ text }) => text)].join(" · ") + hint;
   const rendered = [header, ...lines];
   return rendered.map((line) => truncateToWidth(line, width, "…"));
 }
@@ -1230,6 +1513,14 @@ function updateWidget(): void {
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  const snapshotAppender = (event: PersistedTaskEvent) => {
+    pi.appendEntry(TASK_SNAPSHOT_CUSTOM_TYPE, event);
+  };
+  const enableSnapshotPersistence = () => {
+    appendTaskSnapshotEntry = snapshotAppender;
+  };
+  enableSnapshotPersistence();
+
   pi.events.on("bg:register", (data: unknown) => {
     const ops = data as {
       spawn?: typeof spawn;
@@ -1246,7 +1537,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    enableSnapshotPersistence();
     clearWidget();
+    await restoreFinishedTaskSnapshots(ctx);
+    uiCtx = ctx;
+    updateWidget();
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    clearWidget();
+    await restoreFinishedTaskSnapshots(ctx);
     uiCtx = ctx;
     updateWidget();
   });
@@ -1260,10 +1560,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async () => {
-    if (await discardExpiredFinishedTasks()) updateWidget();
+    await snapshotPersistenceQueue;
+    const reconciliation = await discardExpiredFinishedTasks();
+    if (reconciliation.removed.length > 0 || reconciliation.clearedRetention.length > 0) {
+      updateWidget();
+      await persistTaskReconciliation(reconciliation.removed, reconciliation.clearedRetention);
+    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    await snapshotPersistenceQueue;
+    if (appendTaskSnapshotEntry === snapshotAppender) appendTaskSnapshotEntry = null;
     clearWidget();
     if (ctx?.hasUI && ctx !== uiCtx) ctx.ui.setWidget(WIDGET_KEY, undefined);
     uiCtx = null;
@@ -1287,10 +1594,12 @@ export default function (pi: ExtensionAPI) {
       finishTask(task, null, "shutdown");
     }
     await Promise.all(Array.from(tasks.values()).map((task) => flushConsole(task)));
+    await snapshotPersistenceQueue;
     for (const task of tasks.values()) task.console.terminal.dispose();
     tasks.clear();
     runningTasks.clear();
     outputLogStore.clear();
+    nextTaskOrder = 0;
   });
 
   // ── bg_start ───────────────────────────────────────────────────────
@@ -1365,6 +1674,7 @@ export default function (pi: ExtensionAPI) {
         id, name: params.name, command: params.command, mode,
         process: taskProcess, console, attachment: {}, status: "running",
         exitCode: null, signal: null,
+        order: nextTaskOrder++,
         startedAt: Date.now(), endedAt: null,
         stdoutLogKey, stderrLogKey, stdoutLines: 0, stderrLines: 0,
         done: new AbortController(),

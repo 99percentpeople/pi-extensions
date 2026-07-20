@@ -157,6 +157,7 @@ function createHarness() {
   const widgetUpdates: Array<{ key: string; widget: unknown; options?: unknown }> = [];
   const terminalInput = new FakeTerminalInput();
   const terminalOutput = new FakeTerminalOutput();
+  let branch: unknown[] = [];
   let toolsExpanded = false;
 
   const pi = {
@@ -167,6 +168,9 @@ function createHarness() {
     on: (name: string, handler: (...args: any[]) => Promise<void> | void) => lifecycle.set(name, handler),
     registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: any) => commands.set(name, command),
+    appendEntry: (customType: string, data: unknown) => {
+      branch.push({ type: "custom", customType, data });
+    },
     sendMessage: (message: SentMessage["message"], options?: SentMessage["options"]) => {
       messages.push({ message, options });
     },
@@ -177,6 +181,9 @@ function createHarness() {
     hasUI: false,
     mode: "tui",
     isProjectTrusted: () => true,
+    sessionManager: {
+      getBranch: () => [...branch],
+    },
     ui: {
       setWidget: (key: string, widget: unknown, options?: unknown) => {
         widgetUpdates.push({ key, widget, options });
@@ -215,6 +222,10 @@ function createHarness() {
   };
   const cleanup = async (event: unknown = {}, shutdownCtx: ExtensionContext = ctx) => {
     if (cleaned) return;
+    if ((event as { reason?: string }).reason === "reload") {
+      await registeredShutdown?.(event, shutdownCtx);
+      return;
+    }
     cleaned = true;
     harnessCleanups.delete(cleanupAfterTest);
     await registeredShutdown?.(event, shutdownCtx);
@@ -235,6 +246,8 @@ function createHarness() {
     terminalOutput,
     ctx,
     cleanup: cleanupAfterTest,
+    getBranch: () => [...branch],
+    setBranch: (entries: unknown[]) => { branch = [...entries]; },
     setToolsExpanded: (value: boolean) => { toolsExpanded = value; },
   };
 }
@@ -735,7 +748,7 @@ test("bg_wait renderer shows elapsed time while waiting", async () => {
 });
 
 test("background task widget renders live state without re-registering every tick", async () => {
-  const { tools, lifecycle, children, ptys, widgets, widgetUpdates, ctx } = createHarness();
+  const { tools, lifecycle, children, ptys, widgets, widgetUpdates, ctx, setToolsExpanded } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgStatus = tools.get("bg_status");
   const bgLogs = tools.get("bg_logs");
@@ -764,8 +777,15 @@ test("background task widget renders live state without re-registering every tic
   const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   let renderRequests = 0;
   const component = widgetFactory({ requestRender: () => { renderRequests += 1; } }, plainTheme);
+  const collapsedLines = component.render(200).map((line: string) => line.trimEnd());
+  assert.match(collapsedLines[0], /^2 background tasks · 2 running.*to expand$/);
+  assert.doesNotMatch(collapsedLines[0], /0 finished/);
+  assert.equal(collapsedLines.length, 1, "the collapsed widget should hide the task list");
+
+  setToolsExpanded(true);
   const lines = component.render(200).map((line: string) => line.trimEnd());
-  assert.equal(lines[0], "2 background tasks · 2 running · 0 finished");
+  assert.match(lines[0], /^2 background tasks · 2 running.*to collapse$/);
+  assert.doesNotMatch(lines[0], /0 finished/);
   assert.match(lines[1], /^├─ ◐ pi-debate-pro \([a-z0-9]+\) 0s pty:100x25$/);
   assert.match(lines[2], /^└─ ◐ pi-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
   assert.equal(widgetUpdates.length, 1, "the TUI widget should be registered once");
@@ -787,30 +807,32 @@ test("background task widget renders live state without re-registering every tic
       const rendered = component.render(200);
       return Boolean(
         rendered[0]?.includes("1 running · 1 finished") &&
-        rendered.some((line: string) => line.includes("[terminal] PTY FINAL")),
+        rendered.some((line: string) => line.includes("pi-debate-pro") && line.includes("completed")),
       );
     },
-    "PTY task completion and final terminal log in the widget",
+    "PTY task completion in the widget",
   );
   const mixedLines = component.render(200).map((line: string) => line.trimEnd());
-  assert.equal(mixedLines[0], "2 background tasks · 1 running · 1 finished");
+  assert.match(mixedLines[0], /^2 background tasks · 1 running · 1 finished.*to collapse$/);
   assert.match(mixedLines[1], /^├─ ✓ pi-debate-pro \([a-z0-9]+\) completed \d+s exit=0$/);
-  assert.equal(mixedLines[2], "│  └─ [terminal] PTY FINAL");
-  assert.match(mixedLines[3], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
+  assert.match(mixedLines[2], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
+  assert.doesNotMatch(mixedLines.join("\n"), /PTY FINAL|\[terminal\]/);
 
   await lifecycle.get("before_agent_start")?.({}, widgetCtx);
   const nextTurnLines = component.render(200).map((line: string) => line.trimEnd());
-  assert.equal(nextTurnLines[0], "1 background task · 1 running · 0 finished");
+  assert.match(nextTurnLines[0], /^1 background task · 1 running.*to collapse$/);
+  assert.doesNotMatch(nextTurnLines[0], /0 finished/);
   assert.match(nextTurnLines[1], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
 
   children[0].finish(0, null);
   await waitForCondition(
-    () => component.render(200)[0]?.includes("0 running · 1 finished") ?? false,
+    () => component.render(200)[0]?.includes(" · 1 finished") ?? false,
     "pipe task completion in the widget",
   );
   assert.equal(widgets.has("bg-tasks-widget"), true, "the final task result should remain visible for this turn");
   const finishedLines = component.render(200).map((line: string) => line.trimEnd());
-  assert.equal(finishedLines[0], "1 background task · 0 running · 1 finished");
+  assert.match(finishedLines[0], /^1 background task · 1 finished.*to collapse$/);
+  assert.doesNotMatch(finishedLines[0], /0 running/);
   assert.match(finishedLines[1], /^└─ ✓ pi-build \([a-z0-9]+\) completed \d+s exit=0$/);
   assert.equal(finishedLines[2], "   └─ [stderr] warning");
   assert.equal(widgetUpdates.length, 1, "finishing should update the existing TUI component");
@@ -887,7 +909,7 @@ test("background task widget renders live state without re-registering every tic
   await lifecycle.get("session_shutdown")?.({}, widgetCtx);
 });
 
-test("background task widget previews three items and prioritizes running tasks", async () => {
+test("background task widget hides entries until expanded and preserves task order", async () => {
   const { tools, lifecycle, children, widgets, ctx, setToolsExpanded } = createHarness();
   const bgStart = tools.get("bg_start");
   assert.ok(bgStart);
@@ -916,11 +938,9 @@ test("background task widget previews three items and prioritizes running tasks"
   const component = widgetFactory({ requestRender: () => {} }, plainTheme);
   const collapsed = component.render(200).join("\n");
   assert.match(collapsed, /5 background tasks · 2 running · 3 finished.*to expand/);
-  assert.match(collapsed, /running-four/);
-  assert.match(collapsed, /running-five/);
-  assert.match(collapsed, /finished-one/);
-  assert.doesNotMatch(collapsed, /finished-two|finished-three/);
-  assert.ok(collapsed.indexOf("running-four") < collapsed.indexOf("finished-one"));
+  for (const name of ["finished-one", "finished-two", "finished-three", "running-four", "running-five"]) {
+    assert.doesNotMatch(collapsed, new RegExp(name));
+  }
 
   const colorTheme = {
     fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
@@ -929,14 +949,18 @@ test("background task widget previews three items and prioritizes running tasks"
   const coloredHeader = widgetFactory({ requestRender: () => {} }, colorTheme).render(300)[0];
   assert.match(coloredHeader, /<accent><bold>5 background tasks<\/bold><\/accent>/);
   assert.match(coloredHeader, /<warning>2 running<\/warning>/);
-  assert.match(coloredHeader, /<muted> · 3 finished/);
+  assert.match(coloredHeader, /<muted> · <\/muted><muted>3 finished<\/muted>/);
   assert.doesNotMatch(coloredHeader, /<warning>5 background tasks|3 finished<\/warning>/);
 
   setToolsExpanded(true);
   const expanded = component.render(200).join("\n");
   assert.match(expanded, /to collapse/);
-  for (const name of ["finished-one", "finished-two", "finished-three", "running-four", "running-five"]) {
+  const orderedNames = ["finished-one", "finished-two", "finished-three", "running-four", "running-five"];
+  for (const name of orderedNames) {
     assert.match(expanded, new RegExp(name));
+  }
+  for (let index = 1; index < orderedNames.length; index++) {
+    assert.ok(expanded.indexOf(orderedNames[index - 1]) < expanded.indexOf(orderedNames[index]));
   }
 
   children[3].finish(0, null);
@@ -1007,7 +1031,7 @@ test("tasks finishing while the agent is idle survive the next inspection turn",
 });
 
 test("background task widget uses serializable lines in RPC mode", async () => {
-  const { tools, lifecycle, children, widgets, widgetUpdates, ctx } = createHarness();
+  const { tools, lifecycle, children, widgets, widgetUpdates, ctx, setToolsExpanded } = createHarness();
   const bgStart = tools.get("bg_start");
   assert.ok(bgStart);
 
@@ -1027,10 +1051,12 @@ test("background task widget uses serializable lines in RPC mode", async () => {
 
     const widgetLines = widgets.get("bg-tasks-widget");
     assert.ok(Array.isArray(widgetLines));
-    assert.equal(widgetLines[0], "1 background task · 1 running · 0 finished");
-    assert.match(widgetLines[1], /^└─ ◐ rpc-build \([a-z0-9]+\) 0s stdout:0 stderr:0$/);
+    assert.match(widgetLines[0], /^1 background task · 1 running.*to expand$/);
+    assert.doesNotMatch(widgetLines[0], /0 finished/);
+    assert.equal(widgetLines.length, 1);
     assert.deepEqual(widgetUpdates.at(-1)?.options, { placement: "belowEditor" });
 
+    setToolsExpanded(true);
     Date.now = () => startedAt + 3_725_000;
     await lifecycle.get("tool_execution_end")?.({ toolName: "bg_status" }, rpcCtx);
     assert.match(widgets.get("bg-tasks-widget")[1], / 1h02m05s stdout:0 stderr:0$/);
@@ -1043,7 +1069,8 @@ test("background task widget uses serializable lines in RPC mode", async () => {
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(widgets.has("bg-tasks-widget"), true);
   const finishedWidget = widgets.get("bg-tasks-widget");
-  assert.equal(finishedWidget[0], "1 background task · 0 running · 1 finished");
+  assert.match(finishedWidget[0], /^1 background task · 1 finished.*to collapse$/);
+  assert.doesNotMatch(finishedWidget[0], /0 running/);
   assert.match(finishedWidget[1], /^└─ × rpc-build \([a-z0-9]+\) failed \d+s exit=2$/);
   assert.equal(finishedWidget[2], "   └─ [stderr] RPC FINAL ERROR");
   await lifecycle.get("before_agent_start")?.({}, rpcCtx);
@@ -1188,7 +1215,7 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
 
   children[0].stdout.write("PIPE FINAL SNAPSHOT\n");
   ptys[0].emitData("\x1b[2J\x1b[HPTY FINAL SNAPSHOT\r\n");
-  children[0].finish(0, null);
+  children[0].finish(2, null);
   ptys[0].finish(0);
   await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -1196,7 +1223,7 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
   assert.match(attachCommand.description, /read-only final snapshot/);
   const completions = attachCommand.getArgumentCompletions("");
   assert.ok(completions.some((item: { value: string; label: string }) =>
-    item.value === pipeId && item.label.includes("(completed)")));
+    item.value === pipeId && item.label.includes("(failed)")));
   assert.ok(completions.some((item: { value: string; label: string }) =>
     item.value === ptyId && item.label.includes("(completed)")));
 
@@ -1235,9 +1262,7 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
     const attachedOutput = stdoutChunks.join("");
     assert.match(attachedOutput, attachCase.expected);
     assert.match(attachedOutput, /Task finished - Ctrl\+\] to return/);
-    assert.deepEqual(notifications, [
-      `${attachCase.mode} task "${attachCase.name}" completed (exit code 0).`,
-    ]);
+    assert.deepEqual(notifications, [], "detaching from a finished snapshot should not repeat its task outcome");
 
     const retainedOutput = await bgLogs.execute(
       `logs-${attachCase.id}`,
@@ -1261,6 +1286,184 @@ test("finished tasks expose a read-only attach snapshot until the next turn", as
   await attachCommand.handler(pipeId, missingCtx);
   assert.deepEqual(missingNotifications, [`Task not found: ${pipeId}`]);
 
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("finished pipe and PTY snapshots replay across reload and stay deleted after cleanup", async () => {
+  const {
+    tools,
+    commands,
+    lifecycle,
+    children,
+    ptys,
+    terminalInput,
+    terminalOutput,
+    ctx,
+    getBranch,
+    setBranch,
+  } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgStatus = tools.get("bg_status");
+  const bgLogs = tools.get("bg_logs");
+  assert.ok(bgStart && bgStatus && bgLogs);
+
+  await lifecycle.get("session_start")?.({ reason: "startup" }, ctx);
+  const pipeStarted = await bgStart.execute(
+    "reload-pipe-start",
+    { name: "reload-pipe", command: "fake reload pipe" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const ptyStarted = await bgStart.execute(
+    "reload-pty-start",
+    { name: "reload-pty", command: "fake reload pty", pty: true, cols: 70, rows: 12 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const pipeId = pipeStarted.details.id as string;
+  const ptyId = ptyStarted.details.id as string;
+
+  children[0].stdout.write("PIPE SNAPSHOT BEFORE RELOAD\n");
+  children[0].stderr.write("PIPE ERROR BEFORE RELOAD\n");
+  ptys[0].emitData("\x1b[2J\x1b[HPTY SNAPSHOT BEFORE RELOAD\r\n");
+  children[0].finish(2, null);
+  ptys[0].finish(0);
+  await waitForCondition(
+    () => getBranch().filter((entry: any) => entry.data?.action === "upsert").length === 2,
+    "finished task snapshot entries",
+  );
+  const branchWithSnapshots = getBranch();
+
+  await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  await lifecycle.get("session_start")?.({ reason: "reload" }, ctx);
+
+  const restoredStatus = await bgStatus.execute("reload-status", {}, undefined, undefined, ctx);
+  assert.deepEqual(
+    restoredStatus.details.tasks.map((task: { id: string; status: string; mode: string }) => [task.id, task.status, task.mode]),
+    [[pipeId, "failed", "pipe"], [ptyId, "completed", "pty"]],
+  );
+  const restoredPipeLogs = await bgLogs.execute(
+    "reload-pipe-logs",
+    { id: pipeId, stream: "both" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(restoredPipeLogs.content[0].text, /PIPE SNAPSHOT BEFORE RELOAD/);
+  assert.match(restoredPipeLogs.content[0].text, /PIPE ERROR BEFORE RELOAD/);
+  const restoredPtyLogs = await bgLogs.execute(
+    "reload-pty-logs",
+    { id: ptyId, stream: "terminal" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(restoredPtyLogs.content[0].text, /PTY SNAPSHOT BEFORE RELOAD/);
+
+  const attachCommand = commands.get("bg-attach");
+  for (const attachCase of [
+    { id: pipeId, expected: /PIPE SNAPSHOT BEFORE RELOAD/ },
+    { id: ptyId, expected: /PTY SNAPSHOT BEFORE RELOAD/ },
+  ]) {
+    const chunks: string[] = [];
+    const notifications: string[] = [];
+    const previousWriteHandler = terminalOutput.writeHandler;
+    terminalOutput.writeHandler = (chunk: string | Uint8Array) => {
+      chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    };
+    const attachCtx = {
+      ...ctx,
+      hasUI: true,
+      ui: {
+        ...ctx.ui,
+        notify: (message: string) => notifications.push(message),
+        custom: createAttachCustom(async () => {
+          await waitForRenderedText(chunks, /Task finished - Ctrl\+\] to return/);
+          terminalInput.emit("data", "\x1d");
+        }),
+      },
+    } as unknown as ExtensionContext;
+    try {
+      await attachCommand.handler(attachCase.id, attachCtx);
+    } finally {
+      terminalOutput.writeHandler = previousWriteHandler;
+    }
+    assert.match(chunks.join(""), attachCase.expected);
+    assert.deepEqual(notifications, []);
+  }
+
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const clearedStatus = await bgStatus.execute("reload-cleared", {}, undefined, undefined, ctx);
+  assert.deepEqual(clearedStatus.details.tasks, []);
+  assert.ok(getBranch().some((entry: any) =>
+    entry.data?.action === "reconcile" &&
+    entry.data.removed?.includes(pipeId) &&
+    entry.data.removed?.includes(ptyId)));
+  const branchAfterCleanup = getBranch();
+
+  setBranch(branchWithSnapshots);
+  await lifecycle.get("session_tree")?.({}, ctx);
+  const branchRestoredStatus = await bgStatus.execute("tree-restored", {}, undefined, undefined, ctx);
+  assert.deepEqual(branchRestoredStatus.details.tasks.map((task: { id: string }) => task.id), [pipeId, ptyId]);
+  setBranch(branchAfterCleanup);
+  await lifecycle.get("session_tree")?.({}, ctx);
+  const branchClearedStatus = await bgStatus.execute("tree-cleared", {}, undefined, undefined, ctx);
+  assert.deepEqual(branchClearedStatus.details.tasks, []);
+
+  await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  await lifecycle.get("session_start")?.({ reason: "reload" }, ctx);
+  const replayedClearedStatus = await bgStatus.execute("reload-still-cleared", {}, undefined, undefined, ctx);
+  assert.deepEqual(replayedClearedStatus.details.tasks, []);
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("tasks finishing while idle preserve their extra inspection turn across reload", async () => {
+  const { tools, lifecycle, children, ctx, getBranch } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgStatus = tools.get("bg_status");
+  assert.ok(bgStart && bgStatus);
+
+  await lifecycle.get("session_start")?.({ reason: "startup" }, ctx);
+  const started = await bgStart.execute(
+    "idle-reload-start",
+    { name: "idle-reload", command: "fake idle reload" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const id = started.details.id as string;
+  await lifecycle.get("agent_settled")?.({}, ctx);
+  children[0].stdout.write("IDLE SNAPSHOT BEFORE RELOAD\n");
+  children[0].finish(0, null);
+  await waitForCondition(
+    () => getBranch().some((entry: any) =>
+      entry.data?.action === "upsert" && entry.data.task?.id === id && entry.data.task?.retainForNextAgentTurn === true),
+    "idle retained snapshot entry",
+  );
+
+  await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  await lifecycle.get("session_start")?.({ reason: "reload" }, ctx);
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const firstInspection = await bgStatus.execute("idle-reload-first", { id }, undefined, undefined, ctx);
+  assert.equal(firstInspection.details.status, "completed");
+  assert.ok(getBranch().some((entry: any) =>
+    entry.data?.action === "reconcile" && entry.data.clearedRetention?.includes(id)));
+
+  await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  await lifecycle.get("session_start")?.({ reason: "reload" }, ctx);
+  const restoredInspection = await bgStatus.execute("idle-reload-restored", { id }, undefined, undefined, ctx);
+  assert.equal(restoredInspection.details.status, "completed");
+
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const expired = await bgStatus.execute("idle-reload-expired", { id }, undefined, undefined, ctx);
+  assert.deepEqual(expired.details, {});
+  await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  await lifecycle.get("session_start")?.({ reason: "reload" }, ctx);
+  const replayedExpired = await bgStatus.execute("idle-reload-still-expired", { id }, undefined, undefined, ctx);
+  assert.deepEqual(replayedExpired.details, {});
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 

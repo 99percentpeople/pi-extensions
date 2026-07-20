@@ -96,9 +96,11 @@ still retained.
 ## Status widget
 
 Pi displays background tasks below the editor with their status, duration, and
-latest output. The collapsed widget shows at most three task entries and
-prioritizes running tasks. When more tasks exist, Pi's standard tool expansion
-shortcut (`Ctrl+O` by default) reveals the complete list.
+latest pipe output. The collapsed widget shows only the task totals so it stays
+out of the way by default. Pi's standard tool expansion shortcut (`Ctrl+O` by
+default) reveals the complete task list. Finished pipe tasks include their
+latest output in the expanded view; finished PTY tasks keep the list compact
+because their final screen remains available through attach or explicit logs.
 
 The header uses separate colors for the total, running, and finished counts so
 active work stands out without making the whole widget look like a warning.
@@ -114,13 +116,19 @@ turn if it finishes while idle, giving the model a chance to inspect the result.
 The snapshot is discarded at the next turn boundary after that opportunity.
 
 Once discarded, the old task ID is no longer available through attach, status,
-logs, or wait operations. Retention is intentionally short-lived and stored in
-an in-memory log store; no task output is written to a temporary disk directory.
-Pipe stdout and stderr are capped at 4 MiB each, with the oldest bytes discarded
-when that limit is reached. This is not persistent job
-management. When the Pi session shuts down, the extension detaches consoles,
-terminates remaining processes, clears retained output, and disposes the
-virtual terminals so it does not leave orphaned tasks.
+logs, or wait operations. Completed snapshots are checkpointed as hidden Pi
+session entries, so reloading the extension or navigating the session tree does
+not clear them early. Cleanup writes a matching session event, so an expired
+snapshot cannot reappear after another reload.
+
+Live pipe stdout and stderr remain in memory and are capped at 4 MiB each, with
+the oldest bytes discarded when that limit is reached. A persisted pipe
+snapshot keeps the latest 500 lines, capped at 256 KiB per stream. The attached
+console snapshot keeps 200 lines of scrollback and is capped at 512 KiB. No task
+output is written to a temporary disk directory. This is not persistent job
+management: reload restores only completed read-only snapshots, while session
+shutdown still terminates running processes and disposes live virtual terminals
+so it does not leave orphaned tasks.
 
 ## Sending input and keys
 
