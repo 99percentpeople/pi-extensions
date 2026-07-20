@@ -1,7 +1,15 @@
 # Pi Extensions
 
-Three independently published TypeScript extensions for the
-[Pi coding agent](https://pi.dev/).
+[![CI](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml/badge.svg)](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/99percentpeople/pi-extensions)](LICENSE)
+[![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks)
+[![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter)
+[![todo](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-todo?label=todo)](https://www.npmjs.com/package/@99percentpeople/pi-todo)
+
+A focused collection of TypeScript extensions for the
+[Pi coding agent](https://pi.dev/): run and revisit background tasks, use
+PowerShell consistently on Windows, and keep model-authored plans visible in
+the TUI.
 
 | Extension | npm package | Purpose |
 | --- | --- | --- |
@@ -11,6 +19,16 @@ Three independently published TypeScript extensions for the
 
 The packages have separate versions and releases. Installing one extension does
 not install or enable either of the others.
+
+## Highlights
+
+- Install only the capabilities you need; every extension is an independent npm
+  package.
+- Integrate with Pi's native tools, widgets, session history, and terminal UI.
+- Support interactive PTY applications, persistent task snapshots, and
+  cross-platform shell execution.
+- Validate on Linux, macOS, and Windows, with tag-driven npm releases through
+  GitHub Actions Trusted Publishing.
 
 ## Installation
 
@@ -108,8 +126,8 @@ schema.
 
 ## Development
 
-The repository is a private Bun 1.3.14 workspace. Each extension directory is
-an independently publishable npm package.
+The repository uses a private root package as a Bun 1.3.14 workspace. Each
+extension directory is an independently publishable npm package.
 
 ```bash
 bun install --frozen-lockfile
@@ -167,9 +185,9 @@ independently:
 
 | Package | Tag format | Example |
 | --- | --- | --- |
-| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.0.4` |
+| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.1.3` |
 | pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
-| todo | `todo-v<version>` | `todo-v1.0.0` |
+| todo | `todo-v<version>` | `todo-v1.0.2` |
 
 To publish a release:
 
@@ -179,8 +197,8 @@ To publish a release:
 3. Push the commit, then create and push the matching tag:
 
 ```bash
-git tag background-tasks-v1.0.4
-git push origin master background-tasks-v1.0.4
+git tag background-tasks-v1.1.3
+git push origin master background-tasks-v1.1.3
 ```
 
 The workflow rejects a tag whose version does not exactly match the selected
