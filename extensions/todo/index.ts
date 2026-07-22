@@ -90,8 +90,12 @@ function getCollapsedTodoTasks<T extends TodoDisplayTask>(tasks: readonly T[]): 
     return tasks.slice(-COLLAPSED_TASK_LIMIT);
   }
   const activeIndex = tasks.findIndex((task) => task.status === "in_progress");
-  if (activeIndex <= 0) return tasks.slice(0, COLLAPSED_TASK_LIMIT);
-  return tasks.slice(activeIndex - 1, activeIndex + 2);
+  if (activeIndex < 0) return tasks.slice(0, COLLAPSED_TASK_LIMIT);
+  const start = Math.min(
+    Math.max(0, activeIndex - 1),
+    tasks.length - COLLAPSED_TASK_LIMIT,
+  );
+  return tasks.slice(start, start + COLLAPSED_TASK_LIMIT);
 }
 
 function isTodoStatus(value: unknown): value is TodoStatus {

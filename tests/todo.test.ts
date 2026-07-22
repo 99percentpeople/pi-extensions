@@ -695,6 +695,29 @@ test("todo extension renders a collapsible read-only list above the editor", asy
       completedCollapsed.indexOf("Implement the core API") < completedCollapsed.indexOf("Verify the completed system"),
     "the completed preview should show the last three tasks without reordering",
   );
+
+  await tool.execute(
+    "todo-last-active",
+    {
+      tasks: [
+        { key: "schema" },
+        { key: "scaffold" },
+        { key: "auth" },
+        { key: "core-api" },
+        { key: "system-verify", status: "in_progress" },
+      ],
+      baseRevision: 3,
+    },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const lastActiveCollapsed = widget.render(160).join("\n");
+  assert.match(lastActiveCollapsed, /Todo 4\/5 completed · rev 4.*to expand/);
+  assert.match(lastActiveCollapsed, /Implement user authentication/);
+  assert.match(lastActiveCollapsed, /Implement the core API/);
+  assert.match(lastActiveCollapsed, /Verify the completed system/);
+  assert.doesNotMatch(lastActiveCollapsed, /Design the database schema|Initialize the project scaffold/);
 });
 
 test("todo removes previous-turn completions atomically and replays them across reload and tree changes", async () => {
