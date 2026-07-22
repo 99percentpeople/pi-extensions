@@ -188,7 +188,7 @@ independently:
 | --- | --- | --- |
 | background-tasks | `background-tasks-v<version>` | `background-tasks-v1.1.3` |
 | pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
-| todo | `todo-v<version>` | `todo-v1.1.0` |
+| todo | `todo-v<version>` | `todo-v1.1.1` |
 
 To publish a release:
 

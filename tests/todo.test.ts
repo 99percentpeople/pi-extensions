@@ -417,8 +417,8 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.deepEqual(Object.keys(tool.parameters.properties ?? {}).sort(), ["baseRevision", "tasks"]);
   assert.equal(tool.parameters.properties?.action, undefined);
   assert.doesNotMatch(JSON.stringify(tool.parameters), /cancelled/);
-  assert.match(tool.promptGuidelines?.join("\n") ?? "", /complete plan in one todo call/i);
-  assert.match(tool.promptGuidelines?.join("\n") ?? "", /omitted existing keys are permanently deleted/i);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /define it yourself.*before beginning implementation or other substantive work/i);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /omitted keys are deleted/i);
   assert.equal(commands.size, 0, "the extension should not register a user-facing todo interface");
   assert.deepEqual([...handlers.keys()].sort(), [
     "before_agent_start",
