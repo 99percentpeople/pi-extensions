@@ -394,7 +394,7 @@ test("background tool calls never render undefined while arguments stream", () =
   assert.match(stripVTControlCharacters(completeList.render(160).join("\n")), /bg_status all/);
 });
 
-test("background tasks wait explicitly, discourage polling, and expose the latest log", async () => {
+test("background task tools keep waiting, status, output, and termination separate", async () => {
   const { tools, commands, lifecycle, messages, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgWait = tools.get("bg_wait");
@@ -408,20 +408,39 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   assert.ok(commands.has("bg-kill"));
   assert.equal(commands.has("kill"), false);
 
-  assert.equal(bgWait.executionMode, "parallel");
-  assert.equal(bgStatus.executionMode, "sequential");
-  assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status or bg_logs/i);
-  assert.match(bgStatus.promptGuidelines?.join("\n") ?? "", /Do not poll bg_status/);
-  assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /Do not repeatedly call bg_logs/);
-  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /instead of polling bg_status\/bg_logs/i);
-  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /independent waits execute in parallel/i);
-  assert.match(bgSend.promptGuidelines?.join("\n") ?? "", /Terminal keys always use input/i);
+  const registeredTools = [bgStart, bgWait, bgStatus, bgLogs, bgSend, bgKill];
+  for (const tool of registeredTools) {
+    assert.equal(tool.executionMode, "parallel");
+    for (const guideline of tool.promptGuidelines ?? []) {
+      assert.match(guideline, /\bbg_(?:start|wait|status|logs|send|kill)\b/, `${tool.name} guidelines must name their tool context`);
+    }
+  }
+  const allGuidelines = registeredTools.flatMap((tool) => tool.promptGuidelines ?? []);
+  const orderingRules = allGuidelines.filter((guideline) => /strictly in source order/i.test(guideline));
+  assert.equal(orderingRules.length, 1, "same-task ordering should be explained by one shared rule");
+  assert.match(orderingRules[0], /compose the required bg_\* calls in one assistant response/i);
+  assert.match(orderingRules[0], /same task id.*different task IDs.*parallel/i);
+  assert.match(orderingRules[0], /bg_start and bg_status without id are outside this ordering/i);
+  const lifecycleRules = allGuidelines.filter((guideline) => /survives ordinary agent-run boundaries/i.test(guideline));
+  assert.equal(lifecycleRules.length, 1, "task lifetime and snapshot retention should use one shared rule");
+  assert.match(lifecycleRules[0], /session reload or shutdown terminates it/i);
+  assert.match(lifecycleRules[0], /finishes before the current agent run settles.*only for the rest of that run.*removed before the next run starts/i);
+  assert.match(lifecycleRules[0], /still running when the agent settles.*finishes while the agent is idle.*throughout the next agent run/i);
+  assert.match(lifecycleRules[0], /inspected multiple times during that run.*removed before the following run/i);
+  assert.doesNotMatch(allGuidelines.join("\n"), /reversing them|emit one bg_wait|then bg_logs chain/i);
+  assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /use bg_wait.*use bg_logs separately/i);
+  assert.match(bgStatus.promptGuidelines?.join("\n") ?? "", /never returns process output/i);
+  assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /only background-task tool that reads process output/i);
+  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /returns completion status only/i);
+  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /timeout leaves the task running/i);
+  assert.match(bgSend.promptGuidelines?.join("\n") ?? "", /Use bg_send input for terminal keys/i);
+  assert.match(bgKill.promptGuidelines?.join("\n") ?? "", /termination status only.*use bg_logs/i);
   assert.equal(bgStart.parameters.properties?.wait, undefined);
   assert.equal(bgWait.parameters.properties?.timeout.minimum, 1);
   assert.equal(bgWait.parameters.properties?.timeout.maximum, 3600);
-  assert.ok(bgWait.parameters.properties?.terminal_snapshot);
-  assert.ok(bgStatus.parameters.properties?.terminal_snapshot);
-  assert.ok(bgKill.parameters.properties?.terminal_snapshot);
+  assert.equal(bgWait.parameters.properties?.terminal_snapshot, undefined);
+  assert.equal(bgStatus.parameters.properties?.terminal_snapshot, undefined);
+  assert.equal(bgKill.parameters.properties?.terminal_snapshot, undefined);
   assert.ok(bgSend.parameters.properties?.input);
   assert.deepEqual(
     bgSend.parameters.properties?.signal.enum,
@@ -446,7 +465,7 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     ctx,
   );
   const firstId = first.details.id as string;
-  assert.match(first.content[0].text, /Use bg_wait once/i);
+  assert.match(first.content[0].text, /Use bg_wait for finite completion and bg_logs for output/i);
   let firstWaitSettled = false;
   const firstWait = bgWait.execute("wait-1", { id: firstId, timeout: 1 }, undefined, undefined, ctx)
     .then((result) => {
@@ -459,13 +478,14 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   children[0].finish(0, null);
   const waitResult = await firstWait;
   assert.match(waitResult.content[0].text, /completed/);
-  assert.match(waitResult.content[0].text, /Latest log: \[stdout\] last/);
+  assert.doesNotMatch(waitResult.content[0].text, /first|last|Latest log|stdout|stderr/i);
   assert.equal(waitResult.details.timedOut, false);
   assert.equal(messages.length, 0, "completion should not enqueue an AI follow-up notification");
 
   const detailResult = await bgStatus.execute("status-detail", { id: firstId }, undefined, undefined, ctx);
-  assert.match(detailResult.content[0].text, /Latest log: \[stdout\] last/);
-  assert.equal(detailResult.details.latestLog.text, "last");
+  assert.match(detailResult.content[0].text, /Status:\s+completed/);
+  assert.doesNotMatch(detailResult.content[0].text, /first|last|Latest log|stdout|stderr/i);
+  assert.equal(detailResult.details.latestLog, undefined);
 
   const longRunning = await bgStart.execute(
     "start-2",
@@ -511,9 +531,8 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
     ctx,
   );
   assert.match(killResult.content[0].text, /Status: stopped/);
-  assert.match(killResult.content[0].text, /Latest log: \[stdout\] latest kill output/);
-  assert.doesNotMatch(killResult.content[0].text, /older kill output|── stdout/);
-  assert.equal(killResult.details.latestLog.text, "latest kill output");
+  assert.doesNotMatch(killResult.content[0].text, /older kill output|latest kill output|Latest log|stdout|terminal/i);
+  assert.equal(killResult.details.latestLog, undefined);
   assert.equal(messages.length, 0, "stopping should not enqueue an AI follow-up notification");
 
   const signalTask = await bgStart.execute(
@@ -695,6 +714,109 @@ test("background tasks wait explicitly, discourage polling, and expose the lates
   children[5].finish(0, null);
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("same-task tool calls follow source order while different task chains stay parallel", async () => {
+  const { tools, lifecycle, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgWait = tools.get("bg_wait");
+  const bgLogs = tools.get("bg_logs");
+  assert.ok(bgStart && bgWait && bgLogs);
+
+  const preflight = async (toolName: string, toolCallId: string, input: Record<string, unknown>) => {
+    await lifecycle.get("tool_call")?.({ type: "tool_call", toolName, toolCallId, input }, ctx);
+  };
+  const execute = async (toolName: string, toolCallId: string, input: Record<string, unknown>) => {
+    const tool = tools.get(toolName);
+    assert.ok(tool);
+    try {
+      return await tool.execute(toolCallId, input, undefined, undefined, ctx);
+    } finally {
+      await lifecycle.get("tool_execution_end")?.({ type: "tool_execution_end", toolName, toolCallId }, ctx);
+    }
+  };
+
+  const currentFirst = await bgStart.execute(
+    "ordered-current-start",
+    { name: "ordered-current", command: "fake ordered current" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const currentId = currentFirst.details.id as string;
+  children[0].stdout.write("BEFORE WAIT\n");
+
+  await lifecycle.get("turn_start")?.({ type: "turn_start", turnIndex: 1, timestamp: Date.now() }, ctx);
+  await preflight("bg_logs", "ordered-current-logs", { id: currentId });
+  await preflight("bg_wait", "ordered-current-wait", { id: currentId, timeout: 1 });
+
+  let currentWaitSettled = false;
+  const currentLogs = execute("bg_logs", "ordered-current-logs", { id: currentId });
+  const currentWait = execute("bg_wait", "ordered-current-wait", { id: currentId, timeout: 1 })
+    .then((result) => {
+      currentWaitSettled = true;
+      return result;
+    });
+  const currentOutput = await currentLogs;
+  assert.match(currentOutput.content[0].text, /BEFORE WAIT/);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(currentWaitSettled, false, "logs before wait must read immediately, then release the wait call");
+  children[0].stdout.write("AFTER WAIT\n");
+  children[0].finish(0, null);
+  await currentWait;
+  await lifecycle.get("turn_end")?.({ type: "turn_end", turnIndex: 1 }, ctx);
+
+  const first = await bgStart.execute(
+    "ordered-first-start",
+    { name: "ordered-first", command: "fake ordered first" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const second = await bgStart.execute(
+    "ordered-second-start",
+    { name: "ordered-second", command: "fake ordered second" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const firstId = first.details.id as string;
+  const secondId = second.details.id as string;
+
+  await lifecycle.get("turn_start")?.({ type: "turn_start", turnIndex: 2, timestamp: Date.now() }, ctx);
+  await preflight("bg_wait", "ordered-first-wait", { id: firstId, timeout: 1 });
+  await preflight("bg_logs", "ordered-first-logs", { id: firstId });
+  await preflight("bg_wait", "ordered-second-wait", { id: secondId, timeout: 1 });
+  await preflight("bg_logs", "ordered-second-logs", { id: secondId });
+
+  let firstLogsSettled = false;
+  let secondLogsSettled = false;
+  const firstWait = execute("bg_wait", "ordered-first-wait", { id: firstId, timeout: 1 });
+  const firstLogs = execute("bg_logs", "ordered-first-logs", { id: firstId })
+    .then((result) => {
+      firstLogsSettled = true;
+      return result;
+    });
+  const secondWait = execute("bg_wait", "ordered-second-wait", { id: secondId, timeout: 1 });
+  const secondLogs = execute("bg_logs", "ordered-second-logs", { id: secondId })
+    .then((result) => {
+      secondLogsSettled = true;
+      return result;
+    });
+
+  children[2].stdout.write("SECOND FINAL\n");
+  children[2].finish(0, null);
+  const secondOutput = await secondLogs;
+  assert.match(secondOutput.content[0].text, /SECOND FINAL/);
+  assert.equal(secondLogsSettled, true);
+  assert.equal(firstLogsSettled, false, "the unfinished task must not block a different task chain");
+
+  children[1].stdout.write("FIRST FINAL\n");
+  children[1].finish(0, null);
+  const [, firstOutput] = await Promise.all([firstWait, firstLogs]);
+  await secondWait;
+  assert.match(firstOutput.content[0].text, /FIRST FINAL/);
+  await lifecycle.get("turn_end")?.({ type: "turn_end", turnIndex: 2 }, ctx);
 });
 
 test("bg_wait renderer shows elapsed time while waiting", async () => {
@@ -1838,54 +1960,30 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   const waited = await bgWait.execute("pty-wait", { id, timeout: 1 }, undefined, undefined, ctx);
   assert.equal(waited.details.status, "completed");
   assert.equal(waited.details.mode, "pty");
-  assert.match(waited.content[0].text, /Mode:\s+pty/);
-  assert.doesNotMatch(waited.content[0].text, /Latest log:|terminal snapshot|DONE/);
-  assert.equal(waited.details.latestLog, null);
-  assert.equal(waited.details.terminalSnapshot, false);
-
-  const waitedSnapshot = await bgWait.execute(
-    "pty-wait-snapshot",
-    { id, timeout: 1, terminal_snapshot: true },
-    undefined,
-    undefined,
-    ctx,
-  );
-  assert.match(waitedSnapshot.content[0].text, /── terminal snapshot ──/);
-  assert.match(waitedSnapshot.content[0].text, /DONE/);
-  assert.doesNotMatch(waitedSnapshot.content[0].text, /Latest log:/);
-  assert.equal(waitedSnapshot.details.terminalSnapshot, true);
+  assert.doesNotMatch(waited.content[0].text, /terminal|DONE|Alice/i);
+  assert.equal(waited.details.latestLog, undefined);
+  assert.equal(waited.details.terminalSnapshot, undefined);
 
   const status = await bgStatus.execute("pty-status", { id }, undefined, undefined, ctx);
   assert.match(status.content[0].text, /Mode:\s+pty/);
-  assert.doesNotMatch(status.content[0].text, /Latest log:/);
-  assert.equal(status.details.latestLog, null);
-
-  const statusSnapshot = await bgStatus.execute(
-    "pty-status-snapshot",
-    { id, terminal_snapshot: true },
-    undefined,
-    undefined,
-    ctx,
-  );
-  assert.match(statusSnapshot.content[0].text, /── terminal snapshot ──/);
-  assert.match(statusSnapshot.content[0].text, /DONE/);
-  assert.doesNotMatch(statusSnapshot.content[0].text, /Latest log:/);
+  assert.doesNotMatch(status.content[0].text, /DONE|Alice|terminal snapshot|Latest log/i);
+  assert.equal(status.details.latestLog, undefined);
 
   const statusList = await bgStatus.execute("pty-status-list", {}, undefined, undefined, ctx);
   const listedPty = statusList.details.tasks.find((task: { id: string }) => task.id === id);
   assert.ok(listedPty);
-  assert.equal(listedPty.latestLog, null);
-  assert.doesNotMatch(statusList.content[0].text, new RegExp(`\\[${id}\\].*pty.*\\n  Latest log:`));
+  assert.equal(listedPty.latestLog, undefined);
+  assert.doesNotMatch(statusList.content[0].text, /DONE|Alice|terminal snapshot|Latest log/i);
 
-  const statusListSnapshot = await bgStatus.execute(
-    "pty-status-list-snapshot",
-    { terminal_snapshot: true },
+  const finalLogs = await bgLogs.execute(
+    "pty-final-logs",
+    { id, tail: 10 },
     undefined,
     undefined,
     ctx,
   );
-  assert.match(statusListSnapshot.content[0].text, /── terminal snapshot:/);
-  assert.match(statusListSnapshot.content[0].text, /DONE/);
+  assert.match(finalLogs.content[0].text, /Alice/);
+  assert.match(finalLogs.content[0].text, /DONE/);
 
   const killStarted = await bgStart.execute(
     "pty-kill-start",
@@ -1903,65 +2001,18 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
     ctx,
   );
   assert.match(killed.content[0].text, /Status: stopped/);
-  assert.doesNotMatch(killed.content[0].text, /Latest log:|terminal|FIRST SCREEN ROW|LAST SCREEN ROW/);
-  assert.equal(killed.details.latestLog, null);
+  assert.doesNotMatch(killed.content[0].text, /terminal|FIRST SCREEN ROW|LAST SCREEN ROW/i);
+  assert.equal(killed.details.latestLog, undefined);
 
-  const snapshotKillStarted = await bgStart.execute(
-    "pty-kill-snapshot-start",
-    { name: "pty-kill-snapshot", command: "fake persistent tui", pty: true },
+  const killedLogs = await bgLogs.execute(
+    "pty-killed-logs",
+    { id: killStarted.details.id, tail: 10 },
     undefined,
     undefined,
     ctx,
   );
-  ptys[2].emitData("SNAPSHOT FIRST ROW\r\nSNAPSHOT FINAL ROW\r\n");
-  const snapshotKilled = await bgKill.execute(
-    "pty-kill-snapshot",
-    { id: snapshotKillStarted.details.id, force: true, terminal_snapshot: true },
-    undefined,
-    undefined,
-    ctx,
-  );
-  assert.match(snapshotKilled.content[0].text, /Status: stopped/);
-  assert.match(snapshotKilled.content[0].text, /── terminal snapshot ──/);
-  assert.match(snapshotKilled.content[0].text, /SNAPSHOT FINAL ROW/);
-  assert.doesNotMatch(snapshotKilled.content[0].text, /Latest log:/);
-
-  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-  const renderCases = [
-    { tool: bgWait, args: { id, timeout: 1, terminal_snapshot: true }, result: waitedSnapshot },
-    { tool: bgStatus, args: { id, terminal_snapshot: true }, result: statusSnapshot },
-    { tool: bgStatus, args: { terminal_snapshot: true }, result: statusListSnapshot },
-    { tool: bgKill, args: { id: snapshotKillStarted.details.id, force: true, terminal_snapshot: true }, result: snapshotKilled },
-  ];
-  for (const { tool, args, result } of renderCases) {
-    const renderState = {};
-    const collapsedCall = tool.renderCall?.(args, plainTheme, {
-      lastComponent: undefined,
-      expanded: false,
-      executionStarted: false,
-      state: renderState,
-    });
-    assert.ok(collapsedCall);
-    assert.match(stripVTControlCharacters(collapsedCall.render(120).join("\n")), /to expand/);
-
-    const collapsedResult = tool.renderResult?.(
-      result,
-      { expanded: false, isPartial: false },
-      plainTheme,
-      { lastComponent: undefined, state: renderState, isError: false, invalidate: () => {} },
-    );
-    assert.ok(collapsedResult);
-    assert.doesNotMatch(stripVTControlCharacters(collapsedResult.render(120).join("\n")), /terminal snapshot/);
-
-    const expandedResult = tool.renderResult?.(
-      result,
-      { expanded: true, isPartial: false },
-      plainTheme,
-      { lastComponent: collapsedResult, state: renderState, isError: false, invalidate: () => {} },
-    );
-    assert.ok(expandedResult);
-    assert.match(stripVTControlCharacters(expandedResult.render(120).join("\n")), /terminal snapshot/);
-  }
+  assert.match(killedLogs.content[0].text, /FIRST SCREEN ROW/);
+  assert.match(killedLogs.content[0].text, /LAST SCREEN ROW/);
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });

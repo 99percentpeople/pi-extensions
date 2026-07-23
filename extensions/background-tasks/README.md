@@ -43,8 +43,10 @@ Start lazygit in a background PTY so I can attach to it.
 Run the test suite in the background and inspect the failures when it exits.
 ```
 
-The model can start, wait for, inspect, signal, and stop tasks. Users normally
-only need the two interactive commands:
+The model can start, wait for, inspect, signal, and stop tasks. Model-facing
+tools have narrow responsibilities: `bg_wait` reports completion, `bg_status`
+reports metadata, `bg_logs` reads output, and `bg_kill` reports termination.
+Users normally only need the two interactive commands:
 
 ```text
 /bg-attach <task-id>
@@ -53,6 +55,25 @@ only need the two interactive commands:
 
 Omit the task ID to choose from an interactive list. Press `Ctrl+]` to leave an
 attached console without stopping its task.
+
+## Tool ordering and parallelism
+
+Background tool calls that target the same task ID in one model response execute
+strictly in source order. Calls for different task IDs remain independent and
+can execute in parallel. This supports composable workflows without making one
+tool perform another tool's job:
+
+```text
+bg_wait(A) → bg_logs(A)                 # wait, then read final/current-at-timeout output
+bg_send(A) → bg_wait(A) → bg_logs(A)   # interact, wait, then read output
+bg_kill(A) → bg_logs(A)                 # terminate, then read final output
+```
+
+The ordering is intentional. `bg_logs(A) → bg_wait(A)` reads the output that is
+available first and only then begins waiting. Multiple chains such as
+`bg_wait(A) → bg_logs(A)` and `bg_wait(B) → bg_logs(B)` can run concurrently.
+A `bg_status` call without an ID is a global snapshot and is not part of any
+single-task chain.
 
 ## Pipe and PTY modes
 
@@ -109,13 +130,18 @@ new widget.
 
 ## Output retention and cleanup
 
-When a task exits during an agent turn, its final status, duration, latest log,
-and terminal snapshot remain available for the rest of that turn. A task that
-was still running when the agent became idle is retained through the following
-turn if it finishes while idle, giving the model a chance to inspect the result.
-The snapshot is discarded at the next turn boundary after that opportunity.
+Within the current session, a running task continues across ordinary agent
+runs and remains available to the background tools. Reloading or shutting down
+the session terminates running tasks.
 
-Once discarded, the old task ID is no longer available through attach, status,
+If a task finishes before the current agent run settles, its final status and
+retained output remain available only for the rest of that run and are normally
+removed before the next run starts. Only a task that is still running when the
+agent settles and then finishes while the agent is idle remains available
+throughout the next agent run. It can be inspected multiple times during that
+run and is normally removed before the following run.
+
+Once removed, the old task ID is no longer available through attach, status,
 logs, or wait operations. Completed snapshots are checkpointed as hidden Pi
 session entries, so reloading the extension or navigating the session tree does
 not clear them early. Cleanup writes a matching session event, so an expired
@@ -159,24 +185,25 @@ dedicated kill operation when the goal is reliable process-tree termination.
 
 ## Output inspection
 
-Pipe tasks retain stdout and stderr separately for inspection, while their
-attached console combines both streams in arrival order. PTY tasks expose the
-parsed terminal buffer rather than raw ANSI escape sequences, which makes
-full-screen application output readable to the model.
+`bg_logs` is the only model-facing tool that returns process output. Pipe tasks
+retain stdout and stderr separately, while PTY tasks expose the parsed terminal
+buffer rather than raw ANSI escape sequences. Omitting `stream` works in both
+modes: pipe tasks return stdout and stderr, and PTY tasks return terminal output.
+Use `tail` or `from_line`/`max_lines` to select the retained range.
 
-Normal status and completion checks keep PTY output compact. Pi requests a
-terminal snapshot only when the current or final screen is useful; snapshots
-follow the standard collapsed/expanded tool-output behavior.
+`bg_wait`, `bg_status`, and `bg_kill` deliberately return no logs or terminal
+screens. Emit them before `bg_logs` for the same task when output is needed
+after completion, inspection, or termination.
 
 ## Pi capabilities
 
 The extension exposes a compact set of model-facing operations: start, wait,
-status, logs, send, and kill. They cover process launch, one-shot completion
-waiting, output inspection, text/key/signal delivery, and termination. Users can
-usually describe the desired outcome in natural language instead of calling
-these operations manually. While a tool call is streaming, fields appear only
-after the model writes them; missing arguments are omitted rather than rendered
-as placeholders.
+status, logs, send, and kill. Each operation has one responsibility, and
+same-task source ordering composes them without sacrificing parallel execution
+across tasks. Users can usually describe the desired outcome in natural
+language instead of calling these operations manually. While a tool call is
+streaming, fields appear only after the model writes them; missing arguments are
+omitted rather than rendered as placeholders.
 
 ## Shell and platform behavior
 

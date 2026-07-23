@@ -177,6 +177,11 @@ interface StoredLog {
   size: number;
 }
 
+interface OrderedToolCall {
+  predecessor: Promise<void>;
+  release: () => void;
+}
+
 export class MemoryLogStore {
   private readonly logs = new Map<string, StoredLog>();
 
@@ -286,6 +291,12 @@ let resolveShell: ShellResolver = defaultShellResolver;
 const tasks = new Map<string, BgTask>();
 const runningTasks = new Set<BgTask>();
 const outputLogStore = new MemoryLogStore();
+// Pi preflights sibling calls in source order before executing them concurrently.
+// Build per-task chains during preflight so same-task calls preserve that order
+// without serializing calls for unrelated task IDs.
+const ORDERED_TASK_TOOL_NAMES = new Set(["bg_wait", "bg_status", "bg_logs", "bg_send", "bg_kill"]);
+const orderedToolCalls = new Map<string, OrderedToolCall>();
+const orderedTaskTails = new Map<string, Promise<void>>();
 const TASK_SNAPSHOT_CUSTOM_TYPE = "pi-background-task-snapshots";
 const TASK_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 const PERSISTED_CONSOLE_SCROLLBACK = 200;
@@ -295,6 +306,38 @@ const MAX_PERSISTED_CONSOLE_BYTES = 512 * 1024;
 let appendTaskSnapshotEntry: ((event: PersistedTaskEvent) => void) | null = null;
 let snapshotPersistenceQueue: Promise<void> = Promise.resolve();
 let nextTaskOrder = 0;
+
+function registerOrderedToolCall(toolCallId: string, taskId: string): void {
+  if (orderedToolCalls.has(toolCallId)) return;
+
+  const predecessor = orderedTaskTails.get(taskId) ?? Promise.resolve();
+  let resolveCompletion: () => void = () => {};
+  const completion = new Promise<void>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    resolveCompletion();
+  };
+
+  orderedToolCalls.set(toolCallId, { predecessor, release });
+  orderedTaskTails.set(taskId, completion);
+}
+
+function releaseOrderedToolCall(toolCallId: string): void {
+  const ordered = orderedToolCalls.get(toolCallId);
+  if (!ordered) return;
+  ordered.release();
+  orderedToolCalls.delete(toolCallId);
+}
+
+function clearOrderedToolCalls(): void {
+  for (const ordered of orderedToolCalls.values()) ordered.release();
+  orderedToolCalls.clear();
+  orderedTaskTails.clear();
+}
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -420,22 +463,6 @@ function getTerminalSnapshotLines(task: BgTask): string[] {
   }
   while (lines.at(-1) === "") lines.pop();
   return lines;
-}
-
-const TERMINAL_SNAPSHOT_HEADER = "── terminal snapshot";
-
-function formatPtyScreenSnapshot(task: BgTask, label?: string): string {
-  const rows = task.console.terminal.rows;
-  const snapshot = getTerminalSnapshotLines(task).slice(-rows).join("\n");
-  const header = label ? `${TERMINAL_SNAPSHOT_HEADER}: ${label} ──` : `${TERMINAL_SNAPSHOT_HEADER} ──`;
-  return `${header}\n${snapshot || "(no terminal output yet)"}`;
-}
-
-function renderContentWithoutCollapsedSnapshots(content: string, expanded: boolean): string {
-  if (expanded) return content;
-  const lines = content.split("\n");
-  const snapshotIndex = lines.findIndex((line) => line.startsWith(TERMINAL_SNAPSHOT_HEADER));
-  return snapshotIndex === -1 ? content : lines.slice(0, snapshotIndex).join("\n").trimEnd();
 }
 
 function updatePtyLatestLog(task: BgTask): void {
@@ -748,29 +775,33 @@ function deleteTaskLogs(task: BgTask): void {
   outputLogStore.delete(task.stderrLogKey);
 }
 
-function formatTaskOutputStats(task: BgTask): string[] {
-  if (task.mode === "pty") {
-    const terminal = task.console.terminal;
-    const dimensions = ` (${terminal.cols}x${terminal.rows})`;
-    return [
-      `  Mode:       pty${dimensions}`,
-      `  Terminal:   ${getTerminalSnapshotLines(task).length} rows`,
-    ];
-  }
-  return [
-    `  Stdout:     ${task.stdoutLines} lines`,
-    `  Stderr:     ${task.stderrLines} lines`,
-  ];
-}
-
-function formatLatestLog(latestLog: LatestLog | null): string {
-  if (!latestLog) return "(no output yet)";
-  return `[${latestLog.stream}] ${truncateText(latestLog.text, MAX_DISPLAY_LOG_CHARS)}`;
-}
-
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return;
   throw signal.reason instanceof Error ? signal.reason : new Error("Background task wait cancelled");
+}
+
+function waitForOrderedToolCall(toolCallId: string, signal: AbortSignal | undefined): Promise<void> | undefined {
+  const predecessor = orderedToolCalls.get(toolCallId)?.predecessor;
+  if (!predecessor) return undefined;
+  throwIfAborted(signal);
+  if (!signal) return predecessor;
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(
+      signal.reason instanceof Error ? signal.reason : new Error("Background task tool call cancelled"),
+    ));
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    predecessor.then(() => finish(resolve));
+    if (signal.aborted) onAbort();
+  });
 }
 
 async function waitUntilAllowed(
@@ -1538,6 +1569,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     enableSnapshotPersistence();
+    clearOrderedToolCalls();
     clearWidget();
     await restoreFinishedTaskSnapshots(ctx);
     uiCtx = ctx;
@@ -1545,14 +1577,31 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_tree", async (_event, ctx) => {
+    clearOrderedToolCalls();
     clearWidget();
     await restoreFinishedTaskSnapshots(ctx);
     uiCtx = ctx;
     updateWidget();
   });
 
+  pi.on("turn_start", async () => {
+    clearOrderedToolCalls();
+  });
+
+  pi.on("tool_call", async (event) => {
+    if (!ORDERED_TASK_TOOL_NAMES.has(event.toolName)) return;
+    const taskId = (event.input as Record<string, unknown>).id;
+    if (typeof taskId !== "string" || taskId.length === 0) return;
+    registerOrderedToolCall(event.toolCallId, taskId);
+  });
+
   pi.on("tool_execution_end", async (event, ctx) => {
+    releaseOrderedToolCall(event.toolCallId);
     if (event.toolName.startsWith("bg_")) { uiCtx = ctx; updateWidget(); }
+  });
+
+  pi.on("turn_end", async () => {
+    clearOrderedToolCalls();
   });
 
   pi.on("agent_settled", async () => {
@@ -1569,6 +1618,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    clearOrderedToolCalls();
     await snapshotPersistenceQueue;
     if (appendTaskSnapshotEntry === snapshotAppender) appendTaskSnapshotEntry = null;
     clearWidget();
@@ -1611,9 +1661,10 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Start a long-running command in the background",
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
-      "Set pty=true only when a command requires a terminal or TUI interaction; ordinary builds and servers should keep the default pipe mode.",
-      "For a finite task whose result is needed, continue other useful work first and then call bg_wait once instead of polling bg_status or bg_logs.",
-      "Do not call bg_wait for persistent servers or watchers, or when the task result is not needed before responding.",
+      "Set bg_start pty=true only for terminal-aware or interactive TUI programs; keep the default pipe mode for ordinary builds and servers.",
+      "When a task needs multiple actions or pieces of information, compose the required bg_* calls in one assistant response: calls with the same task id execute strictly in source order, while calls with different task IDs can execute in parallel. bg_start and bg_status without id are outside this ordering.",
+      "Within the current session, a running task survives ordinary agent-run boundaries and remains available to bg_wait, bg_status, bg_logs, bg_send, and bg_kill; session reload or shutdown terminates it. If a task finishes before the current agent run settles, bg_wait and bg_status can inspect its final status and bg_logs can inspect its retained output only for the rest of that run, and the task is normally removed before the next run starts. Only a task that is still running when the agent settles and then finishes while the agent is idle remains available throughout the next agent run; it may be inspected multiple times during that run and is normally removed before the following run.",
+      "After bg_start, use bg_wait only for finite tasks whose completion is needed, and use bg_logs separately for output; do not poll either tool.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "A short descriptive name for the task" }),
@@ -1623,6 +1674,8 @@ export default function (pi: ExtensionAPI) {
       cols: Type.Optional(Type.Number({ description: "Initial PTY columns (default: current terminal or 120)", minimum: 20, maximum: 500 })),
       rows: Type.Optional(Type.Number({ description: "Initial PTY rows (default: current terminal or 30)", minimum: 5, maximum: 200 })),
     }),
+
+    executionMode: "parallel",
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
       const id = generateId();
@@ -1713,7 +1766,7 @@ export default function (pi: ExtensionAPI) {
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nUse bg_wait once if the final result is needed; do not poll bg_status or bg_logs.` }],
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nUse bg_wait for finite completion and bg_logs for output. Same-task bg_* calls follow source order.` }],
         details: { id, name: params.name, command: params.command, pid: taskProcess.pid, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
       };
     },
@@ -1744,24 +1797,24 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_wait",
     label: "BG Wait",
-    description: "Wait for a finite background task to finish or until a timeout. A timeout does not stop the task.",
+    description: "Wait for a finite background task to finish or time out and report its status. Does not return process output or stop the task on timeout.",
     promptSnippet: "Wait once for a finite background task to finish",
     promptGuidelines: [
-      "Use bg_wait once when the final result of a finite background task is required before responding.",
-      "Prefer doing other useful work first, then use bg_wait instead of polling bg_status/bg_logs or running a shell sleep command.",
-      "When results from multiple finite tasks are required, call bg_wait for them together; independent waits execute in parallel.",
-      "For a PTY task, set terminal_snapshot=true when the final terminal screen is needed; it is omitted by default.",
-      "Do not use bg_wait for persistent servers or watchers. A timeout leaves the task running; do not immediately call bg_wait again unless the user asks you to keep waiting.",
+      "Use bg_wait once when a finite task's final status is required before responding.",
+      "bg_wait returns completion status only; use bg_logs as the only tool for reading pipe or PTY output.",
+      "A bg_wait timeout leaves the task running; any later bg_logs call reads the output retained at that point.",
+      "Do not use bg_wait for persistent servers or watchers, and do not immediately wait again after a timeout unless the user asks you to keep waiting.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
       timeout: Type.Optional(Type.Number({ description: "Maximum seconds to wait (default: 300)", minimum: 1, maximum: 3600 })),
-      terminal_snapshot: Type.Optional(Type.Boolean({ description: "For PTY tasks, include the current terminal screen in the result (default: false)" })),
     }),
 
     executionMode: "parallel",
 
-    async execute(_toolCallId, params, signal, onUpdate): Promise<AgentToolResult<Record<string, unknown>>> {
+    async execute(toolCallId, params, signal, onUpdate): Promise<AgentToolResult<Record<string, unknown>>> {
+      const predecessor = waitForOrderedToolCall(toolCallId, signal);
+      if (predecessor) await predecessor;
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
@@ -1792,12 +1845,6 @@ export default function (pi: ExtensionAPI) {
       );
       if (task.exitCode !== null) parts.push(`  Exit code:  ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:     ${task.signal}`);
-      parts.push(...formatTaskOutputStats(task));
-      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
-      else if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
-      if (task.mode === "pipe" && !timedOut && task.exitCode === 0 && task.stderrLines > 0) {
-        parts.push("  Note: the task exited with code 0 but wrote output to stderr.");
-      }
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
@@ -1810,10 +1857,6 @@ export default function (pi: ExtensionAPI) {
           exitCode: task.exitCode,
           signal: task.signal,
           mode: task.mode,
-          stdoutLines: task.stdoutLines,
-          stderrLines: task.stderrLines,
-          latestLog: task.mode === "pipe" ? task.latestLog : null,
-          terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot),
         },
       };
     },
@@ -1826,14 +1869,11 @@ export default function (pi: ExtensionAPI) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const name = renderTaskCallLabel(args.id, theme);
       const timeout = typeof args.timeout === "number" ? theme.fg("dim", `timeout=${args.timeout}s`) : "";
-      const snapshot = args.terminal_snapshot
-        ? theme.fg("dim", `snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
-        : "";
-      text.setText([theme.fg("toolTitle", theme.bold("bg_wait")), name, timeout, snapshot].filter(Boolean).join(" "));
+      text.setText([theme.fg("toolTitle", theme.bold("bg_wait")), name, timeout].filter(Boolean).join(" "));
       return text;
     },
 
-    renderResult(result, { expanded, isPartial }, theme, context) {
+    renderResult(result, { isPartial }, theme, context) {
       const state = context.state as BgWaitRenderState;
       if (state.startedAt !== undefined && isPartial && !state.interval) {
         state.interval = setInterval(() => context.invalidate(), 1000);
@@ -1854,7 +1894,6 @@ export default function (pi: ExtensionAPI) {
         return text;
       }
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const visibleContent = renderContentWithoutCollapsedSnapshots(content, Boolean(expanded));
       const details = result.details as { status?: BgTask["status"]; timedOut?: boolean } | undefined;
       const color = details?.timedOut
         ? "warning"
@@ -1863,7 +1902,7 @@ export default function (pi: ExtensionAPI) {
           : details?.status === "stopped"
             ? "warning"
             : "toolOutput";
-      return new Text(theme.fg(color, visibleContent) || visibleContent, 0, 0);
+      return new Text(theme.fg(color, content) || content, 0, 0);
     },
   });
 
@@ -1872,50 +1911,45 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_status",
     label: "BG Status",
-    description: "Inspect a background task snapshot or list current tasks. This is not a polling or waiting tool.",
-    promptSnippet: "Inspect background tasks only when status details are needed",
+    description: "Inspect task status and metadata or list current tasks. This is not a polling, waiting, or output-reading tool.",
+    promptSnippet: "Inspect background task status only when status details are needed",
     promptGuidelines: [
-      "Do not poll bg_status after bg_start; use bg_wait once when a finite task's final result is required.",
-      "Use bg_status only when the user explicitly asks for current task details, when recovering missing context, or when diagnosing task state.",
-      "Use bg_status without id only when a task ID is unknown and a task list is specifically needed.",
-      "For PTY tasks, set terminal_snapshot=true only when the current terminal screen is needed; it is omitted by default.",
+      "Do not poll bg_status after bg_start; use bg_wait once when a finite task's final status is required.",
+      "Use bg_status only for requested task metadata, recovering a missing task ID, or diagnosing task state.",
+      "Use bg_status without id only when the task ID is unknown and a retained-task list is needed.",
+      "bg_status never returns process output; use bg_logs for both pipe and PTY output.",
     ],
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task ID. If omitted, lists all retained tasks." })),
-      terminal_snapshot: Type.Optional(Type.Boolean({ description: "For PTY tasks, include the current terminal screen in the result (default: false)" })),
     }),
 
-    executionMode: "sequential",
+    executionMode: "parallel",
 
-    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
+    async execute(toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
+      const predecessor = waitForOrderedToolCall(toolCallId, signal);
+      if (predecessor) await predecessor;
       if (!params.id) {
         const entries = Array.from(tasks.values());
         if (entries.length === 0) {
           return { content: [{ type: "text", text: "No background tasks." }], details: { tasks: [] } };
         }
-        await Promise.all(entries.map((task) => flushConsole(task)));
-        const lines = entries.map((t) => {
-          const dur = t.endedAt ? formatDuration(t.endedAt - t.startedAt) : formatDuration(Date.now() - t.startedAt);
-          const exit = t.exitCode !== null ? ` exit=${t.exitCode}` : "";
-          const summary = `[${t.id}] "${t.name}" ${t.status} ${t.mode} (${dur})${exit}`;
-          if (t.mode === "pipe") return `${summary}\n  Latest log: ${formatLatestLog(t.latestLog)}`;
-          return summary;
+        const lines = entries.map((task) => {
+          const duration = task.endedAt
+            ? formatDuration(task.endedAt - task.startedAt)
+            : formatDuration(Date.now() - task.startedAt);
+          const exit = task.exitCode !== null ? ` exit=${task.exitCode}` : "";
+          return `[${task.id}] "${task.name}" ${task.status} ${task.mode} (${duration})${exit}`;
         });
-        if (params.terminal_snapshot) {
-          lines.push(...entries
-            .filter((task) => task.mode === "pty")
-            .map((task) => formatPtyScreenSnapshot(task, `"${task.name}" (${task.id})`)));
-        }
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {
-            tasks: entries.map((t) => ({
-              id: t.id,
-              name: t.name,
-              status: t.status,
-              mode: t.mode,
-              latestLog: t.mode === "pipe" ? t.latestLog : null,
-              terminalSnapshot: t.mode === "pty" && Boolean(params.terminal_snapshot),
+            tasks: entries.map((task) => ({
+              id: task.id,
+              name: task.name,
+              status: task.status,
+              mode: task.mode,
+              exitCode: task.exitCode,
+              signal: task.signal,
             })),
           },
         };
@@ -1924,24 +1958,32 @@ export default function (pi: ExtensionAPI) {
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
-      await flushConsole(task);
-
-      const duration = task.endedAt ? formatDuration(task.endedAt - task.startedAt) : formatDuration(Date.now() - task.startedAt);
+      const duration = task.endedAt
+        ? formatDuration(task.endedAt - task.startedAt)
+        : formatDuration(Date.now() - task.startedAt);
       const parts: string[] = [
         `Task: ${task.name} (${task.id})`,
-        `  Status:    ${task.status}`, `  Command:   ${task.command}`, `  Duration:  ${duration}`,
+        `  Status:    ${task.status}`,
+        `  Command:   ${task.command}`,
+        `  Mode:      ${task.mode}`,
+        `  Duration:  ${duration}`,
       ];
       if (task.exitCode !== null) parts.push(`  Exit code: ${task.exitCode}`);
       if (task.signal) parts.push(`  Signal:    ${task.signal}`);
       if (task.process?.pid) parts.push(`  PID:       ${task.process.pid}`);
-      parts.push(...formatTaskOutputStats(task));
-      if (task.mode === "pipe") parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
-      else if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
       if (task.status === "running") parts.push("  Use bg_wait to await completion; do not poll bg_status.");
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, mode: task.mode, exitCode: task.exitCode, signal: task.signal, pid: task.process?.pid, stdoutLines: task.stdoutLines, stderrLines: task.stderrLines, latestLog: task.mode === "pipe" ? task.latestLog : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
+        details: {
+          id: task.id,
+          name: task.name,
+          status: task.status,
+          mode: task.mode,
+          exitCode: task.exitCode,
+          signal: task.signal,
+          pid: task.process?.pid,
+        },
       };
     },
 
@@ -1951,18 +1993,14 @@ export default function (pi: ExtensionAPI) {
       const label = hasTaskId
         ? renderTaskCallLabel(args.id, theme)
         : context.argsComplete ? theme.fg("toolOutput", "all") : "";
-      const snapshot = args.terminal_snapshot
-        ? theme.fg("dim", `snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
-        : "";
-      text.setText([theme.fg("toolTitle", theme.bold("bg_status")), label, snapshot].filter(Boolean).join(" "));
+      text.setText([theme.fg("toolTitle", theme.bold("bg_status")), label].filter(Boolean).join(" "));
       return text;
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Checking..."), 0, 0);
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const visibleContent = renderContentWithoutCollapsedSnapshots(content, Boolean(expanded));
-      const lines = visibleContent.split("\n").map(l => {
+      const lines = content.split("\n").map(l => {
         if (l.includes("Status:")) {
           if (l.includes("running")) return l.replace("running", theme.fg("success", "running"));
           if (l.includes("completed")) return l.replace("completed", theme.fg("accent", "completed"));
@@ -1981,13 +2019,12 @@ export default function (pi: ExtensionAPI) {
     name: "bg_logs",
     label: "BG Logs",
     description:
-      "Read stdout/stderr output or a PTY screen snapshot from a background task for inspection, not for polling progress.",
-    promptSnippet: "Read output or a terminal screen snapshot from a background task",
+      "Read retained output from a background task: stdout/stderr for pipe mode or the parsed terminal buffer for PTY mode.",
+    promptSnippet: "Read pipe or PTY output from a background task",
     promptGuidelines: [
-      "Use bg_logs to read the output of a background task.",
-      "Use bg_logs with tail=N to read the last N lines of output.",
-      "PTY tasks return a terminal screen snapshot because stdout and stderr are merged by the pseudoterminal.",
-      "Do not repeatedly call bg_logs to wait for progress; use bg_wait once when a finite task's final result is required.",
+      "Use bg_logs as the only background-task tool that reads process output.",
+      "Use bg_logs with tail=N for recent output; omit stream to use the correct default for either pipe or PTY mode.",
+      "Do not poll with bg_logs; use one bg_wait call when a finite task's final status is required.",
     ],
 
     parameters: Type.Object({
@@ -1997,7 +2034,7 @@ export default function (pi: ExtensionAPI) {
       ),
       stream: Type.Optional(
         StringEnum(["stdout", "stderr", "both", "terminal"] as const, {
-          description: "Which stream (default: 'both'); use terminal for PTY snapshots",
+          description: "Which stream (default: 'both'); use terminal for explicit PTY output",
         }),
       ),
       from_line: Type.Optional(
@@ -2010,10 +2047,15 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
 
+    executionMode: "parallel",
+
     async execute(
-      _toolCallId,
+      toolCallId,
       params,
+      signal,
     ): Promise<AgentToolResult<Record<string, unknown>>> {
+      const predecessor = waitForOrderedToolCall(toolCallId, signal);
+      if (predecessor) await predecessor;
       const task = tasks.get(params.id);
       if (!task)
         return {
@@ -2056,7 +2098,7 @@ export default function (pi: ExtensionAPI) {
 
       if (stream === "terminal") {
         return {
-          content: [{ type: "text", text: "(terminal snapshots are only available for PTY tasks)" }],
+          content: [{ type: "text", text: "(terminal output is only available for PTY tasks)" }],
           details: { id: task.id, name: task.name, status: task.status, mode: task.mode },
         };
       }
@@ -2444,9 +2486,9 @@ export default function (pi: ExtensionAPI) {
     description: "Send text and terminal keys using one compact input string, or send an OS signal to a running background task.",
     promptSnippet: "Send a compact text/key input string or an OS signal to a background task",
     promptGuidelines: [
-      "Provide exactly one of input or signal. Plain input is exact text; every terminal key must be inside an angle-bracket token such as <C-d>, <A-f>, <Space>, or <Up>. Escape a literal '<' as \\<.",
-      "Terminal keys always use input. Use signal only when an OS process signal is explicitly intended.",
-      "For pipe tasks, <C-d> or <EOF> closes stdin.",
+      "Provide exactly one of bg_send input or signal. bg_send input is exact text; wrap every terminal key in an angle-bracket token such as <C-d>, <A-f>, <Space>, or <Up>, and escape a literal '<' as \\<.",
+      "Use bg_send input for terminal keys; use bg_send signal only when an OS process signal is explicitly intended.",
+      "For a pipe task, bg_send input=<C-d> or input=<EOF> closes stdin.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
@@ -2454,7 +2496,11 @@ export default function (pi: ExtensionAPI) {
       signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "Named OS signal supported by the current platform, sent to the process group" })),
     }),
 
-    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
+    executionMode: "parallel",
+
+    async execute(toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
+      const predecessor = waitForOrderedToolCall(toolCallId, signal);
+      if (predecessor) await predecessor;
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is not running.` }], details: {} };
@@ -2527,20 +2573,23 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "bg_kill",
     label: "BG Kill",
-    description: "Terminate a background task. Sends SIGTERM by default or SIGKILL with force=true.",
+    description: "Terminate a background task and report the termination result. Sends SIGTERM by default or SIGKILL with force=true; does not return process output.",
     promptSnippet: "Terminate an unresponsive background task",
     promptGuidelines: [
-      "Use bg_kill when a background task needs to be terminated.",
-      "Use bg_kill with force=true to send SIGKILL immediately; otherwise it sends SIGTERM.",
-      "For PTY tasks, set terminal_snapshot=true when the final terminal screen is needed; it is omitted by default.",
+      "Use bg_kill when a background task must be terminated.",
+      "Use bg_kill with force=true to send SIGKILL immediately; otherwise bg_kill sends SIGTERM.",
+      "bg_kill returns termination status only; use bg_logs when process output is needed.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID" }),
       force: Type.Optional(Type.Boolean({ description: "Send SIGKILL instead of SIGTERM (default: false)" })),
-      terminal_snapshot: Type.Optional(Type.Boolean({ description: "For PTY tasks, include the final terminal screen in the result (default: false)" })),
     }),
 
-    async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
+    executionMode: "parallel",
+
+    async execute(toolCallId, params, abortSignal): Promise<AgentToolResult<Record<string, unknown>>> {
+      const predecessor = waitForOrderedToolCall(toolCallId, abortSignal);
+      if (predecessor) await predecessor;
       const task = tasks.get(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is already ${task.status}.` }], details: {} };
@@ -2556,17 +2605,9 @@ export default function (pi: ExtensionAPI) {
       await waitForTaskEnd(task, params.force ? 500 : 2500);
 
       const action = task.status === "running" ? `Sent ${signal} to` : "Terminated";
-      const parts = [`${action} "${task.name}". Status: ${task.status}`];
-      if (task.mode === "pty") {
-        await flushConsole(task);
-        if (params.terminal_snapshot) parts.push(formatPtyScreenSnapshot(task));
-      } else {
-        parts.push(`  Latest log: ${formatLatestLog(task.latestLog)}`);
-      }
-
       return {
-        content: [{ type: "text", text: parts.join("\n") }],
-        details: { id: task.id, name: task.name, status: task.status, signal, mode: task.mode, latestLog: task.mode === "pipe" ? task.latestLog : null, terminalSnapshot: task.mode === "pty" && Boolean(params.terminal_snapshot) },
+        content: [{ type: "text", text: `${action} "${task.name}". Status: ${task.status}` }],
+        details: { id: task.id, name: task.name, status: task.status, signal, mode: task.mode },
       };
     },
 
@@ -2574,21 +2615,16 @@ export default function (pi: ExtensionAPI) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const name = renderTaskCallLabel(args.id, theme);
       const sig = args.force ? theme.fg("error", "SIGKILL") : "";
-      const snapshot = args.terminal_snapshot
-        ? theme.fg("dim", `snapshot (${keyText("app.tools.expand")} ${context.expanded ? "to collapse" : "to expand"})`)
-        : "";
-      text.setText([theme.fg("toolTitle", theme.bold("bg_kill")), name, sig, snapshot].filter(Boolean).join(" "));
+      text.setText([theme.fg("toolTitle", theme.bold("bg_kill")), name, sig].filter(Boolean).join(" "));
       return text;
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Killing..."), 0, 0);
       const content = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const visibleContent = renderContentWithoutCollapsedSnapshots(content, Boolean(expanded));
-      const lines = visibleContent.split("\n").map(l => {
+      const lines = content.split("\n").map(l => {
         if (l.includes("SIGKILL")) return theme.fg("error", l) || l;
         if (l.includes("SIGTERM")) return theme.fg("warning", l) || l;
-        if (l.startsWith("── ") || l.startsWith("-- ")) return theme.fg("accent", l) || l;
         return theme.fg("toolOutput", l) || l;
       });
       return new Text(lines.join("\n"), 0, 0);

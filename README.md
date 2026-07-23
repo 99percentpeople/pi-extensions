@@ -62,8 +62,8 @@ Tools:
 
 - `bg_start` starts a pipe or PTY background task.
 - `bg_wait` waits once for a finite task to finish or time out.
-- `bg_status` inspects one task or lists known tasks.
-- `bg_logs` reads pipe output or a parsed PTY terminal snapshot.
+- `bg_status` reads task metadata or lists known tasks.
+- `bg_logs` is the only tool that reads pipe or parsed PTY output.
 - `bg_send` sends text, terminal keys, or supported process signals.
 - `bg_kill` terminates a task.
 
@@ -82,8 +82,9 @@ bg_start name="git-ui" command="lazygit" pty=true
 
 Terminal keys sent through `bg_send` use angle-bracket tokens such as
 `<C-c>`, `<A-f>`, `<Space>`, `<Up>`, and `<F10>`. Escape a literal `<` as `\<`.
-PTY snapshots are opt-in on status, wait, and kill results and are collapsed
-in Pi's TUI by default.
+Same-task calls in one model response execute in source order, so
+`bg_wait → bg_logs` waits before reading output while different task chains can
+run in parallel. The same sequence works for pipe and PTY tasks.
 
 PTY support uses `node-pty`. If no compatible native binary is available,
 installation may require a C/C++ toolchain. See the
