@@ -15,6 +15,7 @@ retained output, interactive attach, and completion-aware cleanup.
 - Interact with PTY applications using keyboard, mouse, focus, and resize events
 - Inspect separate stdout/stderr logs for pipe tasks or a parsed terminal screen for PTY tasks
 - Wait explicitly for task completion without repeated polling
+- Require unique task names while tasks remain retained, preventing ambiguous references
 - Keep final output available long enough for both the user and model to inspect it
 - Track task status, duration, and recent output in a compact expandable widget
 - Send text, terminal keys, stdin data, and process signals to running tasks
@@ -142,10 +143,12 @@ throughout the next agent run. It can be inspected multiple times during that
 run and is normally removed before the following run.
 
 Once removed, the old task ID is no longer available through attach, status,
-logs, or wait operations. Completed snapshots are checkpointed as hidden Pi
-session entries, so reloading the extension or navigating the session tree does
-not clear them early. Cleanup writes a matching session event, so an expired
-snapshot cannot reappear after another reload.
+logs, or wait operations. Task names must be unique (case-insensitively) among
+all retained running and finished tasks; a name becomes available again when its
+old task is removed by this cleanup lifecycle. Completed snapshots are
+checkpointed as hidden Pi session entries, so reloading the extension or
+navigating the session tree does not clear them early. Cleanup writes a matching
+session event, so an expired snapshot cannot reappear after another reload.
 
 Live pipe stdout and stderr remain in memory and are capped at 4 MiB each, with
 the oldest bytes discarded when that limit is reached. A persisted pipe
@@ -214,6 +217,14 @@ than `cmd.exe`.
 
 Installing `@99percentpeople/pi-pwsh-adapter` explicitly switches both Pi's
 built-in shell tool and background tasks to PowerShell syntax.
+
+Pipe-task completion follows the tracked process's `exit` event rather than the
+stdio `close` event. Launch failures are finalized by the pre-spawn `error`
+event, while `close` is used only to persist any output drained after process
+exit. This matters on Windows, where a descendant can keep a pipe handle open
+after the shell PID has already exited; the task status still transitions out
+of `running`, so later status or kill operations do not target a nonexistent
+process.
 
 ## Native dependency
 

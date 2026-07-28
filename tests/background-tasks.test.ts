@@ -39,6 +39,7 @@ class FakeChildProcess extends EventEmitter {
   finish(code: number | null, signal: NodeJS.Signals | null): void {
     if (this.closed) return;
     this.closed = true;
+    this.emit("exit", code, signal);
     let endedStreams = 0;
     const emitClose = () => {
       endedStreams += 1;
@@ -48,6 +49,23 @@ class FakeChildProcess extends EventEmitter {
     this.stderr.once("end", emitClose);
     this.stdout.end();
     this.stderr.end();
+  }
+
+  exitWithoutClosingStreams(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("exit", code, signal);
+  }
+
+  emitCloseWithoutExit(code: number | null, signal: NodeJS.Signals | null): void {
+    this.emit("close", code, signal);
+  }
+
+  failToSpawn(error: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("error", error);
+    this.emit("close", null, null);
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
@@ -332,6 +350,126 @@ test("background tasks can pass commands through Pi's stdin shell transport", as
   assert.equal(children[0].stdin.writableEnded, true);
   children[0].finish(0, null);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("background task names are unique among retained tasks", async () => {
+  const { tools, lifecycle, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  const first = await bgStart.execute(
+    "unique-name-first",
+    { name: "  Build Server  ", command: "fake first build server" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(first.details.name, "Build Server", "task names should be trimmed before storage");
+
+  await assert.rejects(
+    bgStart.execute(
+      "unique-name-running-duplicate",
+      { name: "build server", command: "fake duplicate while running" },
+      undefined,
+      undefined,
+      ctx,
+    ),
+    new RegExp(`name "build server" is already in use by task ${first.details.id} \\(running\\)`, "i"),
+  );
+  assert.equal(children.length, 1, "a duplicate name must be rejected before spawning");
+
+  children[0].finish(0, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await assert.rejects(
+    bgStart.execute(
+      "unique-name-retained-duplicate",
+      { name: "BUILD SERVER", command: "fake duplicate while retained" },
+      undefined,
+      undefined,
+      ctx,
+    ),
+    /already in use.*completed/i,
+  );
+  assert.equal(children.length, 1, "a retained finished task should continue reserving its name");
+
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const reused = await bgStart.execute(
+    "unique-name-reused",
+    { name: "build server", command: "fake reused build server" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(reused.details.name, "build server");
+  assert.equal(children.length, 2, "the name may be reused after the old task expires");
+  children[1].finish(0, null);
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("pipe task status follows process exit rather than stdio close", async () => {
+  const { tools, lifecycle, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgStatus = tools.get("bg_status");
+  const bgKill = tools.get("bg_kill");
+  assert.ok(bgStart && bgStatus && bgKill);
+
+  const started = await bgStart.execute(
+    "exit-with-open-stdio-start",
+    { name: "exit-with-open-stdio", command: "fake inherited stdio handles" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const id = started.details.id as string;
+  children[0].stdout.write("final output before shell exit\n");
+  children[0].exitWithoutClosingStreams(0, null);
+
+  const status = await bgStatus.execute("exit-with-open-stdio-status", { id }, undefined, undefined, ctx);
+  assert.equal(status.details.status, "completed");
+  assert.equal(status.details.exitCode, 0);
+  assert.doesNotMatch(status.content[0].text, /Use bg_wait to await completion/);
+
+  const killed = await bgKill.execute("exit-with-open-stdio-kill", { id }, undefined, undefined, ctx);
+  assert.match(killed.content[0].text, /already completed/);
+  assert.doesNotMatch(killed.content[0].text, /Failed to send|process.*not found/i);
+
+  const closeOnly = await bgStart.execute(
+    "close-without-exit-start",
+    { name: "close-without-exit", command: "fake close before exit" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const closeOnlyId = closeOnly.details.id as string;
+  children[1].emitCloseWithoutExit(0, null);
+  const stillRunning = await bgStatus.execute(
+    "close-without-exit-status",
+    { id: closeOnlyId },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(stillRunning.details.status, "running", "close must not drive process state");
+  children[1].finish(0, null);
+
+  const failedSpawn = await bgStart.execute(
+    "spawn-error-start",
+    { name: "spawn-error", command: "fake spawn error" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const failedSpawnId = failedSpawn.details.id as string;
+  children[2].failToSpawn(new Error("spawn ENOENT"));
+  const failedStatus = await bgStatus.execute(
+    "spawn-error-status",
+    { id: failedSpawnId },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(failedStatus.details.status, "failed", "a pre-spawn error must be terminal without exit");
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 

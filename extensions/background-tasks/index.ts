@@ -346,6 +346,17 @@ function generateId(): string {
   return id;
 }
 
+function normalizeTaskName(name: string): string {
+  return name.trim();
+}
+
+function findTaskByName(name: string): BgTask | undefined {
+  const normalized = normalizeTaskName(name).toLocaleLowerCase();
+  return Array.from(tasks.values()).find(
+    (task) => normalizeTaskName(task.name).toLocaleLowerCase() === normalized,
+  );
+}
+
 function taskLogKey(id: string, stream: "stdout" | "stderr"): string {
   return `${id}:${stream}`;
 }
@@ -925,9 +936,9 @@ function finishTask(task: BgTask, code: number | null, signal: string | null, fa
   task.done.abort();
   task.attachment.taskExited?.();
   updateWidget();
-  void persistFinishedTaskSnapshot(task)
-    .catch(() => {})
-    .then(() => updateWidget());
+  // Snapshot persistence does not change visible task state; avoid a second,
+  // delayed widget render after the task has already transitioned to finished.
+  void persistFinishedTaskSnapshot(task).catch(() => {});
 }
 
 const ATTACH_DETACH_KEY = "\x1d";
@@ -1412,7 +1423,15 @@ function stopRefreshTimer() {
 
 function startRefreshTimer() {
   if (refreshTimer) return;
-  refreshTimer = setInterval(updateWidget, WIDGET_REFRESH_INTERVAL_MS);
+  refreshTimer = setInterval(() => {
+    // A timer callback may already be queued when the final task exits. Avoid
+    // issuing one stale render after finishTask has stopped the ticker.
+    if (runningTasks.size === 0) {
+      stopRefreshTimer();
+      return;
+    }
+    updateWidget();
+  }, WIDGET_REFRESH_INTERVAL_MS);
   refreshTimer.unref?.();
 }
 
@@ -1661,13 +1680,14 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Start a long-running command in the background",
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
+      "Give each bg_start task a unique name; names are compared case-insensitively across all currently retained tasks.",
       "Set bg_start pty=true only for terminal-aware or interactive TUI programs; keep the default pipe mode for ordinary builds and servers.",
       "When a task needs multiple actions or pieces of information, compose the required bg_* calls in one assistant response: calls with the same task id execute strictly in source order, while calls with different task IDs can execute in parallel. bg_start and bg_status without id are outside this ordering.",
       "Within the current session, a running task survives ordinary agent-run boundaries and remains available to bg_wait, bg_status, bg_logs, bg_send, and bg_kill; session reload or shutdown terminates it. If a task finishes before the current agent run settles, bg_wait and bg_status can inspect its final status and bg_logs can inspect its retained output only for the rest of that run, and the task is normally removed before the next run starts. Only a task that is still running when the agent settles and then finishes while the agent is idle remains available throughout the next agent run; it may be inspected multiple times during that run and is normally removed before the following run.",
       "After bg_start, use bg_wait only for finite tasks whose completion is needed, and use bg_logs separately for output; do not poll either tool.",
     ],
     parameters: Type.Object({
-      name: Type.String({ description: "A short descriptive name for the task" }),
+      name: Type.String({ description: "A short unique name for the task (case-insensitive among retained tasks)", minLength: 1 }),
       command: Type.String({ description: "The shell command to run" }),
       cwd: Type.Optional(Type.String({ description: "Working directory (defaults to current)" })),
       pty: Type.Optional(Type.Boolean({ description: "Run in a pseudoterminal for interactive/TUI programs (default: false)" })),
@@ -1678,6 +1698,16 @@ export default function (pi: ExtensionAPI) {
     executionMode: "parallel",
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
+      const name = normalizeTaskName(params.name);
+      if (!name) throw new Error("Background task name cannot be empty.");
+      const duplicate = findTaskByName(name);
+      if (duplicate) {
+        throw new Error(
+          `Background task name "${name}" is already in use by task ${duplicate.id} (${duplicate.status}). ` +
+          "Choose a unique name.",
+        );
+      }
+
       const id = generateId();
       const stdoutLogKey = taskLogKey(id, "stdout");
       const stderrLogKey = taskLogKey(id, "stderr");
@@ -1724,7 +1754,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const task: BgTask = {
-        id, name: params.name, command: params.command, mode,
+        id, name, command: params.command, mode,
         process: taskProcess, console, attachment: {}, status: "running",
         exitCode: null, signal: null,
         order: nextTaskOrder++,
@@ -1746,16 +1776,42 @@ export default function (pi: ExtensionAPI) {
         });
       } else {
         const child = taskProcess.child;
-        child.stdout?.on("data", (d: Buffer) => recordPipeData(task, "stdout", d));
-        child.stderr?.on("data", (d: Buffer) => recordPipeData(task, "stderr", d));
-        let spawnError: Error | null = null;
-        child.on("error", (err) => {
-          spawnError = err;
+        let outputRevision = 0;
+        child.stdout?.on("data", (d: Buffer) => {
+          outputRevision += 1;
+          recordPipeData(task, "stdout", d);
+        });
+        child.stderr?.on("data", (d: Buffer) => {
+          outputRevision += 1;
+          recordPipeData(task, "stderr", d);
+        });
+        let spawned = false;
+        child.once("spawn", () => {
+          spawned = true;
+        });
+        child.once("error", (err) => {
           const errorLine = `[error: ${err.message}]`;
           recordPipeData(task, "stderr", Buffer.from(`\n${errorLine}\n`));
+          // A launch failure emits `error` and `close`, but never `exit`.
+          if (!spawned) finishTask(task, null, null, true);
         });
-        child.on("close", (code, signal) => {
-          finishTask(task, code, signal, Boolean(spawnError));
+        let outputRevisionAtExit: number | null = null;
+        // Process state follows `exit` only. On Windows, inherited stdio handles can
+        // keep `close` pending long after this PID no longer exists.
+        child.once("exit", (code, signal) => {
+          outputRevisionAtExit = outputRevision;
+          finishTask(task, code, signal);
+        });
+        // `close` is an I/O lifecycle event. If more output arrived after `exit`,
+        // update the snapshot without adding a redundant entry for the normal case.
+        child.once("close", () => {
+          if (
+            task.status !== "running" &&
+            outputRevisionAtExit !== null &&
+            outputRevision !== outputRevisionAtExit
+          ) {
+            void persistFinishedTaskSnapshot(task).catch(() => {});
+          }
         });
         if (shell.initialStdin !== undefined) {
           child.stdin?.end(shell.initialStdin);
@@ -1766,8 +1822,8 @@ export default function (pi: ExtensionAPI) {
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${params.name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nUse bg_wait for finite completion and bg_logs for output. Same-task bg_* calls follow source order.` }],
-        details: { id, name: params.name, command: params.command, pid: taskProcess.pid, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nUse bg_wait for finite completion and bg_logs for output. Same-task bg_* calls follow source order.` }],
+        details: { id, name, command: params.command, pid: taskProcess.pid, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
       };
     },
 
