@@ -292,11 +292,11 @@ independently:
 
 | Package | Tag format | Example |
 | --- | --- | --- |
-| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.1.3` |
+| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.2.2` |
 | cursor-effect | `cursor-effect-v<version>` | `cursor-effect-v0.1.0` |
-| pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
+| pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.2` |
 | thinking-fold | `thinking-fold-v<version>` | `thinking-fold-v0.1.0` |
-| todo | `todo-v<version>` | `todo-v1.1.2` |
+| todo | `todo-v<version>` | `todo-v1.1.3` |
 | shared-settings | `shared-settings-v<version>` | `shared-settings-v0.1.0` |
 
 Publish `shared-settings` before releasing an extension that requires a newer

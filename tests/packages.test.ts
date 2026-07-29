@@ -43,7 +43,7 @@ test("extensions are independently publishable workspace packages", async () => 
   ]);
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "1.2.1");
+  assert.equal(background.version, "1.2.2");
   assert.deepEqual(background.pi?.extensions, ["./index.ts"]);
   assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
   assert.equal(background.dependencies?.["node-pty"], "1.2.0-beta.14");
@@ -58,7 +58,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.0.1");
+  assert.equal(pwsh.version, "1.0.2");
   assert.deepEqual(pwsh.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(pwsh.os, ["win32"]);
   assert.equal(
@@ -84,7 +84,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.1.2");
+  assert.equal(todo.version, "1.1.3");
   assert.deepEqual(todo.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(todo.files, [
     "index.ts",
