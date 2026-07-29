@@ -419,7 +419,11 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.doesNotMatch(JSON.stringify(tool.parameters), /cancelled/);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /define it yourself.*before beginning implementation or other substantive work/i);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /omitted keys are deleted/i);
-  assert.equal(commands.size, 0, "the extension should not register a user-facing todo interface");
+  assert.deepEqual(
+    [...commands.keys()],
+    ["99settings"],
+    "todo exposes only the shared settings menu, not a todo-specific command",
+  );
   assert.deepEqual([...handlers.keys()].sort(), [
     "before_agent_start",
     "session_compact",

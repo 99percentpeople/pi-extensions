@@ -1,51 +1,41 @@
 {
-  "name": "@99percentpeople/pi-todo",
-  "version": "1.1.2",
-  "description": "A minimal atomic todo tool with omission-based deletion, compaction-safe state, dependencies, and a read-only Pi widget",
+  "name": "@99percentpeople/pi-shared-settings",
+  "version": "0.1.0",
+  "description": "Shared namespaced settings store and installed-extension menu for @99percentpeople Pi packages",
   "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts",
   "files": [
     "index.ts",
-    "state.ts",
+    "sectioned-settings-list.ts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "prepublishOnly": "bun run --cwd ../.. check"
   },
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
   "keywords": [
-    "pi-package",
     "pi",
     "coding-agent",
-    "todo",
-    "task-planning"
+    "settings",
+    "extension"
   ],
   "author": "99percentpeople",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/99percentpeople/pi-extensions.git",
-    "directory": "extensions/todo"
+    "directory": "packages/shared-settings"
   },
   "bugs": {
     "url": "https://github.com/99percentpeople/pi-extensions/issues"
   },
-  "homepage": "https://github.com/99percentpeople/pi-extensions#todo",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
-  "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.0"
-  },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-tui": "*"
   }
 }

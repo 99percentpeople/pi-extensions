@@ -1,3 +1,4 @@
+import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
@@ -143,6 +144,12 @@ function renderTodoWidget(state: TodoState, width: number, expanded: boolean, th
 }
 
 export default function todoExtension(pi: ExtensionAPI): void {
+  registerExtensionSettings(pi, {
+    namespace: "todo",
+    title: "Todo",
+    settings: () => [],
+  });
+
   let state = createEmptyTodoState();
   let uiContext: ExtensionContext | undefined;
   let widgetRegistered = false;

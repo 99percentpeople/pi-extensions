@@ -22,6 +22,7 @@
  *   Or: pi -e ./background-tasks/
  */
 
+import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
@@ -1563,6 +1564,12 @@ function updateWidget(): void {
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  registerExtensionSettings(pi, {
+    namespace: "background-tasks",
+    title: "Background Tasks",
+    settings: () => [],
+  });
+
   const snapshotAppender = (event: PersistedTaskEvent) => {
     pi.appendEntry(TASK_SNAPSHOT_CUSTOM_TYPE, event);
   };

@@ -234,6 +234,12 @@ this generally means Xcode command-line tools; Windows builds may require Visual
 Studio C++ and the Windows SDK. Pipe mode does not require a pseudo-terminal at
 runtime, but `node-pty` is still installed as a package dependency.
 
+## Shared settings
+
+Installing this plugin participates in the shared `/99settings` infrastructure,
+but Background Tasks is omitted from the menu while it has no configurable
+values. Operational commands such as `/bg-attach` and `/bg-kill` remain separate.
+
 ## License
 
 MIT

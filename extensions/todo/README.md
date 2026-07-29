@@ -4,8 +4,8 @@ A minimal, atomic todo tool for the [Pi coding agent](https://pi.dev/).
 The model writes the complete task plan in one call instead of issuing one
 `create` call per task.
 
-The extension intentionally has no slash commands, interactive manager, or
-user-editable todo interface. Todo state belongs to the model. A read-only list
+The extension intentionally has no todo-specific slash commands, interactive
+manager, or user-editable todo interface. Todo state belongs to the model. A read-only list
 is rendered above Pi's input box.
 
 ## Features
@@ -187,6 +187,11 @@ model context. It injects that snapshot as one hidden model-facing message on
 the next prompt, or immediately as steering context when overflow recovery or an
 already queued continuation proceeds without a new prompt. This preserves exact
 keys, dependencies, and revision numbers without triggering an extra model turn.
+
+## Shared settings
+
+Installing this plugin participates in the shared `/99settings` infrastructure,
+but Todo is omitted from the menu while it has no configurable values.
 
 ## License
 

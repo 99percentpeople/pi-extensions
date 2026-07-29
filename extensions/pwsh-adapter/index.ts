@@ -1,3 +1,4 @@
+import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import type { ExtensionAPI, BashOperations } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -256,6 +257,12 @@ export function createBgShellResolver(runtime: PowerShellRuntime) {
 }
 
 export default function (pi: ExtensionAPI) {
+  registerExtensionSettings(pi, {
+    namespace: "pwsh-adapter",
+    title: "PowerShell Adapter",
+    settings: () => [],
+  });
+
   // This package is Windows-only. Keep accidental local loads on Unix as a no-op.
   if (process.platform !== "win32") return;
 
