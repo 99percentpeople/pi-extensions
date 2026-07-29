@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-thinking-fold",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fold streaming reasoning into a live tail preview and expand it with Pi's thinking shortcut",
   "type": "module",
   "files": [

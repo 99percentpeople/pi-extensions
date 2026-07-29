@@ -77,7 +77,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(thinkingFold.name, "@99percentpeople/pi-thinking-fold");
-  assert.equal(thinkingFold.version, "0.1.0");
+  assert.equal(thinkingFold.version, "0.1.1");
   assert.deepEqual(thinkingFold.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(thinkingFold.files, [
     "index.ts",
