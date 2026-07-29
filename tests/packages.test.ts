@@ -51,7 +51,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(cursorEffect.name, "@99percentpeople/pi-cursor-effect");
-  assert.equal(cursorEffect.version, "0.1.0");
+  assert.equal(cursorEffect.version, "0.1.1");
   assert.deepEqual(cursorEffect.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(cursorEffect.files, [
     "index.ts",
