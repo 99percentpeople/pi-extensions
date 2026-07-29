@@ -151,10 +151,11 @@ The task list is rendered in a read-only widget above Pi's input box. It follows
 Pi's standard tool-output expansion state (`Ctrl+O` by default):
 
 - collapsed: overall progress and up to three tasks;
-- expanded: the complete todo list with a status glyph and task name only.
+- expanded: the complete todo list with status glyphs, task names, and resolved prerequisites.
 
 While the model is streaming a `todo` call, the tool row updates in place and
-shows each task name as it is written instead of only showing a task count.
+shows each task name and its compact dependency references as they are written
+instead of only showing a task count.
 Sparse updates reuse the current task name and status until their changed fields
 arrive. Fields that are not yet known are omitted: a new task appears after its
 subject is written, and its status glyph appears only after its status is
@@ -170,9 +171,13 @@ first three tasks. Once every task is completed, it shows the last three tasks
 instead so the most recently finished work remains visible. The expand/collapse
 hint is shown only when more than three tasks are visible.
 
-The model-facing result includes keys, dependencies, and descriptions. The
-user-facing live tool call and widget show only status glyphs and task names.
-The shortcut respects the user's `app.tools.expand` keybinding.
+The model-facing result includes keys, dependencies, and descriptions. In the
+user-facing live tool call and widget, tasks participating in the dependency
+graph receive plan-order display numbers after their names, such as
+`○ Inspect #1` and `○ Implement #2 ← #1`. Independent tasks stay unnumbered,
+multiple prerequisites use `← #1, #2`, and stable task keys remain hidden. These
+numbers are display-only and may be reassigned when the plan changes. The
+shortcut respects the user's `app.tools.expand` keybinding.
 
 ## Persistence
 

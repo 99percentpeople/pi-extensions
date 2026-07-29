@@ -460,16 +460,18 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     theme,
     { lastComponent: undefined, expanded: false, argsComplete: false },
   );
-  assert.match(initialDraft.render(160).join("\n"), /✓ Design the database schema/);
+  const initialDraftText = initialDraft.render(160).join("\n");
+  assert.match(initialDraftText, /✓ Design the database schema/);
+  assert.doesNotMatch(initialDraftText, /#1|←/, "independent tasks should remain unnumbered");
 
   const updatedDraft = tool.renderCall(
     {
       tasks: [
         { key: "schema", subject: "Design the database schema", status: "completed" },
-        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed" },
-        { key: "auth", subject: "Implement user authentication", status: "in_progress" },
-        { key: "core-api", subject: "Implement the core API", status: "pending" },
-        { key: "system-verify", subject: "Verify the completed system", status: "pending" },
+        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed", dependsOn: ["schema"] },
+        { key: "auth", subject: "Implement user authentication", status: "in_progress", dependsOn: ["scaffold"] },
+        { key: "core-api", subject: "Implement the core API", status: "pending", dependsOn: ["auth"] },
+        { key: "system-verify", subject: "Verify the completed system", status: "pending", dependsOn: ["core-api"] },
       ],
     },
     theme,
@@ -478,10 +480,10 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.strictEqual(updatedDraft, initialDraft, "streamed arguments should update the existing component");
   const updatedDraftText = updatedDraft.render(160).join("\n");
   assert.match(updatedDraftText, /todo 5 tasks.*to expand/);
-  assert.match(updatedDraftText, /Initialize the project scaffold/);
-  assert.match(updatedDraftText, /Implement user authentication/);
-  assert.match(updatedDraftText, /Implement the core API/);
-  assert.doesNotMatch(updatedDraftText, /Design the database schema|Verify the completed system/);
+  assert.match(updatedDraftText, /Initialize the project scaffold #2 ← #1/);
+  assert.match(updatedDraftText, /Implement user authentication #3 ← #2/);
+  assert.match(updatedDraftText, /Implement the core API #4 ← #3/);
+  assert.doesNotMatch(updatedDraftText, /✓ Design the database schema|Verify the completed system/);
   assert.doesNotMatch(
     updatedDraftText,
     /(?:schema|scaffold|auth|core-api|system-verify):/,
@@ -492,10 +494,10 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     {
       tasks: [
         { key: "schema", subject: "Design the database schema", status: "completed" },
-        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed" },
-        { key: "auth", subject: "Implement user authentication", status: "in_progress" },
-        { key: "core-api", subject: "Implement the core API", status: "pending" },
-        { key: "system-verify", subject: "Verify the completed system", status: "pending" },
+        { key: "scaffold", subject: "Initialize the project scaffold", status: "completed", dependsOn: ["schema"] },
+        { key: "auth", subject: "Implement user authentication", status: "in_progress", dependsOn: ["scaffold"] },
+        { key: "core-api", subject: "Implement the core API", status: "pending", dependsOn: ["auth"] },
+        { key: "system-verify", subject: "Verify the completed system", status: "pending", dependsOn: ["auth", "core-api"] },
       ],
     },
     theme,
@@ -504,8 +506,8 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.strictEqual(expandedDraft, updatedDraft);
   const expandedDraftText = expandedDraft.render(160).join("\n");
   assert.match(expandedDraftText, /to collapse/);
-  assert.match(expandedDraftText, /Design the database schema/);
-  assert.match(expandedDraftText, /Verify the completed system/);
+  assert.match(expandedDraftText, /Design the database schema #1/);
+  assert.match(expandedDraftText, /Verify the completed system #5 ← #3, #4/);
 
   const completedDraft = tool.renderCall(
     {
@@ -538,9 +540,9 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     { lastComponent: undefined, expanded: false, argsComplete: false },
   );
   const sparseDraftText = sparseDraft.render(160).join("\n");
-  assert.match(sparseDraftText, /✓ Inspect the existing extension/);
-  assert.match(sparseDraftText, /◐ Design the snapshot protocol/);
-  assert.match(sparseDraftText, /○ Verify the implementation/);
+  assert.match(sparseDraftText, /✓ Inspect the existing extension #1/);
+  assert.match(sparseDraftText, /◐ Design the snapshot protocol #2 ← #1/);
+  assert.match(sparseDraftText, /○ Verify the implementation #3 ← #2/);
   assert.doesNotMatch(sparseDraftText, /Writing task/);
 
   const emptyDraft = tool.renderCall(
@@ -603,9 +605,9 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   const widget = widgetFactory({ requestRender: () => {} }, theme);
   const collapsedText = widget.render(160).join("\n");
   assert.match(collapsedText, /Todo 0\/3 completed · rev 1/);
-  assert.match(collapsedText, /Inspect the existing extension/);
-  assert.match(collapsedText, /Design the snapshot protocol/);
-  assert.match(collapsedText, /Verify the implementation/);
+  assert.match(collapsedText, /Inspect the existing extension #1/);
+  assert.match(collapsedText, /Design the snapshot protocol #2 ← #1/);
+  assert.match(collapsedText, /Verify the implementation #3 ← #2/);
   assert.doesNotMatch(collapsedText, /\binspect\b/, "stable keys should not be user-visible");
   assert.doesNotMatch(collapsedText, /expand/);
   assert.ok(
@@ -616,10 +618,10 @@ test("todo extension renders a collapsible read-only list above the editor", asy
 
   setToolsExpanded(true);
   const expandedText = widget.render(160).join("\n");
-  assert.match(expandedText, /Inspect the existing extension/);
-  assert.match(expandedText, /Design the snapshot protocol/);
-  assert.match(expandedText, /Verify the implementation/);
-  assert.doesNotMatch(expandedText, /\binspect\b|\bdesign\b|\bverify\b|dependsOn|←/);
+  assert.match(expandedText, /Inspect the existing extension #1/);
+  assert.match(expandedText, /Design the snapshot protocol #2 ← #1/);
+  assert.match(expandedText, /Verify the implementation #3 ← #2/);
+  assert.doesNotMatch(expandedText, /\binspect\b|\bdesign\b|\bverify\b|dependsOn/);
   assert.doesNotMatch(expandedText, /collapse/);
 
   setToolsExpanded(false);

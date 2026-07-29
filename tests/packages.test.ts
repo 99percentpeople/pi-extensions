@@ -84,7 +84,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.1.3");
+  assert.equal(todo.version, "1.2.0");
   assert.deepEqual(todo.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(todo.files, [
     "index.ts",

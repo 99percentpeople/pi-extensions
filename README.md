@@ -198,8 +198,10 @@ It participates in the shared settings runtime but stays hidden from `/99setting
 until it exposes configurable values.
 A read-only widget above the input shows the current task when collapsed and the
 complete list when expanded with Pi's standard `Ctrl+O` binding. Task keys stay
-model-only, so user-facing rows contain only a status glyph and task name. The
-tool call itself remains a compact progress confirmation. Completed tasks stay
+model-only; tasks participating in dependencies receive compact, display-only
+numbers after their names, such as `○ Implement #2 ← #1`, while independent
+tasks remain unnumbered. The tool call itself remains a compact progress
+confirmation. Completed tasks stay
 visible for the current response, then are automatically removed before the
 next response unless unfinished work still depends on them. Exact state follows
 Pi session branches, survives reloads, and is checkpointed back into model
@@ -296,7 +298,7 @@ independently:
 | cursor-effect | `cursor-effect-v<version>` | `cursor-effect-v0.1.0` |
 | pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.2` |
 | thinking-fold | `thinking-fold-v<version>` | `thinking-fold-v0.1.0` |
-| todo | `todo-v<version>` | `todo-v1.1.3` |
+| todo | `todo-v<version>` | `todo-v1.2.0` |
 | shared-settings | `shared-settings-v<version>` | `shared-settings-v0.1.0` |
 
 Publish `shared-settings` before releasing an extension that requires a newer

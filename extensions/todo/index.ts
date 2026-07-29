@@ -25,6 +25,8 @@ const COLLAPSED_TASK_LIMIT = 3;
 interface TodoDisplayTask {
   subject: string;
   status?: TodoStatus;
+  displayNumber?: number;
+  dependencyNumbers?: number[];
 }
 
 const TodoKeySchema = Type.String({
@@ -77,12 +79,17 @@ function formatChange(details: TodoState): string {
 }
 
 function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
-  if (!task.status) return theme.fg("text", task.subject);
+  const number = task.displayNumber !== undefined ? ` #${task.displayNumber}` : "";
+  const dependencies = task.dependencyNumbers?.length
+    ? ` ← ${task.dependencyNumbers.map((dependency) => `#${dependency}`).join(", ")}`
+    : "";
+  const relationship = number || dependencies ? theme.fg("dim", number + dependencies) : "";
+  if (!task.status) return theme.fg("text", task.subject) + relationship;
   const glyph = task.status === "completed" ? "✓" : task.status === "in_progress" ? "◐" : "○";
   const color = task.status === "completed" ? "success" : task.status === "in_progress" ? "warning" : "dim";
   let subject = theme.fg(task.status === "completed" ? "dim" : "text", task.subject);
   if (task.status === "completed") subject = theme.strikethrough(subject);
-  return `${theme.fg(color, glyph)} ${subject}`;
+  return `${theme.fg(color, glyph)} ${subject}${relationship}`;
 }
 
 function getCollapsedTodoTasks<T extends TodoDisplayTask>(tasks: readonly T[]): T[] {
@@ -103,32 +110,74 @@ function isTodoStatus(value: unknown): value is TodoStatus {
   return value === "pending" || value === "in_progress" || value === "completed";
 }
 
+function toDisplayTasks<T extends { key: string; subject: string; status?: TodoStatus; dependsOn?: string[] }>(
+  tasks: readonly T[],
+): TodoDisplayTask[] {
+  const participatingKeys = new Set<string>();
+  for (const task of tasks) {
+    if (!task.dependsOn?.length) continue;
+    participatingKeys.add(task.key);
+    for (const dependency of task.dependsOn) participatingKeys.add(dependency);
+  }
+
+  const numberByKey = new Map<string, number>();
+  for (const task of tasks) {
+    if (participatingKeys.has(task.key)) numberByKey.set(task.key, numberByKey.size + 1);
+  }
+
+  return tasks.map((task) => {
+    const displayNumber = numberByKey.get(task.key);
+    const dependencyNumbers = task.dependsOn
+      ?.map((key) => numberByKey.get(key))
+      .filter((number): number is number => number !== undefined);
+    return {
+      subject: task.subject,
+      status: task.status,
+      ...(displayNumber !== undefined ? { displayNumber } : {}),
+      ...(dependencyNumbers?.length ? { dependencyNumbers } : {}),
+    };
+  });
+}
+
 function resolveDraftTodoTasks(rawTasks: unknown, state: TodoState): TodoDisplayTask[] {
   if (!Array.isArray(rawTasks)) return [];
-  const currentByKey = new Map(getTodoTasks(state).map((task) => [task.key, task]));
+  const currentTasks = getTodoTasks(state);
+  const currentByKey = new Map(currentTasks.map((task) => [task.key, task]));
 
-  return rawTasks.flatMap((rawTask) => {
+  const drafts = rawTasks.flatMap((rawTask) => {
     const draft = rawTask && typeof rawTask === "object"
-      ? rawTask as { key?: unknown; subject?: unknown; status?: unknown }
+      ? rawTask as { key?: unknown; subject?: unknown; status?: unknown; dependsOn?: unknown }
       : {};
     const key = typeof draft.key === "string" ? draft.key.trim() : "";
     const current = key ? currentByKey.get(key) : undefined;
     const streamedSubject = typeof draft.subject === "string" ? draft.subject.trim() : "";
-
     const subject = streamedSubject || current?.subject;
-    if (!subject) return [];
+    if (!key || !subject) return [];
+
+    const streamedDependencies = Array.isArray(draft.dependsOn)
+      ? draft.dependsOn.filter((dependency): dependency is string => typeof dependency === "string")
+      : undefined;
     return [{
+      key,
       subject,
       status: isTodoStatus(draft.status) ? draft.status : current?.status,
+      ...(streamedDependencies !== undefined
+        ? { dependsOn: streamedDependencies }
+        : current?.dependsOn?.length
+          ? { dependsOn: current.dependsOn }
+          : {}),
     }];
   });
+
+  return toDisplayTasks(drafts);
 }
 
 function renderTodoWidget(state: TodoState, width: number, expanded: boolean, theme: Theme): string[] {
   const tasks = getTodoTasks(state);
   if (tasks.length === 0) return [];
   const completed = tasks.filter((task) => task.status === "completed").length;
-  const displayed = expanded ? tasks : getCollapsedTodoTasks(tasks);
+  const displayTasks = toDisplayTasks(tasks);
+  const displayed = expanded ? displayTasks : getCollapsedTodoTasks(displayTasks);
   const canExpand = tasks.length > COLLAPSED_TASK_LIMIT;
   const hint = canExpand
     ? theme.fg("muted", ` · ${keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")}`)
