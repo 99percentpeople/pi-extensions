@@ -4,8 +4,11 @@ on:
   push:
     tags:
       - "background-tasks-v*"
+      - "cursor-effect-v*"
       - "pwsh-adapter-v*"
+      - "thinking-fold-v*"
       - "todo-v*"
+      - "shared-settings-v*"
 
 permissions:
   contents: read
@@ -51,8 +54,11 @@ jobs:
           const tag = process.env.RELEASE_TAG;
           const releases = [
             { prefix: "background-tasks-v", directory: "extensions/background-tasks" },
+            { prefix: "cursor-effect-v", directory: "extensions/cursor-effect" },
             { prefix: "pwsh-adapter-v", directory: "extensions/pwsh-adapter" },
+            { prefix: "thinking-fold-v", directory: "extensions/thinking-fold" },
             { prefix: "todo-v", directory: "extensions/todo" },
+            { prefix: "shared-settings-v", directory: "packages/shared-settings" },
           ];
           const release = releases.find(({ prefix }) => tag.startsWith(prefix));
           if (!release) throw new Error(`Unsupported release tag: ${tag}`);

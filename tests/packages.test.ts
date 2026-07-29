@@ -15,8 +15,13 @@ test("extensions are independently publishable workspace packages", async () => 
   const background = await readPackage(
     "../extensions/background-tasks/package.json",
   );
+  const cursorEffect = await readPackage("../extensions/cursor-effect/package.json");
   const pwsh = await readPackage("../extensions/pwsh-adapter/package.json");
+  const thinkingFold = await readPackage(
+    "../extensions/thinking-fold/package.json",
+  );
   const todo = await readPackage("../extensions/todo/package.json");
+  const sharedSettings = await readPackage("../packages/shared-settings/package.json");
 
   assert.equal(
     root.private,
@@ -30,16 +35,27 @@ test("extensions are independently publishable workspace packages", async () => 
   );
   assert.deepEqual(root.workspaces, [
     "extensions/background-tasks",
+    "extensions/cursor-effect",
     "extensions/pwsh-adapter",
+    "extensions/thinking-fold",
     "extensions/todo",
+    "packages/shared-settings",
   ]);
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
   assert.equal(background.version, "1.2.1");
   assert.deepEqual(background.pi?.extensions, ["./index.ts"]);
+  assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
   assert.equal(background.dependencies?.["node-pty"], "1.2.0-beta.14");
   assert.equal(background.dependencies?.["@xterm/headless"], "6.0.0");
   assert.equal(background.publishConfig?.access, "public");
+
+  assert.equal(cursorEffect.name, "@99percentpeople/pi-cursor-effect");
+  assert.equal(cursorEffect.version, "0.1.0");
+  assert.deepEqual(cursorEffect.pi?.extensions, ["./index.ts"]);
+  assert.deepEqual(cursorEffect.files, ["index.ts", "config.ts", "README.md", "LICENSE"]);
+  assert.equal(cursorEffect.publishConfig?.access, "public");
+  assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
   assert.equal(pwsh.version, "1.0.1");
@@ -49,7 +65,23 @@ test("extensions are independently publishable workspace packages", async () => 
     pwsh.dependencies?.["@99percentpeople/pi-background-tasks"],
     undefined,
   );
+  assert.equal(pwsh.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
   assert.equal(pwsh.publishConfig?.access, "public");
+
+  assert.equal(thinkingFold.name, "@99percentpeople/pi-thinking-fold");
+  assert.equal(thinkingFold.version, "0.1.0");
+  assert.deepEqual(thinkingFold.pi?.extensions, ["./index.ts"]);
+  assert.deepEqual(thinkingFold.files, [
+    "index.ts",
+    "renderer.ts",
+    "config.ts",
+    "model-behaviors.ts",
+    "model-behaviors.json",
+    "README.md",
+    "LICENSE",
+  ]);
+  assert.equal(thinkingFold.publishConfig?.access, "public");
+  assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
   assert.equal(todo.version, "1.1.2");
@@ -61,7 +93,18 @@ test("extensions are independently publishable workspace packages", async () => 
     "LICENSE",
   ]);
   assert.equal(todo.publishConfig?.access, "public");
-  assert.equal(todo.dependencies, undefined);
+  assert.equal(todo.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.0");
+
+  assert.equal(sharedSettings.name, "@99percentpeople/pi-shared-settings");
+  assert.equal(sharedSettings.version, "0.1.0");
+  assert.equal(sharedSettings.pi, undefined);
+  assert.deepEqual(sharedSettings.files, [
+    "index.ts",
+    "sectioned-settings-list.ts",
+    "README.md",
+    "LICENSE",
+  ]);
+  assert.equal(sharedSettings.publishConfig?.access, "public");
 });
 
 test("PowerShell runtime prefers version 7 and falls back to Windows PowerShell 5.1", () => {

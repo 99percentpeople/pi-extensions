@@ -7,17 +7,23 @@
   "type": "module",
   "workspaces": [
     "extensions/background-tasks",
+    "extensions/cursor-effect",
     "extensions/pwsh-adapter",
-    "extensions/todo"
+    "extensions/thinking-fold",
+    "extensions/todo",
+    "packages/shared-settings"
   ],
   "scripts": {
-    "test": "node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/todo.test.ts tests/packages.test.ts",
+    "test": "node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/cursor-effect.test.ts tests/shared-settings.test.ts tests/thinking-fold.test.ts tests/todo.test.ts tests/packages.test.ts",
     "lint": "tsc --noEmit",
     "check": "bun run lint && bun run test",
     "pack:background-tasks": "bun pm pack --dry-run --cwd extensions/background-tasks",
+    "pack:cursor-effect": "bun pm pack --dry-run --cwd extensions/cursor-effect",
     "pack:pwsh-adapter": "bun pm pack --dry-run --cwd extensions/pwsh-adapter",
+    "pack:thinking-fold": "bun pm pack --dry-run --cwd extensions/thinking-fold",
     "pack:todo": "bun pm pack --dry-run --cwd extensions/todo",
-    "pack:check": "bun run check && bun run pack:background-tasks && bun run pack:pwsh-adapter && bun run pack:todo"
+    "pack:shared-settings": "bun pm pack --dry-run --cwd packages/shared-settings",
+    "pack:check": "bun run check && bun run pack:shared-settings && bun run pack:background-tasks && bun run pack:cursor-effect && bun run pack:pwsh-adapter && bun run pack:thinking-fold && bun run pack:todo"
   },
   "author": "99percentpeople",
   "license": "MIT",

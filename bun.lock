@@ -18,6 +18,7 @@
       "name": "@99percentpeople/pi-background-tasks",
       "version": "1.2.1",
       "dependencies": {
+        "@99percentpeople/pi-shared-settings": "0.1.0",
         "@xterm/addon-serialize": "0.14.0",
         "@xterm/headless": "6.0.0",
         "node-pty": "1.2.0-beta.14",
@@ -29,22 +30,59 @@
         "typebox": "*",
       },
     },
+    "extensions/cursor-effect": {
+      "name": "@99percentpeople/pi-cursor-effect",
+      "version": "0.1.0",
+      "dependencies": {
+        "@99percentpeople/pi-shared-settings": "0.1.0",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+      },
+    },
     "extensions/pwsh-adapter": {
       "name": "@99percentpeople/pi-pwsh-adapter",
       "version": "1.0.1",
+      "dependencies": {
+        "@99percentpeople/pi-shared-settings": "0.1.0",
+      },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "typebox": "*",
       },
     },
+    "extensions/thinking-fold": {
+      "name": "@99percentpeople/pi-thinking-fold",
+      "version": "0.1.0",
+      "dependencies": {
+        "@99percentpeople/pi-shared-settings": "0.1.0",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+      },
+    },
     "extensions/todo": {
       "name": "@99percentpeople/pi-todo",
       "version": "1.1.2",
+      "dependencies": {
+        "@99percentpeople/pi-shared-settings": "0.1.0",
+      },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
         "@earendil-works/pi-tui": "*",
         "typebox": "*",
+      },
+    },
+    "packages/shared-settings": {
+      "name": "@99percentpeople/pi-shared-settings",
+      "version": "0.1.0",
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
       },
     },
   },
@@ -54,7 +92,13 @@
   "packages": {
     "@99percentpeople/pi-background-tasks": ["@99percentpeople/pi-background-tasks@workspace:extensions/background-tasks"],
 
+    "@99percentpeople/pi-cursor-effect": ["@99percentpeople/pi-cursor-effect@workspace:extensions/cursor-effect"],
+
     "@99percentpeople/pi-pwsh-adapter": ["@99percentpeople/pi-pwsh-adapter@workspace:extensions/pwsh-adapter"],
+
+    "@99percentpeople/pi-shared-settings": ["@99percentpeople/pi-shared-settings@workspace:packages/shared-settings"],
+
+    "@99percentpeople/pi-thinking-fold": ["@99percentpeople/pi-thinking-fold@workspace:extensions/thinking-fold"],
 
     "@99percentpeople/pi-todo": ["@99percentpeople/pi-todo@workspace:extensions/todo"],
 

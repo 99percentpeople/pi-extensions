@@ -3,22 +3,68 @@
 [![CI](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml/badge.svg)](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/99percentpeople/pi-extensions)](LICENSE)
 [![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks)
+[![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect)
 [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter)
+[![thinking-fold](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-thinking-fold?label=thinking-fold)](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold)
 [![todo](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-todo?label=todo)](https://www.npmjs.com/package/@99percentpeople/pi-todo)
 
 A focused collection of TypeScript extensions for the
-[Pi coding agent](https://pi.dev/): run and revisit background tasks, use
-PowerShell consistently on Windows, and keep model-authored plans visible in
-the TUI.
+[Pi coding agent](https://pi.dev/): run and revisit background tasks, style the
+main session status cursors, use PowerShell consistently on Windows, fold long reasoning traces, and keep
+model-authored plans visible in the TUI.
 
 | Extension | npm package | Purpose |
 | --- | --- | --- |
 | background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Background commands, explicit waits, logs, signals, and optional PTY/TUI interaction |
+| cursor-effect | [`@99percentpeople/pi-cursor-effect`](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Selectable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
+| thinking-fold | [`@99percentpeople/pi-thinking-fold`](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Live tail previews for long reasoning traces with full summaries and Ctrl+T expansion |
 | todo | [`@99percentpeople/pi-todo`](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Minimal atomic whole-plan todo writes with dependencies and a read-only list above the input |
 
 The packages have separate versions and releases. Installing one extension does
-not install or enable either of the others.
+not install or enable any of the others.
+
+## Shared settings
+
+Installing any extension in this collection enables one configuration command:
+
+```text
+/99settings
+```
+
+The menu discovers installed plugins at runtime and shows only plugins that
+currently expose configurable values. Plugins without settings are omitted.
+Configuration is stored atomically in one file:
+
+```text
+~/.pi/agent/99extensions.json
+```
+
+For example:
+
+```json
+{
+  "cursor-effect": {
+    "theme": "default",
+    "custom": {
+      "loader": { "style": "pi-default", "speed": "normal", "color": "accent" },
+      "label": {
+        "style": "wave",
+        "speed": "normal",
+        "crestWidth": "soft",
+        "palette": "accent"
+      }
+    }
+  },
+  "thinking-fold": {
+    "mode": "auto",
+    "previewLines": 5,
+    "autoCollapse": true
+  }
+}
+```
+
+Operational commands such as `/bg-attach` and `/bg-kill` remain separate.
 
 ## Highlights
 
@@ -47,6 +93,14 @@ pi install npm:@99percentpeople/pi-pwsh-adapter
 
 Without the adapter, `bg_start` follows Pi's configured Bash resolution and
 command prefix, including Git Bash on Windows.
+
+Install the reasoning-fold and optional cursor-effect extensions from this
+checkout while developing:
+
+```bash
+pi install ./extensions/thinking-fold
+pi install ./extensions/cursor-effect
+```
 
 Install the snapshot-based todo extension after removing another extension that
 registers the same `todo` tool:
@@ -105,6 +159,30 @@ The adapter is a Windows-only package that:
 The startup notification and tool prompt identify the selected version so the
 model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 
+## cursor-effect
+
+`cursor-effect` owns visual styling for Pi's main working, retry, compaction,
+and branch-summary status cursors, while leaving tool/bash/extension loaders
+alone. Complete themes include Default, Claude Code, and Codex without tuning
+controls. Selecting Custom reveals independent Loader and Label submenus for
+speed, color, crest width, and palette while preserving those custom values.
+It does not modify Items, tool/bash loaders, widgets, messages, or model events.
+Use the shared `/99settings` menu to configure the persistent effects. See the
+[cursor-effect package documentation](extensions/cursor-effect/README.md).
+
+## thinking-fold
+
+Long reasoning traces stay under a once-per-second timed Item header. Summary
+models keep only that timed Item header and provide their latest headline as a
+plain main-cursor status. Completed thinking auto-collapses to `Thought for
+xx.xs`; `Ctrl+T` restores the full original content and keeps that view expanded
+across later turns until toggled again.
+`/99settings` configures it alongside other installed plugins, and `Ctrl+T` toggles complete
+thinking without taking over Pi's native `Ctrl+O` tool expansion. The
+compatibility patch changes only display copies; session messages and reasoning
+signatures remain untouched. See the
+[thinking-fold package documentation](extensions/thinking-fold/README.md).
+
 ## todo
 
 The `todo` tool replaces per-task CRUD calls with one atomic `tasks[]` snapshot.
@@ -115,7 +193,9 @@ authoritative: omitted keys are deleted directly, stale revisions can be
 rejected, and invalid dependency graphs do not partially mutate state. Deleted
 tasks leave no cancelled status or archived record.
 
-The extension deliberately registers no slash commands or interactive manager.
+The extension deliberately registers no todo-specific slash commands or interactive manager.
+It participates in the shared settings runtime but stays hidden from `/99settings`
+until it exposes configurable values.
 A read-only widget above the input shows the current task when collapsed and the
 complete list when expanded with Pi's standard `Ctrl+O` binding. Task keys stay
 model-only, so user-facing rows contain only a status glyph and task name. The
@@ -129,7 +209,8 @@ for the schema.
 ## Development
 
 The repository uses a private root package as a Bun 1.3.14 workspace. Each
-extension directory is an independently publishable npm package.
+extension directory is independently publishable and depends on the small
+`pi-shared-settings` infrastructure package.
 
 ```bash
 bun install --frozen-lockfile
@@ -141,6 +222,8 @@ Load an extension directly while developing:
 
 ```bash
 pi -e ./extensions/background-tasks/index.ts
+pi -e ./extensions/cursor-effect/index.ts
+pi -e ./extensions/thinking-fold/index.ts
 pi -e ./extensions/todo/index.ts
 ```
 
@@ -152,8 +235,21 @@ extensions/
 │   ├── index.ts
 │   ├── package.json
 │   └── README.md
+├── cursor-effect/
+│   ├── index.ts
+│   ├── config.ts
+│   ├── package.json
+│   └── README.md
 ├── pwsh-adapter/
 │   ├── index.ts
+│   ├── package.json
+│   └── README.md
+├── thinking-fold/
+│   ├── index.ts
+│   ├── renderer.ts
+│   ├── config.ts
+│   ├── model-behaviors.ts
+│   ├── model-behaviors.json
 │   ├── package.json
 │   └── README.md
 └── todo/
@@ -161,8 +257,17 @@ extensions/
     ├── state.ts
     ├── package.json
     └── README.md
+packages/
+└── shared-settings/
+    ├── index.ts
+    ├── sectioned-settings-list.ts
+    ├── package.json
+    └── README.md
 tests/
 ├── background-tasks.test.ts
+├── cursor-effect.test.ts
+├── shared-settings.test.ts
+├── thinking-fold.test.ts
 ├── todo.test.ts
 └── packages.test.ts
 ```
@@ -174,7 +279,7 @@ Publishing with GitHub Actions OIDC. It does not require an `NPM_TOKEN` GitHub
 secret.
 
 Before the first automated release, configure a Trusted Publisher separately
-for all three npm packages:
+for all six npm packages:
 
 - Provider: GitHub Actions
 - Organization or user: `99percentpeople`
@@ -188,8 +293,14 @@ independently:
 | Package | Tag format | Example |
 | --- | --- | --- |
 | background-tasks | `background-tasks-v<version>` | `background-tasks-v1.1.3` |
+| cursor-effect | `cursor-effect-v<version>` | `cursor-effect-v0.1.0` |
 | pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.1` |
+| thinking-fold | `thinking-fold-v<version>` | `thinking-fold-v0.1.0` |
 | todo | `todo-v<version>` | `todo-v1.1.2` |
+| shared-settings | `shared-settings-v<version>` | `shared-settings-v0.1.0` |
+
+Publish `shared-settings` before releasing an extension that requires a newer
+shared-settings version.
 
 To publish a release:
 
@@ -210,7 +321,9 @@ package's `package.json`.
 
 ```bash
 pi remove npm:@99percentpeople/pi-background-tasks
+pi remove npm:@99percentpeople/pi-cursor-effect
 pi remove npm:@99percentpeople/pi-pwsh-adapter
+pi remove npm:@99percentpeople/pi-thinking-fold
 pi remove npm:@99percentpeople/pi-todo
 ```
 
