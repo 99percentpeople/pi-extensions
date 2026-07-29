@@ -1,0 +1,171 @@
+# @99percentpeople/pi-thinking-fold
+
+Fold long, streaming reasoning blocks into a small live preview in Pi's TUI.
+The preview follows the latest terminal-visible lines instead of letting a
+reasoning trace continuously grow upward.
+
+## Behavior
+
+While a trace model streams reasoning, the assistant Item contains a timed
+header and its latest terminal-visible lines:
+
+```text
+Thinking 7.1s  (ctrl+t to expand)
+  checking the final branch…
+  validating the result…
+```
+
+The cursor working row separately displays the plain status `Thinking...`. For a
+summary model, the Item contains only the same timed header while the cursor row
+displays its newest summary headline, for example `Running focused tests`.
+
+Cursor styling is intentionally outside this package. Install
+[`@99percentpeople/pi-cursor-effect`](../cursor-effect/README.md) to apply the
+optional wave effect to this and Pi's other main working-cursor labels.
+
+The Item timer redraws only once per second. When reasoning finishes, the timer
+freezes as soon as answer text or a tool call starts, and the block
+automatically becomes a single line with precise elapsed
+time. This also handles OpenAI-compatible providers that delay their
+`thinking_end` event until the entire answer has streamed:
+
+```text
+Thought for 12.3s  (ctrl+t to expand)
+```
+
+Additional behavior:
+
+- Long traces, including DeepSeek-style `reasoning_content`, show the latest 5
+  visual lines by default.
+- Pi's normalized `thinking_start` / `thinking_delta` / `thinking_end` events
+  drive streaming and timing, so model IDs never need per-model adapters.
+- Models configured as `summary` keep only the timed header in the Item and show
+  the newest headline in the cursor row; `trace` models add the Item tail preview.
+- An empty Pi `thinking_start` still creates the timed Item. If a provider emits
+  its entire summary immediately before `thinking_end`, the cursor keeps that
+  headline visible for at least one second before `Responding…`.
+- Models that expose neither a trace nor a summary use Pi's working row to say
+  that reasoning details are unavailable.
+- `Ctrl+T` (or the configured `app.thinking.toggle` binding) switches between
+  the folded view and complete reasoning blocks. The chosen state persists
+  across later turns until `Ctrl+T` is pressed again.
+- `Ctrl+O` keeps its native Pi behavior and only expands tools and other
+  expandable UI content.
+
+The extension changes display-only message copies. Original assistant messages,
+reasoning signatures, session persistence, and model context are not modified.
+No extra session entries are added. After a reload, old durations are
+reconstructed from Pi's message timestamps and are therefore approximate.
+
+## Install
+
+Install this checkout as a user-local development package:
+
+```bash
+pi install ./extensions/thinking-fold
+```
+
+Or test without adding it to settings:
+
+```bash
+pi -e ./extensions/thinking-fold/index.ts
+```
+
+Remove the local package with:
+
+```bash
+pi remove ./extensions/thinking-fold
+```
+
+## Settings
+
+Run the shared `/99settings` menu. It lists installed `@99percentpeople`
+plugins that expose configurable values and configures:
+
+- reasoning behavior: `auto`, `trace`, or `summary`;
+- live preview line count;
+- automatic collapse after reasoning completes, unless the persistent `Ctrl+T`
+  view is currently expanded.
+
+Settings persist globally in:
+
+```text
+~/.pi/agent/99extensions.json
+```
+
+under the `thinking-fold` namespace. `previewLines` accepts 1 through 20. `auto`
+resolves the current Pi message against the
+built-in model behavior configuration described below. An unmatched model uses
+`trace`. Explicit `mode trace` and `mode summary` override the model rules.
+
+## Model behavior configuration
+
+[`model-behaviors.json`](model-behaviors.json) is the package's single built-in
+compatibility table. A rule selects by any combination of case-insensitive
+JavaScript regular-expression sources in `api`, `provider`, and `model`:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "responses-summary",
+      "api": "responses$",
+      "behavior": "summary"
+    },
+    {
+      "id": "deepseek-trace",
+      "provider": "^deepseek$",
+      "model": "^deepseek-.*$",
+      "behavior": "trace"
+    }
+  ]
+}
+```
+
+Patterns are regex source strings without `/.../` delimiters; use `^` and `$`
+when a full-field match is required. Invalid expressions fail validation at
+startup. Rules with more selectors win, then `model` is considered more specific
+than `provider`, and `provider` more specific than `api`; a later rule wins a
+remaining tie.
+
+The built-in table uses conservative API-family baselines:
+
+| API/provider family | Behavior | Basis |
+|---|---|---|
+| OpenAI-compatible Chat Completions | `trace` | Pi reads `reasoning_content`, `reasoning`, or `reasoning_text` |
+| Anthropic-compatible gateways | `trace` | Safe fallback because gateway semantics vary |
+| Amazon Bedrock Converse | `trace` | Safe fallback because the model behind `reasoningContent` varies |
+| Mistral Conversations | `trace` | Pi streams explicit `thinking` content items |
+| `pi-messages` gateways | `trace` | Safe fallback for an intentionally generic protocol |
+| OpenAI/Azure/Codex Responses | `summary` | Pi consumes `reasoning_summary_text` events |
+| Google Generative AI/Vertex | `summary` | Pi consumes Google thought parts |
+| First-party Anthropic | `summary` | Pi requests summarized thinking display |
+
+The conservative Trace rules cover common providers such as OpenRouter, Groq,
+Together, Fireworks, Cerebras, Hugging Face, Kimi, MiniMax, Moonshot, Qwen,
+xAI Chat Completions, Z.AI, Xiaomi, NVIDIA, Mistral, and Bedrock through their
+Pi API adapter. They do not claim that every routed model exposes a raw chain of
+thought; Trace is chosen because it preserves visible content if an untested
+backend differs. Provider/model-specific rules can override these API baselines
+later.
+
+Only the previously exercised OpenAI Responses, Google, and DeepSeek paths have
+live model coverage in this repository. The additional families are validated
+against Pi 0.82.1 adapter source and static fixtures, not paid provider calls.
+The first config version intentionally supports only `trace` and `summary`, is
+shipped with the package, and has no user override file. This keeps compatibility
+data declarative and leaves provider/model names out of rendering code.
+
+## Compatibility
+
+Pi currently exports `AssistantMessageComponent` but does not provide an
+extension hook for replacing normal assistant-message rendering. This package
+therefore installs a guarded compatibility patch around the component's public
+`updateContent()` and `render()` methods. It verifies those methods at startup,
+prevents duplicate patches across reloads, and restores the originals during
+session shutdown.
+
+The package was developed against Pi 0.82.1. If Pi changes the component API,
+the extension disables itself and reports a warning instead of modifying
+messages or failing the session.
