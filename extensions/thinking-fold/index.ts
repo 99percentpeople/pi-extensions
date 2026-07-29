@@ -18,17 +18,12 @@ import {
   createThinkingCursorLabel,
   DEFAULT_THINKING_CURSOR_LABEL,
   installThinkingFoldPatch,
-  type ThinkingFoldMode,
   type ThinkingFoldPatchHandle,
 } from "./renderer.ts";
 
 const STREAM_STATUS_KEY = "thinking-fold-stream";
 const ITEM_TIMER_INTERVAL_MS = 1000;
 const MIN_SUMMARY_CURSOR_MS = 1000;
-
-function parseMode(value: string): ThinkingFoldMode | undefined {
-  return value === "auto" || value === "trace" || value === "summary" ? value : undefined;
-}
 
 export function endsThinkingPhase(type: AssistantMessageEvent["type"]): boolean {
   return (
@@ -163,35 +158,37 @@ export default function (pi: ExtensionAPI) {
     title: "Thinking Fold",
     settings: () => [
       {
-        id: "mode",
-        label: "Reasoning behavior",
-        description: "Auto follows the built-in model behavior rules",
-        currentValue: config.mode,
-        values: ["auto", "trace", "summary"],
+        id: "foldThreshold",
+        label: "Fold after lines",
+        description: "Show at most this many terminal-visible lines in a preview",
+        currentValue: String(config.foldThreshold),
+        values: lineValues(config.foldThreshold),
       },
       {
-        id: "previewLines",
-        label: "Live preview lines",
-        description: "Terminal-visible reasoning lines kept while the model is thinking",
-        currentValue: String(config.previewLines),
-        values: lineValues(config.previewLines),
+        id: "streamingBehavior",
+        label: "While thinking",
+        description: "Preview shows the latest lines; collapse shows only the timer",
+        currentValue: config.streamingBehavior,
+        values: ["preview", "collapse"],
       },
       {
-        id: "autoCollapse",
-        label: "Collapse when done",
-        description: "Replace completed reasoning with a one-line duration title",
-        currentValue: config.autoCollapse ? "on" : "off",
-        values: ["on", "off"],
+        id: "completedBehavior",
+        label: "After thinking",
+        description: "Collapse hides content; preview keeps a tail; full keeps all content",
+        currentValue: config.completedBehavior,
+        values: ["collapse", "preview", "full"],
       },
     ],
     onChange: (id, value, ctx) => {
-      if (id === "mode") {
-        const mode = parseMode(value);
-        if (mode) applyConfig({ ...config, mode }, ctx);
-      } else if (id === "previewLines") {
-        applyConfig({ ...config, previewLines: Number(value) }, ctx);
-      } else if (id === "autoCollapse") {
-        applyConfig({ ...config, autoCollapse: value === "on" }, ctx);
+      if (id === "foldThreshold") {
+        applyConfig({ ...config, foldThreshold: Number(value) }, ctx);
+      } else if (id === "streamingBehavior" && (value === "preview" || value === "collapse")) {
+        applyConfig({ ...config, streamingBehavior: value }, ctx);
+      } else if (
+        id === "completedBehavior" &&
+        (value === "collapse" || value === "preview" || value === "full")
+      ) {
+        applyConfig({ ...config, completedBehavior: value }, ctx);
       }
     },
   });
@@ -354,9 +351,11 @@ export {
   formatThinkingSeconds,
   installThinkingFoldPatch,
   resolveThinkingBehavior,
+  type ThinkingCompletedBehavior,
   type ThinkingDisplayState,
   type ThinkingFoldMode,
   type ThinkingFoldOptions,
+  type ThinkingStreamingBehavior,
   type ThinkingFoldPatchHandle,
   type ThinkingTiming,
 } from "./renderer.ts";

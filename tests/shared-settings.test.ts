@@ -74,7 +74,7 @@ test("shared settings preserve independent namespaces and unknown data", async (
     writeSettingsNamespace("cursor-effect", { style: "wave" }, path);
     writeSettingsNamespace(
       "thinking-fold",
-      { mode: "summary", previewLines: 5, autoCollapse: true },
+      { foldThreshold: 5, streamingBehavior: "preview", completedBehavior: "collapse" },
       path,
     );
 
@@ -82,7 +82,11 @@ test("shared settings preserve independent namespaces and unknown data", async (
     assert.deepEqual(document, {
       unknown: { keep: true },
       "cursor-effect": { style: "wave" },
-      "thinking-fold": { mode: "summary", previewLines: 5, autoCollapse: true },
+      "thinking-fold": {
+        foldThreshold: 5,
+        streamingBehavior: "preview",
+        completedBehavior: "collapse",
+      },
     });
     assert.deepEqual(
       readSettingsNamespace("cursor-effect", (value) => value, path),
@@ -104,18 +108,18 @@ test("section headers keep short labels and values in one visual column", () => 
         values: ["wave", "none"],
       },
       {
-        id: "thinking:mode",
+        id: "thinking:threshold",
         section: "Thinking Fold",
-        label: "Reasoning behavior",
-        currentValue: "auto",
-        values: ["auto", "trace", "summary"],
-      },
-      {
-        id: "thinking:lines",
-        section: "Thinking Fold",
-        label: "预览行数",
+        label: "Fold after lines",
         currentValue: "5",
         values: ["3", "5"],
+      },
+      {
+        id: "thinking:completed",
+        section: "Thinking Fold",
+        label: "After thinking",
+        currentValue: "collapse",
+        values: ["collapse", "preview", "full"],
       },
     ],
     20,
@@ -136,7 +140,7 @@ test("section headers keep short labels and values in one visual column", () => 
   assert.ok(output.includes("  Thinking Fold"));
   assert.equal(output.includes("installed"), false);
 
-  const expectedValues = ["wave", "auto", "5"];
+  const expectedValues = ["wave", "5", "collapse"];
   const valueColumns = expectedValues.map((value) => {
     const line = output.find((candidate) => candidate.endsWith(value));
     assert.ok(line, `missing row value ${value}`);
@@ -144,7 +148,7 @@ test("section headers keep short labels and values in one visual column", () => 
   });
   assert.deepEqual(
     [...new Set(valueColumns)],
-    [22],
+    [20],
     "ASCII and wide-character labels share one aligned value column",
   );
 });

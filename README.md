@@ -59,9 +59,9 @@ For example:
     }
   },
   "thinking-fold": {
-    "mode": "auto",
-    "previewLines": 5,
-    "autoCollapse": true
+    "foldThreshold": 5,
+    "streamingBehavior": "preview",
+    "completedBehavior": "collapse"
   }
 }
 ```
@@ -174,13 +174,12 @@ Use the shared `/99settings` menu to configure the persistent effects. See the
 
 ## thinking-fold
 
-Long reasoning traces stay under a once-per-second timed Item header. Summary
-models keep only that timed Item header and provide their latest headline as a
-plain main-cursor status. Completed thinking auto-collapses to `Thought for
-xx.xs`; `Ctrl+T` restores the full original content and keeps that view expanded
-across later turns until toggled again.
-`/99settings` configures it alongside other installed plugins, and `Ctrl+T` toggles complete
-thinking without taking over Pi's native `Ctrl+O` tool expansion. The
+Long reasoning traces stay under a once-per-second timed Item header. Model
+behavior controls the main-cursor status headline, while `/99settings` separately
+controls the fold threshold, the display while thinking, and the display after
+thinking. Completed thinking defaults to `Thought for xx.xs`; `Ctrl+T` restores
+the full original content and keeps that view expanded across later turns until
+toggled again. `Ctrl+T` does not take over Pi's native `Ctrl+O` tool expansion. The
 compatibility patch changes only display copies; session messages and reasoning
 signatures remain untouched. See the
 [thinking-fold package documentation](extensions/thinking-fold/README.md).

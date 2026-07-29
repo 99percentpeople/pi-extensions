@@ -6,8 +6,8 @@ reasoning trace continuously grow upward.
 
 ## Behavior
 
-While a trace model streams reasoning, the assistant Item contains a timed
-header and its latest terminal-visible lines:
+When **While thinking** is set to `preview`, the assistant Item contains a
+timed header and its latest terminal-visible lines:
 
 ```text
 Thinking 7.1s  (ctrl+t to expand)
@@ -15,19 +15,20 @@ Thinking 7.1s  (ctrl+t to expand)
   validating the result…
 ```
 
-The cursor working row separately displays the plain status `Thinking...`. For a
-summary model, the Item contains only the same timed header while the cursor row
-displays its newest summary headline, for example `Running focused tests`.
+The cursor working row separately displays the plain status `Thinking...`. Model
+behavior determines whether that row uses a summary headline (for example,
+`Running focused tests`) or `Thinking...`; it does not change the configured
+Item display strategy.
 
 Cursor styling is intentionally outside this package. Install
 [`@99percentpeople/pi-cursor-effect`](../cursor-effect/README.md) to apply the
 optional wave effect to this and Pi's other main working-cursor labels.
 
 The Item timer redraws only once per second. When reasoning finishes, the timer
-freezes as soon as answer text or a tool call starts, and the block
-automatically becomes a single line with precise elapsed
-time. This also handles OpenAI-compatible providers that delay their
-`thinking_end` event until the entire answer has streamed:
+freezes as soon as answer text or a tool call starts. With automatic collapse
+enabled, the block becomes a single line with precise elapsed time. This also
+handles OpenAI-compatible providers that delay their `thinking_end` event until
+the entire answer has streamed:
 
 ```text
 Thought for 12.3s  (ctrl+t to expand)
@@ -35,20 +36,23 @@ Thought for 12.3s  (ctrl+t to expand)
 
 Additional behavior:
 
-- Long traces, including DeepSeek-style `reasoning_content`, show the latest 5
-  visual lines by default.
+- The `preview` strategy shows the latest 5 visual lines by default, for traces
+  and summaries alike.
 - Pi's normalized `thinking_start` / `thinking_delta` / `thinking_end` events
   drive streaming and timing, so model IDs never need per-model adapters.
-- Models configured as `summary` keep only the timed header in the Item and show
-  the newest headline in the cursor row; `trace` models add the Item tail preview.
+- Set **While thinking** to `collapse` to show only the timer, or `preview` to
+  show the latest lines. Set **After thinking** to `collapse`, `preview`, or
+  `full` independently.
 - An empty Pi `thinking_start` still creates the timed Item. If a provider emits
   its entire summary immediately before `thinking_end`, the cursor keeps that
   headline visible for at least one second before `Responding…`.
 - Models that expose neither a trace nor a summary use Pi's working row to say
   that reasoning details are unavailable.
 - `Ctrl+T` (or the configured `app.thinking.toggle` binding) switches between
-  the folded view and complete reasoning blocks. The chosen state persists
-  across later turns until `Ctrl+T` is pressed again.
+  the folded view and complete reasoning blocks. Its expansion hint appears
+  only when content is actually hidden: by a `collapse` strategy, or because a
+  thinking block exceeds the configured fold threshold. The chosen state
+  persists across later turns until `Ctrl+T` is pressed again.
 - `Ctrl+O` keeps its native Pi behavior and only expands tools and other
   expandable UI content.
 
@@ -80,12 +84,13 @@ pi remove ./extensions/thinking-fold
 ## Settings
 
 Run the shared `/99settings` menu. It lists installed `@99percentpeople`
-plugins that expose configurable values and configures:
+plugins that expose three independent display controls:
 
-- reasoning behavior: `auto`, `trace`, or `summary`;
-- live preview line count;
-- automatic collapse after reasoning completes, unless the persistent `Ctrl+T`
-  view is currently expanded.
+- **Fold after lines** (1–20): maximum terminal-visible lines retained by a
+  `preview` display;
+- **While thinking**: `preview` (latest lines) or `collapse` (timer only);
+- **After thinking**: `collapse` (timer only), `preview` (latest lines), or
+  `full` (all reasoning text). The default is `collapse`.
 
 Settings persist globally in:
 
@@ -93,10 +98,10 @@ Settings persist globally in:
 ~/.pi/agent/99extensions.json
 ```
 
-under the `thinking-fold` namespace. `previewLines` accepts 1 through 20. `auto`
-resolves the current Pi message against the
-built-in model behavior configuration described below. An unmatched model uses
-`trace`. Explicit `mode trace` and `mode summary` override the model rules.
+under the `thinking-fold` namespace. The model behavior is always resolved from
+the built-in model behavior configuration described below; an unmatched model
+uses `trace`. Existing `previewLines` and `autoCollapse` settings are migrated
+to the equivalent new values when next saved.
 
 ## Model behavior configuration
 

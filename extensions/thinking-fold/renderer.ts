@@ -6,11 +6,16 @@ import {
 import { resolveConfiguredThinkingBehavior } from "./model-behaviors.ts";
 
 export type ThinkingFoldMode = "auto" | "trace" | "summary";
+export type ThinkingStreamingBehavior = "preview" | "collapse";
+export type ThinkingCompletedBehavior = "collapse" | "preview" | "full";
 
 export interface ThinkingFoldOptions {
   mode: ThinkingFoldMode;
   previewLines: number;
-  autoCollapse: boolean;
+  streamingBehavior: ThinkingStreamingBehavior;
+  completedBehavior: ThinkingCompletedBehavior;
+  /** @deprecated Use completedBehavior instead. */
+  autoCollapse?: boolean;
   toggleKey: string;
 }
 
@@ -29,7 +34,8 @@ export const DEFAULT_THINKING_CURSOR_LABEL = "Thinking...";
 export const DEFAULT_THINKING_FOLD_OPTIONS: ThinkingFoldOptions = {
   mode: "auto",
   previewLines: 5,
-  autoCollapse: true,
+  streamingBehavior: "preview",
+  completedBehavior: "collapse",
   toggleKey: "ctrl+t",
 };
 
@@ -83,13 +89,25 @@ const PATCH_SYMBOL = Symbol.for("@99percentpeople/pi-thinking-fold/assistant-mes
 
 function normalizedOptions(options: Partial<ThinkingFoldOptions>): ThinkingFoldOptions {
   const previewLines = options.previewLines ?? DEFAULT_THINKING_FOLD_OPTIONS.previewLines;
+  const completedBehavior =
+    options.completedBehavior === "collapse" ||
+    options.completedBehavior === "preview" ||
+    options.completedBehavior === "full"
+      ? options.completedBehavior
+      : options.autoCollapse === false
+        ? "preview"
+        : DEFAULT_THINKING_FOLD_OPTIONS.completedBehavior;
   return {
     mode: options.mode ?? DEFAULT_THINKING_FOLD_OPTIONS.mode,
     previewLines:
       Number.isInteger(previewLines) && previewLines > 0
         ? previewLines
         : DEFAULT_THINKING_FOLD_OPTIONS.previewLines,
-    autoCollapse: options.autoCollapse ?? DEFAULT_THINKING_FOLD_OPTIONS.autoCollapse,
+    streamingBehavior:
+      options.streamingBehavior === "collapse" || options.streamingBehavior === "preview"
+        ? options.streamingBehavior
+        : DEFAULT_THINKING_FOLD_OPTIONS.streamingBehavior,
+    completedBehavior,
     toggleKey: options.toggleKey?.trim() || DEFAULT_THINKING_FOLD_OPTIONS.toggleKey,
   };
 }
@@ -175,21 +193,37 @@ function foldThinkingText(
   return result.visualLines.map((line) => line.trimEnd()).join("\n");
 }
 
+function hasFoldedThinkingContent(
+  message: AssistantMessage,
+  previewLines: number,
+  width: number,
+  outputPad: number,
+): boolean {
+  const availableWidth = Math.max(10, width - outputPad * 2);
+  return message.content.some(
+    (block) =>
+      block.type === "thinking" &&
+      truncateToVisualLines(block.thinking, previewLines, availableWidth).skippedCount > 0,
+  );
+}
+
 function createStreamingThinkingLabel(
   options: ThinkingFoldOptions,
   timing: ThinkingTiming | undefined,
   now: number,
+  canExpand: boolean,
 ): string {
   const duration = timing ? formatThinkingSeconds(now - timing.startedAt) : "0.0s";
-  return `Thinking ${duration}  (${options.toggleKey} to expand)`;
+  return `Thinking ${duration}${canExpand ? `  (${options.toggleKey} to expand)` : ""}`;
 }
 
 function createCompletedThinkingLabel(
   options: ThinkingFoldOptions,
   timing: ThinkingTiming,
+  canExpand: boolean,
 ): string {
   const duration = formatThinkingSeconds(timing.completedAt! - timing.startedAt);
-  return `Thought for ${duration}  (${options.toggleKey} to expand)`;
+  return `Thought for ${duration}${canExpand ? `  (${options.toggleKey} to expand)` : ""}`;
 }
 
 export function createThinkingDisplayMessage(
@@ -205,41 +239,39 @@ export function createThinkingDisplayMessage(
   const firstThinkingIndex = message.content.findIndex((block) => block.type === "thinking");
   if (firstThinkingIndex === -1) return message;
 
-  const behavior = resolveThinkingBehavior(message, options.mode);
   const timing = display.timing;
   const completed = timing?.completedAt !== undefined;
+  const displayBehavior: ThinkingCompletedBehavior = completed
+    ? options.completedBehavior
+    : options.streamingBehavior;
+  const hasThinkingContent = message.content.some(
+    (block) => block.type === "thinking" && block.thinking.trim(),
+  );
+  const canExpand =
+    displayBehavior === "collapse"
+      ? hasThinkingContent
+      : displayBehavior === "preview" &&
+        hasFoldedThinkingContent(message, options.previewLines, width, outputPad);
   const label =
     completed && timing
-      ? createCompletedThinkingLabel(options, timing)
-      : createStreamingThinkingLabel(options, timing, display.now ?? Date.now());
+      ? createCompletedThinkingLabel(options, timing, canExpand)
+      : createStreamingThinkingLabel(options, timing, display.now ?? Date.now(), canExpand);
   let changed = false;
   const content = message.content.map((block, index) => {
     if (block.type !== "thinking") return block;
 
-    let thinking: string;
-    if (!completed) {
-      // The Item owns the once-per-second timer and expansion hint. Trace
-      // content follows it as an ordinary tail preview; summary content stays
-      // cursor-only so the latest headline is not duplicated.
-      const visibleThinking =
-        behavior === "summary"
-          ? ""
-          : foldThinkingText(block.thinking, options.previewLines, width, outputPad);
-      thinking =
-        index === firstThinkingIndex
-          ? visibleThinking
-            ? `${label}\n${visibleThinking}`
-            : label
-          : visibleThinking;
-    } else if (options.autoCollapse) {
-      thinking = index === firstThinkingIndex ? label! : "";
-    } else {
-      const visibleThinking =
-        behavior === "summary"
-          ? block.thinking
-          : foldThinkingText(block.thinking, options.previewLines, width, outputPad);
-      thinking = index === firstThinkingIndex ? `${label!}\n${visibleThinking}` : visibleThinking;
-    }
+    const visibleThinking =
+      displayBehavior === "collapse"
+        ? ""
+        : displayBehavior === "preview"
+          ? foldThinkingText(block.thinking, options.previewLines, width, outputPad)
+          : block.thinking;
+    const thinking =
+      index === firstThinkingIndex
+        ? visibleThinking
+          ? `${label}\n${visibleThinking}`
+          : label
+        : visibleThinking;
 
     if (thinking === block.thinking) return block;
     changed = true;

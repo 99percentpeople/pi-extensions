@@ -5,20 +5,21 @@ import {
 } from "@99percentpeople/pi-shared-settings";
 import {
   DEFAULT_THINKING_FOLD_OPTIONS,
-  type ThinkingFoldMode,
+  type ThinkingCompletedBehavior,
   type ThinkingFoldOptions,
+  type ThinkingStreamingBehavior,
 } from "./renderer.ts";
 
 export interface ThinkingFoldConfig {
-  mode: ThinkingFoldMode;
-  previewLines: number;
-  autoCollapse: boolean;
+  foldThreshold: number;
+  streamingBehavior: ThinkingStreamingBehavior;
+  completedBehavior: ThinkingCompletedBehavior;
 }
 
 export const DEFAULT_THINKING_FOLD_CONFIG: ThinkingFoldConfig = {
-  mode: DEFAULT_THINKING_FOLD_OPTIONS.mode,
-  previewLines: DEFAULT_THINKING_FOLD_OPTIONS.previewLines,
-  autoCollapse: DEFAULT_THINKING_FOLD_OPTIONS.autoCollapse,
+  foldThreshold: DEFAULT_THINKING_FOLD_OPTIONS.previewLines,
+  streamingBehavior: DEFAULT_THINKING_FOLD_OPTIONS.streamingBehavior,
+  completedBehavior: DEFAULT_THINKING_FOLD_OPTIONS.completedBehavior,
 };
 
 export const THINKING_FOLD_SETTINGS_NAMESPACE = "thinking-fold";
@@ -27,28 +28,44 @@ export function getThinkingFoldConfigPath(): string {
   return getSharedSettingsPath();
 }
 
-function isMode(value: unknown): value is ThinkingFoldMode {
-  return value === "auto" || value === "trace" || value === "summary";
+function isFoldThreshold(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 20;
+}
+
+function isStreamingBehavior(value: unknown): value is ThinkingStreamingBehavior {
+  return value === "preview" || value === "collapse";
+}
+
+function isCompletedBehavior(value: unknown): value is ThinkingCompletedBehavior {
+  return value === "collapse" || value === "preview" || value === "full";
 }
 
 export function normalizeThinkingFoldConfig(value: unknown): ThinkingFoldConfig {
   if (!value || typeof value !== "object") return { ...DEFAULT_THINKING_FOLD_CONFIG };
-  const input = value as Partial<Record<keyof ThinkingFoldConfig, unknown>>;
-  const previewLines =
-    typeof input.previewLines === "number" &&
-    Number.isInteger(input.previewLines) &&
-    input.previewLines >= 1 &&
-    input.previewLines <= 20
-      ? input.previewLines
-      : DEFAULT_THINKING_FOLD_CONFIG.previewLines;
+  const input = value as {
+    foldThreshold?: unknown;
+    previewLines?: unknown;
+    streamingBehavior?: unknown;
+    completedBehavior?: unknown;
+    autoCollapse?: unknown;
+  };
 
   return {
-    mode: isMode(input.mode) ? input.mode : DEFAULT_THINKING_FOLD_CONFIG.mode,
-    previewLines,
-    autoCollapse:
-      typeof input.autoCollapse === "boolean"
-        ? input.autoCollapse
-        : DEFAULT_THINKING_FOLD_CONFIG.autoCollapse,
+    // previewLines and autoCollapse are legacy settings. Preserve their visible
+    // behavior when migrating an existing user configuration.
+    foldThreshold: isFoldThreshold(input.foldThreshold)
+      ? input.foldThreshold
+      : isFoldThreshold(input.previewLines)
+        ? input.previewLines
+        : DEFAULT_THINKING_FOLD_CONFIG.foldThreshold,
+    streamingBehavior: isStreamingBehavior(input.streamingBehavior)
+      ? input.streamingBehavior
+      : DEFAULT_THINKING_FOLD_CONFIG.streamingBehavior,
+    completedBehavior: isCompletedBehavior(input.completedBehavior)
+      ? input.completedBehavior
+      : input.autoCollapse === false
+        ? "preview"
+        : DEFAULT_THINKING_FOLD_CONFIG.completedBehavior,
   };
 }
 
@@ -69,6 +86,13 @@ export function saveThinkingFoldConfig(
 
 export function configToRenderOptions(
   config: ThinkingFoldConfig,
-): Pick<ThinkingFoldOptions, "mode" | "previewLines" | "autoCollapse"> {
-  return { ...config };
+): Pick<
+  ThinkingFoldOptions,
+  "previewLines" | "streamingBehavior" | "completedBehavior"
+> {
+  return {
+    previewLines: config.foldThreshold,
+    streamingBehavior: config.streamingBehavior,
+    completedBehavior: config.completedBehavior,
+  };
 }

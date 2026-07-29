@@ -168,10 +168,10 @@ test("model behavior rules support layered regex matching and deterministic prio
   );
 });
 
-test("empty thinking_start still creates the timed Item before summary text arrives", () => {
+test("empty thinking_start still creates a timed Item before summary text arrives", () => {
   const source = assistant("", "openai-responses");
   const display = createThinkingDisplayMessage(source, options, false, 80, 1, streamingDisplay());
-  assert.equal(thinkingText(display), "Thinking 2.5s  (ctrl+t to expand)");
+  assert.equal(thinkingText(display), "Thinking 2.5s");
 });
 
 test("instant summaries receive a minimum cursor visibility window", () => {
@@ -219,7 +219,7 @@ test("visual truncation accounts for wrapped wide text", () => {
   assert.ok(thinkingText(display).split("\n").length <= 3);
 });
 
-test("summary Item keeps only its timer while the cursor shows the latest headline", () => {
+test("summary Item follows the configured streaming preview while the cursor shows its headline", () => {
   const summary = assistant(
     "**Inspecting the implementation**\n\n**Running focused tests**",
     "openai-responses",
@@ -228,8 +228,7 @@ test("summary Item keeps only its timer while the cursor shows the latest headli
   assert.equal(extractLatestSummaryHeadline(summary), "Running focused tests");
   assert.equal(
     thinkingText(display),
-    "Thinking 2.5s  (ctrl+t to expand)",
-    "the streaming Item does not duplicate summaries",
+    "Thinking 2.5s\n**Inspecting the implementation**\n\n**Running focused tests**",
   );
   assert.equal(createThinkingCursorLabel(summary, "auto"), "Running focused tests");
 });
@@ -248,11 +247,83 @@ test("explicit summary mode uses the newest plain-text headline for any provider
     streamingDisplay(),
   );
   assert.equal(extractLatestSummaryHeadline(summary), "Checking physical decision-tree constraints.");
-  assert.equal(thinkingText(display), "Thinking 2.5s  (ctrl+t to expand)");
+  assert.equal(
+    thinkingText(display),
+    "Thinking 2.5s\nAnalyzing the information bound.\n\nChecking physical decision-tree constraints.",
+  );
   assert.equal(
     createThinkingCursorLabel(summary, "summary"),
     "Checking physical decision-tree constraints.",
   );
+});
+
+test("completed untruncated thinking does not advertise expansion", () => {
+  const completed: ThinkingDisplayState = { timing: { startedAt: 1_000, completedAt: 2_000 } };
+  const shortTrace = createThinkingDisplayMessage(
+    assistant("one\ntwo", "openai-completions"),
+    { ...options, completedBehavior: "preview" },
+    false,
+    80,
+    1,
+    completed,
+  );
+  const summary = createThinkingDisplayMessage(
+    assistant("Searching Pi provider URL and auth storage", "openai-responses"),
+    { ...options, completedBehavior: "preview" },
+    false,
+    80,
+    1,
+    completed,
+  );
+
+  assert.equal(thinkingText(shortTrace), "Thought for 1.0s\none\ntwo");
+  assert.equal(
+    thinkingText(summary),
+    "Thought for 1.0s\nSearching Pi provider URL and auth storage",
+  );
+});
+
+test("completed overflowed summaries retain only the configured tail", () => {
+  const summary = assistant(
+    Array.from({ length: 6 }, (_, index) => `summary ${index + 1}`).join("\n"),
+    "openai-responses",
+  );
+  const display = createThinkingDisplayMessage(
+    summary,
+    { ...options, completedBehavior: "preview" },
+    false,
+    80,
+    1,
+    { timing: { startedAt: 1_000, completedAt: 2_000 } },
+  );
+
+  assert.equal(
+    thinkingText(display),
+    "Thought for 1.0s  (ctrl+t to expand)\nsummary 4\nsummary 5\nsummary 6",
+  );
+});
+
+test("display strategies control streaming and completed thinking independently", () => {
+  const source = assistant("one\ntwo\nthree\nfour");
+  const streaming = createThinkingDisplayMessage(
+    source,
+    { ...options, streamingBehavior: "collapse" },
+    false,
+    80,
+    1,
+    streamingDisplay(),
+  );
+  const full = createThinkingDisplayMessage(
+    source,
+    { ...options, completedBehavior: "full" },
+    false,
+    80,
+    1,
+    { timing: { startedAt: 1_000, completedAt: 2_000 } },
+  );
+
+  assert.equal(thinkingText(streaming), "Thinking 2.5s  (ctrl+t to expand)");
+  assert.equal(thinkingText(full), "Thought for 1.0s\none\ntwo\nthree\nfour");
 });
 
 test("completed thinking collapses to a duration title and expands on demand", () => {
@@ -309,8 +380,8 @@ test("component patch times, folds, preserves expansion across turns, and restor
   assert.equal(AssistantMessageComponent.prototype.render, originalRender);
 });
 
-test("auto-collapse can be disabled", () => {
-  const disabledOptions = { ...options, autoCollapse: false };
+test("completed preview keeps a truncated tail", () => {
+  const disabledOptions = { ...options, completedBehavior: "preview" as const };
   const source = assistant("one\ntwo\nthree\nfour");
   const display = createThinkingDisplayMessage(source, disabledOptions, false, 80, 1, {
     timing: { startedAt: 1_000, completedAt: 2_000 },
@@ -348,14 +419,19 @@ test("global config normalizes, saves, and reloads", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-thinking-fold-"));
   const path = join(directory, "99extensions.json");
   try {
-    assert.deepEqual(normalizeThinkingFoldConfig({ previewLines: 999 }), {
+    assert.deepEqual(normalizeThinkingFoldConfig({ foldThreshold: 999 }), {
       ...DEFAULT_THINKING_FOLD_CONFIG,
+    });
+    assert.deepEqual(normalizeThinkingFoldConfig({ previewLines: 8, autoCollapse: false }), {
+      foldThreshold: 8,
+      streamingBehavior: "preview",
+      completedBehavior: "preview",
     });
 
     const config = {
-      mode: "trace" as const,
-      previewLines: 8,
-      autoCollapse: false,
+      foldThreshold: 8,
+      streamingBehavior: "collapse" as const,
+      completedBehavior: "full" as const,
     };
     saveThinkingFoldConfig(config, path);
     assert.deepEqual(loadThinkingFoldConfig(path), config);
