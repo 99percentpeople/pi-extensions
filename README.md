@@ -52,7 +52,9 @@ For example:
         "style": "wave",
         "speed": "normal",
         "crestWidth": "soft",
-        "palette": "accent"
+        "palette": "accent",
+        "direction": "left-to-right",
+        "pause": "none"
       }
     }
   },

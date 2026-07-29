@@ -32,10 +32,42 @@ functional without this package.
   shimmer, refreshed every 32ms;
 - `custom`: independently configure Loader and Label effects.
 
-Preset themes intentionally expose no speed or color overrides. Custom retains
-all previous controls: Pi/None/Claude loaders with speed and color, plus
-None/Wave labels with speed, crest width, and palette. Custom values remain in
-the configuration while another preset is selected.
+Preset themes intentionally expose no speed or color overrides. `Custom` keeps
+Loader and Label controls independent and retains their values while another
+preset is selected.
+
+### Custom Loader effects
+
+| Effect | Description |
+| --- | --- |
+| Pi default | Pi's ten-frame Braille spinner |
+| None | Hide the leading indicator |
+| Claude Code | The platform-specific Claude mark sequence |
+| Pulse | `· • ● •` pulse |
+| Dots | Fixed-width three-dot fill |
+| Bounce | Rising and falling block |
+| Orbit | `◐ ◓ ◑ ◒` rotation |
+
+Every visible Custom loader supports Slow/Normal/Fast speed and
+Accent/Text/Muted/Claude color. Frames have a stable display width, so the
+label does not jump horizontally.
+
+### Custom Label effects
+
+| Effect | Description |
+| --- | --- |
+| None | Keep the native label styling |
+| Wave | A crest with a softer trailing band |
+| Shimmer | A cosine-smoothed highlight |
+| Scan | A crisp moving highlight band |
+| Pulse | Whole-label brightness breathing |
+| Rainbow | A moving ANSI 256-color spectrum |
+
+Animated labels support speed and a loop pause. Moving effects also support
+left-to-right, right-to-left, and ping-pong directions. Wave, Shimmer, and Scan
+provide crest width controls; all non-Rainbow effects support Accent, Thinking,
+and Monochrome palettes. Loader and Label clocks are independent, and label
+segmentation preserves emoji and combining-character graphemes.
 
 ## Install
 
@@ -92,7 +124,9 @@ under the `cursor-effect` namespace:
         "style": "wave",
         "speed": "normal",
         "crestWidth": "soft",
-        "palette": "accent"
+        "palette": "accent",
+        "direction": "left-to-right",
+        "pause": "none"
       }
     }
   }
@@ -102,12 +136,20 @@ under the `cursor-effect` namespace:
 ## Compatibility
 
 Pi does not currently expose a renderer hook for its main status indicators.
-This package therefore installs a guarded patch on `Loader.updateDisplay()` and
-`Loader.render()`, activated only for Pi's four main status kinds: `working`,
-`retry`, `compaction`, and `branchSummary`. Tool, bash, and extension loaders do
-not have those kinds and remain unchanged. The patch checks the expected methods
-at startup, avoids duplicates, and restores the original prototype during
-session shutdown. Pre-styled ANSI labels are left unchanged.
+This package therefore installs a guarded patch on `Loader.updateDisplay()`,
+`Loader.render()`, and `Loader.stop()`, activated only for Pi's four main status
+kinds: `working`, `retry`, `compaction`, and `branchSummary`. The `stop()` wrapper
+owns the independent Label timer and prevents it from outliving a status row.
+Tool, bash, and extension loaders do not have those kinds and remain unchanged.
+The patch checks the expected methods at startup, avoids duplicates, and restores
+the original prototype during session shutdown. Pre-styled ANSI labels are left
+unchanged.
+
+Streaming label changes preserve the current Label effect phase instead of
+restarting it for every partial summary or status message. Loader animation
+remains driven by Pi's normal interval callbacks. Pi rendering and extension
+callbacks share Node's main event loop, so terminal animation cannot redraw
+while a synchronous callback is blocking that thread.
 
 ## License
 

@@ -6,6 +6,9 @@
   "files": [
     "index.ts",
     "config.ts",
+    "runtime-patch.ts",
+    "settings.ts",
+    "effects",
     "README.md",
     "LICENSE"
   ],

@@ -5,12 +5,21 @@ import {
 } from "@99percentpeople/pi-shared-settings";
 
 export type CursorEffectTheme = "default" | "claude-code" | "codex" | "custom";
-export type LoaderEffectStyle = "pi-default" | "none" | "claude";
-export type LabelEffectStyle = "none" | "wave";
+export type LoaderEffectStyle =
+  | "pi-default"
+  | "none"
+  | "claude"
+  | "pulse"
+  | "dots"
+  | "bounce"
+  | "orbit";
+export type LabelEffectStyle = "none" | "wave" | "shimmer" | "scan" | "pulse" | "rainbow";
 export type EffectSpeed = "slow" | "normal" | "fast";
 export type LoaderEffectColor = "accent" | "text" | "muted" | "claude";
 export type WaveCrestWidth = "narrow" | "soft" | "wide";
 export type WavePalette = "accent" | "thinking" | "monochrome";
+export type EffectDirection = "left-to-right" | "right-to-left" | "ping-pong";
+export type EffectPause = "none" | "short" | "long";
 
 export interface CustomCursorEffects {
   loader: {
@@ -23,6 +32,8 @@ export interface CustomCursorEffects {
     speed: EffectSpeed;
     crestWidth: WaveCrestWidth;
     palette: WavePalette;
+    direction: EffectDirection;
+    pause: EffectPause;
   };
 }
 
@@ -42,6 +53,8 @@ export const DEFAULT_CUSTOM_CURSOR_EFFECTS: CustomCursorEffects = {
     speed: "normal",
     crestWidth: "soft",
     palette: "accent",
+    direction: "left-to-right",
+    pause: "none",
   },
 };
 
@@ -73,15 +86,29 @@ function normalizeCustomCursorEffects(value: unknown): CustomCursorEffects {
   const label = input.label ?? {};
   return {
     loader: {
-      style: oneOf(loader.style, ["pi-default", "none", "claude"], "pi-default"),
+      style: oneOf(
+        loader.style,
+        ["pi-default", "none", "claude", "pulse", "dots", "bounce", "orbit"],
+        "pi-default",
+      ),
       speed: oneOf(loader.speed, ["slow", "normal", "fast"], "normal"),
       color: oneOf(loader.color, ["accent", "text", "muted", "claude"], "accent"),
     },
     label: {
-      style: oneOf(label.style ?? legacyLabelStyle, ["none", "wave"], "wave"),
+      style: oneOf(
+        label.style ?? legacyLabelStyle,
+        ["none", "wave", "shimmer", "scan", "pulse", "rainbow"],
+        "wave",
+      ),
       speed: oneOf(label.speed, ["slow", "normal", "fast"], "normal"),
       crestWidth: oneOf(label.crestWidth, ["narrow", "soft", "wide"], "soft"),
       palette: oneOf(label.palette, ["accent", "thinking", "monochrome"], "accent"),
+      direction: oneOf(
+        label.direction,
+        ["left-to-right", "right-to-left", "ping-pong"],
+        "left-to-right",
+      ),
+      pause: oneOf(label.pause, ["none", "short", "long"], "none"),
     },
   };
 }
