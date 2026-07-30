@@ -1,23 +1,21 @@
 {
   "name": "@99percentpeople/pi-cursor-effect",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Apply selectable visual effects to Pi's main working cursor status",
   "type": "module",
   "files": [
-    "index.ts",
-    "config.ts",
-    "runtime-patch.ts",
-    "settings.ts",
-    "effects",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "build": "bun run ../../scripts/build-package.ts",
+    "prepack": "bun run build",
     "prepublishOnly": "bun run --cwd ../.. check"
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "keywords": [
@@ -44,7 +42,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.0"
+    "@99percentpeople/pi-shared-settings": "0.1.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

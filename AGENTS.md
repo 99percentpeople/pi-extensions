@@ -28,8 +28,9 @@ Each extension should:
 2. Include its own publishable `package.json`, `README.md`, and `LICENSE`
 3. Export a default function that receives `ExtensionAPI`
 4. Use TypeScript with proper type annotations
-5. Include `promptSnippet` and `promptGuidelines` for tools
-6. Provide custom rendering when appropriate
+5. Build its npm runtime artifact to `dist/index.js`
+6. Include `promptSnippet` and `promptGuidelines` for tools
+7. Provide custom rendering when appropriate
 
 ### Extension Types
 
@@ -56,11 +57,12 @@ pi -e ./extensions/my-extension/index.ts
 ## Development Workflow
 
 1. Create an extension package under `extensions/my-extension/`
-2. Declare `./index.ts` under `pi.extensions` in that package's `package.json`
-3. Add the package directory to the root Bun `workspaces` array
-4. Test with `pi -e ./extensions/my-extension/index.ts`
-5. Update README.md with documentation
-6. Run `bun run check` and the package's pack dry-run
+2. Add the shared `build` and `prepack` scripts and declare `./dist/index.js` under `pi.extensions`
+3. Add the package directory to the root Bun `workspaces` and build scripts
+4. Test source with `pi -e ./extensions/my-extension/index.ts`
+5. Build with `bun run --cwd extensions/my-extension build`
+6. Update README.md with documentation
+7. Run `bun run check` and the package's pack dry-run
 
 ## Resources
 

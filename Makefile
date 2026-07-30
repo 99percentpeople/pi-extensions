@@ -1,13 +1,14 @@
 # Pi Extensions Makefile
 # Provides common development commands
 
-.PHONY: help install lint test check clean pack
+.PHONY: help install build lint test check clean pack
 
 # Default target
 help:
 	@echo "Pi Extensions Development Commands:"
 	@echo ""
 	@echo "  make install    - Install dependencies"
+	@echo "  make build      - Build all npm package artifacts"
 	@echo "  make lint       - Run type checking"
 	@echo "  make test       - Run unit tests"
 	@echo "  make check      - Run type checking and unit tests"
@@ -19,6 +20,10 @@ help:
 # Install dependencies
 install:
 	bun install
+
+# Build npm package artifacts
+build:
+	bun run build:all
 
 # Type checking
 lint:
@@ -37,6 +42,8 @@ clean:
 	rm -rf node_modules
 	rm -rf dist
 	rm -rf build
+	rm -rf extensions/*/dist
+	rm -rf packages/*/dist
 	rm -f *.tsbuildinfo
 
 # Validate independently published packages

@@ -108,9 +108,12 @@ Without the adapter, `bg_start` follows Pi's configured Bash resolution and
 command prefix, including Git Bash on Windows.
 
 Install Codex subscription API tools after signing in to Pi's `openai-codex`
-provider:
+provider. Build local package directories before installing them from this
+checkout:
 
 ```bash
+bun run build:packages
+bun run --cwd extensions/codex-api build
 pi install ./extensions/codex-api
 ```
 
@@ -118,6 +121,9 @@ Install the reasoning-fold and optional cursor-effect extensions from this
 checkout while developing:
 
 ```bash
+bun run build:packages
+bun run --cwd extensions/thinking-fold build
+bun run --cwd extensions/cursor-effect build
 pi install ./extensions/thinking-fold
 pi install ./extensions/cursor-effect
 ```
@@ -249,11 +255,18 @@ extension directory is independently publishable and depends on the small
 
 ```bash
 bun install --frozen-lockfile
+bun run build:all
 bun run check
 bun run pack:check
 ```
 
-Load an extension directly while developing:
+Each extension and the shared runtime helper bundle their local TypeScript
+modules into `dist/index.js` before npm packing. Pi core packages and runtime
+dependencies remain external. The `prepack` lifecycle runs this build for both
+package validation and publishing. Use `build:extensions` for `extensions/`,
+`build:packages` for `packages/`, and `build:all` for both groups.
+
+Load an extension directly from TypeScript while developing:
 
 ```bash
 pi -e ./extensions/background-tasks/index.ts

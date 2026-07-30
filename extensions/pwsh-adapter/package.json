@@ -1,22 +1,24 @@
 {
   "name": "@99percentpeople/pi-pwsh-adapter",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "PowerShell 7 and Windows PowerShell 5.1 shell adapter for Pi",
   "type": "module",
   "os": [
     "win32"
   ],
   "files": [
-    "index.ts",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "build": "bun run ../../scripts/build-package.ts",
+    "prepack": "bun run build",
     "prepublishOnly": "bun run --cwd ../.. check"
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "keywords": [
@@ -44,7 +46,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.0"
+    "@99percentpeople/pi-shared-settings": "0.1.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

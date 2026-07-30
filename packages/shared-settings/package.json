@@ -1,17 +1,18 @@
 {
   "name": "@99percentpeople/pi-shared-settings",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared namespaced settings store and installed-extension menu for @99percentpeople Pi packages",
   "type": "module",
-  "main": "./index.ts",
-  "types": "./index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "files": [
-    "index.ts",
-    "sectioned-settings-list.ts",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "build": "bun run ../../scripts/build-package.ts && tsc -p tsconfig.build.json",
+    "prepack": "bun run build",
     "prepublishOnly": "bun run --cwd ../.. check"
   },
   "keywords": [

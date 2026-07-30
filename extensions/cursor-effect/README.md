@@ -75,9 +75,12 @@ segmentation preserves emoji and combining-character graphemes.
 pi install npm:@99percentpeople/pi-cursor-effect
 ```
 
-For local development:
+For local development, build the npm artifact before installing the package
+directory:
 
 ```bash
+bun run build:packages
+bun run --cwd extensions/cursor-effect build
 pi install ./extensions/cursor-effect
 ```
 

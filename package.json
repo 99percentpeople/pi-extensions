@@ -15,7 +15,11 @@
     "packages/shared-settings"
   ],
   "scripts": {
-    "test": "node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/codex-api.test.ts tests/cursor-effect.test.ts tests/shared-settings.test.ts tests/thinking-fold.test.ts tests/todo.test.ts tests/packages.test.ts",
+    "build": "bun run build:all",
+    "build:all": "bun run build:packages && bun run build:extensions",
+    "build:packages": "bun run --cwd packages/shared-settings build",
+    "build:extensions": "bun run --cwd extensions/background-tasks build && bun run --cwd extensions/codex-api build && bun run --cwd extensions/cursor-effect build && bun run --cwd extensions/pwsh-adapter build && bun run --cwd extensions/thinking-fold build && bun run --cwd extensions/todo build",
+    "test": "bun run build:packages && node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/codex-api.test.ts tests/cursor-effect.test.ts tests/shared-settings.test.ts tests/thinking-fold.test.ts tests/todo.test.ts tests/packages.test.ts",
     "lint": "tsc --noEmit",
     "check": "bun run lint && bun run test",
     "pack:background-tasks": "bun pm pack --dry-run --cwd extensions/background-tasks",

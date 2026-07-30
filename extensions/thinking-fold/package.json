@@ -1,23 +1,26 @@
 {
   "name": "@99percentpeople/pi-thinking-fold",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Fold streaming reasoning into a live tail preview and expand it with Pi's thinking shortcut",
   "type": "module",
   "files": [
-    "index.ts",
-    "renderer.ts",
-    "config.ts",
-    "model-behaviors.ts",
-    "model-behaviors.json",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "build": "bun run ../../scripts/build-package.ts",
+    "prepack": "bun run build",
     "prepublishOnly": "bun run --cwd ../.. check"
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
+    ]
+  },
+  "piBuild": {
+    "assets": [
+      "model-behaviors.json"
     ]
   },
   "keywords": [
@@ -44,7 +47,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.0"
+    "@99percentpeople/pi-shared-settings": "0.1.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

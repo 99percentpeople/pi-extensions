@@ -65,9 +65,11 @@ reconstructed from Pi's message timestamps and are therefore approximate.
 
 ## Install
 
-Install this checkout as a user-local development package:
+Build and install this checkout as a user-local development package:
 
 ```bash
+bun run build:packages
+bun run --cwd extensions/thinking-fold build
 pi install ./extensions/thinking-fold
 ```
 

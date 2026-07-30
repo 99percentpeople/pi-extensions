@@ -24,9 +24,12 @@ ChatGPT subscription backend rather than metered Platform API usage.
 pi install npm:@99percentpeople/pi-codex-api
 ```
 
-During development:
+During development, build the npm artifact before installing the package
+directory:
 
 ```bash
+bun run build:packages
+bun run --cwd extensions/codex-api build
 pi install ./extensions/codex-api
 ```
 
