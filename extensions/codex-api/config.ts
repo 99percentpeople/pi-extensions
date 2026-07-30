@@ -4,7 +4,7 @@ import {
   writeSettingsNamespace,
 } from "@99percentpeople/pi-shared-settings";
 
-export type CodexSearchMode = "cached" | "indexed" | "live";
+export type CodexSearchMode = "auto" | "cached" | "indexed" | "live";
 export type CodexSearchContextSize = "low" | "medium" | "high";
 export type CodexImageQuality = "auto" | "low" | "medium" | "high";
 
@@ -22,7 +22,7 @@ export const CODEX_API_SETTINGS_NAMESPACE = "codex-api";
 export const DEFAULT_CODEX_API_CONFIG: CodexApiConfig = {
   fastMode: false,
   allowOtherProviders: false,
-  searchMode: "cached",
+  searchMode: "auto",
   searchContextSize: "medium",
   imageQuality: "auto",
   usageStatus: true,
@@ -44,7 +44,7 @@ export function normalizeCodexApiConfig(value: unknown): CodexApiConfig {
       : DEFAULT_CODEX_API_CONFIG.allowOtherProviders,
     searchMode: oneOf(
       input.searchMode,
-      ["cached", "indexed", "live"],
+      ["auto", "cached", "indexed", "live"],
       DEFAULT_CODEX_API_CONFIG.searchMode,
     ),
     searchContextSize: oneOf(

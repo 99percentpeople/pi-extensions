@@ -78,7 +78,11 @@ Uses the first-party Codex standalone search API. Supported command families:
 - PDF page screenshots;
 - finance, weather, sports, and time lookups.
 
-Search mode is configurable as Cached, Indexed, or Live. External content is
+Search mode is configurable as Auto, Cached, Indexed, or Live. In Auto, the AI
+requests a per-call mode: Cached for stable facts and known references, Indexed
+for recent documentation and announcements, and Live for same-day or real-time
+information. An omitted request defaults to Indexed. Selecting a fixed mode
+pins every call to that mode, regardless of the AI request. External content is
 untrusted and should never be treated as instructions.
 
 ## Parameter ownership
@@ -88,8 +92,8 @@ user policy, and internal protocol fields:
 
 | Owner | Search | Image |
 | --- | --- | --- |
-| AI per call | queries, recency, task-specific domains, navigation/lookup commands, response length | prompt, local or recent-conversation references, task-specific size, explicit quality override, destination path |
-| User in `/99settings` | Cached/Indexed/Live mode and search context size | default image quality |
+| AI per call | queries, recency, task-specific domains, navigation/lookup commands, response length, and the requested mode when Auto is enabled | prompt, local or recent-conversation references, task-specific size, explicit quality override, destination path |
+| User in `/99settings` | Auto or a fixed Cached/Indexed/Live policy, plus search context size | default image quality |
 | Extension/backend | session/model routing, caller policy and token ceiling | fixed `gpt-image-2`, automatic background, one PNG result, reference and dimension validation |
 
 Model selection, batch count, output format, input fidelity, masks, moderation,
@@ -120,8 +124,10 @@ raw citation dump. The collapsed view shows three title/domain/snippet cards;
 Pi's configured tool-output expansion shortcut (`Ctrl+O` by default) expands
 every source with its full URL. Internal reference markers,
 word-limit metadata, and separators are hidden. Open/click/find/PDF operations
-use a cleaned document view, while weather, finance, sports, and time lookups
-use a compact data view. This changes only the TUI display copy: the model
+use cleaned document cards. Batched navigation renders each returned page as a
+separate numbered card with a short per-page preview, one shared expansion hint,
+and visible warning styling for unresolved references. Weather, finance,
+sports, and time lookups use a compact data view. This changes only the TUI display copy: the model
 still receives the complete original search output.
 
 Search and image parameters stream into the call row while the model constructs
@@ -179,7 +185,7 @@ The **Codex API** section controls:
   separately logged-in `openai-codex` OAuth account. It never sends the active
   model provider's credentials to ChatGPT.
 - **Fast mode** — enables or disables the priority service tier;
-- Cached, Indexed, or Live search;
+- Auto search routing, or a fixed Cached, Indexed, or Live policy;
 - search context size;
 - default GPT Image 2 quality (`Auto`, `Low`, `Medium`, or `High`);
 - subscription usage status visibility.

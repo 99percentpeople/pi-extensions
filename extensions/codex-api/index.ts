@@ -73,13 +73,16 @@ export {
   createCodexSearchDisplay,
   formatCodexSearchDisplay,
   type CodexSearchDisplay,
+  type CodexSearchDocument,
   type CodexSearchDisplayLine,
   type CodexSearchDisplayLineRole,
   type CodexSearchSource,
 } from "./search-display.ts";
 export {
   registerCodexSearchTool,
+  resolveSearchMode,
   SearchCommandsSchema,
+  type CodexEffectiveSearchMode,
   type CodexSearchDetails,
 } from "./search.ts";
 export {

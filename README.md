@@ -50,7 +50,7 @@ For example:
   "codex-api": {
     "fastMode": false,
     "allowOtherProviders": false,
-    "searchMode": "cached",
+    "searchMode": "auto",
     "searchContextSize": "medium",
     "imageQuality": "auto",
     "usageStatus": true
@@ -183,12 +183,14 @@ model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 
 `codex-api` reuses Pi's existing ChatGPT subscription OAuth to expose
 `codex_image` and `codex_search`, without an OpenAI API key or MCP server. It
-also provides `/fast` for the priority service tier and `/codex-usage` for the
-latest usage windows and credits reported by Codex response headers. Image
+also provides settings-controlled Fast mode for the priority service tier and
+`/codex-usage` for current subscription usage windows and credits. Image
 outputs are saved as non-overwriting PNG files and returned to the model for
 follow-up inspection. Search supports web and image queries, page navigation,
-PDF screenshots, finance, weather, sports, and time operations. Configure Fast,
-search mode, search context size, and usage status through `/99settings`. See the
+PDF screenshots, finance, weather, sports, and time operations. Auto search lets
+the AI choose Cached, Indexed, or Live per call, while fixed user modes always
+win. Configure Fast, search mode, search context size, and usage status through
+`/99settings`. See the
 [codex-api package documentation](extensions/codex-api/README.md).
 
 ## cursor-effect

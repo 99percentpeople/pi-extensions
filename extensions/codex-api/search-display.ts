@@ -7,20 +7,34 @@ export interface CodexSearchSource {
   snippet?: string;
 }
 
+export interface CodexSearchDocument {
+  source?: CodexSearchSource;
+  body: string;
+}
+
 export type CodexSearchDisplay =
   | { kind: "sources"; sources: CodexSearchSource[] }
-  | { kind: "document"; source?: CodexSearchSource; body: string }
+  | {
+      kind: "document";
+      source?: CodexSearchSource;
+      body: string;
+      /** One entry per open/click/find/screenshot result block. */
+      documents?: CodexSearchDocument[];
+    }
   | { kind: "data"; body: string };
 
-export type CodexSearchDisplayLineRole = "title" | "url" | "body" | "hint";
+export type CodexSearchDisplayLineRole = "title" | "url" | "body" | "hint" | "error";
 
 export interface CodexSearchDisplayLine {
   role: CodexSearchDisplayLineRole;
   text: string;
+  /** Styled keyHint kept separate so renderers do not recolor it. */
+  expandHint?: string;
 }
 
 const SOURCE_PREVIEW_COUNT = 3;
 const DOCUMENT_PREVIEW_LINES = 10;
+const MULTI_DOCUMENT_PREVIEW_LINES = 5;
 const RESULT_SEPARATOR = /\s*-{40,}\s*/;
 const CITATION_MARKER = /cite[^]*/g;
 const WORD_LIMIT = /\[wordlim:\s*[^\]]+\]/gi;
@@ -130,9 +144,14 @@ function removeDocumentLinePrefix(line: string): string {
 }
 
 function isDocumentChrome(line: string): boolean {
-  return /^\*?\s*\[(?:Button|Input):/i.test(line)
+  return /^\*?\s*\[(?:Button|Input)(?::[^\]]*)?\]\s*$/i.test(line)
     || /^(?:\*\s*)+$/.test(line)
     || /^(?:\*\s*)?(?:L\d+:\s*)+$/.test(line);
+}
+
+function cleanDocumentLine(line: string): string {
+  const cleaned = cleanInline(removeDocumentLinePrefix(line));
+  return cleanInline(cleaned.replace(/(?:^|\s)L\d+:\s*/g, " "));
 }
 
 export function cleanCodexSearchOutput(output: string): string {
@@ -140,7 +159,7 @@ export function cleanCodexSearchOutput(output: string): string {
     .split(RESULT_SEPARATOR)
     .join("\n\n")
     .split("\n")
-    .map((line) => cleanInline(removeDocumentLinePrefix(line)))
+    .map(cleanDocumentLine)
     .filter((line) => line && !/^Image:/i.test(line) && !isDocumentChrome(line));
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -168,18 +187,72 @@ function hasItems(value: unknown): boolean {
   return Array.isArray(value) && value.length > 0;
 }
 
+function documentSourceFromBlock(block: string): CodexSearchSource | undefined {
+  const first = block.split("\n").map((line) => line.trim()).find(Boolean);
+  if (!first) return undefined;
+  const heading = /^(.*?)\s+\((https?:\/\/[^)]*)?\)\s*$/.exec(first);
+  if (!heading) return undefined;
+  const title = cleanInline(heading[1]);
+  if (!title) return undefined;
+  const url = safeUrl(heading[2]);
+  return {
+    ...(/^Internal Error$/i.test(title) ? { type: "error" } : {}),
+    title,
+    ...(url ? { domain: domainFor(url), url } : {}),
+  };
+}
+
+function mergeDocumentSource(
+  blockSource: CodexSearchSource | undefined,
+  resultSources: CodexSearchSource[],
+  index: number,
+): CodexSearchSource | undefined {
+  if (!blockSource) return resultSources[index];
+  const matched = resultSources.find((source) =>
+    (blockSource.url !== undefined && source.url === blockSource.url)
+    || source.title === blockSource.title
+  );
+  if (!matched) return blockSource;
+  return {
+    ...blockSource,
+    ...matched,
+    type: blockSource.type ?? matched.type,
+    title: matched.title || blockSource.title,
+    domain: matched.domain ?? blockSource.domain,
+    url: matched.url ?? blockSource.url,
+  };
+}
+
 function documentBody(output: string, source: CodexSearchSource | undefined): string {
   const lines = cleanCodexDocumentOutput(output).split("\n");
-  if (!source) return lines.join("\n");
-  while (lines.length > 0) {
-    const first = lines[0];
-    const isHeading = first === source.title
-      || (source.url !== undefined && first.includes(source.url))
-      || (source.domain !== undefined && first === source.domain);
-    if (!isHeading) break;
-    lines.shift();
+  if (source) {
+    while (lines.length > 0) {
+      const first = lines[0];
+      const headingText = first.replace(/\s+\([^)]*\)\s*$/, "");
+      const isHeading = first === source.title
+        || headingText === source.title
+        || (source.url !== undefined && first.includes(source.url))
+        || (source.domain !== undefined && first === source.domain);
+      if (!isHeading) break;
+      lines.shift();
+    }
   }
-  return lines.join("\n").trim();
+  return lines.filter((line, index) => line !== lines[index - 1]).join("\n").trim();
+}
+
+function searchDocuments(
+  output: string,
+  results: unknown[] | undefined,
+): CodexSearchDocument[] {
+  const resultSources = (results ?? [])
+    .map(normalizeSource)
+    .filter((value): value is CodexSearchSource => value !== undefined);
+  const blocks = output.split(RESULT_SEPARATOR).map((block) => block.trim()).filter(Boolean);
+  const effectiveBlocks = blocks.length > 0 ? blocks : [output];
+  return effectiveBlocks.map((block, index) => {
+    const source = mergeDocumentSource(documentSourceFromBlock(block), resultSources, index);
+    return { source, body: documentBody(block, source) };
+  });
 }
 
 export function createCodexSearchDisplay(
@@ -192,7 +265,14 @@ export function createCodexSearchDisplay(
     return { kind: "sources", sources };
   }
   if (hasItems(params.open) || hasItems(params.click) || hasItems(params.find) || hasItems(params.screenshot)) {
-    return { kind: "document", source: sources[0], body: documentBody(output, sources[0]) };
+    const documents = searchDocuments(output, results);
+    const first = documents[0] ?? { source: sources[0], body: documentBody(output, sources[0]) };
+    return {
+      kind: "document",
+      source: first.source,
+      body: first.body,
+      documents,
+    };
   }
   return { kind: "data", body: cleanCodexSearchOutput(output) };
 }
@@ -210,8 +290,12 @@ function sourceLines(source: CodexSearchSource, index: number, expanded: boolean
   return lines;
 }
 
-function appendExpandHint(text: string, expandHint?: string): string {
-  return expandHint ? `${text} (${expandHint})` : text;
+function expandHintLine(text: string, expandHint?: string): CodexSearchDisplayLine {
+  return {
+    role: "hint",
+    text: expandHint ? `${text} (${expandHint})` : text,
+    ...(expandHint ? { expandHint } : {}),
+  };
 }
 
 function excerptLines(body: string, expanded: boolean, expandHint?: string): CodexSearchDisplayLine[] {
@@ -219,10 +303,46 @@ function excerptLines(body: string, expanded: boolean, expandHint?: string): Cod
   const shown = expanded ? all : all.slice(0, DOCUMENT_PREVIEW_LINES);
   const lines: CodexSearchDisplayLine[] = shown.map((text) => ({ role: "body", text }));
   if (!expanded && shown.length < all.length) {
-    lines.push({
-      role: "hint",
-      text: appendExpandHint(`… ${all.length - shown.length} more lines`, expandHint),
-    });
+    lines.push(expandHintLine(`… ${all.length - shown.length} more lines`, expandHint));
+  }
+  return lines;
+}
+
+function documentLines(
+  documents: CodexSearchDocument[],
+  expanded: boolean,
+  expandHint?: string,
+): CodexSearchDisplayLine[] {
+  const multiple = documents.length > 1;
+  const previewLines = multiple ? MULTI_DOCUMENT_PREVIEW_LINES : DOCUMENT_PREVIEW_LINES;
+  const lines: CodexSearchDisplayLine[] = [];
+  let hiddenLineCount = 0;
+
+  documents.forEach((document, index) => {
+    if (document.source) {
+      const title = multiple ? `${index + 1}. ${document.source.title}` : document.source.title;
+      lines.push({
+        role: document.source.type === "error" ? "error" : "title",
+        text: title,
+      });
+      const location = expanded
+        ? document.source.url ?? document.source.domain
+        : document.source.domain ?? document.source.url;
+      if (location) lines.push({ role: "url", text: `   ${location}` });
+    }
+
+    const allBodyLines = document.body.split("\n").filter(Boolean);
+    const shownBodyLines = expanded ? allBodyLines : allBodyLines.slice(0, previewLines);
+    lines.push(...shownBodyLines.map((text) => ({
+      role: "body" as const,
+      text: `   ${text}`,
+    })));
+    hiddenLineCount += allBodyLines.length - shownBodyLines.length;
+  });
+
+  if (!expanded && hiddenLineCount > 0) {
+    const scope = multiple ? ` across ${documents.length} results` : "";
+    lines.push(expandHintLine(`… ${hiddenLineCount} more lines${scope}`, expandHint));
   }
   return lines;
 }
@@ -237,22 +357,17 @@ export function formatCodexSearchDisplay(
     const lines: CodexSearchDisplayLine[] = [];
     shown.forEach((source, index) => lines.push(...sourceLines(source, index, expanded)));
     if (!expanded && shown.length < display.sources.length) {
-      lines.push({
-        role: "hint",
-        text: appendExpandHint(`… ${display.sources.length - shown.length} more results`, expandHint),
-      });
+      lines.push(expandHintLine(`… ${display.sources.length - shown.length} more results`, expandHint));
     }
     return lines;
   }
 
   if (display.kind === "document") {
-    const lines: CodexSearchDisplayLine[] = [];
-    if (display.source) {
-      lines.push({ role: "title", text: display.source.title });
-      if (display.source.url) lines.push({ role: "url", text: display.source.url });
-    }
-    lines.push(...excerptLines(display.body, expanded, expandHint));
-    return lines;
+    return documentLines(
+      display.documents ?? [{ source: display.source, body: display.body }],
+      expanded,
+      expandHint,
+    );
   }
 
   return excerptLines(display.body, expanded, expandHint);

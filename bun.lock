@@ -32,7 +32,7 @@
     },
     "extensions/codex-api": {
       "name": "@99percentpeople/pi-codex-api",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.0",
       },

@@ -32,7 +32,9 @@ import {
   registerCodexSearchTool,
   registerCodexUsageAndFast,
   resolveCodexApiRoot,
+  resolveSearchMode,
   saveCodexApiConfig,
+  SEARCH_MODE_LABELS,
 } from "../extensions/codex-api/index.ts";
 
 function jwt(accountId = "acct-123"): string {
@@ -279,13 +281,23 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     const partialImageCall = tool.renderCall!(
       { prompt: "a red" },
       plainTheme,
-      renderContext(false, { args: { prompt: "a red" }, argsComplete: false, executionStarted: false }),
+      renderContext(false, {
+        args: { prompt: "a red" },
+        argsComplete: false,
+        executionStarted: false,
+        isPartial: true,
+      }),
     );
     assert.match(render(partialImageCall), /codex_image generate "a red" …/);
     const startedImageCall = tool.renderCall!(
       { prompt: "a red" },
       plainTheme,
-      renderContext(false, { args: { prompt: "a red" }, argsComplete: false, executionStarted: true }),
+      renderContext(false, {
+        args: { prompt: "a red" },
+        argsComplete: false,
+        executionStarted: true,
+        isPartial: true,
+      }),
     );
     assert.doesNotMatch(render(startedImageCall), / …$/);
     const completeImageArgs = { prompt: "a red fox", output_path: generatedPath };
@@ -469,14 +481,24 @@ test("codex_search sends official commands and subscription search settings", as
     pi,
     () => ({
       ...DEFAULT_CODEX_API_CONFIG,
-      searchMode: "live",
+      searchMode: "auto",
       searchContextSize: "high",
     }),
     () => { searchRefreshes += 1; },
   ));
+  assert.ok(tool.parameters.properties?.search_mode);
+  const searchGuidelines = tool.promptGuidelines?.join("\n") ?? "";
+  assert.match(searchGuidelines, /search_mode.*cached.*indexed.*live.*Auto.*fixed user mode/i);
+  assert.match(
+    searchGuidelines,
+    /same-day.*exact calendar date.*recency to 1.*freshness.*source-timezone/i,
+  );
   try {
     const updates: any[] = [];
-    const args = { search_query: [{ q: "Codex documentation", domains: ["openai.com"] }] };
+    const args = {
+      search_query: [{ q: "Codex documentation", domains: ["openai.com"] }],
+      search_mode: "live" as const,
+    };
     const result = await tool.execute(
       "search-call",
       args,
@@ -489,6 +511,8 @@ test("codex_search sends official commands and subscription search settings", as
     assert.equal(request?.body.model, "gpt-5.6");
     assert.equal(request?.body.settings.external_web_access, true);
     assert.equal(request?.body.settings.search_context_size, "high");
+    assert.equal(request?.body.commands.search_mode, undefined);
+    assert.equal(result.details.mode, "live");
     assert.equal(result.content[0].type, "text");
     assert.match(result.content[0].type === "text" ? result.content[0].text : "", /turn0search0/);
     assert.deepEqual(
@@ -496,6 +520,7 @@ test("codex_search sends official commands and subscription search settings", as
       ["authenticating", "searching"],
     );
     assert.ok(updates.every((update) => !("operation" in update.details)));
+    assert.ok(updates.every((update) => update.details.mode === "live"));
     assert.ok(result.details && !("operation" in result.details));
     assert.equal(searchRefreshes, 1);
 
@@ -503,13 +528,23 @@ test("codex_search sends official commands and subscription search settings", as
     const partialCallComponent = tool.renderCall!(
       partialArgs,
       plainTheme,
-      renderContext(false, { args: partialArgs, argsComplete: false, executionStarted: false }),
+      renderContext(false, {
+        args: partialArgs,
+        argsComplete: false,
+        executionStarted: false,
+        isPartial: true,
+      }),
     );
-    assert.match(render(partialCallComponent), /codex_search search "Codex doc" …/);
+    assert.match(render(partialCallComponent), /codex_search search "Codex doc" mode=indexed …/);
     const startedSearchCall = tool.renderCall!(
       partialArgs,
       plainTheme,
-      renderContext(false, { args: partialArgs, argsComplete: false, executionStarted: true }),
+      renderContext(false, {
+        args: partialArgs,
+        argsComplete: false,
+        executionStarted: true,
+        isPartial: true,
+      }),
     );
     assert.doesNotMatch(render(startedSearchCall), / …$/);
     const completeCallComponent = tool.renderCall!(
@@ -519,11 +554,27 @@ test("codex_search sends official commands and subscription search settings", as
     );
     assert.equal(completeCallComponent, partialCallComponent);
     const collapsedCall = render(completeCallComponent);
-    assert.match(collapsedCall, /codex_search search "Codex documentation" domains=openai.com/);
+    assert.match(collapsedCall, /codex_search search "Codex documentation" domains=openai.com mode=live/);
     assert.doesNotMatch(collapsedCall, / …$/);
+    const restoredCompleteCall = tool.renderCall!(
+      args,
+      plainTheme,
+      renderContext(false, {
+        args,
+        argsComplete: false,
+        executionStarted: false,
+        isPartial: false,
+      }),
+    );
+    assert.doesNotMatch(
+      render(restoredCompleteCall),
+      / …$/,
+      "a completed/restored result must not retain the argument-streaming suffix",
+    );
     const styledSearchArgs = {
       search_query: [{ q: "Codex documentation", domains: ["openai.com"], recency: 7 }],
       response_length: "long",
+      search_mode: "live" as const,
     };
     const styledSearchCall = tool.renderCall!(
       styledSearchArgs,
@@ -532,7 +583,38 @@ test("codex_search sends official commands and subscription search settings", as
     );
     assert.match(
       render(styledSearchCall),
-      /<toolTitle>codex_search<\/toolTitle> <accent>search<\/accent> <muted>"Codex documentation"<\/muted> <dim>recent=7d domains=openai\.com<\/dim><dim> · <\/dim><dim>response=long<\/dim>/,
+      /<toolTitle>codex_search<\/toolTitle> <accent>search<\/accent> <muted>"Codex documentation"<\/muted> <dim>recent=7d domains=openai\.com<\/dim><dim> <\/dim><dim>response=long<\/dim><dim> <\/dim><dim>mode=live<\/dim>/,
+    );
+    const multiOpenArgs = {
+      open: [
+        { ref_id: "turn2reddit18" },
+        { ref_id: "turn2search9" },
+        { ref_id: "turn2search1" },
+      ],
+    };
+    const multiOpenCall = render(tool.renderCall!(
+      multiOpenArgs,
+      taggedTheme,
+      renderContext(false, { args: multiOpenArgs }),
+    ));
+    assert.match(
+      multiOpenCall,
+      /<toolTitle>codex_search<\/toolTitle> <accent>open<\/accent> <muted>turn2reddit18<\/muted><dim>\s*<\/dim><accent>open<\/accent> <muted>turn2search9<\/muted><dim>\s*<\/dim><accent>open<\/accent> <muted>turn2search1<\/muted><dim>\s*<\/dim><dim>mode=indexed<\/dim>/,
+    );
+    const multiSearchArgs = {
+      search_query: [
+        { q: "first query", recency: 1 },
+        { q: "second query", domains: ["example.com"] },
+      ],
+    };
+    const multiSearchCall = render(tool.renderCall!(
+      multiSearchArgs,
+      taggedTheme,
+      renderContext(false, { args: multiSearchArgs }),
+    ));
+    assert.match(
+      multiSearchCall,
+      /<accent>search<\/accent> <muted>"first query"<\/muted> <dim>recent=1d<\/dim><dim>\s*<\/dim><accent>search<\/accent> <muted>"second query"<\/muted> <dim>domains=example\.com<\/dim>/,
     );
     const collapsedResult = stripVTControlCharacters(render(tool.renderResult!(
       result,
@@ -546,6 +628,24 @@ test("codex_search sends official commands and subscription search settings", as
     assert.match(collapsedResult, /3\. Source 3/);
     assert.match(collapsedResult, /2 more results \( ?to expand\)/);
     assert.doesNotMatch(collapsedResult, /4\. Source 4|turn0search|wordlim|Search result line|Completed/);
+    const hintGuardTheme = {
+      ...plainTheme,
+      fg: (_color: string, text: string) => {
+        assert.doesNotMatch(
+          text,
+          /to expand/,
+          "the surrounding search-line color must not override keyHint styling",
+        );
+        return text;
+      },
+    } as Theme;
+    const guardedCollapsedResult = stripVTControlCharacters(render(tool.renderResult!(
+      result,
+      { expanded: false, isPartial: false },
+      hintGuardTheme,
+      renderContext(false, { args }),
+    )));
+    assert.match(guardedCollapsedResult, /2 more results \( ?to expand\)/);
     const expandedResult = render(tool.renderResult!(
       result,
       { expanded: true, isPartial: false },
@@ -579,16 +679,20 @@ test("codex_search uses the logged-in Codex model when cross-provider tools are 
   const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => ({
     ...DEFAULT_CODEX_API_CONFIG,
     allowOtherProviders: true,
+    searchMode: "cached",
   })));
   try {
-    await tool.execute(
+    const result = await tool.execute(
       "cross-provider-search",
-      { search_query: [{ q: "Codex" }] },
+      { search_query: [{ q: "Codex" }], search_mode: "live" },
       undefined,
       undefined,
       otherProviderContext(process.cwd()),
     );
     assert.equal(request?.body.model, "gpt-5.6-codex");
+    assert.equal(request?.body.settings.external_web_access, false);
+    assert.equal(request?.body.commands.search_mode, undefined);
+    assert.equal(result.details.mode, "cached");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -648,14 +752,82 @@ test("Codex search display normalizes raw sources and document views", () => {
     }],
   );
   assert.equal(documentDisplay.kind, "document");
-  const collapsedDocument = formatCodexSearchDisplay(documentDisplay, false, "ctrl+o to expand")
-    .map((line) => line.text)
-    .join("\n");
-  assert.match(collapsedDocument, /^Opened page\nhttps:\/\/docs\.example\/page/);
-  assert.match(collapsedDocument, /Document line 1/);
-  assert.doesNotMatch(collapsedDocument, /https:\/\/docs\.example\/page\n\nDocument line 1/);
+  if (documentDisplay.kind === "document") assert.equal(documentDisplay.documents?.length, 1);
+  const collapsedDocumentLines = formatCodexSearchDisplay(documentDisplay, false, "ctrl+o to expand");
+  assert.equal(collapsedDocumentLines.at(-1)?.expandHint, "ctrl+o to expand");
+  const collapsedDocument = collapsedDocumentLines.map((line) => line.text).join("\n");
+  assert.match(collapsedDocument, /^Opened page\n   docs\.example/);
+  assert.match(collapsedDocument, /   Document line 1/);
+  assert.doesNotMatch(collapsedDocument, /https:\/\/docs\.example\/page/);
   assert.match(collapsedDocument, /2 more lines \(ctrl\+o to expand\)/);
   assert.doesNotMatch(collapsedDocument, /cite|wordlim|Image:|Button:|L\d+:|-{20}/);
+  const expandedDocument = formatCodexSearchDisplay(documentDisplay, true)
+    .map((line) => line.text)
+    .join("\n");
+  assert.match(expandedDocument, /^Opened page\n   https:\/\/docs\.example\/page/);
+  assert.match(expandedDocument, /Document line 12/);
+  assert.doesNotMatch(expandedDocument, /more lines/);
+
+  const multiDocumentOutput = [
+    [
+      "First page (https://one.example/article)",
+      "citeturn4view0 [wordlim: 200] Content type: text/html; Total lines: 20",
+      "L0: # First page",
+      ...Array.from({ length: 7 }, (_, index) => `L${index + 1}: First line ${index + 1}`),
+      "L8: [Input]",
+    ].join("\n"),
+    [
+      "Second page (https://two.example/article)",
+      "citeturn4view1 [wordlim: 200] Content type: text/html; Total lines: 20",
+      "L0: # Second page",
+      ...Array.from({ length: 6 }, (_, index) => `L${index + 1}: Second line ${index + 1}`),
+      "L7: cite2†Terms L8: ## Embedded heading",
+    ].join("\n"),
+    [
+      "Internal Error ()",
+      "citeturn4view2 [wordlim: 200] Unable to resolve open call",
+      "L0: Unable to resolve open call",
+    ].join("\n"),
+  ].join("\n----------------------------------------\n");
+  const multiDocumentDisplay = createCodexSearchDisplay(
+    {
+      open: [
+        { ref_id: "turn2reddit18" },
+        { ref_id: "turn2search9" },
+        { ref_id: "turn2search1" },
+      ],
+    },
+    multiDocumentOutput,
+  );
+  assert.equal(multiDocumentDisplay.kind, "document");
+  if (multiDocumentDisplay.kind === "document") {
+    assert.equal(multiDocumentDisplay.documents?.length, 3);
+  }
+  const multiDocumentLines = formatCodexSearchDisplay(
+    multiDocumentDisplay,
+    false,
+    "ctrl+o to expand",
+  );
+  const collapsedMultiDocument = multiDocumentLines.map((line) => line.text).join("\n");
+  assert.match(collapsedMultiDocument, /^1\. First page\n   one\.example/);
+  assert.match(collapsedMultiDocument, /\n2\. Second page\n   two\.example/);
+  assert.match(collapsedMultiDocument, /\n3\. Internal Error\n   Unable to resolve open call/);
+  assert.doesNotMatch(collapsedMultiDocument, /\n\n/);
+  assert.match(collapsedMultiDocument, /4 more lines across 3 results \(ctrl\+o to expand\)$/);
+  assert.equal(multiDocumentLines.filter((line) => line.expandHint).length, 1);
+  assert.equal(multiDocumentLines.find((line) => line.text.includes("Internal Error"))?.role, "error");
+  assert.doesNotMatch(
+    collapsedMultiDocument,
+    /https:\/\/|First line 6|Second line 6|\[Input\]|cite|wordlim|L\d+:/,
+  );
+  const expandedMultiDocument = formatCodexSearchDisplay(multiDocumentDisplay, true)
+    .map((line) => line.text)
+    .join("\n");
+  assert.match(expandedMultiDocument, /https:\/\/one\.example\/article/);
+  assert.match(expandedMultiDocument, /First line 7/);
+  assert.match(expandedMultiDocument, /Second line 6/);
+  assert.match(expandedMultiDocument, /Embedded heading/);
+  assert.doesNotMatch(expandedMultiDocument, /more lines|\[Input\]|cite|wordlim|L\d+:/);
 
   const dataDisplay = createCodexSearchDisplay(
     { weather: [{ location: "Tokyo" }] },
@@ -950,6 +1122,20 @@ test("Codex usage watches auth.json for account switches and ignores stale reque
 });
 
 test("Codex API config normalizes, saves, and reloads", async () => {
+  assert.equal(DEFAULT_CODEX_API_CONFIG.searchMode, "auto");
+  assert.deepEqual(SEARCH_MODE_LABELS, {
+    auto: "Auto",
+    cached: "Cached",
+    indexed: "Indexed",
+    live: "Live",
+  });
+  assert.equal(normalizeCodexApiConfig({ searchMode: "auto" }).searchMode, "auto");
+  assert.equal(resolveSearchMode("auto"), "indexed");
+  assert.equal(resolveSearchMode("auto", "live"), "live");
+  assert.equal(resolveSearchMode("auto", "cached"), "cached");
+  assert.equal(resolveSearchMode("cached", "live"), "cached");
+  assert.equal(resolveSearchMode("indexed", "live"), "indexed");
+  assert.equal(resolveSearchMode("live", "cached"), "live");
   assert.deepEqual(normalizeCodexApiConfig({
     fastMode: true,
     allowOtherProviders: true,

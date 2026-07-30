@@ -320,7 +320,10 @@ export function registerCodexImageTool(
           + (sizeParameter ? ` ${theme.fg("dim", sizeParameter)}` : "")
           + (qualityParameter ? ` ${theme.fg("dim", qualityParameter)}` : "")
           + (outputParameter ? ` ${theme.fg("muted", outputParameter)}` : "")
-          + streamingSuffix(theme, context.argsComplete || context.executionStarted),
+          + streamingSuffix(
+              theme,
+              context.argsComplete || context.executionStarted || !context.isPartial,
+            ),
       );
       return text;
     },

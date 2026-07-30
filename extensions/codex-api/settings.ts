@@ -9,6 +9,7 @@ import {
 } from "./config.ts";
 
 const SEARCH_MODE_LABELS: Record<CodexSearchMode, string> = {
+  auto: "Auto",
   cached: "Cached",
   indexed: "Indexed",
   live: "Live",
@@ -63,7 +64,7 @@ export function registerCodexApiSettings(
         {
           id: "searchMode",
           label: "Search mode",
-          description: "Cached avoids live access; Indexed and Live allow fresher results",
+          description: "Auto lets the AI choose per call; fixed modes cannot be overridden",
           currentValue: SEARCH_MODE_LABELS[config.searchMode],
           values: Object.values(SEARCH_MODE_LABELS),
         },
