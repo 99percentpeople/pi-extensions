@@ -235,7 +235,7 @@ function resolveDraftTodoTasks(
 }
 
 function renderExpandHint(expanded: boolean, theme: Theme): string {
-  return theme.fg("dim", " (")
+  return theme.fg("dim", "  (")
     + keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")
     + theme.fg("dim", ")");
 }
