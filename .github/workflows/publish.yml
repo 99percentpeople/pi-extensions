@@ -93,4 +93,5 @@ jobs:
         working-directory: ${{ steps.release.outputs.directory }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+          NPM_OTP: ${{ secrets.NPM_OTP }}
+        run: npm publish --access public --ignore-scripts --otp="$NPM_OTP"
