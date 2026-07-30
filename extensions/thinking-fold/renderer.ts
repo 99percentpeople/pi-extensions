@@ -6,8 +6,9 @@ import {
 import { resolveConfiguredThinkingBehavior } from "./model-behaviors.ts";
 
 export type ThinkingFoldMode = "auto" | "trace" | "summary";
-export type ThinkingStreamingBehavior = "preview" | "collapse";
-export type ThinkingCompletedBehavior = "collapse" | "preview" | "full";
+export type ThinkingStreamingBehavior = "auto" | "preview" | "collapse";
+export type ThinkingCompletedBehavior = "auto" | "collapse" | "preview" | "full";
+type EffectiveThinkingDisplayBehavior = Exclude<ThinkingCompletedBehavior, "auto">;
 
 export interface ThinkingFoldOptions {
   mode: ThinkingFoldMode;
@@ -34,8 +35,8 @@ export const DEFAULT_THINKING_CURSOR_LABEL = "Thinking...";
 export const DEFAULT_THINKING_FOLD_OPTIONS: ThinkingFoldOptions = {
   mode: "auto",
   previewLines: 5,
-  streamingBehavior: "preview",
-  completedBehavior: "collapse",
+  streamingBehavior: "auto",
+  completedBehavior: "auto",
   toggleKey: "ctrl+t",
 };
 
@@ -90,13 +91,16 @@ const PATCH_SYMBOL = Symbol.for("@99percentpeople/pi-thinking-fold/assistant-mes
 function normalizedOptions(options: Partial<ThinkingFoldOptions>): ThinkingFoldOptions {
   const previewLines = options.previewLines ?? DEFAULT_THINKING_FOLD_OPTIONS.previewLines;
   const completedBehavior =
+    options.completedBehavior === "auto" ||
     options.completedBehavior === "collapse" ||
     options.completedBehavior === "preview" ||
     options.completedBehavior === "full"
       ? options.completedBehavior
       : options.autoCollapse === false
         ? "preview"
-        : DEFAULT_THINKING_FOLD_OPTIONS.completedBehavior;
+        : options.autoCollapse === true
+          ? "collapse"
+          : DEFAULT_THINKING_FOLD_OPTIONS.completedBehavior;
   return {
     mode: options.mode ?? DEFAULT_THINKING_FOLD_OPTIONS.mode,
     previewLines:
@@ -104,7 +108,9 @@ function normalizedOptions(options: Partial<ThinkingFoldOptions>): ThinkingFoldO
         ? previewLines
         : DEFAULT_THINKING_FOLD_OPTIONS.previewLines,
     streamingBehavior:
-      options.streamingBehavior === "collapse" || options.streamingBehavior === "preview"
+      options.streamingBehavior === "auto" ||
+      options.streamingBehavior === "collapse" ||
+      options.streamingBehavior === "preview"
         ? options.streamingBehavior
         : DEFAULT_THINKING_FOLD_OPTIONS.streamingBehavior,
     completedBehavior,
@@ -161,6 +167,21 @@ export function resolveThinkingBehavior(
   if (mode !== "auto") return mode;
 
   return resolveConfiguredThinkingBehavior(message) ?? "trace";
+}
+
+export function resolveThinkingDisplayBehavior(
+  message: AssistantMessage,
+  options: Pick<
+    ThinkingFoldOptions,
+    "mode" | "streamingBehavior" | "completedBehavior"
+  >,
+  completed: boolean,
+): EffectiveThinkingDisplayBehavior {
+  if (completed) {
+    return options.completedBehavior === "auto" ? "collapse" : options.completedBehavior;
+  }
+  if (options.streamingBehavior !== "auto") return options.streamingBehavior;
+  return resolveThinkingBehavior(message, options.mode) === "summary" ? "collapse" : "preview";
 }
 
 export function formatThinkingSeconds(milliseconds: number): string {
@@ -241,9 +262,7 @@ export function createThinkingDisplayMessage(
 
   const timing = display.timing;
   const completed = timing?.completedAt !== undefined;
-  const displayBehavior: ThinkingCompletedBehavior = completed
-    ? options.completedBehavior
-    : options.streamingBehavior;
+  const displayBehavior = resolveThinkingDisplayBehavior(message, options, completed);
   const hasThinkingContent = message.content.some(
     (block) => block.type === "thinking" && block.thinking.trim(),
   );

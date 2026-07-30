@@ -29,6 +29,7 @@ import { constants as osConstants } from "node:os";
 import { stripVTControlCharacters } from "node:util";
 import {
   getShellConfig,
+  keyHint,
   keyText,
   SettingsManager,
   type AgentToolResult,
@@ -1490,8 +1491,11 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
     }
   }
 
+  const hintDescription = expanded ? "to collapse" : "to expand";
   const hint = visible.length > 0
-    ? ` · ${keyText("app.tools.expand")} ${expanded ? "to collapse" : "to expand"}`
+    ? theme
+      ? theme.fg("muted", " · ") + keyHint("app.tools.expand", hintDescription)
+      : ` · ${keyText("app.tools.expand")} ${hintDescription}`
     : "";
   const title = `${visible.length} background task${visible.length === 1 ? "" : "s"}`;
   const statusParts = [
@@ -1501,7 +1505,7 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
   const header = theme
     ? theme.fg("accent", theme.bold(title)) +
       statusParts.map(({ color, text }) => theme.fg("muted", " · ") + theme.fg(color, text)).join("") +
-      theme.fg("muted", hint)
+      hint
     : [title, ...statusParts.map(({ text }) => text)].join(" · ") + hint;
   const rendered = [header, ...lines];
   return rendered.map((line) => truncateToWidth(line, width, "…"));

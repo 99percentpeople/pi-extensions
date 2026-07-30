@@ -33,11 +33,11 @@ function isFoldThreshold(value: unknown): value is number {
 }
 
 function isStreamingBehavior(value: unknown): value is ThinkingStreamingBehavior {
-  return value === "preview" || value === "collapse";
+  return value === "auto" || value === "preview" || value === "collapse";
 }
 
 function isCompletedBehavior(value: unknown): value is ThinkingCompletedBehavior {
-  return value === "collapse" || value === "preview" || value === "full";
+  return value === "auto" || value === "collapse" || value === "preview" || value === "full";
 }
 
 export function normalizeThinkingFoldConfig(value: unknown): ThinkingFoldConfig {
@@ -65,7 +65,9 @@ export function normalizeThinkingFoldConfig(value: unknown): ThinkingFoldConfig 
       ? input.completedBehavior
       : input.autoCollapse === false
         ? "preview"
-        : DEFAULT_THINKING_FOLD_CONFIG.completedBehavior,
+        : input.autoCollapse === true
+          ? "collapse"
+          : DEFAULT_THINKING_FOLD_CONFIG.completedBehavior,
   };
 }
 

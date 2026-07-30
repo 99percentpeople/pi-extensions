@@ -1,6 +1,11 @@
 import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import {
+  keyHint,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -30,7 +35,8 @@ interface TodoDisplayTask {
 }
 
 const TodoKeySchema = Type.String({
-  description: "Stable 1-40 character lowercase task key, e.g. inspect-api or write-tests",
+  description:
+    "Stable 1-40 character lowercase task key, e.g. inspect-api or write-tests",
   minLength: 1,
   maxLength: 40,
   pattern: "^[a-z0-9][a-z0-9._-]*$",
@@ -38,38 +44,54 @@ const TodoKeySchema = Type.String({
 
 const TodoTaskSchema = Type.Object({
   key: TodoKeySchema,
-  subject: Type.Optional(Type.String({
-    description: "Short imperative task subject; required for a new key, omitted to preserve an existing value",
-    minLength: 1,
-    maxLength: 160,
-  })),
-  description: Type.Optional(Type.String({
-    description: "Long-form task description; omitted to preserve, empty string to clear",
-    maxLength: 2_000,
-  })),
-  status: Type.Optional(StringEnum(["pending", "in_progress", "completed"] as const, {
-    description: "Current task status; required for a new key, omitted to preserve an existing value",
-  })),
-  dependsOn: Type.Optional(Type.Array(Type.String(), {
-    description: "Dependency keys; omitted to preserve, empty array to clear",
-    maxItems: 20,
-  })),
+  subject: Type.Optional(
+    Type.String({
+      description:
+        "Short imperative task subject; required for a new key, omitted to preserve an existing value",
+      minLength: 1,
+      maxLength: 160,
+    }),
+  ),
+  description: Type.Optional(
+    Type.String({
+      description:
+        "Long-form task description; omitted to preserve, empty string to clear",
+      maxLength: 2_000,
+    }),
+  ),
+  status: Type.Optional(
+    StringEnum(["pending", "in_progress", "completed"] as const, {
+      description:
+        "Current task status; required for a new key, omitted to preserve an existing value",
+    }),
+  ),
+  dependsOn: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "Dependency keys; omitted to preserve, empty array to clear",
+      maxItems: 20,
+    }),
+  ),
 });
 
 const TodoParamsSchema = Type.Object({
   tasks: Type.Array(TodoTaskSchema, {
-    description: "Complete authoritative list of tasks to retain; omitted current keys are deleted, existing tasks may omit unchanged fields, and new keys require subject and status",
+    description:
+      "Complete authoritative list of tasks to retain; omitted current keys are deleted, existing tasks may omit unchanged fields, and new keys require subject and status",
     maxItems: MAX_TODO_TASKS,
   }),
-  baseRevision: Type.Optional(Type.Integer({
-    description: "Revision shown in current todo context; rejects stale writes when provided",
-    minimum: 0,
-  })),
+  baseRevision: Type.Optional(
+    Type.Integer({
+      description:
+        "Revision shown in current todo context; rejects stale writes when provided",
+      minimum: 0,
+    }),
+  ),
 });
 
 function formatChange(details: TodoState): string {
   const visible = getTodoTasks(details);
-  if (visible.length === 0) return `Todo plan cleared (revision ${details.revision}).`;
+  if (visible.length === 0)
+    return `Todo plan cleared (revision ${details.revision}).`;
   const lines = visible.map((task) => {
     const description = task.description ? ` — ${task.description}` : "";
     const deps = task.dependsOn?.length ? ` ← ${task.dependsOn.join(",")}` : "";
@@ -79,20 +101,38 @@ function formatChange(details: TodoState): string {
 }
 
 function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
-  const number = task.displayNumber !== undefined ? ` #${task.displayNumber}` : "";
+  const number =
+    task.displayNumber !== undefined ? ` #${task.displayNumber}` : "";
   const dependencies = task.dependencyNumbers?.length
     ? ` ← ${task.dependencyNumbers.map((dependency) => `#${dependency}`).join(", ")}`
     : "";
-  const relationship = number || dependencies ? theme.fg("dim", number + dependencies) : "";
+  const relationship =
+    number || dependencies ? theme.fg("dim", number + dependencies) : "";
   if (!task.status) return theme.fg("text", task.subject) + relationship;
-  const glyph = task.status === "completed" ? "✓" : task.status === "in_progress" ? "◐" : "○";
-  const color = task.status === "completed" ? "success" : task.status === "in_progress" ? "warning" : "dim";
-  let subject = theme.fg(task.status === "completed" ? "dim" : "text", task.subject);
+  const glyph =
+    task.status === "completed"
+      ? "✓"
+      : task.status === "in_progress"
+        ? "◐"
+        : "○";
+  const color =
+    task.status === "completed"
+      ? "success"
+      : task.status === "in_progress"
+        ? "warning"
+        : "muted";
+  let subject = theme.fg(
+    task.status === "completed" ? "dim" : "text",
+    task.subject,
+  );
   if (task.status === "completed") subject = theme.strikethrough(subject);
+  else if (task.status === "pending") subject = theme.fg("muted", subject);
   return `${theme.fg(color, glyph)} ${subject}${relationship}`;
 }
 
-function getCollapsedTodoTasks<T extends TodoDisplayTask>(tasks: readonly T[]): T[] {
+function getCollapsedTodoTasks<T extends TodoDisplayTask>(
+  tasks: readonly T[],
+): T[] {
   if (tasks.length <= COLLAPSED_TASK_LIMIT) return [...tasks];
   if (tasks.every((task) => task.status === "completed")) {
     return tasks.slice(-COLLAPSED_TASK_LIMIT);
@@ -107,12 +147,19 @@ function getCollapsedTodoTasks<T extends TodoDisplayTask>(tasks: readonly T[]): 
 }
 
 function isTodoStatus(value: unknown): value is TodoStatus {
-  return value === "pending" || value === "in_progress" || value === "completed";
+  return (
+    value === "pending" || value === "in_progress" || value === "completed"
+  );
 }
 
-function toDisplayTasks<T extends { key: string; subject: string; status?: TodoStatus; dependsOn?: string[] }>(
-  tasks: readonly T[],
-): TodoDisplayTask[] {
+function toDisplayTasks<
+  T extends {
+    key: string;
+    subject: string;
+    status?: TodoStatus;
+    dependsOn?: string[];
+  },
+>(tasks: readonly T[]): TodoDisplayTask[] {
   const participatingKeys = new Set<string>();
   for (const task of tasks) {
     if (!task.dependsOn?.length) continue;
@@ -122,7 +169,8 @@ function toDisplayTasks<T extends { key: string; subject: string; status?: TodoS
 
   const numberByKey = new Map<string, number>();
   for (const task of tasks) {
-    if (participatingKeys.has(task.key)) numberByKey.set(task.key, numberByKey.size + 1);
+    if (participatingKeys.has(task.key))
+      numberByKey.set(task.key, numberByKey.size + 1);
   }
 
   return tasks.map((task) => {
@@ -139,52 +187,81 @@ function toDisplayTasks<T extends { key: string; subject: string; status?: TodoS
   });
 }
 
-function resolveDraftTodoTasks(rawTasks: unknown, state: TodoState): TodoDisplayTask[] {
+function resolveDraftTodoTasks(
+  rawTasks: unknown,
+  state: TodoState,
+): TodoDisplayTask[] {
   if (!Array.isArray(rawTasks)) return [];
   const currentTasks = getTodoTasks(state);
   const currentByKey = new Map(currentTasks.map((task) => [task.key, task]));
 
   const drafts = rawTasks.flatMap((rawTask) => {
-    const draft = rawTask && typeof rawTask === "object"
-      ? rawTask as { key?: unknown; subject?: unknown; status?: unknown; dependsOn?: unknown }
-      : {};
+    const draft =
+      rawTask && typeof rawTask === "object"
+        ? (rawTask as {
+            key?: unknown;
+            subject?: unknown;
+            status?: unknown;
+            dependsOn?: unknown;
+          })
+        : {};
     const key = typeof draft.key === "string" ? draft.key.trim() : "";
     const current = key ? currentByKey.get(key) : undefined;
-    const streamedSubject = typeof draft.subject === "string" ? draft.subject.trim() : "";
+    const streamedSubject =
+      typeof draft.subject === "string" ? draft.subject.trim() : "";
     const subject = streamedSubject || current?.subject;
     if (!key || !subject) return [];
 
     const streamedDependencies = Array.isArray(draft.dependsOn)
-      ? draft.dependsOn.filter((dependency): dependency is string => typeof dependency === "string")
+      ? draft.dependsOn.filter(
+          (dependency): dependency is string => typeof dependency === "string",
+        )
       : undefined;
-    return [{
-      key,
-      subject,
-      status: isTodoStatus(draft.status) ? draft.status : current?.status,
-      ...(streamedDependencies !== undefined
-        ? { dependsOn: streamedDependencies }
-        : current?.dependsOn?.length
-          ? { dependsOn: current.dependsOn }
-          : {}),
-    }];
+    return [
+      {
+        key,
+        subject,
+        status: isTodoStatus(draft.status) ? draft.status : current?.status,
+        ...(streamedDependencies !== undefined
+          ? { dependsOn: streamedDependencies }
+          : current?.dependsOn?.length
+            ? { dependsOn: current.dependsOn }
+            : {}),
+      },
+    ];
   });
 
   return toDisplayTasks(drafts);
 }
 
-function renderTodoWidget(state: TodoState, width: number, expanded: boolean, theme: Theme): string[] {
+function renderExpandHint(expanded: boolean, theme: Theme): string {
+  return theme.fg("dim", " (")
+    + keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")
+    + theme.fg("dim", ")");
+}
+
+function renderTodoWidget(
+  state: TodoState,
+  width: number,
+  expanded: boolean,
+  theme: Theme,
+): string[] {
   const tasks = getTodoTasks(state);
   if (tasks.length === 0) return [];
   const completed = tasks.filter((task) => task.status === "completed").length;
   const displayTasks = toDisplayTasks(tasks);
-  const displayed = expanded ? displayTasks : getCollapsedTodoTasks(displayTasks);
+  const displayed = expanded
+    ? displayTasks
+    : getCollapsedTodoTasks(displayTasks);
   const canExpand = tasks.length > COLLAPSED_TASK_LIMIT;
-  const hint = canExpand
-    ? theme.fg("muted", ` · ${keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")}`)
-    : "";
+  const hint = canExpand ? renderExpandHint(expanded, theme) : "";
   const lines = [
-    theme.fg("accent", theme.bold(`Todo ${completed}/${tasks.length} completed`)) +
-      theme.fg("muted", ` · rev ${state.revision}`) + hint,
+    theme.fg(
+      "accent",
+      theme.bold(`Todo ${completed}/${tasks.length} completed`),
+    ) +
+      theme.fg("dim", ` rev ${state.revision}`) +
+      hint,
   ];
 
   lines.push(...displayed.map((task) => renderTaskLine(task, theme)));
@@ -207,7 +284,9 @@ export default function todoExtension(pi: ExtensionAPI): void {
 
   const clearWidget = (): void => {
     if (widgetRegistered && uiContext?.hasUI) {
-      try { uiContext.ui.setWidget(WIDGET_KEY, undefined); } catch {}
+      try {
+        uiContext.ui.setWidget(WIDGET_KEY, undefined);
+      } catch {}
     }
     widgetRegistered = false;
     widgetTui = undefined;
@@ -227,9 +306,16 @@ export default function todoExtension(pi: ExtensionAPI): void {
           widgetTui = tui;
           return {
             render: (width: number) =>
-              renderTodoWidget(state, width, uiContext?.ui.getToolsExpanded() ?? false, theme),
+              renderTodoWidget(
+                state,
+                width,
+                uiContext?.ui.getToolsExpanded() ?? false,
+                theme,
+              ),
             invalidate: () => {},
-            dispose: () => { if (widgetTui === tui) widgetTui = undefined; },
+            dispose: () => {
+              if (widgetTui === tui) widgetTui = undefined;
+            },
           };
         },
         { placement: "aboveEditor" },
@@ -256,7 +342,10 @@ export default function todoExtension(pi: ExtensionAPI): void {
     executionMode: "sequential",
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Todo update cancelled");
+      if (signal?.aborted)
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Todo update cancelled");
       const details = writeTodoSnapshot(state, params);
       state = cloneTodoState(details);
       updateWidget(ctx);
@@ -267,17 +356,22 @@ export default function todoExtension(pi: ExtensionAPI): void {
     },
 
     renderCall(args, theme, context) {
-      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      const text =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const tasks = resolveDraftTodoTasks(args.tasks, state);
       const hasTaskList = Array.isArray(args.tasks);
       const count = hasTaskList ? args.tasks.length : 0;
       const canExpand = tasks.length > COLLAPSED_TASK_LIMIT;
       const displayed = context.expanded ? tasks : getCollapsedTodoTasks(tasks);
-      const hint = canExpand
-        ? theme.fg("muted", ` · ${keyHint("app.tools.expand", context.expanded ? "to collapse" : "to expand")}`)
+      const hint = canExpand ? renderExpandHint(context.expanded, theme) : "";
+      const summary = hasTaskList
+        ? theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`)
         : "";
-      const summary = hasTaskList ? theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`) : "";
-      const lines = [[theme.fg("toolTitle", theme.bold("todo")), summary].filter(Boolean).join(" ") + hint];
+      const lines = [
+        [theme.fg("toolTitle", theme.bold("todo")), summary]
+          .filter(Boolean)
+          .join(" ") + hint,
+      ];
       if (displayed.length > 0) {
         lines.push(...displayed.map((task) => renderTaskLine(task, theme)));
       }
@@ -286,17 +380,25 @@ export default function todoExtension(pi: ExtensionAPI): void {
     },
 
     renderResult(result, { isPartial }, theme, context) {
-      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      const text =
+        (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       if (isPartial) {
         text.setText(theme.fg("warning", "Validating todo plan..."));
         return text;
       }
       if (!result.details) {
         const output = result.content
-          .filter((item): item is { type: "text"; text: string } => item.type === "text")
+          .filter(
+            (item): item is { type: "text"; text: string } =>
+              item.type === "text",
+          )
           .map((item) => item.text)
           .join("\n");
-        text.setText(output ? theme.fg(context.isError ? "error" : "toolOutput", output) : "");
+        text.setText(
+          output
+            ? theme.fg(context.isError ? "error" : "toolOutput", output)
+            : "",
+        );
         return text;
       }
       // The completed call remains visible above this result and already contains
@@ -322,12 +424,15 @@ export default function todoExtension(pi: ExtensionAPI): void {
     pi.appendEntry(TODO_STATE_CUSTOM_TYPE, checkpoint);
     if (event.willRetry || ctx.hasPendingMessages()) {
       contextCheckpointNeeded = false;
-      pi.sendMessage({
-        customType: TODO_STATE_CUSTOM_TYPE,
-        content: formatChange(checkpoint),
-        display: false,
-        details: checkpoint,
-      }, { deliverAs: "steer" });
+      pi.sendMessage(
+        {
+          customType: TODO_STATE_CUSTOM_TYPE,
+          content: formatChange(checkpoint),
+          display: false,
+          details: checkpoint,
+        },
+        { deliverAs: "steer" },
+      );
     } else {
       contextCheckpointNeeded = true;
     }

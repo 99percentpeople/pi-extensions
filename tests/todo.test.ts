@@ -447,7 +447,14 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.ok(tool.renderResult);
   initTheme("dark", false);
   const theme = {
-    fg: (_color: string, text: string) => text,
+    fg: (_color: string, text: string) => {
+      assert.doesNotMatch(
+        text,
+        /to (?:expand|collapse)/,
+        "the surrounding theme must not override keyHint's key/description styles",
+      );
+      return text;
+    },
     bold: (text: string) => text,
     strikethrough: (text: string) => text,
   };
@@ -604,7 +611,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.ok(widgetFactory);
   const widget = widgetFactory({ requestRender: () => {} }, theme);
   const collapsedText = widget.render(160).join("\n");
-  assert.match(collapsedText, /Todo 0\/3 completed · rev 1/);
+  assert.match(collapsedText, /Todo 0\/3 completed rev 1/);
   assert.match(collapsedText, /Inspect the existing extension #1/);
   assert.match(collapsedText, /Design the snapshot protocol #2 ← #1/);
   assert.match(collapsedText, /Verify the implementation #3 ← #2/);
@@ -642,7 +649,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     ctx,
   );
   const overflowCollapsed = widget.render(160).join("\n");
-  assert.match(overflowCollapsed, /Todo 2\/5 completed · rev 2.*to expand/);
+  assert.match(overflowCollapsed, /Todo 2\/5 completed rev 2.*to expand/);
   assert.match(overflowCollapsed, /Initialize the project scaffold/);
   assert.match(overflowCollapsed, /Implement user authentication/);
   assert.match(overflowCollapsed, /Implement the core API/);
@@ -691,7 +698,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     ctx,
   );
   const completedCollapsed = widget.render(160).join("\n");
-  assert.match(completedCollapsed, /Todo 5\/5 completed · rev 3.*to expand/);
+  assert.match(completedCollapsed, /Todo 5\/5 completed rev 3.*to expand/);
   assert.match(completedCollapsed, /Implement user authentication/);
   assert.match(completedCollapsed, /Implement the core API/);
   assert.match(completedCollapsed, /Verify the completed system/);
@@ -719,7 +726,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
     ctx,
   );
   const lastActiveCollapsed = widget.render(160).join("\n");
-  assert.match(lastActiveCollapsed, /Todo 4\/5 completed · rev 4.*to expand/);
+  assert.match(lastActiveCollapsed, /Todo 4\/5 completed rev 4.*to expand/);
   assert.match(lastActiveCollapsed, /Implement user authentication/);
   assert.match(lastActiveCollapsed, /Implement the core API/);
   assert.match(lastActiveCollapsed, /Verify the completed system/);

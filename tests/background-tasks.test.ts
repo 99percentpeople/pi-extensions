@@ -5,9 +5,15 @@ import { constants as osConstants } from "node:os";
 import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  initTheme,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import type { IPty } from "node-pty";
 import backgroundTasks, { MemoryLogStore } from "../extensions/background-tasks/index.ts";
+
+initTheme("dark", false);
 
 interface RegisteredTool {
   name: string;
@@ -1037,13 +1043,17 @@ test("background task widget renders live state without re-registering every tic
   const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   let renderRequests = 0;
   const component = widgetFactory({ requestRender: () => { renderRequests += 1; } }, plainTheme);
-  const collapsedLines = component.render(200).map((line: string) => line.trimEnd());
+  const collapsedLines = component.render(200).map((line: string) =>
+    stripVTControlCharacters(line).trimEnd()
+  );
   assert.match(collapsedLines[0], /^2 background tasks · 2 running.*to expand$/);
   assert.doesNotMatch(collapsedLines[0], /0 finished/);
   assert.equal(collapsedLines.length, 1, "the collapsed widget should hide the task list");
 
   setToolsExpanded(true);
-  const lines = component.render(200).map((line: string) => line.trimEnd());
+  const lines = component.render(200).map((line: string) =>
+    stripVTControlCharacters(line).trimEnd()
+  );
   assert.match(lines[0], /^2 background tasks · 2 running.*to collapse$/);
   assert.doesNotMatch(lines[0], /0 finished/);
   assert.match(lines[1], /^├─ ◐ pi-debate-pro \([a-z0-9]+\) 0s pty:100x25$/);
@@ -1072,14 +1082,18 @@ test("background task widget renders live state without re-registering every tic
     },
     "PTY task completion in the widget",
   );
-  const mixedLines = component.render(200).map((line: string) => line.trimEnd());
+  const mixedLines = component.render(200).map((line: string) =>
+    stripVTControlCharacters(line).trimEnd()
+  );
   assert.match(mixedLines[0], /^2 background tasks · 1 running · 1 finished.*to collapse$/);
   assert.match(mixedLines[1], /^├─ ✓ pi-debate-pro \([a-z0-9]+\) completed \d+s exit=0$/);
   assert.match(mixedLines[2], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
   assert.doesNotMatch(mixedLines.join("\n"), /PTY FINAL|\[terminal\]/);
 
   await lifecycle.get("before_agent_start")?.({}, widgetCtx);
-  const nextTurnLines = component.render(200).map((line: string) => line.trimEnd());
+  const nextTurnLines = component.render(200).map((line: string) =>
+    stripVTControlCharacters(line).trimEnd()
+  );
   assert.match(nextTurnLines[0], /^1 background task · 1 running.*to collapse$/);
   assert.doesNotMatch(nextTurnLines[0], /0 finished/);
   assert.match(nextTurnLines[1], /^└─ ◐ pi-build \([a-z0-9]+\) \d+s stdout:2 stderr:1$/);
@@ -1090,7 +1104,9 @@ test("background task widget renders live state without re-registering every tic
     "pipe task completion in the widget",
   );
   assert.equal(widgets.has("bg-tasks-widget"), true, "the final task result should remain visible for this turn");
-  const finishedLines = component.render(200).map((line: string) => line.trimEnd());
+  const finishedLines = component.render(200).map((line: string) =>
+    stripVTControlCharacters(line).trimEnd()
+  );
   assert.match(finishedLines[0], /^1 background task · 1 finished.*to collapse$/);
   assert.doesNotMatch(finishedLines[0], /0 running/);
   assert.match(finishedLines[1], /^└─ ✓ pi-build \([a-z0-9]+\) completed \d+s exit=0$/);

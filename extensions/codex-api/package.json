@@ -1,10 +1,19 @@
 {
-  "name": "@99percentpeople/pi-background-tasks",
-  "version": "1.2.3",
-  "description": "Background tasks, explicit waits, logs, signals, and PTY/TUI support for Pi",
+  "name": "@99percentpeople/pi-codex-api",
+  "version": "0.1.0",
+  "description": "Expose Codex subscription image, search, Fast, and usage APIs as native Pi tools and commands",
   "type": "module",
   "files": [
     "index.ts",
+    "client.ts",
+    "config.ts",
+    "image.ts",
+    "render.ts",
+    "search-display.ts",
+    "search.ts",
+    "settings.ts",
+    "usage.ts",
+    "skills",
     "README.md",
     "LICENSE"
   ],
@@ -14,44 +23,42 @@
   "pi": {
     "extensions": [
       "./index.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "keywords": [
     "pi-package",
     "pi",
     "coding-agent",
-    "background-tasks",
-    "pty",
-    "tui"
+    "codex",
+    "chatgpt",
+    "image-generation",
+    "web-search"
   ],
   "author": "99percentpeople",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/99percentpeople/pi-extensions.git",
-    "directory": "extensions/background-tasks"
+    "directory": "extensions/codex-api"
   },
   "bugs": {
     "url": "https://github.com/99percentpeople/pi-extensions/issues"
   },
-  "homepage": "https://github.com/99percentpeople/pi-extensions#background-tasks",
+  "homepage": "https://github.com/99percentpeople/pi-extensions#codex-api",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "@99percentpeople/pi-shared-settings": "0.1.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
-  },
-  "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.0",
-    "@xterm/addon-serialize": "0.14.0",
-    "@xterm/headless": "6.0.0",
-    "node-pty": "1.2.0-beta.14"
-  },
-  "trustedDependencies": [
-    "node-pty"
-  ]
+  }
 }

@@ -17,18 +17,18 @@ Thinking 7.1s  (ctrl+t to expand)
 
 The cursor working row separately displays the plain status `Thinking...`. Model
 behavior determines whether that row uses a summary headline (for example,
-`Running focused tests`) or `Thinking...`; it does not change the configured
-Item display strategy.
+`Running focused tests`) or `Thinking...`. With the default `auto` streaming
+behavior, summary content stays hidden while trace content shows a tail preview.
 
 Cursor styling is intentionally outside this package. Install
 [`@99percentpeople/pi-cursor-effect`](../cursor-effect/README.md) to apply the
 optional wave effect to this and Pi's other main working-cursor labels.
 
 The Item timer redraws only once per second. When reasoning finishes, the timer
-freezes as soon as answer text or a tool call starts. With automatic collapse
-enabled, the block becomes a single line with precise elapsed time. This also
-handles OpenAI-compatible providers that delay their `thinking_end` event until
-the entire answer has streamed:
+freezes as soon as answer text or a tool call starts. The default `auto`
+completion behavior hides content for every model, leaving a single line with
+precise elapsed time. This also handles OpenAI-compatible providers that delay
+their `thinking_end` event until the entire answer has streamed:
 
 ```text
 Thought for 12.3s  (ctrl+t to expand)
@@ -40,9 +40,11 @@ Additional behavior:
   and summaries alike.
 - Pi's normalized `thinking_start` / `thinking_delta` / `thinking_end` events
   drive streaming and timing, so model IDs never need per-model adapters.
-- Set **While thinking** to `collapse` to show only the timer, or `preview` to
-  show the latest lines. Set **After thinking** to `collapse`, `preview`, or
-  `full` independently.
+- **While thinking** defaults to `auto`: summaries show only the timer while
+  traces show their latest lines. Explicit `collapse` and `preview` override
+  that model-aware choice.
+- **After thinking** defaults to `auto`, which hides completed content for both
+  summaries and traces. Explicit `collapse`, `preview`, and `full` override it.
 - An empty Pi `thinking_start` still creates the timed Item. If a provider emits
   its entire summary immediately before `thinking_end`, the cursor keeps that
   headline visible for at least one second before `Responding…`.
@@ -88,9 +90,12 @@ plugins that expose three independent display controls:
 
 - **Fold after lines** (1–20): maximum terminal-visible lines retained by a
   `preview` display;
-- **While thinking**: `preview` (latest lines) or `collapse` (timer only);
-- **After thinking**: `collapse` (timer only), `preview` (latest lines), or
-  `full` (all reasoning text). The default is `collapse`.
+- **While thinking**: `auto` (hide summaries, preview traces), `preview`
+  (latest lines), or `collapse` (timer only);
+- **After thinking**: `auto` (hide every model), `collapse` (timer only),
+  `preview` (latest lines), or `full` (all reasoning text).
+
+Both behavior settings default to `auto`.
 
 Settings persist globally in:
 

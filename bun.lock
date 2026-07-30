@@ -16,7 +16,7 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.2.2",
+      "version": "1.2.3",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.0",
         "@xterm/addon-serialize": "0.14.0",
@@ -30,9 +30,22 @@
         "typebox": "*",
       },
     },
+    "extensions/codex-api": {
+      "name": "@99percentpeople/pi-codex-api",
+      "version": "0.1.0",
+      "dependencies": {
+        "@99percentpeople/pi-shared-settings": "0.1.0",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+        "typebox": "*",
+      },
+    },
     "extensions/cursor-effect": {
       "name": "@99percentpeople/pi-cursor-effect",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.0",
       },
@@ -54,7 +67,7 @@
     },
     "extensions/thinking-fold": {
       "name": "@99percentpeople/pi-thinking-fold",
-      "version": "0.1.0",
+      "version": "0.1.2",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.0",
       },
@@ -66,7 +79,7 @@
     },
     "extensions/todo": {
       "name": "@99percentpeople/pi-todo",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.0",
       },
@@ -91,6 +104,8 @@
   ],
   "packages": {
     "@99percentpeople/pi-background-tasks": ["@99percentpeople/pi-background-tasks@workspace:extensions/background-tasks"],
+
+    "@99percentpeople/pi-codex-api": ["@99percentpeople/pi-codex-api@workspace:extensions/codex-api"],
 
     "@99percentpeople/pi-cursor-effect": ["@99percentpeople/pi-cursor-effect@workspace:extensions/cursor-effect"],
 

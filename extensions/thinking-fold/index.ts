@@ -167,26 +167,29 @@ export default function (pi: ExtensionAPI) {
       {
         id: "streamingBehavior",
         label: "While thinking",
-        description: "Preview shows the latest lines; collapse shows only the timer",
+        description: "Auto hides summaries and previews traces while they stream",
         currentValue: config.streamingBehavior,
-        values: ["preview", "collapse"],
+        values: ["auto", "preview", "collapse"],
       },
       {
         id: "completedBehavior",
         label: "After thinking",
-        description: "Collapse hides content; preview keeps a tail; full keeps all content",
+        description: "Auto hides completed content for every model",
         currentValue: config.completedBehavior,
-        values: ["collapse", "preview", "full"],
+        values: ["auto", "collapse", "preview", "full"],
       },
     ],
     onChange: (id, value, ctx) => {
       if (id === "foldThreshold") {
         applyConfig({ ...config, foldThreshold: Number(value) }, ctx);
-      } else if (id === "streamingBehavior" && (value === "preview" || value === "collapse")) {
+      } else if (
+        id === "streamingBehavior" &&
+        (value === "auto" || value === "preview" || value === "collapse")
+      ) {
         applyConfig({ ...config, streamingBehavior: value }, ctx);
       } else if (
         id === "completedBehavior" &&
-        (value === "collapse" || value === "preview" || value === "full")
+        (value === "auto" || value === "collapse" || value === "preview" || value === "full")
       ) {
         applyConfig({ ...config, completedBehavior: value }, ctx);
       }
@@ -351,6 +354,7 @@ export {
   formatThinkingSeconds,
   installThinkingFoldPatch,
   resolveThinkingBehavior,
+  resolveThinkingDisplayBehavior,
   type ThinkingCompletedBehavior,
   type ThinkingDisplayState,
   type ThinkingFoldMode,

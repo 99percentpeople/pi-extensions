@@ -219,15 +219,24 @@ test("visual truncation accounts for wrapped wide text", () => {
   assert.ok(thinkingText(display).split("\n").length <= 3);
 });
 
-test("summary Item follows the configured streaming preview while the cursor shows its headline", () => {
+test("automatic streaming hides summaries while the cursor shows their headline", () => {
   const summary = assistant(
     "**Inspecting the implementation**\n\n**Running focused tests**",
     "openai-responses",
   );
   const display = createThinkingDisplayMessage(summary, options, false, 80, 1, streamingDisplay());
+  const preview = createThinkingDisplayMessage(
+    summary,
+    { ...options, streamingBehavior: "preview" },
+    false,
+    80,
+    1,
+    streamingDisplay(),
+  );
   assert.equal(extractLatestSummaryHeadline(summary), "Running focused tests");
+  assert.equal(thinkingText(display), "Thinking 2.5s  (ctrl+t to expand)");
   assert.equal(
-    thinkingText(display),
+    thinkingText(preview),
     "Thinking 2.5s\n**Inspecting the implementation**\n\n**Running focused tests**",
   );
   assert.equal(createThinkingCursorLabel(summary, "auto"), "Running focused tests");
@@ -247,10 +256,7 @@ test("explicit summary mode uses the newest plain-text headline for any provider
     streamingDisplay(),
   );
   assert.equal(extractLatestSummaryHeadline(summary), "Checking physical decision-tree constraints.");
-  assert.equal(
-    thinkingText(display),
-    "Thinking 2.5s\nAnalyzing the information bound.\n\nChecking physical decision-tree constraints.",
-  );
+  assert.equal(thinkingText(display), "Thinking 2.5s  (ctrl+t to expand)");
   assert.equal(
     createThinkingCursorLabel(summary, "summary"),
     "Checking physical decision-tree constraints.",
@@ -326,15 +332,18 @@ test("display strategies control streaming and completed thinking independently"
   assert.equal(thinkingText(full), "Thought for 1.0s\none\ntwo\nthree\nfour");
 });
 
-test("completed thinking collapses to a duration title and expands on demand", () => {
-  const source = assistant("one\ntwo\nthree\nfour");
+test("automatic completion collapses traces and summaries", () => {
+  const trace = assistant("one\ntwo\nthree\nfour");
+  const summary = assistant("Checking the implementation", "openai-responses");
   const completed: ThinkingDisplayState = {
     timing: { startedAt: 1_000, completedAt: 4_780 },
     now: 5_000,
   };
-  const collapsed = createThinkingDisplayMessage(source, options, false, 80, 1, completed);
-  assert.equal(thinkingText(collapsed), "Thought for 3.8s  (ctrl+t to expand)");
-  assert.equal(createThinkingDisplayMessage(source, options, true, 80, 1, completed), source);
+  const collapsedTrace = createThinkingDisplayMessage(trace, options, false, 80, 1, completed);
+  const collapsedSummary = createThinkingDisplayMessage(summary, options, false, 80, 1, completed);
+  assert.equal(thinkingText(collapsedTrace), "Thought for 3.8s  (ctrl+t to expand)");
+  assert.equal(thinkingText(collapsedSummary), "Thought for 3.8s  (ctrl+t to expand)");
+  assert.equal(createThinkingDisplayMessage(trace, options, true, 80, 1, completed), trace);
   assert.equal(formatThinkingSeconds(-100), "0.0s");
 });
 
@@ -424,8 +433,13 @@ test("global config normalizes, saves, and reloads", async () => {
     });
     assert.deepEqual(normalizeThinkingFoldConfig({ previewLines: 8, autoCollapse: false }), {
       foldThreshold: 8,
-      streamingBehavior: "preview",
+      streamingBehavior: "auto",
       completedBehavior: "preview",
+    });
+    assert.deepEqual(normalizeThinkingFoldConfig({ autoCollapse: true }), {
+      foldThreshold: 5,
+      streamingBehavior: "auto",
+      completedBehavior: "collapse",
     });
 
     const config = {

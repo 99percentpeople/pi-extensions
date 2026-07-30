@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "background-tasks-v*"
+      - "codex-api-v*"
       - "cursor-effect-v*"
       - "pwsh-adapter-v*"
       - "thinking-fold-v*"
@@ -54,6 +55,7 @@ jobs:
           const tag = process.env.RELEASE_TAG;
           const releases = [
             { prefix: "background-tasks-v", directory: "extensions/background-tasks" },
+            { prefix: "codex-api-v", directory: "extensions/codex-api" },
             { prefix: "cursor-effect-v", directory: "extensions/cursor-effect" },
             { prefix: "pwsh-adapter-v", directory: "extensions/pwsh-adapter" },
             { prefix: "thinking-fold-v", directory: "extensions/thinking-fold" },

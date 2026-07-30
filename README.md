@@ -3,19 +3,22 @@
 [![CI](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml/badge.svg)](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/99percentpeople/pi-extensions)](LICENSE)
 [![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks)
+[![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api)
 [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect)
 [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter)
 [![thinking-fold](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-thinking-fold?label=thinking-fold)](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold)
 [![todo](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-todo?label=todo)](https://www.npmjs.com/package/@99percentpeople/pi-todo)
 
 A focused collection of TypeScript extensions for the
-[Pi coding agent](https://pi.dev/): run and revisit background tasks, style the
-main session status cursors, use PowerShell consistently on Windows, fold long reasoning traces, and keep
+[Pi coding agent](https://pi.dev/): run and revisit background tasks, expose
+Codex subscription image and search APIs, style the main session status cursors,
+use PowerShell consistently on Windows, fold long reasoning traces, and keep
 model-authored plans visible in the TUI.
 
 | Extension | npm package | Purpose |
 | --- | --- | --- |
 | background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Background commands, explicit waits, logs, signals, and optional PTY/TUI interaction |
+| codex-api | [`@99percentpeople/pi-codex-api`](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation/editing, first-party search, Fast mode, and subscription usage status |
 | cursor-effect | [`@99percentpeople/pi-cursor-effect`](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Selectable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
 | thinking-fold | [`@99percentpeople/pi-thinking-fold`](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Live tail previews for long reasoning traces with full summaries and Ctrl+T expansion |
@@ -44,6 +47,14 @@ For example:
 
 ```json
 {
+  "codex-api": {
+    "fastMode": false,
+    "allowOtherProviders": false,
+    "searchMode": "cached",
+    "searchContextSize": "medium",
+    "imageQuality": "auto",
+    "usageStatus": true
+  },
   "cursor-effect": {
     "theme": "default",
     "custom": {
@@ -60,8 +71,8 @@ For example:
   },
   "thinking-fold": {
     "foldThreshold": 5,
-    "streamingBehavior": "preview",
-    "completedBehavior": "collapse"
+    "streamingBehavior": "auto",
+    "completedBehavior": "auto"
   }
 }
 ```
@@ -95,6 +106,13 @@ pi install npm:@99percentpeople/pi-pwsh-adapter
 
 Without the adapter, `bg_start` follows Pi's configured Bash resolution and
 command prefix, including Git Bash on Windows.
+
+Install Codex subscription API tools after signing in to Pi's `openai-codex`
+provider:
+
+```bash
+pi install ./extensions/codex-api
+```
 
 Install the reasoning-fold and optional cursor-effect extensions from this
 checkout while developing:
@@ -160,6 +178,18 @@ The adapter is a Windows-only package that:
 
 The startup notification and tool prompt identify the selected version so the
 model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
+
+## codex-api
+
+`codex-api` reuses Pi's existing ChatGPT subscription OAuth to expose
+`codex_image` and `codex_search`, without an OpenAI API key or MCP server. It
+also provides `/fast` for the priority service tier and `/codex-usage` for the
+latest usage windows and credits reported by Codex response headers. Image
+outputs are saved as non-overwriting PNG files and returned to the model for
+follow-up inspection. Search supports web and image queries, page navigation,
+PDF screenshots, finance, weather, sports, and time operations. Configure Fast,
+search mode, search context size, and usage status through `/99settings`. See the
+[codex-api package documentation](extensions/codex-api/README.md).
 
 ## cursor-effect
 
