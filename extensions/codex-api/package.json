@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-codex-api",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Expose Codex subscription image, search, Fast, and usage APIs as native Pi tools and commands",
   "type": "module",
   "files": [
@@ -16,7 +16,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/index.ts"
     ],
     "skills": [
       "./skills"
@@ -47,7 +47,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.1"
+    "@99percentpeople/pi-shared-settings": "0.1.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

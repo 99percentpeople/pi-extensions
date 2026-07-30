@@ -27,6 +27,7 @@ const result = await Bun.build({
   target: "node",
   format: "esm",
   packages: "external",
+  naming: "[name].ts",
   sourcemap: "linked",
   minify: false,
 });
@@ -52,4 +53,4 @@ for (const asset of manifest.piBuild?.assets ?? []) {
   await cp(source, destination, { recursive: true });
 }
 
-console.log(`Built ${manifest.name} -> ${relative(packageDir, outdir)}/index.js`);
+console.log(`Built ${manifest.name} -> ${relative(packageDir, outdir)}/index.ts`);

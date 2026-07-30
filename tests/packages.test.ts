@@ -11,7 +11,7 @@ async function readPackage(path: string): Promise<Record<string, any>> {
 }
 
 function assertBuiltExtensionPackage(packageJson: Record<string, any>): void {
-  assert.deepEqual(packageJson.pi?.extensions, ["./dist/index.js"]);
+  assert.deepEqual(packageJson.pi?.extensions, ["./dist/index.ts"]);
   assert.equal(
     packageJson.scripts?.build,
     "bun run ../../scripts/build-package.ts",
@@ -67,16 +67,16 @@ test("extensions are independently publishable workspace packages", async () => 
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "1.2.4");
+  assert.equal(background.version, "1.2.5");
   assertBuiltExtensionPackage(background);
   assert.deepEqual(background.files, ["dist", "README.md", "LICENSE"]);
-  assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.1");
+  assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
   assert.equal(background.dependencies?.["node-pty"], "1.2.0-beta.14");
   assert.equal(background.dependencies?.["@xterm/headless"], "6.0.0");
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
-  assert.equal(codexApi.version, "0.1.3");
+  assert.equal(codexApi.version, "0.1.4");
   assertBuiltExtensionPackage(codexApi);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
   assert.deepEqual(codexApi.files, [
@@ -86,7 +86,7 @@ test("extensions are independently publishable workspace packages", async () => 
     "LICENSE",
   ]);
   assert.equal(codexApi.publishConfig?.access, "public");
-  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.1");
+  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
   assert.equal(codexApi.peerDependencies?.["@earendil-works/pi-tui"], "*");
   assert.match(codexApiSkill, /^---\nname: gpt-image-prompts\n/m);
   assert.match(codexApiSkill, /Craft and refine production-ready prompts for GPT Image 2/);
@@ -94,14 +94,14 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.doesNotMatch(codexApiSkill, /codex_search|codex_image|output_path|referenced_image_paths/);
 
   assert.equal(cursorEffect.name, "@99percentpeople/pi-cursor-effect");
-  assert.equal(cursorEffect.version, "0.1.2");
+  assert.equal(cursorEffect.version, "0.1.3");
   assertBuiltExtensionPackage(cursorEffect);
   assert.deepEqual(cursorEffect.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(cursorEffect.publishConfig?.access, "public");
-  assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.1");
+  assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.0.3");
+  assert.equal(pwsh.version, "1.0.4");
   assertBuiltExtensionPackage(pwsh);
   assert.deepEqual(pwsh.files, ["dist", "README.md", "LICENSE"]);
   assert.deepEqual(pwsh.os, ["win32"]);
@@ -109,28 +109,28 @@ test("extensions are independently publishable workspace packages", async () => 
     pwsh.dependencies?.["@99percentpeople/pi-background-tasks"],
     undefined,
   );
-  assert.equal(pwsh.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.1");
+  assert.equal(pwsh.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(thinkingFold.name, "@99percentpeople/pi-thinking-fold");
-  assert.equal(thinkingFold.version, "0.1.3");
+  assert.equal(thinkingFold.version, "0.1.4");
   assertBuiltExtensionPackage(thinkingFold);
   assert.deepEqual(thinkingFold.files, ["dist", "README.md", "LICENSE"]);
   assert.deepEqual(thinkingFold.piBuild?.assets, ["model-behaviors.json"]);
   assert.equal(thinkingFold.publishConfig?.access, "public");
-  assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.1");
+  assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.2.2");
+  assert.equal(todo.version, "1.2.3");
   assertBuiltExtensionPackage(todo);
   assert.deepEqual(todo.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(todo.publishConfig?.access, "public");
-  assert.equal(todo.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.1");
+  assert.equal(todo.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(sharedSettings.name, "@99percentpeople/pi-shared-settings");
-  assert.equal(sharedSettings.version, "0.1.1");
+  assert.equal(sharedSettings.version, "0.1.2");
   assert.equal(sharedSettings.pi, undefined);
-  assert.equal(sharedSettings.main, "./dist/index.js");
+  assert.equal(sharedSettings.main, "./dist/index.ts");
   assert.equal(sharedSettings.types, "./dist/index.d.ts");
   assert.deepEqual(sharedSettings.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(

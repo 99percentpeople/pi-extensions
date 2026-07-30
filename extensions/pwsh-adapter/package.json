@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-pwsh-adapter",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "PowerShell 7 and Windows PowerShell 5.1 shell adapter for Pi",
   "type": "module",
   "os": [
@@ -18,7 +18,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/index.ts"
     ]
   },
   "keywords": [
@@ -46,7 +46,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.1"
+    "@99percentpeople/pi-shared-settings": "0.1.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

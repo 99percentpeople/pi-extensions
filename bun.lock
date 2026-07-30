@@ -16,9 +16,9 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.2.4",
+      "version": "1.2.5",
       "dependencies": {
-        "@99percentpeople/pi-shared-settings": "0.1.1",
+        "@99percentpeople/pi-shared-settings": "0.1.2",
         "@xterm/addon-serialize": "0.14.0",
         "@xterm/headless": "6.0.0",
         "node-pty": "1.2.0-beta.14",
@@ -32,9 +32,9 @@
     },
     "extensions/codex-api": {
       "name": "@99percentpeople/pi-codex-api",
-      "version": "0.1.3",
+      "version": "0.1.4",
       "dependencies": {
-        "@99percentpeople/pi-shared-settings": "0.1.1",
+        "@99percentpeople/pi-shared-settings": "0.1.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -45,9 +45,9 @@
     },
     "extensions/cursor-effect": {
       "name": "@99percentpeople/pi-cursor-effect",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "dependencies": {
-        "@99percentpeople/pi-shared-settings": "0.1.1",
+        "@99percentpeople/pi-shared-settings": "0.1.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
@@ -56,9 +56,9 @@
     },
     "extensions/pwsh-adapter": {
       "name": "@99percentpeople/pi-pwsh-adapter",
-      "version": "1.0.3",
+      "version": "1.0.4",
       "dependencies": {
-        "@99percentpeople/pi-shared-settings": "0.1.1",
+        "@99percentpeople/pi-shared-settings": "0.1.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
@@ -67,9 +67,9 @@
     },
     "extensions/thinking-fold": {
       "name": "@99percentpeople/pi-thinking-fold",
-      "version": "0.1.3",
+      "version": "0.1.4",
       "dependencies": {
-        "@99percentpeople/pi-shared-settings": "0.1.1",
+        "@99percentpeople/pi-shared-settings": "0.1.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -79,9 +79,9 @@
     },
     "extensions/todo": {
       "name": "@99percentpeople/pi-todo",
-      "version": "1.2.2",
+      "version": "1.2.3",
       "dependencies": {
-        "@99percentpeople/pi-shared-settings": "0.1.1",
+        "@99percentpeople/pi-shared-settings": "0.1.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -92,7 +92,7 @@
     },
     "packages/shared-settings": {
       "name": "@99percentpeople/pi-shared-settings",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "@earendil-works/pi-tui": "*",

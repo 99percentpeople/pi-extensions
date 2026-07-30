@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-todo",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "A minimal atomic todo tool with omission-based deletion, compaction-safe state, dependencies, and a read-only Pi widget",
   "type": "module",
   "files": [
@@ -15,7 +15,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/index.ts"
     ]
   },
   "keywords": [
@@ -41,7 +41,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.1"
+    "@99percentpeople/pi-shared-settings": "0.1.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

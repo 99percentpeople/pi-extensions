@@ -261,9 +261,11 @@ bun run pack:check
 ```
 
 Each extension and the shared runtime helper bundle their local TypeScript
-modules into `dist/index.js` before npm packing. Pi core packages and runtime
-dependencies remain external. The `prepack` lifecycle runs this build for both
-package validation and publishing. Use `build:extensions` for `extensions/`,
+modules into `dist/index.ts` before npm packing. Keeping the bundled entrypoint
+as TypeScript lets Pi resolve peer imports against its active runtime, which is
+required by extensions that patch TUI classes. Pi core packages and runtime
+dependencies remain external. The `prepack` lifecycle runs the build for package
+validation and publishing. Use `build:extensions` for `extensions/`,
 `build:packages` for `packages/`, and `build:all` for both groups.
 
 Load an extension directly from TypeScript while developing:
