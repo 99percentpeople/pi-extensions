@@ -10,12 +10,6 @@ on:
       - "thinking-fold-v*"
       - "todo-v*"
       - "shared-settings-v*"
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Existing release tag to publish"
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -34,8 +28,6 @@ jobs:
     steps:
       - name: Check out release tag
         uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -55,7 +47,7 @@ jobs:
       - name: Resolve package and verify tag
         id: release
         env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           node <<'NODE'
           const fs = require("node:fs");
@@ -91,7 +83,4 @@ jobs:
 
       - name: Publish ${{ steps.release.outputs.name }}@${{ steps.release.outputs.version }}
         working-directory: ${{ steps.release.outputs.directory }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_OTP: ${{ secrets.NPM_OTP }}
-        run: npm publish --access public --ignore-scripts --otp="$NPM_OTP"
+        run: npm publish --access public

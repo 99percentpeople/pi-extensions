@@ -57,7 +57,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
-  assert.equal(codexApi.version, "0.1.0");
+  assert.equal(codexApi.version, "0.1.1");
   assert.deepEqual(codexApi.pi?.extensions, ["./index.ts"]);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
   assert.deepEqual(codexApi.files, [
