@@ -7,6 +7,12 @@ Pick a preset (`Claude Code` or `Codex`) for an authentic busy-row look, or
 build your own: spinner glyph, animated label effects (wave, shimmer, scan,
 rainbow), speed, color, and direction — all from `/99settings`.
 
+## Demo
+
+Animated working cursor while the model is busy (Claude Code preset):
+
+![cursor-effect demo](../../promo/demo/cursor-effect.gif)
+
 ## Scope
 
 This package changes Pi's main `working`, `retry`, `compaction`, and

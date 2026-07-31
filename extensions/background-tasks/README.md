@@ -9,6 +9,13 @@ Just ask Pi to *"start the dev server in the background"* — then keep
 chatting while it runs. `bg_*` tools start, wait on, inspect, and stop tasks;
 `/bg-attach` opens a live terminal you can interact with (`Ctrl+]` to leave).
 
+## Demo
+
+Ask Pi to start a server in the background — the task keeps running while
+you chat, and the status widget tracks it:
+
+![background-tasks demo](../../promo/demo/background-tasks.gif)
+
 ## Features
 
 - Run builds, servers, watchers, tests, and terminal applications in the background

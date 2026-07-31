@@ -20,6 +20,20 @@ search, Fast mode, and usage monitoring — **no OpenAI API key required**.
 - **Reset cards** — when you run out of messages, `/codex-redeem` redeems an
   earned reset card safely: pick a card, confirm, done.
 
+## Demo
+
+Subscription usage, limit-reached state, and reset-card redemption:
+
+![codex usage demo](../../promo/demo/codex-api.gif)
+
+Web search with clean result cards (search → open a result → summarize):
+
+![codex search demo](../../promo/demo/codex-search.gif)
+
+Image generation with `gpt-image-2` (saved PNG + description):
+
+![codex image demo](../../promo/demo/codex-image.gif)
+
 ## Quick start
 
 ```bash

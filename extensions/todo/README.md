@@ -12,6 +12,13 @@ The extension intentionally has no todo-specific slash commands, interactive
 manager, or user-editable todo interface. Todo state belongs to the model. A read-only list
 is rendered above Pi's input box.
 
+## Demo
+
+The model creates the plan, works through it, and the widget tracks progress
+from `0/3` to `3/3 completed`:
+
+![todo demo](../../promo/demo/todo.gif)
+
 ## Features
 
 - One-call creation of a complete plan

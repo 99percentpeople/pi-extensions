@@ -9,6 +9,13 @@ it collapses to `Thought for 12.3s`. Press `Ctrl+T` anytime to expand the full
 reasoning trace. Behavior is tunable in `/99settings` (fold depth, while/
 after-thinking strategies).
 
+## Demo
+
+Reasoning collapses to a stable tail preview with a timer, then to
+`Thought for Xs (ctrl+t to expand)` — no more scroll-storms:
+
+![thinking-fold demo](../../promo/demo/thinking-fold.gif)
+
 ## Behavior
 
 When **While thinking** is set to `preview`, the assistant Item contains a
