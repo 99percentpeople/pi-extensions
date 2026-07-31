@@ -9,6 +9,11 @@ import { createCodexApiClient } from "./client.ts";
 import type { CodexApiConfig } from "./config.ts";
 
 const USAGE_PATH = "../wham/usage";
+const REDEEM_CREDITS_PATH = "../wham/rate-limit-reset-credits";
+const REDEEM_PATH = "../wham/rate-limit-reset-credits/consume";
+const REDEEM_CONFIRM_WINDOW_MS = 10_000;
+const REDEEM_DIALOG_TIMEOUT_MS = 30_000;
+const REDEEM_RETRY_WINDOW_MS = 5 * 60_000;
 const USAGE_REFRESH_INTERVAL_MS = 60_000;
 const AUTH_WATCH_DEBOUNCE_MS = 100;
 
@@ -32,6 +37,29 @@ export interface CodexRateLimitSnapshot {
   primary?: CodexRateLimitWindow;
   secondary?: CodexRateLimitWindow;
   credits?: CodexCreditsSnapshot;
+  /** True when the server reports the account has hit its Codex usage limit. */
+  limitReached?: boolean;
+}
+
+export interface CodexAccountSnapshot {
+  planType?: string;
+  email?: string;
+}
+
+export interface CodexRedeemCredit {
+  id: string;
+  title?: string;
+  description?: string;
+  status?: string;
+  /** Epoch milliseconds, when provided by the backend. */
+  grantedAt?: number;
+  expiresAt?: number;
+}
+
+export interface CodexRedeemCreditsSnapshot {
+  availableCount: number;
+  totalEarnedCount?: number;
+  credits: CodexRedeemCredit[];
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -47,6 +75,19 @@ function property(value: Record<string, unknown>, snake: string, camel: string):
 function payloadNumber(value: unknown): number | undefined {
   const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(number) ? number : undefined;
+}
+
+function payloadDate(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+  return undefined;
+}
+
+function payloadString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function payloadBool(value: unknown): boolean | undefined {
@@ -88,6 +129,7 @@ function payloadSnapshot(
   limitName: string | undefined,
   rateLimitValue: unknown,
   creditsValue?: unknown,
+  limitReached?: boolean,
 ): CodexRateLimitSnapshot {
   const rateLimit = object(rateLimitValue);
   return {
@@ -96,6 +138,53 @@ function payloadSnapshot(
     primary: payloadWindow(rateLimit && property(rateLimit, "primary_window", "primaryWindow")),
     secondary: payloadWindow(rateLimit && property(rateLimit, "secondary_window", "secondaryWindow")),
     credits: payloadCredits(creditsValue),
+    limitReached,
+  };
+}
+
+export function parseCodexAccountInfo(value: unknown): CodexAccountSnapshot | undefined {
+  const input = object(value);
+  if (!input) return undefined;
+  const planType = payloadString(property(input, "plan_type", "planType"));
+  const email = payloadString(property(input, "email", "email"));
+  if (planType === undefined && email === undefined) return undefined;
+  return { planType, email };
+}
+
+export function maskCodexEmail(email: string): string {
+  const [local, domain] = email.split("@");
+  if (!domain) return "***";
+  const head = local.length > 3 ? local.slice(0, 3) : local.slice(0, 1);
+  return `${head}***@${domain}`;
+}
+
+export function parseCodexRedeemCredits(value: unknown): CodexRedeemCreditsSnapshot | undefined {
+  const input = object(value);
+  if (!input) return undefined;
+  const availableCount = payloadNumber(property(input, "available_count", "availableCount"));
+  if (availableCount === undefined) return undefined;
+  const credits: CodexRedeemCredit[] = [];
+  const list = property(input, "credits", "credits");
+  if (Array.isArray(list)) {
+    for (const item of list) {
+      const credit = object(item);
+      if (!credit) continue;
+      const id = payloadString(property(credit, "id", "id"));
+      if (!id) continue;
+      credits.push({
+        id,
+        title: payloadString(property(credit, "title", "title")),
+        description: payloadString(property(credit, "description", "description")),
+        status: payloadString(property(credit, "status", "status")),
+        grantedAt: payloadDate(property(credit, "granted_at", "grantedAt")),
+        expiresAt: payloadDate(property(credit, "expires_at", "expiresAt")),
+      });
+    }
+  }
+  return {
+    availableCount,
+    totalEarnedCount: payloadNumber(property(input, "total_earned_count", "totalEarnedCount")),
+    credits,
   };
 }
 
@@ -103,8 +192,10 @@ export function parseCodexUsagePayload(value: unknown): CodexRateLimitSnapshot[]
   const input = object(value);
   if (!input) return [];
   const rateLimit = property(input, "rate_limit", "rateLimit");
+  const rateLimitObject = object(rateLimit);
+  const limitReached = payloadBool(rateLimitObject && property(rateLimitObject, "limit_reached", "limitReached"));
   const snapshots = rateLimit !== undefined || input.credits !== undefined
-    ? [payloadSnapshot("codex", undefined, rateLimit, input.credits)]
+    ? [payloadSnapshot("codex", undefined, rateLimit, input.credits, limitReached)]
     : [];
   const additional = property(input, "additional_rate_limits", "additionalRateLimits");
   if (Array.isArray(additional)) {
@@ -171,13 +262,18 @@ export function parseCodexRateLimits(input: Record<string, string>): CodexRateLi
           balance: headers["x-codex-credits-balance"],
         }
       : undefined;
-    if (!primary && !secondary && !credits) return [];
+    // The backend includes this header only when the account is currently rate limited.
+    const limitReached = prefix === "x-codex"
+      ? headers["x-codex-rate-limit-reached-type"] !== undefined
+      : undefined;
+    if (!primary && !secondary && !credits && !limitReached) return [];
     return [{
       limitId: prefix.slice(2).replace(/-/g, "_"),
       limitName: headers[`${prefix}-limit-name`],
       primary,
       secondary,
       credits,
+      limitReached,
     }];
   });
 }
@@ -190,11 +286,16 @@ function resetText(epochSeconds: number | undefined, now = Date.now()): string |
   if (epochSeconds === undefined) return undefined;
   const remainingMs = epochSeconds * 1000 - now;
   if (remainingMs <= 0) return undefined;
-  const minutes = Math.ceil(remainingMs / 60_000);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.ceil(minutes / 60);
-  if (hours < 48) return `${hours}h`;
-  return `${Math.ceil(hours / 24)}d`;
+  const totalMinutes = Math.ceil(remainingMs / 60_000);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  if (totalMinutes < 24 * 60) {
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
 }
 
 const KNOWN_WINDOWS = [
@@ -249,10 +350,11 @@ function usageBar(remaining: number): string {
   return `[${"█".repeat(filled)}${"░".repeat(USAGE_BAR_WIDTH - filled)}]`;
 }
 
-function windowText(item: LabeledWindow, labelWidth: number, now: number): string {
+function windowText(item: LabeledWindow, labelWidth: number, now: number, limitReached: boolean): string {
   const reset = resetText(item.window.resetsAt, now);
   const remaining = remainingPercent(item.window);
-  return `${item.label.padEnd(labelWidth)} ${usageBar(remaining)} ${percent(remaining)}% left${reset ? ` resets in ${reset}` : ""}`;
+  const state = limitReached ? "limit reached" : `${percent(remaining)}% left`;
+  return `${item.label.padEnd(labelWidth)} ${usageBar(limitReached ? 0 : remaining)} ${state}${reset ? ` resets in ${reset}` : ""}`;
 }
 
 function creditsText(credits: CodexCreditsSnapshot): string {
@@ -263,23 +365,74 @@ function creditsText(credits: CodexCreditsSnapshot): string {
   return "no additional credits";
 }
 
+export interface CodexUsageExtras {
+  account?: CodexAccountSnapshot;
+  redeemCredits?: CodexRedeemCreditsSnapshot;
+}
+
+function planLabel(planType: string): string {
+  return planType.charAt(0).toUpperCase() + planType.slice(1);
+}
+
+function formatDateTime(epochMs: number): string {
+  // Render in the user's local timezone with an explicit UTC offset label, so
+  // the expiry reads naturally while the boundary stays unambiguous.
+  const date = new Date(epochMs);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const offsetMinutes = -new Date(epochMs).getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMinutes);
+  const offset = abs % 60 === 0
+    ? `UTC${sign}${abs / 60}`
+    : `UTC${sign}${Math.floor(abs / 60)}:${pad(abs % 60)}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())} ${offset}`;
+}
+
+/** Renders redeem lines; returns an empty array when there is nothing to redeem. */
+export function formatCodexRedeemCredits(
+  redeemCredits: CodexRedeemCreditsSnapshot | undefined,
+  now = Date.now(),
+): string[] {
+  if (!redeemCredits || redeemCredits.availableCount <= 0) return [];
+  const lines = [`rate limit redeem${redeemCredits.availableCount === 1 ? "" : ` ×${redeemCredits.availableCount}`}`];
+  const available = redeemCredits.credits
+    .filter((credit) => credit.status === undefined || credit.status === "available")
+    // Earliest expiring first, so the most urgent card is visible at the top.
+    .sort((left, right) => (left.expiresAt ?? Number.POSITIVE_INFINITY) - (right.expiresAt ?? Number.POSITIVE_INFINITY));
+  for (const credit of available) {
+    const details: string[] = ["available"];
+    if (credit.expiresAt !== undefined) {
+      details.push(credit.expiresAt > now ? `expires ${formatDateTime(credit.expiresAt)}` : "expired");
+    }
+    lines.push(`  ${credit.title ?? "reset credit"} (${details.join(", ")})`);
+  }
+  return lines.length > 1 ? lines : [];
+}
+
 export function formatCodexUsage(
   snapshots: CodexRateLimitSnapshot[],
   now = Date.now(),
+  extras: CodexUsageExtras = {},
 ): string {
   if (snapshots.length === 0) {
     return "No Codex usage data is available. Run /codex-usage with an active Codex subscription model to refresh it.";
   }
   const lines = ["Codex usage"];
+  if (extras.account) {
+    const plan = extras.account.planType ? planLabel(extras.account.planType) : "unknown plan";
+    lines.push("", `account · ${plan}${extras.account.email ? ` (${maskCodexEmail(extras.account.email)})` : ""}`);
+  }
   for (const snapshot of snapshots) {
     const name = snapshot.limitName ?? snapshot.limitId;
     const windows = activeWindows(snapshot, now);
     const labelWidth = Math.max(0, ...windows.map((window) => window.label.length));
     lines.push("", name);
     if (windows.length === 0) lines.push("  no active usage windows");
-    else lines.push(...windows.map((window) => `  ${windowText(window, labelWidth, now)}`));
+    else lines.push(...windows.map((window) => `  ${windowText(window, labelWidth, now, snapshot.limitReached === true)}`));
     if (snapshot.credits) lines.push(`  ${creditsText(snapshot.credits)}`);
   }
+  const redeemLines = formatCodexRedeemCredits(extras.redeemCredits, now);
+  if (redeemLines.length > 0) lines.push("", ...redeemLines);
   return lines.join("\n");
 }
 
@@ -300,7 +453,8 @@ export function formatCodexStatus(
   if (!shortest) return undefined;
   const remaining = remainingPercent(shortest.window);
   const reset = resetText(shortest.window.resetsAt, now);
-  return `Codex ${shortest.label} ${percent(remaining)}%${reset ? ` ${reset}` : ""}${fastMode ? " Fast" : ""}`;
+  const usage = snapshot.limitReached === true ? "limit reached" : `${percent(remaining)}%`;
+  return `Codex ${shortest.label} ${usage}${reset ? ` ${reset}` : ""}${fastMode ? " Fast" : ""}`;
 }
 
 export function applyFastModePayload(payload: unknown, enabled: boolean): unknown {
@@ -318,8 +472,16 @@ interface AccountUsageFetch {
   promise: Promise<void>;
 }
 
+interface PendingRedeem {
+  redeemRequestId: string;
+  creditId?: string;
+  expiresAt: number;
+}
+
 interface AccountUsageState {
   snapshots: CodexRateLimitSnapshot[];
+  account?: CodexAccountSnapshot;
+  redeemCredits?: CodexRedeemCreditsSnapshot;
   lastFetchAt: number;
   usageFetch?: AccountUsageFetch;
 }
@@ -341,6 +503,7 @@ export function registerCodexUsageAndFast(
   options: CodexUsageOptions = {},
 ): CodexUsageHandle {
   const usageByAccount = new Map<string, AccountUsageState>();
+  const pendingRedeemByAccount = new Map<string, PendingRedeem>();
   let activeAccountId: string | undefined;
   let credentialRevision = 0;
   let latestContext: ExtensionContext | undefined;
@@ -382,6 +545,7 @@ export function registerCodexUsageAndFast(
     credentialRevision += 1;
     activeAccountId = undefined;
     usageByAccount.clear();
+    pendingRedeemByAccount.clear();
     if (action === "set") showSyncingStatus(ctx);
     else setStatus(ctx, undefined);
   };
@@ -391,6 +555,7 @@ export function registerCodexUsageAndFast(
     credentialRevision += 1;
     activeAccountId = accountId;
     usageByAccount.clear();
+    pendingRedeemByAccount.clear();
     showSyncingStatus(ctx);
     return true;
   };
@@ -452,6 +617,7 @@ export function registerCodexUsageAndFast(
         const parsed = parseCodexUsagePayload(payload);
         if (parsed.length === 0) throw new Error("Codex usage API returned no usage data");
         state.snapshots = parsed;
+        state.account = parseCodexAccountInfo(payload);
         state.lastFetchAt = Date.now();
       })();
       let nextFetch: AccountUsageFetch;
@@ -564,7 +730,7 @@ export function registerCodexUsageAndFast(
   };
 
   pi.registerCommand("codex-usage", {
-    description: "Refresh and show Codex subscription usage limits and credits",
+    description: "Refresh and show Codex subscription usage, plan, and rate limit redeems",
     handler: async (_args, ctx) => {
       try {
         await refreshUsage(ctx, true);
@@ -577,7 +743,151 @@ export function registerCodexUsageAndFast(
         }
         ctx.ui.notify(`Failed to refresh Codex usage; showing the latest snapshot: ${message}`, "warning");
       }
-      ctx.ui.notify(formatCodexUsage(currentState()?.snapshots ?? []), "info");
+      try {
+        const resolved = await resolveActiveClient(ctx, controller.getConfig());
+        const state = accountState(resolved.accountId);
+        const payload = await resolved.client.get<unknown>(REDEEM_CREDITS_PATH);
+        state.redeemCredits = parseCodexRedeemCredits(payload);
+      } catch {
+        // Redeem details are best-effort; the base usage message still shows.
+      }
+      const state = currentState();
+      const message = formatCodexUsage(state?.snapshots ?? [], Date.now(), {
+        account: state?.account,
+        redeemCredits: state?.redeemCredits,
+      });
+      // Notify renders in dim; wrap the message in muted so the usage block is
+      // slightly more visible. The embedded ANSI codes survive the notify path.
+      ctx.ui.notify(ctx.ui.theme ? ctx.ui.theme.fg("muted", message) : message, "info");
+    },
+  });
+
+  pi.registerCommand("codex-redeem", {
+    description: "Preview and redeem an earned Codex rate limit reset credit (confirmation required)",
+    handler: async (_args, ctx) => {
+      const config = controller.getConfig();
+      if (ctx.model?.provider !== "openai-codex" && !config.allowOtherProviders) {
+        ctx.ui.notify(
+          "An active openai-codex model is required to redeem a rate limit reset. "
+            + "Enable Other providers in /99settings to use the logged-in Codex subscription from another model.",
+          "error",
+        );
+        return;
+      }
+      let resolved: Awaited<ReturnType<typeof resolveActiveClient>>;
+      try {
+        resolved = await resolveActiveClient(ctx, config);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Failed to resolve the Codex subscription: ${message}`, "error");
+        return;
+      }
+      const state = accountState(resolved.accountId);
+      try {
+        const payload = await resolved.client.get<unknown>(REDEEM_CREDITS_PATH);
+        const redeemCredits = parseCodexRedeemCredits(payload);
+        state.redeemCredits = redeemCredits;
+        const now = Date.now();
+        if (!redeemCredits || redeemCredits.availableCount <= 0) {
+          pendingRedeemByAccount.delete(resolved.accountId);
+          ctx.ui.notify("No Codex rate limit reset credits are available to redeem.", "info");
+          return;
+        }
+        const availableCredits = [...redeemCredits.credits]
+          .filter((item) => item.status === undefined || item.status === "available")
+          // Prefer the card that expires soonest, so near-expiry credits are used first.
+          .sort((left, right) => (left.expiresAt ?? Number.POSITIVE_INFINITY) - (right.expiresAt ?? Number.POSITIVE_INFINITY));
+        const credit = availableCredits[0] ?? redeemCredits.credits[0];
+        const expiryOf = (item: CodexRedeemCredit | undefined): string =>
+          item?.expiresAt !== undefined && item.expiresAt > now
+            ? ` (expires ${formatDateTime(item.expiresAt)})`
+            : "";
+        let selected = credit;
+
+        if (ctx.hasUI) {
+          // 1) Pick a card when more than one is available.
+          if (availableCredits.length > 1) {
+            const options = availableCredits.map((item) => `${item.title ?? "reset credit"}${expiryOf(item)}`);
+            const choice = await ctx.ui.select("Select a reset credit to redeem", options, {
+              timeout: REDEEM_DIALOG_TIMEOUT_MS,
+            });
+            if (choice === undefined) {
+              pendingRedeemByAccount.delete(resolved.accountId);
+              ctx.ui.notify("Redeem cancelled — no reset credit was consumed.", "info");
+              return;
+            }
+            const index = options.indexOf(choice);
+            selected = availableCredits[index] ?? credit;
+          }
+          // 2) Confirm the selection before redeeming. "No" is listed first so
+          // a stray Enter on the default-selected row cancels instead of redeeming.
+          const confirmOptions = ["No", "Yes"];
+          const choice = await ctx.ui.select(
+            `Redeem ${selected?.title ?? "Full reset"}${expiryOf(selected)}?`,
+            confirmOptions,
+            { timeout: REDEEM_DIALOG_TIMEOUT_MS },
+          );
+          if (choice !== confirmOptions[1]) {
+            pendingRedeemByAccount.delete(resolved.accountId);
+            ctx.ui.notify("Redeem cancelled — no reset credit was consumed.", "info");
+            return;
+          }
+        }
+
+        // Reuse an in-flight redeem_request_id while it is still valid, so a
+        // retry after a network failure cannot consume a second credit.
+        const targetId = selected?.id;
+        const existing = pendingRedeemByAccount.get(resolved.accountId);
+        const pending = existing && existing.expiresAt > now && existing.creditId === targetId
+          ? existing
+          : {
+              redeemRequestId: crypto.randomUUID(),
+              creditId: targetId,
+              expiresAt: now + REDEEM_CONFIRM_WINDOW_MS,
+            };
+        pendingRedeemByAccount.set(resolved.accountId, pending);
+
+        if (!ctx.hasUI && (!existing || existing.expiresAt <= now || existing.creditId !== targetId)) {
+          // No dialog UI: preview now and require a second run within the window.
+          ctx.ui.notify(
+            `${redeemCredits.availableCount} rate limit reset redeem available: ${credit?.title ?? "Full reset"}${expiryOf(credit)}. `
+              + `Run /codex-redeem again within ${REDEEM_CONFIRM_WINDOW_MS / 1000}s to confirm.`,
+            "warning",
+          );
+          return;
+        }
+
+        try {
+          await resolved.client.post<unknown>(REDEEM_PATH, {
+            redeem_request_id: pending.redeemRequestId,
+            credit_id: pending.creditId,
+          });
+          pendingRedeemByAccount.delete(resolved.accountId);
+          try {
+            await refreshUsage(ctx, true);
+          } catch {
+            // The redeem succeeded; usage refresh is best-effort.
+          }
+          const status = formatCodexStatus(currentState()?.snapshots ?? [], config.fastMode);
+          ctx.ui.notify(
+            `✓ Rate limit reset redeemed — usage reset.${status ? `\n${status}` : ""}`,
+            "info",
+          );
+        } catch (error) {
+          // Keep the redeem_request_id so a retry stays idempotent.
+          pending.expiresAt = Date.now() + REDEEM_RETRY_WINDOW_MS;
+          pendingRedeemByAccount.set(resolved.accountId, pending);
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(
+            `Failed to redeem a rate limit reset: ${message}. `
+              + "Run /codex-redeem again to retry with the same request ID.",
+            "error",
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Failed to redeem a rate limit reset: ${message}`, "error");
+      }
     },
   });
 
@@ -610,6 +920,7 @@ export function registerCodexUsageAndFast(
     credentialRevision += 1;
     activeAccountId = undefined;
     usageByAccount.clear();
+    pendingRedeemByAccount.clear();
     latestContext = undefined;
     accountObserverActive = false;
     if (authWatchDebounce) clearTimeout(authWatchDebounce);

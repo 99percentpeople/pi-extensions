@@ -187,15 +187,18 @@ model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 
 ## codex-api
 
-`codex-api` reuses Pi's existing ChatGPT subscription OAuth to expose
-`codex_image` and `codex_search`, without an OpenAI API key or MCP server. It
-also provides settings-controlled Fast mode for the priority service tier and
-`/codex-usage` for current subscription usage windows and credits. Image
-outputs are saved as non-overwriting PNG files and returned to the model for
-follow-up inspection. Search supports web and image queries, page navigation,
-PDF screenshots, finance, weather, sports, and time operations. Auto search lets
-the AI choose Cached, Indexed, or Live per call, while fixed user modes always
-win. Configure Fast, search mode, search context size, and usage status through
+`codex-api` turns your ChatGPT subscription into Pi tools — `codex_image`
+and `codex_search` — without an OpenAI API key or MCP server. They even work
+while a third-party model (DeepSeek, Google, …) is active: enable **Other
+providers** in `/99settings` and the tools reuse Pi's logged-in
+`openai-codex` subscription. It also provides settings-controlled Fast mode,
+`/codex-usage` for quota, plan info, and earned reset cards, and
+`/codex-redeem` to confirmably redeem a reset card when you run out of
+messages. Image outputs are saved as non-overwriting PNG files and returned to
+the model for follow-up inspection. Search supports web and image queries, page
+navigation, PDF screenshots, finance, weather, sports, and time operations,
+with Auto routing (Cached / Indexed / Live per call) or fixed user modes.
+Configure Fast, search mode, search context size, and usage status through
 `/99settings`. See the
 [codex-api package documentation](extensions/codex-api/README.md).
 

@@ -3,6 +3,10 @@
 A focused [Pi](https://github.com/earendil-works/pi) extension for selectable
 visual effects on Pi's **main session status cursors**.
 
+Pick a preset (`Claude Code` or `Codex`) for an authentic busy-row look, or
+build your own: spinner glyph, animated label effects (wave, shimmer, scan,
+rainbow), speed, color, and direction — all from `/99settings`.
+
 ## Scope
 
 This package changes Pi's main `working`, `retry`, `compaction`, and

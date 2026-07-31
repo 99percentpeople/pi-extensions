@@ -4,6 +4,10 @@ A minimal, atomic todo tool for the [Pi coding agent](https://pi.dev/).
 The model writes the complete task plan in one call instead of issuing one
 `create` call per task.
 
+You see your plan as a live list above the input box: progress, active task,
+and dependencies update as the model works, and finished tasks roll off
+automatically. No commands to learn — just let the model maintain the plan.
+
 The extension intentionally has no todo-specific slash commands, interactive
 manager, or user-editable todo interface. Todo state belongs to the model. A read-only list
 is rendered above Pi's input box.

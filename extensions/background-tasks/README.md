@@ -5,6 +5,10 @@ blocking the current conversation. The extension supports ordinary background
 processes as well as full PTY-backed terminal applications, with live status,
 retained output, interactive attach, and completion-aware cleanup.
 
+Just ask Pi to *"start the dev server in the background"* — then keep
+chatting while it runs. `bg_*` tools start, wait on, inspect, and stop tasks;
+`/bg-attach` opens a live terminal you can interact with (`Ctrl+]` to leave).
+
 ## Features
 
 - Run builds, servers, watchers, tests, and terminal applications in the background

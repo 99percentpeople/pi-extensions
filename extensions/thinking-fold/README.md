@@ -4,6 +4,11 @@ Fold long, streaming reasoning blocks into a small live preview in Pi's TUI.
 The preview follows the latest terminal-visible lines instead of letting a
 reasoning trace continuously grow upward.
 
+During thinking you see a compact tail preview with a live timer; afterwards
+it collapses to `Thought for 12.3s`. Press `Ctrl+T` anytime to expand the full
+reasoning trace. Behavior is tunable in `/99settings` (fold depth, while/
+after-thinking strategies).
+
 ## Behavior
 
 When **While thinking** is set to `preview`, the assistant Item contains a

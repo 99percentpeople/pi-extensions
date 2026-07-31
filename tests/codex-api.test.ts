@@ -23,11 +23,15 @@ import {
   formatCodexSearchDisplay,
   formatCodexStatus,
   formatCodexUsage,
+  formatCodexRedeemCredits,
   loadCodexApiConfig,
   normalizeCodexApiConfig,
   normalizeCodexImageSize,
   parseCodexRateLimits,
   parseCodexUsagePayload,
+  maskCodexEmail,
+  parseCodexAccountInfo,
+  parseCodexRedeemCredits,
   registerCodexImageTool,
   registerCodexSearchTool,
   registerCodexUsageAndFast,
@@ -42,6 +46,18 @@ function jwt(accountId = "acct-123"): string {
   return `${encode({ alg: "none" })}.${encode({
     "https://api.openai.com/auth": { chatgpt_account_id: accountId },
   })}.signature`;
+}
+
+function formatLocalDateTime(epochMs: number): string {
+  const date = new Date(epochMs);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const offsetMinutes = -new Date(epochMs).getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMinutes);
+  const offset = abs % 60 === 0
+    ? `UTC${sign}${abs / 60}`
+    : `UTC${sign}${Math.floor(abs / 60)}:${pad(abs % 60)}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())} ${offset}`;
 }
 
 function toolRegistry(register: (pi: ExtensionAPI) => void): ToolDefinition {
@@ -926,6 +942,104 @@ test("Codex usage labels server windows and hides inactive placeholders", () => 
   assert.match(boundedText, /weekly \[░░░░░░░░░░░░░░░░░░░░\] 0% left/);
 });
 
+test("Codex usage reset time shows granular day/hour/minute units", () => {
+  const now = 1_700_000_000_000;
+  const snapshotFor = (secondsFromNow: number) => [{
+    limitId: "codex",
+    primary: {
+      usedPercent: 50,
+      windowMinutes: 7 * 24 * 60,
+      resetsAt: now / 1000 + secondsFromNow,
+    },
+  }];
+
+  assert.match(formatCodexUsage(snapshotFor(5 * 24 * 60 * 60 + 3 * 60 * 60), now), /resets in 5d 3h/);
+  assert.match(formatCodexUsage(snapshotFor(6 * 24 * 60 * 60), now), /resets in 6d/);
+  assert.match(formatCodexUsage(snapshotFor(12 * 60 * 60 + 30 * 60), now), /resets in 12h 30m/);
+  assert.match(formatCodexUsage(snapshotFor(23 * 60 * 60 + 59 * 60), now), /resets in 23h 59m/);
+  assert.match(formatCodexUsage(snapshotFor(60 * 60), now), /resets in 1h/);
+  assert.match(formatCodexUsage(snapshotFor(45 * 60), now), /resets in 45m/);
+  assert.match(formatCodexUsage(snapshotFor(59 * 60), now), /resets in 59m/);
+  assert.match(formatCodexUsage(snapshotFor(60), now), /resets in 1m/);
+  assert.doesNotMatch(formatCodexUsage(snapshotFor(60), now), /resets in 0m/);
+
+  assert.equal(formatCodexStatus(snapshotFor(5 * 24 * 60 * 60 + 3 * 60 * 60), false, now), "Codex weekly 50% 5d 3h");
+  assert.equal(formatCodexStatus(snapshotFor(12 * 60 * 60 + 30 * 60), false, now), "Codex weekly 50% 12h 30m");
+  assert.equal(formatCodexStatus(snapshotFor(45 * 60), false, now), "Codex weekly 50% 45m");
+});
+
+test("Codex usage shows limit reached instead of a percentage", () => {
+  const now = 1_700_000_000_000;
+  const resetAt = now / 1000 + 5 * 24 * 60 * 60 + 3 * 60 * 60;
+  const snapshots = parseCodexUsagePayload({
+    plan_type: "plus",
+    rate_limit: {
+      allowed: false,
+      limit_reached: true,
+      primary_window: {
+        used_percent: 100,
+        limit_window_seconds: 7 * 24 * 60 * 60,
+        reset_at: resetAt,
+      },
+      secondary_window: null,
+    },
+    credits: { has_credits: false, unlimited: false, balance: "0" },
+  });
+  assert.equal(snapshots[0].limitReached, true);
+
+  const usageText = formatCodexUsage(snapshots, now);
+  assert.match(usageText, /weekly \[░░░░░░░░░░░░░░░░░░░░\] limit reached resets in 5d 3h/);
+  assert.doesNotMatch(usageText, /% left|% used/);
+  assert.match(usageText, /no additional credits/);
+
+  assert.equal(
+    formatCodexStatus(snapshots, false, now),
+    "Codex weekly limit reached 5d 3h",
+  );
+  assert.equal(
+    formatCodexStatus(snapshots, true, now),
+    "Codex weekly limit reached 5d 3h Fast",
+  );
+
+  // Not reached: percentages remain.
+  const normal = parseCodexUsagePayload({
+    rate_limit: {
+      allowed: true,
+      limit_reached: false,
+      primary_window: {
+        used_percent: 65,
+        limit_window_seconds: 7 * 24 * 60 * 60,
+        reset_at: resetAt,
+      },
+    },
+  });
+  assert.equal(normal[0].limitReached, false);
+  assert.equal(formatCodexStatus(normal, false, now), "Codex weekly 35% 5d 3h");
+  assert.match(formatCodexUsage(normal, now), /weekly \[\u2588{7}\u2591{13}\] 35% left/);
+
+  // Header fallback: the reached-type header marks the snapshot.
+  const headerSnapshots = parseCodexRateLimits({
+    "X-Codex-Primary-Used-Percent": "100",
+    "X-Codex-Primary-Window-Minutes": "300",
+    "X-Codex-Primary-Reset-At": String(Math.floor(now / 1000) + 3600),
+    "X-Codex-Rate-Limit-Reached-Type": "rate_limit_reached",
+  });
+  assert.equal(headerSnapshots[0].limitReached, true);
+  assert.equal(
+    formatCodexStatus(headerSnapshots, false, now),
+    "Codex 5h limit reached 1h",
+  );
+  assert.match(formatCodexUsage(headerSnapshots, now), /5h\s+\[░░░░░░░░░░░░░░░░░░░░\] limit reached resets in 1h/);
+
+  const normalHeaderSnapshots = parseCodexRateLimits({
+    "X-Codex-Primary-Used-Percent": "50",
+    "X-Codex-Primary-Window-Minutes": "300",
+    "X-Codex-Primary-Reset-At": String(Math.floor(now / 1000) + 3600),
+  });
+  assert.equal(normalHeaderSnapshots[0].limitReached, false);
+  assert.equal(formatCodexStatus(normalHeaderSnapshots, false, now), "Codex 5h 50% 1h");
+});
+
 test("Codex usage refreshes directly from the official WHAM endpoint", async () => {
   const resetAt = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
   const payload = {
@@ -962,11 +1076,13 @@ test("Codex usage refreshes directly from the official WHAM endpoint", async () 
   assert.equal(parsed[1].limitName, "gpt-5.6-luna");
 
   let command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> } | undefined;
+  let redeemCommand: { handler: (args: string, ctx: ExtensionContext) => Promise<void> } | undefined;
   const commands: string[] = [];
   const pi = {
     registerCommand(name: string, definition: any) {
       commands.push(name);
       if (name === "codex-usage") command = definition;
+      if (name === "codex-redeem") redeemCommand = definition;
     },
     on() {},
   } as unknown as ExtensionAPI;
@@ -975,12 +1091,13 @@ test("Codex usage refreshes directly from the official WHAM endpoint", async () 
     updateConfig: () => {},
   });
   assert.ok(command);
-  assert.deepEqual(commands, ["codex-usage"]);
+  assert.ok(redeemCommand);
+  assert.deepEqual(commands, ["codex-usage", "codex-redeem"]);
 
   const originalFetch = globalThis.fetch;
-  let request: { url: string; init?: RequestInit } | undefined;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
   globalThis.fetch = async (input, init) => {
-    request = { url: String(input), init };
+    requests.push({ url: String(input), init });
     return new Response(JSON.stringify(payload));
   };
   const notifications: Array<{ message: string; level: string }> = [];
@@ -989,18 +1106,445 @@ test("Codex usage refreshes directly from the official WHAM endpoint", async () 
   ctx.ui = {
     notify: (message: string, level: string) => notifications.push({ message, level }),
     setStatus: (_key: string, value: string | undefined) => statuses.push(value),
-    theme: { fg: (color: string, text: string) => `[${color}]${text}` },
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
   };
   try {
     await command.handler("", ctx);
-    assert.equal(request?.url, "https://chatgpt.com/backend-api/wham/usage");
-    assert.equal(request?.init?.method, "GET");
+    assert.ok(requests.some((request) => request.url === "https://chatgpt.com/backend-api/wham/usage"
+      && request.init?.method === "GET"));
+    assert.ok(requests.some((request) => request.url === "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+      && request.init?.method === "GET"));
     const message = notifications.at(-1)?.message ?? "";
-    assert.match(message, /^Codex usage\n\ncodex\n/);
+    assert.match(message, /^\[muted\]Codex usage\n\naccount · Pro\n\ncodex\n/);
     assert.match(message, /weekly \[█████████████░░░░░░░\] 65% left/);
     assert.doesNotMatch(message, /% used|5h|•|codex:/);
     assert.match(message, /\n\ngpt-5\.6-luna\n  daily \[██████████████████░░\] 90% left/);
     assert.equal(statuses.at(-1), "[muted]Codex weekly 65% 7d");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Codex account and redeem credits parse and display", () => {
+  assert.equal(maskCodexEmail("alice@example.com"), "ali***@example.com");
+  assert.equal(maskCodexEmail("ab@example.com"), "a***@example.com");
+  assert.equal(maskCodexEmail("no-domain"), "***");
+
+  const account = parseCodexAccountInfo({
+    plan_type: "plus",
+    email: "alice@example.com",
+    user_id: "user-x",
+  });
+  assert.deepEqual(account, { planType: "plus", email: "alice@example.com" });
+  assert.equal(parseCodexAccountInfo({ user_id: "user-x" }), undefined);
+
+  const redeem = parseCodexRedeemCredits({
+    credits: [{
+      id: "RateLimitResetCredit_90c666dc336481918f61dbee048f2f0e",
+      reset_type: "codex_rate_limits",
+      is_supported_by_plan: true,
+      status: "available",
+      granted_at: "2026-07-13T18:14:16.753394Z",
+      expires_at: "2026-08-12T18:14:16.753394Z",
+      title: "Full reset",
+      description: "Thanks for using Codex! You've been granted one free rate limit reset.",
+    }],
+    available_count: 1,
+    total_earned_count: 0,
+  });
+  assert.ok(redeem);
+  assert.equal(redeem.availableCount, 1);
+  assert.equal(redeem.totalEarnedCount, 0);
+  assert.equal(redeem.credits.length, 1);
+  assert.equal(redeem.credits[0].id, "RateLimitResetCredit_90c666dc336481918f61dbee048f2f0e");
+  assert.equal(redeem.credits[0].status, "available");
+  assert.equal(redeem.credits[0].title, "Full reset");
+  assert.ok(redeem.credits[0].grantedAt);
+  assert.ok(redeem.credits[0].expiresAt);
+  assert.equal(parseCodexRedeemCredits({ available_count: 0, credits: [] })?.availableCount, 0);
+  assert.equal(parseCodexRedeemCredits({ credits: [] }), undefined);
+
+  const snapshots = parseCodexUsagePayload({
+    rate_limit: {
+      primary_window: {
+        used_percent: 100,
+        limit_window_seconds: 7 * 24 * 60 * 60,
+        reset_at: Math.floor(Date.now() / 1000) + 5 * 24 * 60 * 60,
+      },
+    },
+  });
+  const text = formatCodexUsage(snapshots, Date.now(), { account, redeemCredits: redeem });
+  assert.match(text, /^Codex usage\n\naccount · Plus \(ali\*\*\*@example\.com\)\n\ncodex\n/);
+  assert.ok(text.includes(`\n\nrate limit redeem\n  Full reset (available, expires ${formatLocalDateTime(Date.parse("2026-08-12T18:14:16.753394Z"))})`));
+  assert.doesNotMatch(text, /unknown plan/);
+
+  const emptyRedeem = formatCodexUsage(snapshots, Date.now(), {
+    account,
+    redeemCredits: { availableCount: 0, credits: [] },
+  });
+  assert.doesNotMatch(emptyRedeem, /rate limit redeem/);
+  assert.match(emptyRedeem, /account · Plus/);
+});
+
+test("Codex redeem credits sort by expiry and skip non-available cards", () => {
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  const text = formatCodexRedeemCredits({
+    availableCount: 2,
+    totalEarnedCount: 3,
+    credits: [
+      { id: "late", title: "Full reset", status: "available", expiresAt: now + 12 * day },
+      { id: "redeemed", title: "Full reset", status: "redeemed" },
+      { id: "early", title: "Full reset", status: "available", expiresAt: now + 3 * day },
+      { id: "expired", title: "Full reset", status: "expired" },
+    ],
+  }, now).join("\n");
+  assert.match(text, /^rate limit redeem ×2\n/);
+  assert.match(text, /  Full reset \(available, expires /);
+  assert.doesNotMatch(text, /redeemed|expired/);
+  // The earliest expiring card is listed first.
+  assert.ok(text.indexOf(`expires ${formatLocalDateTime(now + 3 * day)}`) < text.indexOf(`expires ${formatLocalDateTime(now + 12 * day)}`));
+});
+
+test("Codex usage redeem command previews then confirms before consuming", async () => {
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+  const pi = {
+    registerCommand(name: string, definition: any) {
+      commands.set(name, definition);
+    },
+    on(name: string, handler: (event: any, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  });
+  const redeemCommand = commands.get("codex-redeem");
+  assert.ok(redeemCommand);
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method?: string; body?: unknown }> = [];
+  const usagePayload = {
+    plan_type: "plus",
+    rate_limit: {
+      limit_reached: true,
+      primary_window: {
+        used_percent: 100,
+        limit_window_seconds: 7 * 24 * 60 * 60,
+        reset_at: Math.floor(Date.now() / 1000) + 60 * 60,
+      },
+    },
+  };
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    requests.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (url.endsWith("/rate-limit-reset-credits")) {
+      const day = 24 * 60 * 60 * 1000;
+      return new Response(JSON.stringify({
+        credits: [
+          {
+            id: "late-credit",
+            status: "available",
+            title: "Full reset",
+            expires_at: new Date(Date.now() + 30 * day).toISOString(),
+          },
+          {
+            id: "early-credit",
+            status: "available",
+            title: "Full reset",
+            expires_at: new Date(Date.now() + 2 * day).toISOString(),
+          },
+        ],
+        available_count: 2,
+        total_earned_count: 2,
+      }));
+    }
+    if (url.endsWith("/consume")) {
+      return new Response(JSON.stringify({ outcome: "reset" }));
+    }
+    return new Response(JSON.stringify(usagePayload));
+  };
+  const notifications: Array<{ message: string; level: string }> = [];
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.hasUI = false;
+  ctx.ui = {
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+  try {
+    // First run: preview only, no consume request, and a pending redeem is armed.
+    await redeemCommand.handler("", ctx);
+    assert.equal(requests.filter((request) => request.url.endsWith("/consume")).length, 0);
+    const preview = notifications.at(-1);
+    assert.equal(preview?.level, "warning");
+    assert.match(preview?.message ?? "", /2 rate limit reset redeem available: Full reset/);
+    assert.match(preview?.message ?? "", /Run \/codex-redeem again within 10s to confirm/);
+
+    // Second run within the window: consumes with the same redeem_request_id.
+    await redeemCommand.handler("", ctx);
+    const consumeRequests = requests.filter((request) => request.url.endsWith("/consume"));
+    assert.equal(consumeRequests.length, 1);
+    assert.equal(consumeRequests[0].method, "POST");
+    const body = consumeRequests[0].body as { redeem_request_id?: string; credit_id?: string };
+    assert.ok(body.redeem_request_id);
+    // The earliest expiring available card is picked.
+    assert.equal(body.credit_id, "early-credit");
+    const success = notifications.at(-1);
+    assert.equal(success?.level, "info");
+    assert.match(success?.message ?? "", /✓ Rate limit reset redeemed — usage reset/);
+
+    // Third run: a fresh preview with a new redeem_request_id.
+    await redeemCommand.handler("", ctx);
+    const after = notifications.at(-1);
+    assert.equal(after?.level, "warning");
+    assert.match(after?.message ?? "", /Run \/codex-redeem again/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Codex usage command wraps the notify output in muted styling", async () => {
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+  const pi = {
+    registerCommand(name: string, definition: any) {
+      commands.set(name, definition);
+    },
+    on() {},
+  } as unknown as ExtensionAPI;
+  registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  });
+  const usageCommand = commands.get("codex-usage");
+  assert.ok(usageCommand);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    plan_type: "plus",
+    rate_limit: {
+      limit_reached: true,
+      primary_window: {
+        used_percent: 100,
+        limit_window_seconds: 7 * 24 * 60 * 60,
+        reset_at: Math.floor(Date.now() / 1000) + 60 * 60,
+      },
+    },
+  }));
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.hasUI = true;
+  ctx.ui = {
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+  try {
+    await usageCommand.handler("", ctx);
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].level, "info");
+    assert.match(notifications[0].message, /^\[muted\]Codex usage\n\naccount · Plus/);
+    assert.match(notifications[0].message, /weekly \[░░░░░░░░░░░░░░░░░░░░\] limit reached/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Codex usage redeem confirms via dialog when UI is available", async () => {
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+  const pi = {
+    registerCommand(name: string, definition: any) {
+      commands.set(name, definition);
+    },
+    on() {},
+  } as unknown as ExtensionAPI;
+  registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  });
+  const redeemCommand = commands.get("codex-redeem");
+  assert.ok(redeemCommand);
+
+  const originalFetch = globalThis.fetch;
+  const consumeRequests: Array<{ redeemRequestId?: string; creditId?: string; failed: boolean }> = [];
+  let consumeFails = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/rate-limit-reset-credits")) {
+      const day = 24 * 60 * 60 * 1000;
+      return new Response(JSON.stringify({
+        credits: [
+          {
+            id: "early-credit",
+            status: "available",
+            title: "Full reset",
+            expires_at: new Date(Date.now() + 3 * day).toISOString(),
+          },
+          {
+            id: "late-credit",
+            status: "available",
+            title: "Full reset",
+            expires_at: new Date(Date.now() + 20 * day).toISOString(),
+          },
+        ],
+        available_count: 2,
+        total_earned_count: 2,
+      }));
+    }
+    if (url.endsWith("/consume")) {
+      const body = JSON.parse(String(init?.body));
+      const failed = consumeFails > 0;
+      consumeRequests.push({ redeemRequestId: body.redeem_request_id, creditId: body.credit_id, failed });
+      if (failed) {
+        consumeFails -= 1;
+        return new Response("{\"error\":\"boom\"}", { status: 500 });
+      }
+      return new Response(JSON.stringify({ outcome: "reset" }));
+    }
+    return new Response(JSON.stringify({
+      rate_limit: {
+        limit_reached: false,
+        primary_window: {
+          used_percent: 0,
+          limit_window_seconds: 7 * 24 * 60 * 60,
+          reset_at: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
+        },
+      },
+    }));
+  };
+  const notifications: Array<{ message: string; level: string }> = [];
+  const selects: Array<{ title: string; options: string[] }> = [];
+  let confirmResult = true;
+  let selectResult: string | undefined;
+  const ctx = context(process.cwd()) as any;
+  ctx.hasUI = true;
+  ctx.ui = {
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    select: async (title: string, options: string[]) => {
+      selects.push({ title, options });
+      // The confirmation selector always lists "No" first and "Yes" second.
+      if (options.length === 2 && options[0] === "No") {
+        return confirmResult ? options[1] : options[0];
+      }
+      if (selectResult === "auto-first") return options[0];
+      if (selectResult === "auto-last") return options[1];
+      return selectResult;
+    },
+    setStatus() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+  const fmt = formatLocalDateTime;
+  try {
+    // Escaping the card list cancels without consuming or confirming.
+    selectResult = undefined;
+    await redeemCommand.handler("", ctx);
+    assert.equal(selects.length, 1);
+    assert.equal(consumeRequests.length, 0);
+    assert.match(notifications.at(-1)?.message ?? "", /Redeem cancelled — no reset credit was consumed/);
+
+    // Card options are sorted by expiry, earliest first.
+    assert.equal(selects[0].title, "Select a reset credit to redeem");
+    assert.equal(selects[0].options.length, 2);
+    assert.ok(selects[0].options[0].includes(`expires ${fmt(Date.now() + 3 * 24 * 60 * 60 * 1000)}`));
+    assert.ok(selects[0].options[1].includes(`expires ${fmt(Date.now() + 20 * 24 * 60 * 60 * 1000)}`));
+
+    // Picking "No" on the confirmation selector cancels without consuming.
+    selectResult = "auto-first";
+    confirmResult = false;
+    await redeemCommand.handler("", ctx);
+    assert.equal(selects.length, 3);
+    const confirmSelector = selects[2];
+    // The card details are in the title, matching the earlier dialog design.
+    assert.match(confirmSelector.title, /^Redeem Full reset \(expires /);
+    assert.equal(confirmSelector.options.length, 2);
+    // "No" is the default-selected first row, so a stray Enter cannot redeem.
+    assert.equal(confirmSelector.options[0], "No");
+    assert.equal(confirmSelector.options[1], "Yes");
+    assert.equal(consumeRequests.length, 0);
+    assert.match(notifications.at(-1)?.message ?? "", /Redeem cancelled — no reset credit was consumed/);
+
+    // Picking "Yes" redeems the card chosen earlier in a single run.
+    selectResult = "auto-last";
+    confirmResult = true;
+    await redeemCommand.handler("", ctx);
+    assert.equal(consumeRequests.length, 1);
+    assert.ok(consumeRequests[0].redeemRequestId);
+    assert.equal(consumeRequests[0].creditId, "late-credit");
+    assert.equal(notifications.at(-1)?.level, "info");
+    assert.match(notifications.at(-1)?.message ?? "", /✓ Rate limit reset redeemed — usage reset/);
+
+    // A network failure keeps the redeem_request_id; the retry reuses it for the same card.
+    consumeFails = 1;
+    selectResult = "auto-first";
+    await redeemCommand.handler("", ctx);
+    assert.equal(notifications.at(-1)?.level, "error");
+    assert.match(notifications.at(-1)?.message ?? "", /retry with the same request ID/);
+    assert.equal(consumeRequests.at(-1)?.failed, true);
+    const failedRequestId = consumeRequests.at(-1)?.redeemRequestId;
+    await redeemCommand.handler("", ctx);
+    assert.equal(consumeRequests.at(-1)?.failed, false);
+    // The retry reuses the failed attempt's idempotency key.
+    assert.equal(consumeRequests.at(-1)?.redeemRequestId, failedRequestId);
+    assert.equal(consumeRequests.at(-1)?.creditId, "early-credit");
+    assert.notEqual(failedRequestId, consumeRequests[0].redeemRequestId);
+    assert.equal(notifications.at(-1)?.level, "info");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Codex usage redeem reports when no credits are available", async () => {
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+  const pi = {
+    registerCommand(name: string, definition: any) {
+      commands.set(name, definition);
+    },
+    on() {},
+  } as unknown as ExtensionAPI;
+  registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  });
+  const redeemCommand = commands.get("codex-redeem");
+  assert.ok(redeemCommand);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    credits: [],
+    available_count: 0,
+    total_earned_count: 0,
+  }));
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.ui = {
+    notify: (message: string, level: string) => notifications.push({ message, level }),
+    setStatus() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+  try {
+    await redeemCommand.handler("", ctx);
+    assert.equal(notifications.at(-1)?.level, "info");
+    assert.match(notifications.at(-1)?.message ?? "", /No Codex rate limit reset credits are available to redeem/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1039,7 +1583,10 @@ test("Codex usage watches auth.json for account switches and ignores stale reque
   };
   ctx.ui = {
     setStatus: (_key: string, value: string | undefined) => statuses.push(value),
-    theme: { fg: (color: string, text: string) => `[${color}]${text}` },
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
     notify() {},
   };
 
