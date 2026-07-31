@@ -219,6 +219,42 @@ test("visual truncation accounts for wrapped wide text", () => {
   assert.ok(thinkingText(display).split("\n").length <= 3);
 });
 
+test("trailing newlines do not make the folded preview jump rows", () => {
+  const base = Array.from({ length: 6 }, (_, index) => `line ${index + 1}`).join("\n");
+  // A streaming chunk boundary that ends with a newline must render the same
+  // folded tail as the same text without it (the Text component would otherwise
+  // count the trailing break as an extra empty row).
+  const plain = createThinkingDisplayMessage(
+    assistant(base),
+    { ...options, previewLines: 3 },
+    false,
+    80,
+    1,
+    streamingDisplay(),
+  );
+  const trailingNewline = createThinkingDisplayMessage(
+    assistant(`${base}\n`),
+    { ...options, previewLines: 3 },
+    false,
+    80,
+    1,
+    streamingDisplay(),
+  );
+  const trailingBlanks = createThinkingDisplayMessage(
+    assistant(`${base}\n\n`),
+    { ...options, previewLines: 3 },
+    false,
+    80,
+    1,
+    streamingDisplay(),
+  );
+  const plainText = thinkingText(plain);
+  assert.equal(thinkingText(trailingNewline), plainText);
+  assert.equal(thinkingText(trailingBlanks), plainText);
+  assert.match(plainText, /\nline 4\nline 5\nline 6$/);
+  assert.doesNotMatch(plainText, /\n\n$/);
+});
+
 test("automatic streaming hides summaries while the cursor shows their headline", () => {
   const summary = assistant(
     "**Inspecting the implementation**\n\n**Running focused tests**",

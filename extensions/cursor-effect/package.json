@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-cursor-effect",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Apply selectable visual effects to Pi's main working cursor status",
   "type": "module",
   "files": [

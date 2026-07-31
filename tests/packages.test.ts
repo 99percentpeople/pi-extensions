@@ -67,7 +67,7 @@ test("extensions are independently publishable workspace packages", async () => 
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "1.2.5");
+  assert.equal(background.version, "1.2.6");
   assertBuiltExtensionPackage(background);
   assert.deepEqual(background.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
@@ -94,14 +94,14 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.doesNotMatch(codexApiSkill, /codex_search|codex_image|output_path|referenced_image_paths/);
 
   assert.equal(cursorEffect.name, "@99percentpeople/pi-cursor-effect");
-  assert.equal(cursorEffect.version, "0.1.3");
+  assert.equal(cursorEffect.version, "0.1.4");
   assertBuiltExtensionPackage(cursorEffect);
   assert.deepEqual(cursorEffect.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(cursorEffect.publishConfig?.access, "public");
   assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.0.4");
+  assert.equal(pwsh.version, "1.0.5");
   assertBuiltExtensionPackage(pwsh);
   assert.deepEqual(pwsh.files, ["dist", "README.md", "LICENSE"]);
   assert.deepEqual(pwsh.os, ["win32"]);
@@ -113,7 +113,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(thinkingFold.name, "@99percentpeople/pi-thinking-fold");
-  assert.equal(thinkingFold.version, "0.1.4");
+  assert.equal(thinkingFold.version, "0.1.5");
   assertBuiltExtensionPackage(thinkingFold);
   assert.deepEqual(thinkingFold.files, ["dist", "README.md", "LICENSE"]);
   assert.deepEqual(thinkingFold.piBuild?.assets, ["model-behaviors.json"]);
@@ -121,7 +121,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.2.3");
+  assert.equal(todo.version, "1.2.4");
   assertBuiltExtensionPackage(todo);
   assert.deepEqual(todo.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(todo.publishConfig?.access, "public");

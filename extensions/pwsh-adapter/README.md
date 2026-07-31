@@ -2,6 +2,10 @@
 
 PowerShell shell adapter for the [Pi coding agent] on Windows.
 
+Make Pi speak PowerShell instead of bash: `!`/`!!` commands and the built-in
+shell tool run through PowerShell 7 (or Windows PowerShell 5.1), with UTF-8
+input/output configured automatically.
+
 It replaces Pi's `bash` compatibility tool and user `!`/`!!` commands with
 PowerShell, configures UTF-8 input/output, and adapts
 `@99percentpeople/pi-background-tasks` to use the same runtime when both

@@ -210,7 +210,12 @@ function foldThinkingText(
   outputPad: number,
 ): string {
   const availableWidth = Math.max(10, width - outputPad * 2);
-  const result = truncateToVisualLines(text, previewLines, availableWidth);
+  // The Text component renders trailing line breaks as extra empty rows, so a
+  // streaming chunk boundary that ends with a newline briefly grows the tail
+  // preview by one row and the folded block visibly jumps. Drop trailing line
+  // breaks before truncation to keep the folded height stable across chunks.
+  const stableText = text.replace(/\r?\n+$/, "");
+  const result = truncateToVisualLines(stableText, previewLines, availableWidth);
   return result.visualLines.map((line) => line.trimEnd()).join("\n");
 }
 
