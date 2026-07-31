@@ -318,8 +318,16 @@ test("label timer advances faster than a slow loader and stops cleanly", async (
   const working = new WorkingLoader("Independent timing");
   try {
     const first = rendered(working);
-    await delay(85);
-    const second = rendered(working);
+    // The label timer (60ms at fast speed) is independent of the 500ms loader
+    // frames. Poll instead of sleeping a fixed window: unref'd timers can be
+    // delayed past 85ms under CI scheduling pressure, which made a single
+    // check flaky on shared runners.
+    let second = first;
+    const deadline = Date.now() + 2_000;
+    while (second === first && Date.now() < deadline) {
+      await delay(20);
+      second = rendered(working);
+    }
     assert.notEqual(first, second, "label advances without waiting for the loader frame");
   } finally {
     working.stop();
