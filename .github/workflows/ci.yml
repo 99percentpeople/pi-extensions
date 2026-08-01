@@ -38,6 +38,10 @@ jobs:
       if: runner.os != 'Windows'
       run: bun run test
 
+    - name: SSH Remote Windows tests
+      if: runner.os == 'Windows'
+      run: node --import tsx --test --test-isolation=process tests/ssh-remote.test.ts
+
   packages:
     needs: validate
     runs-on: ubuntu-latest

@@ -2,6 +2,9 @@ import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createLsToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
   renderDiff,
@@ -19,7 +22,7 @@ import {
   type RemoteWorkspace,
   type SshShellPreference,
 } from "./adapters/index.ts";
-import { createSshBackgroundShellResolver } from "./background.ts";
+import { createSshBackgroundShellResolver, type BackgroundShellResolverContext } from "./background.ts";
 import {
   OpenSshClient,
   type SshClientOptions,
@@ -31,6 +34,14 @@ import {
   createRemoteReadOperations,
   createRemoteWriteOperations,
 } from "./operations.ts";
+import {
+  DEFAULT_REMOTE_FIND_LIMIT,
+  DEFAULT_REMOTE_GREP_LIMIT,
+  formatRemoteFindResult,
+  formatRemoteGrepResult,
+  formatRemoteLsResult,
+  resolveRemoteLimit,
+} from "./search-tools.ts";
 import { registerRemoteWorkspaceFiles } from "./workspace-files.ts";
 import {
   findSshSessionState,
@@ -295,18 +306,6 @@ export function createSshRemoteExtension(
       type: "string",
     });
 
-    if (platform === "win32") {
-      pi.on("session_start", (_event, ctx) => {
-        if (pi.getFlag("ssh")) {
-          ctx.ui.notify(
-            "SSH Remote currently supports Linux and macOS clients only; remote mode was not enabled.",
-            "error",
-          );
-        }
-      });
-      return;
-    }
-
     let runtime: RuntimeState = { kind: "disabled" };
     let autoSessionName: string | undefined;
     let autoSessionTitle: string | undefined;
@@ -344,17 +343,36 @@ export function createSshRemoteExtension(
       ctx.ui.notify(`SSH remote unavailable: ${message}`, "error");
     };
 
-    const emitBackgroundBackend = (
-      ctx: ExtensionContext,
-      connection: ActiveConnection,
-    ): void => {
+    const emitBackgroundBackend = (ctx: ExtensionContext): void => {
+      // Registered for every session that requests an SSH workspace. The
+      // resolver reads the live runtime state on each launch: active sessions
+      // run tasks on the remote (reconnecting picks up the new connection),
+      // failed/connecting sessions fail closed like the routed tools, and a
+      // session without SSH falls back to the default local shell backend.
       pi.events.emit("bg:register", {
-        resolveShell: createSshBackgroundShellResolver({
-          ssh: { ...connection.client.options },
-          adapter: connection.adapter,
-          workspace: connection.workspace,
-          localCwd: ctx.cwd,
-        }),
+        resolveShell: (
+          command: string,
+          interactive: boolean,
+          context?: BackgroundShellResolverContext,
+        ) => {
+          if (runtime.kind === "active") {
+            return createSshBackgroundShellResolver({
+              ssh: { ...runtime.client.options },
+              adapter: runtime.adapter,
+              workspace: runtime.workspace,
+              localCwd: ctx.cwd,
+            })(command, interactive, context);
+          }
+          if (runtime.kind === "failed") {
+            throw new Error(`SSH remote is unavailable: ${runtime.error}`);
+          }
+          if (runtime.kind === "connecting") {
+            throw new Error(
+              `SSH remote is still connecting to ${runtime.intent.target}`,
+            );
+          }
+          return undefined;
+        },
       });
     };
 
@@ -371,12 +389,14 @@ export function createSshRemoteExtension(
         client = createClient({
           target: intent.target,
           configFile: intent.configFile,
+          executable: platform === "win32" ? "ssh.exe" : undefined,
           connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
           batchMode: true,
         });
         const requestedCwd =
           intent.storedState?.remoteCwd ?? intent.requestedCwd;
         const selected = await selectRemote(client, {
+          localPlatform: platform,
           preference: intent.shellPreference,
           expectedPlatform: intent.storedState?.remotePlatform,
           expectedShell: intent.storedState?.remoteShell,
@@ -434,9 +454,7 @@ export function createSshRemoteExtension(
           autoSessionName = undefined;
           autoSessionTitle = undefined;
         }
-        emitBackgroundBackend(ctx, active);
         updateStatus(ctx);
-
         active.remoteGitBranch = await detectRemoteGitBranch(
           active.adapter,
           active.workspace,
@@ -614,8 +632,24 @@ export function createSshRemoteExtension(
     const writeTemplate = createWriteToolDefinition(process.cwd());
     const editTemplate = createEditToolDefinition(process.cwd());
     const bashTemplate = createBashToolDefinition(process.cwd());
+    const grepTemplate = createGrepToolDefinition(process.cwd());
+    const findTemplate = createFindToolDefinition(process.cwd());
+    const lsTemplate = createLsToolDefinition(process.cwd());
 
-    pi.registerTool({
+    const remoteSearchPath = (
+      active: ActiveConnection,
+      value: string | undefined,
+      localCwd: string,
+    ): string => {
+      const nativePath = active.adapter.mapCwd(
+        value || ".",
+        localCwd,
+        active.workspace,
+      );
+      return active.adapter.toToolPath(nativePath, active.workspace);
+    };
+
+    const remoteReadTool: typeof readTemplate = {
       ...readTemplate,
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
@@ -637,9 +671,9 @@ export function createSshRemoteExtension(
           return restoreToolResultPath(result, path, displayPath);
         });
       },
-    });
+    };
 
-    pi.registerTool({
+    const remoteWriteTool: typeof writeTemplate = {
       ...writeTemplate,
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
@@ -661,9 +695,95 @@ export function createSshRemoteExtension(
           return restoreToolResultPath(result, path, displayPath);
         });
       },
-    });
+    };
 
-    pi.registerTool({
+    const remoteGrepTool: typeof grepTemplate = {
+      ...grepTemplate,
+      async execute(id, params, signal, onUpdate, ctx) {
+        const active = requireActive();
+        if (!active) {
+          return createGrepToolDefinition(ctx.cwd).execute(
+            id,
+            params,
+            signal,
+            onUpdate,
+            ctx,
+          );
+        }
+        const path = remoteSearchPath(active, params.path, ctx.cwd);
+        const limit = resolveRemoteLimit(
+          params.limit,
+          DEFAULT_REMOTE_GREP_LIMIT,
+        );
+        const matches = await active.adapter.grep(
+          path,
+          params.pattern,
+          {
+            glob: params.glob,
+            ignoreCase: params.ignoreCase,
+            literal: params.literal,
+            limit,
+          },
+          signal,
+        );
+        return formatRemoteGrepResult(
+          active.adapter,
+          matches,
+          limit,
+          params.context,
+          signal,
+        );
+      },
+    };
+
+    const remoteFindTool: typeof findTemplate = {
+      ...findTemplate,
+      async execute(id, params, signal, onUpdate, ctx) {
+        const active = requireActive();
+        if (!active) {
+          return createFindToolDefinition(ctx.cwd).execute(
+            id,
+            params,
+            signal,
+            onUpdate,
+            ctx,
+          );
+        }
+        const path = remoteSearchPath(active, params.path, ctx.cwd);
+        const limit = resolveRemoteLimit(
+          params.limit,
+          DEFAULT_REMOTE_FIND_LIMIT,
+        );
+        const entries = await active.adapter.findEntries(
+          path,
+          params.pattern,
+          limit,
+          signal,
+        );
+        return formatRemoteFindResult(entries, limit);
+      },
+    };
+
+    const remoteLsTool: typeof lsTemplate = {
+      ...lsTemplate,
+      async execute(id, params, signal, onUpdate, ctx) {
+        const active = requireActive();
+        if (!active) {
+          return createLsToolDefinition(ctx.cwd).execute(
+            id,
+            params,
+            signal,
+            onUpdate,
+            ctx,
+          );
+        }
+        const path = remoteSearchPath(active, params.path, ctx.cwd);
+        const entries = await active.adapter.listDirectory(path, signal);
+        return formatRemoteLsResult(entries, params.limit);
+      },
+    };
+
+    const remoteEditTool: typeof editTemplate = {
       ...editTemplate,
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
@@ -756,9 +876,9 @@ export function createSshRemoteExtension(
         empty.clear();
         return empty;
       },
-    });
+    };
 
-    pi.registerTool({
+    const remoteBashTool: typeof bashTemplate = {
       ...bashTemplate,
       description: bashTemplate.description.replace(
         "Execute a bash command in the current working directory.",
@@ -781,7 +901,24 @@ export function createSshRemoteExtension(
           operations: createRemoteBashOperations(active.adapter),
         }).execute(id, params, signal, onUpdate, ctx);
       },
-    });
+    };
+
+    let remoteToolsRegistered = false;
+    const registerRemoteTools = (): void => {
+      if (remoteToolsRegistered) return;
+      remoteToolsRegistered = true;
+      const activeTools = pi.getActiveTools();
+      pi.registerTool(remoteReadTool);
+      pi.registerTool(remoteWriteTool);
+      pi.registerTool(remoteGrepTool);
+      pi.registerTool(remoteFindTool);
+      pi.registerTool(remoteLsTool);
+      pi.registerTool(remoteEditTool);
+      pi.registerTool(remoteBashTool);
+      // Dynamic registration may refresh extension tools as active. Preserve
+      // the exact pre-SSH selection, including optional grep/find/ls state.
+      pi.setActiveTools(activeTools);
+    };
 
     pi.on("session_start", async (event, ctx) => {
       runtime = { kind: "disabled" };
@@ -791,6 +928,8 @@ export function createSshRemoteExtension(
       try {
         intent = resolveIntent(event, ctx);
       } catch (error) {
+        registerRemoteTools();
+        emitBackgroundBackend(ctx);
         fail(ctx, error);
         return;
       }
@@ -798,7 +937,9 @@ export function createSshRemoteExtension(
         updateStatus(ctx);
         return;
       }
+      registerRemoteTools();
       registerSshCommands();
+      emitBackgroundBackend(ctx);
       await connect(intent, ctx);
     });
 
@@ -819,6 +960,26 @@ export function createSshRemoteExtension(
         autoSessionTitle,
       );
       pi.setSessionName(autoSessionName);
+    });
+
+    pi.on("tool_call", (event) => {
+      // Background task backends are registered through a shared "bg:register"
+      // bus where the last registrant wins (for example pi-pwsh-adapter
+      // re-registers a local PowerShell backend on session start). That makes
+      // bg_start silently run on the local machine while the SSH workspace is
+      // unavailable. Fail closed here instead, independent of registration
+      // order, so background tasks match the routed tools.
+      if (event.toolName !== "bg_start") return;
+      if (runtime.kind === "failed") {
+        return { block: true, reason: `SSH remote is unavailable: ${runtime.error}` };
+      }
+      if (runtime.kind === "connecting") {
+        return {
+          block: true,
+          reason: `SSH remote is still connecting to ${runtime.intent.target}`,
+        };
+      }
+      return undefined;
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
@@ -860,8 +1021,7 @@ export function createSshRemoteExtension(
         systemPrompt:
           `${base}\n\nSSH remote workspace is active at ${location} ` +
           `(${runtime.session.remotePlatform}/${runtime.session.remoteShell}). ` +
-          "The read, write, edit, bash, user ! commands, compatible bg_* commands, and codex_image workspace paths operate on that remote workspace. " +
-          "codex_image output_path and referenced_image_paths are transferred through SSH. " +
+          "The read, write, edit, bash, optional grep/find/ls, and user ! commands operate on that remote workspace. " +
           `${shellGuidance} Do not treat the local Pi working directory as the project filesystem.`,
       };
     });

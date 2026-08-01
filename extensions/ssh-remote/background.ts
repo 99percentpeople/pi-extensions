@@ -40,10 +40,18 @@ export function createSshBackgroundShellResolver(
       options.localCwd,
       options.workspace,
     );
+    // Non-interactive launches on Windows add -n so ssh.exe does not wedge
+    // when spawned with piped stdio (see client.ts). Interactive launches
+    // keep stdin for user input.
+    const windowsClient = options.ssh.executable === "ssh.exe";
     return {
       file: options.ssh.executable ?? "ssh",
       args: [
-        ...buildSshArguments(options.ssh, interactive),
+        ...buildSshArguments(
+          options.ssh,
+          interactive,
+          !interactive && windowsClient,
+        ),
         options.adapter.buildShellCommand(command, remoteCwd, undefined, interactive),
       ],
       env: { ...(options.env ?? process.env) },

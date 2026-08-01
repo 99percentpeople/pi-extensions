@@ -13,10 +13,14 @@ export interface SelectedRemote {
   workspace: RemoteWorkspace;
 }
 
-function createAdapter(executor: SshExecutor, shell: RemoteShell): RemoteAdapter {
+function createAdapter(
+  executor: SshExecutor,
+  shell: RemoteShell,
+  localPlatform: NodeJS.Platform,
+): RemoteAdapter {
   return shell === "bash"
-    ? new UnixBashAdapter(executor)
-    : new WindowsPowerShellAdapter(executor, shell);
+    ? new UnixBashAdapter(executor, localPlatform)
+    : new WindowsPowerShellAdapter(executor, shell, localPlatform);
 }
 
 function shellCandidates(options: SelectRemoteAdapterOptions): RemoteShell[] {
@@ -37,7 +41,11 @@ export async function selectRemoteAdapter(
 ): Promise<SelectedRemote> {
   const failures: string[] = [];
   for (const shell of shellCandidates(options)) {
-    const adapter = createAdapter(executor, shell);
+    const adapter = createAdapter(
+      executor,
+      shell,
+      options.localPlatform ?? process.platform,
+    );
     if (options.expectedPlatform && adapter.platform !== options.expectedPlatform) {
       failures.push(`${shell}: expected ${options.expectedPlatform}, adapter is ${adapter.platform}`);
       continue;
@@ -64,6 +72,10 @@ export { UnixBashAdapter } from "./unix.ts";
 export { WindowsPowerShellAdapter } from "./windows.ts";
 export type {
   RemoteAdapter,
+  RemoteDirectoryEntry,
+  RemoteFindEntry,
+  RemoteGrepMatch,
+  RemoteGrepOptions,
   RemotePlatform,
   RemoteShell,
   RemoteWorkspace,

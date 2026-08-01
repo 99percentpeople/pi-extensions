@@ -2,11 +2,11 @@
 
 Use the local [Pi coding agent](https://pi.dev/) against a remote Unix or
 Windows workspace. The extension routes Pi's built-in `read`, `write`, `edit`,
-and `bash` tools, user `!`/`!!` commands, and compatible background tasks
-through the system OpenSSH client while leaving the Pi UI, model credentials,
-packages, and session files on the local machine.
+and `bash` tools plus the optional `grep`, `find`, and `ls` tools and user
+`!`/`!!` commands through the system OpenSSH client while leaving the Pi UI,
+model credentials, packages, and session files on the local machine.
 
-Version 0.1.0 supports Linux and macOS clients connected to:
+Version 0.2.0 supports Linux, macOS, and Windows clients connected to:
 
 - Unix hosts with Bash and the usual POSIX utilities;
 - Windows OpenSSH hosts with PowerShell 7 or Windows PowerShell 5.1.
@@ -19,7 +19,7 @@ Version 0.1.0 supports Linux and macOS clients connected to:
 - Accepts rsync-style targets such as `host:/srv/project` and `user@host:path`
 - Auto-detects remote Unix/Bash or Windows/PowerShell environments
 - Keeps Pi's native tool schemas, truncation, diffs, rendering, and mutation
-  queue behavior
+  queue behavior; `grep`, `find`, and `ls` retain Pi's default disabled state
 - Streams file contents over SSH stdin/stdout instead of putting them in
   command-line arguments
 - Stores the target, platform, shell, remote home, and resolved cwd in the Pi
@@ -47,9 +47,13 @@ pi -e ./extensions/ssh-remote/index.ts --ssh devbox:/srv/project
 
 ## OpenSSH configuration
 
-The extension invokes the system `ssh` executable with the destination alias
-unchanged. Without `--ssh-config`, OpenSSH automatically reads its normal user
-and system configuration, including `~/.ssh/config`.
+The extension invokes the system `ssh` executable (`ssh.exe` on Windows) with
+its destination alias unchanged. Without `--ssh-config`, OpenSSH automatically
+reads its normal user and system configuration, including `~/.ssh/config`.
+
+On Windows, install or enable the Windows OpenSSH Client capability and ensure
+`ssh.exe` is available on `PATH`. The same user SSH config and `ssh-agent`
+credentials used by a manual PowerShell `ssh <host>` command are reused.
 
 ```sshconfig
 Host devbox
@@ -139,8 +143,8 @@ Windows user profile and working directory. Drive-relative paths such as
 `C:folder` and `~other` paths are rejected because their meaning is ambiguous.
 
 The tool remains named `bash` for Pi compatibility, but its prompt and session
-context tell the model to use PowerShell syntax. User `!`/`!!` commands and
-compatible background tasks use the same remote PowerShell runtime.
+context tell the model to use PowerShell syntax. User `!`/`!!` commands use the
+same remote PowerShell runtime.
 
 ## Session resume
 
@@ -189,7 +193,7 @@ list. It queries the current remote Git branch after a successful connection
 and appends the first user message when it arrives, producing a line such as:
 
 ```text
-~ • SSH yzzpc:C:\Users\zyearz\Desktop\pi-extensions (master) • Fix the build
+~ • SSH devbox:C:\Users\dev\Desktop\pi-extensions (master) • Fix the build
 ```
 
 The first message is normalized to one line, matching the information Pi uses
@@ -229,8 +233,8 @@ adding tool-specific SSH hooks.
 For example, a Windows SSH session can use:
 
 ```text
-output_path: C:\Users\zyearz\Desktop\wallpaper.png
-referenced_image_paths: [C:\Users\zyearz\Desktop\reference.jpg]
+output_path: C:\Users\dev\Desktop\wallpaper.png
+referenced_image_paths: [C:\Users\dev\Desktop\reference.jpg]
 ```
 
 ## Background tasks
@@ -248,12 +252,25 @@ job after resume.
 
 - `todo`, `thinking-fold`, `cursor-effect`, and `codex_search` remain local and
   work normally.
-- `pi-pwsh-adapter` is a Windows-client-only package, while SSH Remote 0.1.0
-  supports Linux/macOS clients. SSH Remote is a no-op on Windows clients, so the
-  two packages do not compete for the same shell backend.
-- Pi's optional standalone `grep`, `find`, and `ls` tools are not overridden.
-  They are disabled by default; use the corresponding command through remote
-  `bash`/PowerShell instead of enabling those local tools in an SSH session.
+- On Windows clients, local sessions are left untouched so
+  `pi-pwsh-adapter` can continue to own the local `bash` tool. SSH Remote
+  registers its tool overrides only for sessions that request, resume, or
+  inherit an SSH workspace.
+- A failed remote connection (unreachable host, missing remote directory, or
+  no supported remote shell) reports the error and leaves the session in a
+  `Disconnected` state: tools fail closed with the probe error, while
+  `/ssh-status` and `/ssh-reconnect` stay available for recovery.
+- Background tasks follow the same rule: while the SSH workspace is
+  unavailable, `bg_start` is blocked with the probe error instead of silently
+  running on the local machine (the shared background-task backend can be
+  claimed by other adapters such as `pi-pwsh-adapter`, so the block is applied
+  at the tool level to stay independent of registration order).
+- Pi's optional standalone `grep`, `find`, and `ls` tools remain disabled by
+  default. If enabled through `--tools` or the tool selector, they execute on
+  the remote workspace and fail closed with the other routed tools.
+- Unix `find` uses remote `rg` when available so `.gitignore` is honored; its
+  POSIX fallback and the native Windows implementation always exclude `.git`
+  and `node_modules` but do not parse every `.gitignore` rule.
 - Remote project discovery is not virtualized. Local `AGENTS.md`, `.pi`, skills,
   and project settings still come from Pi's local anchor directory.
 - `read` downloads a complete remote file before applying Pi's line and byte
@@ -264,7 +281,6 @@ job after resume.
   write steps.
 - Remote shell commands export safe Pi model/session identifiers but do not
   export `PI_SESSION_FILE`, because that path exists only on the local host.
-- Windows clients are not supported in 0.1.0. Windows SSH targets are supported.
 
 ## Security
 

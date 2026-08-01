@@ -406,6 +406,35 @@ test("shell adapters can separate a logical task cwd from the local launch cwd",
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
+test("bg_start falls back to the default shell when the resolver returns undefined", async () => {
+  const { tools, lifecycle, children, ctx, eventBus } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+  eventBus.emit("bg:register", {
+    resolveShell: () => undefined,
+    spawn: () => {
+      const child = new FakeChildProcess(92_000_000 + children.length);
+      children.push(child);
+      return child as unknown as ChildProcess;
+    },
+  });
+
+  const result = await bgStart.execute(
+    "fallback-default",
+    { name: "fallback-default", command: "echo local" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const text = result.content.map((item) => item.text ?? "").join(" ");
+  assert.match(text, /fallback-default/i);
+  assert.equal(children.length, 1);
+
+  children[0].finish(0, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
 test("background task names are unique among retained tasks", async () => {
   const { tools, lifecycle, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");

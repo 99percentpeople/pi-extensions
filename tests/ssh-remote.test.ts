@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import { gunzipSync } from "node:zlib";
 import {
   collectWorkspaceFile,
   resolveWorkspaceFiles,
 } from "@99percentpeople/pi-workspace-files";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  createReadToolDefinition,
+  createWriteToolDefinition,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
   selectRemoteAdapter,
@@ -100,6 +105,27 @@ class FakeSshClient implements SshRemoteClient {
     if (command.includes("file --mime-type")) {
       return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 1 };
     }
+    if (command.includes("PI_SSH_REMOTE_LS")) {
+      return {
+        stdout: Buffer.from("D\0src\0F\0README.md\0"),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
+    if (command.includes("PI_SSH_REMOTE_FIND")) {
+      return {
+        stdout: Buffer.from("F\0src/index.ts\0F\0src/util.ts\0"),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
+    if (command.includes("PI_SSH_REMOTE_GREP")) {
+      return {
+        stdout: Buffer.from("G\x00src/index.ts\x0012\x00remoteMatch()\x00"),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
     if (command.startsWith("test -e ")) {
       return {
         stdout: Buffer.alloc(0),
@@ -148,11 +174,23 @@ test("SSH targets use rsync-style syntax and robust shell quoting", () => {
   assert.throws(() => normalizeRemoteToolPath("~other/file", "/home/deploy"), /~user/);
 });
 
-test("cwd mapping preserves paths relative to the local anchor", () => {
+test("cwd mapping preserves paths relative to POSIX and Windows local anchors", () => {
   assert.equal(mapCwdToRemote(".", "/local/project", "/srv/project"), "/srv/project");
   assert.equal(mapCwdToRemote("packages/api", "/local/project", "/srv/project"), "/srv/project/packages/api");
   assert.equal(mapCwdToRemote("/local/project/src", "/local/project", "/srv/project"), "/srv/project/src");
   assert.equal(mapCwdToRemote("/var/tmp", "/local/project", "/srv/project"), "/var/tmp");
+  assert.equal(
+    mapCwdToRemote("C:\\local\\project\\src", "C:\\local\\project", "/srv/project"),
+    "/srv/project/src",
+  );
+  assert.equal(
+    mapCwdToRemote("/var/tmp", "C:\\local\\project", "/srv/project"),
+    "/var/tmp",
+  );
+  assert.throws(
+    () => mapCwdToRemote("D:\\other", "C:\\local\\project", "/srv/project"),
+    /Cannot map local absolute cwd/,
+  );
 });
 
 test("OpenSSH arguments preserve config aliases and run non-interactively", () => {
@@ -174,7 +212,69 @@ test("OpenSSH arguments preserve config aliases and run non-interactively", () =
       "devbox",
     ],
   );
-  assert.ok(buildSshArguments({ target: "devbox" }, true).includes("-tt"));
+  assert.deepEqual(
+    buildSshArguments({ target: "devbox" }, true).includes("-tt"),
+    true,
+  );
+  assert.deepEqual(
+    buildSshArguments({ target: "devbox" }, false, true),
+    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-T", "-n", "devbox"],
+  );
+});
+
+test("Windows ssh.exe adds -n for no-stdin commands and uses a temp file for input", async () => {
+  class FakeProcess extends EventEmitter {
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    kill(): boolean {
+      queueMicrotask(() => this.emit("close", 0));
+      return true;
+    }
+  }
+
+  const spawned: Array<{ args: readonly string[]; options: SpawnOptions }> = [];
+  const spawn = (
+    _file: string,
+    args: readonly string[],
+    options: SpawnOptions,
+  ): ChildProcess => {
+    spawned.push({ args, options });
+    const child = new FakeProcess();
+    queueMicrotask(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.stdin.end();
+      child.emit("close", 0);
+    });
+    return child as unknown as ChildProcess;
+  };
+
+  // No input: args gain -n, stdin is ignored, stdout/stderr are temp files.
+  const client = new OpenSshClient(
+    { target: "winbox", executable: "ssh.exe" },
+    spawn,
+  );
+  await client.run("echo ok");
+  assert.ok(spawned[0].args.includes("-n"));
+  const stdio0 = spawned[0].options.stdio as Array<string | number>;
+  assert.equal(stdio0[0], "ignore");
+  assert.equal(typeof stdio0[1], "number");
+  assert.equal(typeof stdio0[2], "number");
+
+  // With input: no -n, stdin is a temp file handle, and all files are
+  // removed afterwards.
+  await client.run("cat", { input: "payload" });
+  assert.ok(!spawned[1].args.includes("-n"));
+  const stdio1 = spawned[1].options.stdio as Array<string | number>;
+  assert.equal(typeof stdio1[0], "number");
+  assert.equal(typeof stdio1[1], "number");
+  assert.equal(typeof stdio1[2], "number");
+  client.dispose();
+  const leftovers = readdirSync(tmpdir()).filter((name) =>
+    name.startsWith("pi-ssh-stdin-"),
+  );
+  assert.deepEqual(leftovers, []);
 });
 
 test("OpenSSH client probes remote home and canonical cwd through framed output", async () => {
@@ -189,11 +289,13 @@ test("OpenSSH client probes remote home and canonical cwd through framed output"
   }
 
   const commands: string[] = [];
+  let spawnOptions: SpawnOptions | undefined;
   const spawn = (
     _file: string,
     args: readonly string[],
-    _options: SpawnOptions,
+    options: SpawnOptions,
   ): ChildProcess => {
+    spawnOptions = options;
     const child = new FakeProcess();
     const command = args.at(-1) ?? "";
     commands.push(command);
@@ -219,12 +321,33 @@ test("OpenSSH client probes remote home and canonical cwd through framed output"
     cwd: "/srv/project",
   });
   assert.match(commands[1], /cd -- '\/home\/deploy\/project'/);
+  assert.deepEqual(spawnOptions?.stdio, ["pipe", "pipe", "pipe"]);
   client.dispose();
+});
+
+test("remote Unix paths use a Windows-safe logical namespace", () => {
+  const adapter = new UnixBashAdapter(
+    new FakeSshClient({ target: "devbox" }),
+    "win32",
+  );
+  const workspace: RemoteWorkspace = {
+    platform: "unix",
+    shell: "bash",
+    home: "/home/deploy",
+    cwd: "/srv/project",
+  };
+  const logical = adapter.toToolPath("src/a file.ts", workspace);
+  assert.match(logical, /^C:\\__pi_ssh_remote_unix__\\root\\/);
+  assert.equal(adapter.fromToolPath(logical), "/srv/project/src/a file.ts");
+  assert.equal(
+    adapter.fromToolPath(adapter.toToolPath("~/notes.txt", workspace)),
+    "/home/deploy/notes.txt",
+  );
 });
 
 test("remote file operations quote paths and stream write content over stdin", async () => {
   const client = new FakeSshClient({ target: "devbox" });
-  const adapter = new UnixBashAdapter(client);
+  const adapter = new UnixBashAdapter(client, "linux");
   const read = createRemoteReadOperations(adapter);
   const write = createRemoteWriteOperations(adapter);
   const edit = createRemoteEditOperations(adapter);
@@ -288,7 +411,11 @@ test("background resolver maps remote cwd while launching ssh from a local direc
 
 function decodePowerShellInvocation(command: string): string {
   const encoded = command.trim().split(/\s+/).at(-1) ?? "";
-  return Buffer.from(encoded, "base64").toString("utf16le");
+  const script = Buffer.from(encoded, "base64").toString("utf16le");
+  const compressed = /\$data = \[Convert\]::FromBase64String\('([^']+)'\)/.exec(script)?.[1];
+  return compressed
+    ? gunzipSync(Buffer.from(compressed, "base64")).toString("utf8")
+    : script;
 }
 
 class FakeWindowsSshClient implements SshRemoteClient {
@@ -328,6 +455,30 @@ class FakeWindowsSshClient implements SshRemoteClient {
     if (script.includes("ReadAllBytes")) {
       return { stdout: Buffer.from("windows contents\r\n"), stderr: Buffer.alloc(0), exitCode: 0 };
     }
+    if (script.includes("PI_SSH_REMOTE_LS")) {
+      return {
+        stdout: Buffer.from(`D\t${Buffer.from("src").toString("base64")}\r\nF\t${Buffer.from("README.md").toString("base64")}\r\n`),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
+    if (script.includes("PI_SSH_REMOTE_FIND")) {
+      return {
+        stdout: Buffer.from(`F\t${Buffer.from("src/main.ts").toString("base64")}\r\n`),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
+    if (script.includes("PI_SSH_REMOTE_GREP")) {
+      const relative = Buffer.from("src/main.ts").toString("base64");
+      const text = Buffer.from("RemoteMatch()").toString("base64");
+      const full = Buffer.from("C:\\Users\\Admin\\src\\main.ts").toString("base64");
+      return {
+        stdout: Buffer.from(`${relative}\t8\t${text}\t${full}\r\n`),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
     return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
   }
 
@@ -348,6 +499,9 @@ test("Windows paths round-trip through Pi's logical POSIX namespace", () => {
   const uncPath = "\\\\server\\share\\folder\\file.txt";
   assert.equal(decodeWindowsToolPath(encodeWindowsToolPath(drivePath)), drivePath);
   assert.equal(decodeWindowsToolPath(encodeWindowsToolPath(uncPath)), uncPath);
+  const windowsLogical = encodeWindowsToolPath(drivePath, "win32");
+  assert.match(windowsLogical, /^C:\\__pi_ssh_remote_windows__\\drive\\/);
+  assert.equal(decodeWindowsToolPath(windowsLogical), drivePath);
   assert.equal(
     resolveWindowsRemotePath("~\\project\\src", "C:\\Users\\Admin", "D:\\work"),
     "C:\\Users\\Admin\\project\\src",
@@ -358,11 +512,70 @@ test("Windows paths round-trip through Pi's logical POSIX namespace", () => {
   );
 });
 
+test("Pi file tools resolve remote logical paths on native Windows", {
+  skip: process.platform !== "win32" ? "requires Windows path semantics" : false,
+}, async () => {
+  const harness = createExtensionHarness({ cwd: process.cwd() });
+
+  const unixClient = new FakeSshClient({ target: "devbox" });
+  const unixAdapter = new UnixBashAdapter(unixClient, "win32");
+  const unixWorkspace: RemoteWorkspace = {
+    platform: "unix",
+    shell: "bash",
+    home: "/home/deploy",
+    cwd: "/srv/project",
+  };
+  const unixRoot = unixAdapter.toToolPath(unixWorkspace.cwd, unixWorkspace);
+  const unixPath = unixAdapter.toToolPath("notes.txt", unixWorkspace);
+  const readResult = await createReadToolDefinition(unixRoot, {
+    operations: createRemoteReadOperations(unixAdapter),
+  }).execute(
+    "read-native-windows",
+    { path: unixPath },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(readResult.content[0].text, "remote contents\n");
+
+  const windowsClient = new FakeWindowsSshClient();
+  const windowsAdapter = new WindowsPowerShellAdapter(
+    windowsClient,
+    "pwsh",
+    "win32",
+  );
+  const windowsWorkspace: RemoteWorkspace = {
+    platform: "windows",
+    shell: "pwsh",
+    home: "C:\\Users\\Admin",
+    cwd: "C:\\Users\\Admin\\project",
+  };
+  const windowsRoot = windowsAdapter.toToolPath(
+    windowsWorkspace.cwd,
+    windowsWorkspace,
+  );
+  const windowsPath = windowsAdapter.toToolPath("notes.txt", windowsWorkspace);
+  const writeResult = await createWriteToolDefinition(windowsRoot, {
+    operations: createRemoteWriteOperations(windowsAdapter),
+  }).execute(
+    "write-native-windows",
+    { path: windowsPath, content: "windows value" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(writeResult.content[0].text, /Successfully wrote 13 bytes/);
+});
+
 test("PowerShell scripts use EncodedCommand and keep user commands out of SSH arguments", () => {
   assert.equal(Buffer.from(encodePowerShell("Write-Output ok"), "base64").toString("utf16le"), "Write-Output ok");
   const invocation = buildPowerShellInvocation("pwsh", "Write-Output ok");
   assert.match(invocation, /^pwsh\.exe .* -EncodedCommand /);
   assert.match(decodePowerShellInvocation(invocation), /Write-Output ok/);
+  const longScript = `Write-Output ok\n${"# repeated control script\n".repeat(1_000)}`;
+  const compressedInvocation = buildPowerShellInvocation("pwsh", longScript);
+  assert.ok(compressedInvocation.length < 8_000);
+  assert.equal(decodePowerShellInvocation(compressedInvocation), longScript);
 
   const shellCommand = buildWindowsPowerShellCommand(
     "powershell",
@@ -399,6 +612,18 @@ test("remote adapter auto-detects Windows PowerShell and streams file content ov
     adapter.mapCwd("/local/project/src", "/local/project", workspace),
     "C:\\Users\\Admin\\project\\src",
   );
+  assert.equal(
+    adapter.mapCwd(
+      "C:\\local\\project\\src",
+      "C:\\local\\project",
+      workspace,
+    ),
+    "C:\\Users\\Admin\\project\\src",
+  );
+  assert.equal(
+    adapter.mapCwd("D:\\remote", "C:\\local\\project", workspace),
+    "D:\\remote",
+  );
   const resolver = createSshBackgroundShellResolver({
     ssh: { target: "winbox" },
     adapter,
@@ -433,6 +658,7 @@ interface HarnessOptions {
   branch?: unknown[];
   sessionName?: string;
   cwd?: string;
+  activeTools?: string[];
 }
 
 function createExtensionHarness(options: HarnessOptions = {}) {
@@ -446,7 +672,9 @@ function createExtensionHarness(options: HarnessOptions = {}) {
   const notifications: Array<{ message: string; level?: string }> = [];
   const statuses = new Map<string, unknown>();
   const themeCalls: Array<{ color: string; text: string }> = [];
+  let shutdowns = 0;
   let sessionName: string | undefined = options.sessionName;
+  let activeTools = [...(options.activeTools ?? ["read", "bash", "edit", "write"])];
   if (options.flag) flags.set("ssh", options.flag);
   if (options.configFlag) flags.set("ssh-config", options.configFlag);
 
@@ -456,6 +684,8 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     },
     getFlag: (name: string) => flags.get(name),
     registerTool: (tool: any) => tools.set(tool.name, tool),
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (names: string[]) => { activeTools = [...names]; },
     registerCommand: (name: string, command: any) => commands.set(name, command),
     on: (name: string, handler: (...args: any[]) => any) => {
       const list = handlers.get(name) ?? [];
@@ -491,6 +721,9 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     model: undefined,
     thinkingLevel: "off",
     isProjectTrusted: () => true,
+    shutdown: () => {
+      shutdowns++;
+    },
     sessionManager: {
       getBranch: () => [...entries],
       getSessionId: () => "session-id",
@@ -527,6 +760,8 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     themeCalls,
     emit,
     getSessionName: () => sessionName,
+    getActiveTools: () => [...activeTools],
+    getShutdowns: () => shutdowns,
   };
 }
 
@@ -538,9 +773,17 @@ test("SSH commands stay hidden in local sessions", async () => {
   const harness = createExtensionHarness();
   createSshRemoteExtension({ platform: "linux" })(harness.pi);
 
+  assert.deepEqual(harness.getActiveTools(), ["read", "bash", "edit", "write"]);
+  assert.equal(harness.tools.has("grep"), false);
+  assert.equal(harness.tools.has("find"), false);
+  assert.equal(harness.tools.has("ls"), false);
   assert.equal(harness.commands.has("ssh-status"), false);
   assert.equal(harness.commands.has("ssh-reconnect"), false);
   await harness.emit("session_start", { reason: "startup" });
+  assert.deepEqual(harness.getActiveTools(), ["read", "bash", "edit", "write"]);
+  assert.equal(harness.tools.has("grep"), false);
+  assert.equal(harness.tools.has("find"), false);
+  assert.equal(harness.tools.has("ls"), false);
   assert.equal(harness.commands.has("ssh-status"), false);
   assert.equal(harness.commands.has("ssh-reconnect"), false);
 });
@@ -567,10 +810,192 @@ test("SSH commands appear for remote sessions and reconnect the active target", 
   assert.equal(clients[1].options.target, "devbox");
 });
 
+test("optional grep, find, and ls tools stay opt-in and route through SSH", async () => {
+  const client = new FakeSshClient({ target: "devbox" });
+  const activeTools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+  const harness = createExtensionHarness({
+    flag: "devbox:/srv/project",
+    activeTools,
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: () => client,
+  })(harness.pi);
+
+  assert.deepEqual(harness.getActiveTools(), activeTools);
+  await harness.emit("session_start", { reason: "startup" });
+
+  const lsResult = await harness.tools.get("ls").execute(
+    "ls-remote",
+    {},
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(lsResult.content[0].text, "README.md\nsrc/");
+
+  const findResult = await harness.tools.get("find").execute(
+    "find-remote",
+    { pattern: "**/*.ts" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(findResult.content[0].text, "src/index.ts\nsrc/util.ts");
+
+  const grepResult = await harness.tools.get("grep").execute(
+    "grep-remote",
+    { pattern: "remoteMatch" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(grepResult.content[0].text, "src/index.ts:12: remoteMatch()");
+  assert.ok(client.calls.some((call) => call.command.includes("PI_SSH_REMOTE_LS")));
+  assert.ok(client.calls.some((call) => call.command.includes("PI_SSH_REMOTE_FIND")));
+  assert.ok(client.calls.some((call) => call.command.includes("PI_SSH_REMOTE_GREP")));
+});
+
+test("optional search tools fail closed when SSH is unavailable", async () => {
+  const harness = createExtensionHarness({
+    flag: "offline-host",
+    activeTools: ["read", "grep", "find", "ls"],
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => new FakeSshClient(options),
+    selectRemote: async () => { throw new Error("connection refused"); },
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  for (const name of ["grep", "find", "ls"]) {
+    await assert.rejects(
+      () => harness.tools.get(name).execute(
+        `${name}-offline`,
+        name === "grep"
+          ? { pattern: "secret" }
+          : name === "find"
+            ? { pattern: "*.ts" }
+            : {},
+        undefined,
+        undefined,
+        harness.ctx,
+      ),
+      /SSH remote is unavailable: connection refused/,
+    );
+  }
+});
+
+test("startup connection failure leaves the session alive for reconnect", async () => {
+  // A failed connection during session_start keeps the session running in a
+  // failed state so /ssh-reconnect and /ssh-status stay available.
+  const clients: FakeSshClient[] = [];
+  let failNextProbe = false;
+  const harness = createExtensionHarness({ flag: "devbox:/srv/project" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async () => {
+      if (failNextProbe) throw new Error("temporary failure");
+      return {
+        adapter: new UnixBashAdapter(clients.at(-1)!, "linux"),
+        workspace: {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd: "/srv/project",
+        },
+      };
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(harness.getShutdowns(), 0);
+  assert.equal(harness.statuses.has("ssh-remote"), true);
+
+  // A failed reconnect keeps the session alive for another attempt.
+  failNextProbe = true;
+  await harness.commands.get("ssh-reconnect").handler("", harness.ctx);
+  assert.equal(harness.getShutdowns(), 0);
+  assert.ok(
+    harness.notifications.some((n) => n.message.includes("temporary failure")),
+  );
+
+  // Recovery works once the remote is reachable again.
+  failNextProbe = false;
+  await harness.commands.get("ssh-reconnect").handler("", harness.ctx);
+  assert.equal(harness.getShutdowns(), 0);
+  assert.ok(
+    harness.notifications.some((n) => n.message.includes("SSH remote active")),
+  );
+});
+
+test("background resolver fails closed while SSH is unavailable", async () => {
+  // A session whose SSH connection failed registers a state-aware background
+  // resolver: bg tasks fail with the probe error instead of silently running
+  // on the local machine.
+  const harness = createExtensionHarness({ flag: "offline-host" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => new FakeSshClient(options),
+    selectRemote: async () => {
+      throw new Error("connection refused");
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+  const register = harness.events.find((event) => event.name === "bg:register");
+  assert.ok(register);
+  const resolveShell = register.payload.resolveShell;
+  assert.throws(
+    () => resolveShell("pwd", false, { cwd: "/local/project", projectTrusted: true }),
+    /SSH remote is unavailable: connection refused/,
+  );
+
+  // Sessions without any SSH intent never register a resolver, so background
+  // tasks keep using the default local shell backend.
+  const local = createExtensionHarness();
+  createSshRemoteExtension({ platform: "linux" })(local.pi);
+  await local.emit("session_start", { reason: "startup" });
+  assert.equal(local.events.filter((event) => event.name === "bg:register").length, 0);
+});
+
+test("bg_start is blocked while the SSH workspace is unavailable", async () => {
+  const harness = createExtensionHarness({ flag: "offline-host" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => new FakeSshClient(options),
+    selectRemote: async () => {
+      throw new Error("connection refused");
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  const blocked = await harness.emit("tool_call", {
+    toolName: "bg_start",
+    toolCallId: "bg-1",
+    input: { name: "x", command: "echo hi" },
+  });
+  assert.deepEqual(blocked, {
+    block: true,
+    reason: "SSH remote is unavailable: connection refused",
+  });
+
+  // Non-bg tools and active sessions are unaffected.
+  const other = await harness.emit("tool_call", {
+    toolName: "bash",
+    toolCallId: "b-1",
+    input: { command: "pwd" },
+  });
+  assert.equal(other, undefined);
+});
+
 test("extension persists, routes, prompts, and restores an SSH workspace", async () => {
   const clients: FakeSshClient[] = [];
   const extension = createSshRemoteExtension({
-    platform: "linux",
+    platform: process.platform,
     createClient: (options) => {
       const client = new FakeSshClient(
         options,
@@ -646,14 +1071,17 @@ test("extension persists, routes, prompts, and restores an SSH workspace", async
 test("extension routes Windows workspaces through PowerShell without exposing logical paths", async () => {
   const clients: FakeWindowsSshClient[] = [];
   const extension = createSshRemoteExtension({
-    platform: "linux",
+    platform: process.platform,
     createClient: (options) => {
       const client = new FakeWindowsSshClient(options);
       clients.push(client);
       return client;
     },
   });
-  const harness = createExtensionHarness({ flag: "winbox" });
+  const harness = createExtensionHarness({
+    flag: "winbox",
+    activeTools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+  });
   extension(harness.pi);
 
   await harness.emit("session_start", { reason: "startup" });
@@ -700,7 +1128,37 @@ test("extension routes Windows workspaces through PowerShell without exposing lo
   }) as { systemPrompt: string };
   assert.match(prompt.systemPrompt, /Current working directory: C:\\Users\\Admin/);
   assert.match(prompt.systemPrompt, /PowerShell syntax, not Bash syntax/);
+  assert.doesNotMatch(prompt.systemPrompt, /compatible|bg_\*|codex_image/);
+  assert.equal(
+    clients[0].options.executable,
+    process.platform === "win32" ? "ssh.exe" : undefined,
+  );
   assert.ok(harness.events.some((event) => event.name === "bg:register"));
+
+  const lsResult = await harness.tools.get("ls").execute(
+    "ls-win",
+    {},
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(lsResult.content[0].text, "README.md\nsrc/");
+  const findResult = await harness.tools.get("find").execute(
+    "find-win",
+    { pattern: "**/*.ts" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(findResult.content[0].text, "src/main.ts");
+  const grepResult = await harness.tools.get("grep").execute(
+    "grep-win",
+    { pattern: "RemoteMatch" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(grepResult.content[0].text, "src/main.ts:8: RemoteMatch()");
 
   await harness.emit("session_shutdown", { reason: "quit" });
   assert.equal(clients[0].disposed, true);
@@ -708,7 +1166,7 @@ test("extension routes Windows workspaces through PowerShell without exposing lo
   const resumedClients: FakeWindowsSshClient[] = [];
   const resumed = createExtensionHarness({ branch: [sessionEntry(saved)] });
   createSshRemoteExtension({
-    platform: "linux",
+    platform: process.platform,
     createClient: (options) => {
       const client = new FakeWindowsSshClient(options);
       resumedClients.push(client);
@@ -777,12 +1235,85 @@ test("workspace files provider maps Unix paths and reports existing files", asyn
   await harness.emit("session_shutdown", { reason: "quit" });
 });
 
-test("Windows clients leave core tools to the local PowerShell adapter", async () => {
-  const harness = createExtensionHarness({ flag: "winbox" });
+test("Windows local sessions leave core tools to the PowerShell adapter", async () => {
+  const harness = createExtensionHarness({ cwd: "C:\\local\\project" });
   createSshRemoteExtension({ platform: "win32" })(harness.pi);
   assert.equal(harness.tools.size, 0);
   await harness.emit("session_start", { reason: "startup" });
-  assert.match(harness.notifications.at(-1)?.message ?? "", /Linux and macOS clients only/);
+  assert.equal(harness.tools.size, 0);
+  assert.equal(harness.notifications.length, 0);
+});
+
+test("Windows clients route Unix workspaces through ssh.exe", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({
+    flag: "devbox:/srv/project",
+    cwd: "C:\\local\\project",
+  });
+  createSshRemoteExtension({
+    platform: "win32",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(clients[0].options.executable, "ssh.exe");
+  const result = await harness.tools.get("bash").execute(
+    "bash-win-client",
+    { command: "pwd" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(result.content[0].text, "(no output)");
+  assert.ok(clients[0].calls.some((call) => call.command.includes("exec bash -lc")));
+  const background = harness.events.find((event) => event.name === "bg:register")
+    ?.payload as {
+      resolveShell: (
+        command: string,
+        interactive: boolean,
+        context: { cwd: string; projectTrusted: boolean },
+      ) => { file: string; cwd?: string };
+    };
+  const launch = background.resolveShell("pwd", false, {
+    cwd: "C:\\local\\project\\src",
+    projectTrusted: true,
+  });
+  assert.equal(launch.file, "ssh.exe");
+  assert.equal(launch.cwd, "C:\\local\\project");
+});
+
+test("Windows clients route Windows shells through ssh.exe", async () => {
+  const clients: FakeWindowsSshClient[] = [];
+  const harness = createExtensionHarness({
+    flag: "winbox",
+    cwd: "C:\\local\\project",
+  });
+  createSshRemoteExtension({
+    platform: "win32",
+    createClient: (options) => {
+      const client = new FakeWindowsSshClient(options);
+      clients.push(client);
+      return client;
+    },
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(clients[0].options.executable, "ssh.exe");
+  const result = await harness.tools.get("bash").execute(
+    "pwsh-win-client",
+    { command: "Get-Location" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(result.content[0].text, "(no output)");
+  assert.ok(clients[0].calls.some((call) =>
+    decodePowerShellInvocation(call.command).includes("Get-Location")
+  ));
 });
 
 test("session state migrates Unix v1 entries and validates Windows v2 paths", () => {
@@ -858,7 +1389,9 @@ test("resumed sessions reconnect without --ssh and reject a different target", a
     flag: "production:/srv/project",
     branch: [sessionEntry(stored)],
   });
-  createSshRemoteExtension({ platform: "linux" })(conflicting.pi);
+  createSshRemoteExtension({
+    platform: "linux",
+  })(conflicting.pi);
   await conflicting.emit("session_start", { reason: "resume" });
   assert.match(conflicting.notifications.at(-1)?.message ?? "", /bound to devbox:\/srv\/project/);
   assert.equal(conflicting.statuses.get("ssh-remote"), "SSH: Disconnected");

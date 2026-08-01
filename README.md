@@ -22,7 +22,7 @@ fold long reasoning traces, and keep model-authored plans visible in the TUI.
 | codex-api | [`@99percentpeople/pi-codex-api`](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation/editing, first-party search, Fast mode, and subscription usage status |
 | cursor-effect | [`@99percentpeople/pi-cursor-effect`](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Selectable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
-| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi file, shell, and compatible background tools to remote Unix or Windows workspaces through OpenSSH |
+| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi file and shell tools to remote Unix or Windows workspaces through OpenSSH |
 | thinking-fold | [`@99percentpeople/pi-thinking-fold`](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Live tail previews for long reasoning traces with full summaries and Ctrl+T expansion |
 | todo | [`@99percentpeople/pi-todo`](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Minimal atomic whole-plan todo writes with dependencies and a read-only list above the input |
 
@@ -210,9 +210,9 @@ model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 
 ## ssh-remote
 
-`ssh-remote` keeps Pi local while routing `read`, `write`, `edit`, `bash`, user
-`!`/`!!`, and compatible `background-tasks` launches through the system
-OpenSSH client. Targets use rsync-style syntax such as
+`ssh-remote` keeps Pi local while routing `read`, `write`, `edit`, `bash`, the
+optional `grep`, `find`, and `ls` tools, and user `!`/`!!` commands through the
+system OpenSSH client. Targets use rsync-style syntax such as
 `devbox:/srv/project`, so normal `~/.ssh/config` aliases, keys, ports,
 `ProxyJump`, and multiplexing continue to work. Unix hosts use Bash; Windows
 OpenSSH hosts use PowerShell 7 or Windows PowerShell 5.1. The resolved target,
@@ -223,9 +223,8 @@ automatic `SSH target:path (branch) • first message` session name places the
 remote location and opening request in Pi's normal footer and native `/resume`
 list without replacing the footer. When `codex-api` is installed, its image
 output and reference paths use SSH Remote's shared binary workspace backend,
-including native Windows paths, without local staging. Version 0.1.0 supports
-Linux and macOS clients with Unix or Windows
-remote hosts. See the
+including native Windows paths, without local staging. Version 0.2.0 supports
+Linux, macOS, and Windows clients with Unix or Windows remote hosts. See the
 [ssh-remote package documentation](extensions/ssh-remote/README.md).
 
 ## codex-api
@@ -378,10 +377,25 @@ tests/
 ├── shared-settings.test.ts
 ├── workspace-files.test.ts
 ├── ssh-remote.test.ts
+├── ssh-remote-windows-integration.test.ts
 ├── thinking-fold.test.ts
 ├── todo.test.ts
+├── README.md
 └── packages.test.ts
+e2e/
+├── README.md
+├── remote-windows-smoke.ts
+└── local-windows-smoke.ts
 ```
+
+Windows-specific verification needs a live Windows SSH host and is documented
+next to the code, not here:
+
+- [tests/README.md](tests/README.md) — unit vs integration layout, and how to
+  run the Windows integration suite (`PI_SSH_TEST_HOST` / `PI_SSH_TEST_SHELL`).
+- [e2e/README.md](e2e/README.md) — end-to-end smoke scripts for both
+  directions: `remote-windows-smoke.ts` (Pi on Linux/macOS → Windows remote)
+  and `local-windows-smoke.ts` (Pi running on Windows), no model required.
 
 ## Automated npm releases
 

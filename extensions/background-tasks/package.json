@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-background-tasks",
-  "version": "1.2.7",
+  "version": "1.2.8",
   "description": "Background tasks, explicit waits, logs, signals, and PTY/TUI support for Pi",
   "type": "module",
   "files": [

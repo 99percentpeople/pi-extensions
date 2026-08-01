@@ -76,7 +76,7 @@ test("extensions are independently publishable workspace packages", async () => 
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "1.2.7");
+  assert.equal(background.version, "1.2.8");
   assertBuiltExtensionPackage(background);
   assert.deepEqual(background.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
@@ -123,7 +123,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
-  assert.equal(sshRemote.version, "0.1.0");
+  assert.equal(sshRemote.version, "0.2.0");
   assertBuiltExtensionPackage(sshRemote);
   assert.deepEqual(sshRemote.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");

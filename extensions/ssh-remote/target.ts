@@ -5,7 +5,7 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { posix } from "node:path";
+import { posix, win32 } from "node:path";
 
 export interface ParsedSshTarget {
   target: string;
@@ -68,7 +68,9 @@ export function shellQuote(value: string): string {
 
 export function expandLocalPath(value: string, cwd: string): string {
   if (value === "~") return homedir();
-  if (value.startsWith("~/")) return resolve(homedir(), value.slice(2));
+  if (value.startsWith("~/") || value.startsWith("~\\")) {
+    return resolve(homedir(), value.slice(2));
+  }
   return resolve(cwd, value);
 }
 
@@ -87,17 +89,36 @@ export function normalizeRemoteToolPath(value: string, remoteHome: string): stri
   return normalizeRemoteHomePath(stripped, remoteHome);
 }
 
-function isInsideLocalRoot(root: string, value: string): boolean {
-  const fromRoot = relative(root, value);
+interface LocalPathApi {
+  isAbsolute(value: string): boolean;
+  relative(from: string, to: string): string;
+  resolve(...paths: string[]): string;
+  readonly sep: string;
+}
+
+const nativeLocalPathApi: LocalPathApi = { isAbsolute, relative, resolve, sep };
+
+function localPathApi(cwd: string): LocalPathApi {
+  return /^[A-Za-z]:[\\/]/.test(cwd) || /^\\\\[^\\]/.test(cwd)
+    ? win32
+    : nativeLocalPathApi;
+}
+
+function isInsideLocalRoot(
+  api: LocalPathApi,
+  root: string,
+  value: string,
+): boolean {
+  const fromRoot = api.relative(root, value);
   return fromRoot === "" || (
-    !fromRoot.startsWith(`..${sep}`)
+    !fromRoot.startsWith(`..${api.sep}`)
     && fromRoot !== ".."
-    && !isAbsolute(fromRoot)
+    && !api.isAbsolute(fromRoot)
   );
 }
 
-function toPosix(value: string): string {
-  return value.split(sep).join(posix.sep);
+function toPosix(value: string, separator: string): string {
+  return value.split(separator).join(posix.sep);
 }
 
 /**
@@ -110,18 +131,27 @@ export function mapCwdToRemote(
   localCwd: string,
   remoteCwd: string,
 ): string {
-  if (!isAbsolute(value)) {
-    return posix.resolve(remoteCwd, toPosix(value));
+  const api = localPathApi(localCwd);
+  if (!api.isAbsolute(value)) {
+    return posix.resolve(remoteCwd, toPosix(value, api.sep));
   }
 
-  const localRoot = resolve(localCwd);
-  const absolute = resolve(value);
-  if (isInsideLocalRoot(localRoot, absolute)) {
-    const fromRoot = relative(localRoot, absolute);
+  const localRoot = api.resolve(localCwd);
+  const absolute = api.resolve(value);
+  if (isInsideLocalRoot(api, localRoot, absolute)) {
+    const fromRoot = api.relative(localRoot, absolute);
     return fromRoot
-      ? posix.resolve(remoteCwd, toPosix(fromRoot))
+      ? posix.resolve(remoteCwd, toPosix(fromRoot, api.sep))
       : posix.normalize(remoteCwd);
   }
 
-  return posix.normalize(toPosix(value));
+  if (
+    api === win32
+    && (/^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\]/.test(value))
+  ) {
+    throw new Error(
+      `Cannot map local absolute cwd to the remote Unix workspace: ${value}`,
+    );
+  }
+  return posix.normalize(toPosix(value, api.sep));
 }

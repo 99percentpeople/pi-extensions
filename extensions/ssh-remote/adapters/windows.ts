@@ -1,3 +1,4 @@
+import { gzipSync } from "node:zlib";
 import {
   isAbsolute as isLocalAbsolute,
   relative as localRelative,
@@ -6,11 +7,20 @@ import {
   win32,
 } from "node:path";
 import type { SshExecutor, SshRunOptions } from "../client.ts";
-import type { RemoteAdapter, RemoteShell, RemoteWorkspace } from "./types.ts";
+import type {
+  RemoteAdapter,
+  RemoteDirectoryEntry,
+  RemoteFindEntry,
+  RemoteGrepMatch,
+  RemoteGrepOptions,
+  RemoteShell,
+  RemoteWorkspace,
+} from "./types.ts";
 
 const WINDOWS_ENV_START = "\u001ePI_SSH_WINDOWS_ENV\u001f";
 const WINDOWS_CWD_START = "\u001ePI_SSH_WINDOWS_CWD\u001f";
 const VIRTUAL_WINDOWS_ROOT = "/__pi_ssh_remote_windows__";
+const WINDOWS_LOCAL_WINDOWS_ROOT = "C:\\__pi_ssh_remote_windows__";
 const REMOTE_SESSION_ENV_KEYS = [
   "PI_SESSION_ID",
   "PI_PROVIDER",
@@ -77,21 +87,37 @@ export function resolveWindowsRemotePath(
   return validateWindowsPath("path", resolved);
 }
 
-export function encodeWindowsToolPath(nativePath: string): string {
+export function encodeWindowsToolPath(
+  nativePath: string,
+  localPlatform: NodeJS.Platform = process.platform,
+): string {
   const normalized = validateWindowsPath("path", nativePath);
+  let kind: "drive" | "unc";
+  let components: string[];
   if (normalized.startsWith("\\\\")) {
-    const components = normalized.slice(2).split("\\").filter(Boolean);
+    kind = "unc";
+    components = normalized.slice(2).split("\\").filter(Boolean);
     if (components.length < 2) throw new Error(`Invalid UNC path: ${nativePath}`);
-    return `${VIRTUAL_WINDOWS_ROOT}/unc/${components.map(encodeSegment).join("/")}`;
+  } else {
+    kind = "drive";
+    components = [
+      normalized.slice(0, 1).toUpperCase(),
+      ...normalized.slice(3).split("\\").filter(Boolean),
+    ];
   }
 
-  const drive = normalized.slice(0, 1).toUpperCase();
-  const rest = normalized.slice(3).split("\\").filter(Boolean);
-  return `${VIRTUAL_WINDOWS_ROOT}/drive/${encodeSegment(drive)}${rest.length ? `/${rest.map(encodeSegment).join("/")}` : ""}`;
+  const encoded = components.map(encodeSegment);
+  return localPlatform === "win32"
+    ? win32.join(WINDOWS_LOCAL_WINDOWS_ROOT, kind, ...encoded)
+    : `${VIRTUAL_WINDOWS_ROOT}/${kind}/${encoded.join("/")}`;
 }
 
 export function decodeWindowsToolPath(toolPath: string): string {
-  const normalized = toolPath.replace(/\\/g, "/");
+  let normalized = toolPath.replace(/\\/g, "/");
+  const windowsLocal = /^[A-Za-z]:(\/__pi_ssh_remote_windows__(?:\/|$).*)$/i.exec(
+    normalized,
+  );
+  if (windowsLocal) normalized = windowsLocal[1];
   if (!normalized.startsWith(`${VIRTUAL_WINDOWS_ROOT}/`)) {
     throw new Error(`Invalid logical Windows tool path: ${toolPath}`);
   }
@@ -127,7 +153,27 @@ export function buildPowerShellInvocation(
   nonInteractive = true,
 ): string {
   const mode = nonInteractive ? " -NonInteractive" : "";
-  return `${powerShellExecutable(shell)} -NoLogo -NoProfile${mode} -EncodedCommand ${encodePowerShell(script)}`;
+  let encoded = encodePowerShell(script);
+  if (encoded.length > 6_000) {
+    const compressed = gzipSync(Buffer.from(script, "utf8")).toString("base64");
+    const loader = `
+$data = [Convert]::FromBase64String('${compressed}')
+$inputStream = New-Object IO.MemoryStream(,$data)
+$gzip = New-Object IO.Compression.GzipStream($inputStream, [IO.Compression.CompressionMode]::Decompress)
+$reader = New-Object IO.StreamReader($gzip, [Text.Encoding]::UTF8)
+try { $source = $reader.ReadToEnd() } finally { $reader.Dispose(); $gzip.Dispose(); $inputStream.Dispose() }
+& ([ScriptBlock]::Create($source))
+`;
+    encoded = encodePowerShell(loader);
+  }
+  if (encoded.length > 7_500) {
+    throw new Error("PowerShell control script exceeds the Windows command-line limit");
+  }
+  return `${powerShellExecutable(shell)} -NoLogo -NoProfile${mode} -EncodedCommand ${encoded}`;
+}
+
+function decodeUtf8Base64(value: string): string {
+  return Buffer.from(value, "base64").toString("utf8");
 }
 
 function utf8BytesExpression(value: string): string {
@@ -148,6 +194,7 @@ $stdout.Write($bytes, 0, $bytes.Length)
 function wrappedPowerShellScript(body: string): string {
   return `
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8
 [Console]::OutputEncoding = $utf8
@@ -169,12 +216,34 @@ function parseFrame(text: string, prefix: string): string | undefined {
   return start === -1 || end === -1 ? undefined : text.slice(start + marker.length, end);
 }
 
-function isInsideLocalRoot(root: string, value: string): boolean {
-  const fromRoot = localRelative(root, value);
+interface LocalPathApi {
+  isAbsolute(value: string): boolean;
+  relative(from: string, to: string): string;
+  resolve(...paths: string[]): string;
+  readonly sep: string;
+}
+
+const nativeLocalPathApi: LocalPathApi = {
+  isAbsolute: isLocalAbsolute,
+  relative: localRelative,
+  resolve: resolveLocal,
+  sep: localSeparator,
+};
+
+function localPathApi(cwd: string): LocalPathApi {
+  return isFullyQualifiedWindowsPath(cwd) ? win32 : nativeLocalPathApi;
+}
+
+function isInsideLocalRoot(
+  api: LocalPathApi,
+  root: string,
+  value: string,
+): boolean {
+  const fromRoot = api.relative(root, value);
   return fromRoot === "" || (
-    !fromRoot.startsWith(`..${localSeparator}`)
+    !fromRoot.startsWith(`..${api.sep}`)
     && fromRoot !== ".."
-    && !isLocalAbsolute(fromRoot)
+    && !api.isAbsolute(fromRoot)
   );
 }
 
@@ -209,6 +278,7 @@ export class WindowsPowerShellAdapter implements RemoteAdapter {
   constructor(
     private readonly executor: SshExecutor,
     readonly shell: "pwsh" | "powershell",
+    private readonly localPlatform: NodeJS.Platform = process.platform,
   ) {}
 
   async inspectWorkspace(requestedCwd?: string): Promise<RemoteWorkspace> {
@@ -254,7 +324,10 @@ ${writeFrameScript("PI_SSH_WINDOWS_CWD", ["$cwdPath"])}
   }
 
   toToolPath(path: string, workspace: RemoteWorkspace): string {
-    return encodeWindowsToolPath(resolveWindowsRemotePath(path, workspace.home, workspace.cwd));
+    return encodeWindowsToolPath(
+      resolveWindowsRemotePath(path, workspace.home, workspace.cwd),
+      this.localPlatform,
+    );
   }
 
   fromToolPath(path: string): string {
@@ -266,16 +339,24 @@ ${writeFrameScript("PI_SSH_WINDOWS_CWD", ["$cwdPath"])}
     const expanded = normalizeWindowsHomePath(stripped, workspace.home);
     if (expanded.startsWith(VIRTUAL_WINDOWS_ROOT)) return this.fromToolPath(expanded);
 
-    if (isLocalAbsolute(expanded) && !isFullyQualifiedWindowsPath(expanded)) {
-      const localRoot = resolveLocal(localCwd);
-      const absolute = resolveLocal(expanded);
-      if (!isInsideLocalRoot(localRoot, absolute)) {
-        throw new Error(`Cannot map local absolute cwd to the remote Windows workspace: ${value}`);
+    const localPaths = localPathApi(localCwd);
+    if (localPaths.isAbsolute(expanded)) {
+      const localRoot = localPaths.resolve(localCwd);
+      const absolute = localPaths.resolve(expanded);
+      if (isInsideLocalRoot(localPaths, localRoot, absolute)) {
+        const relative = localPaths.relative(localRoot, absolute);
+        return relative
+          ? win32.resolve(
+              workspace.cwd,
+              relative.split(localPaths.sep).join("\\"),
+            )
+          : workspace.cwd;
       }
-      const relative = localRelative(localRoot, absolute);
-      return relative
-        ? win32.resolve(workspace.cwd, relative.split(localSeparator).join("\\"))
-        : workspace.cwd;
+      if (!isFullyQualifiedWindowsPath(expanded)) {
+        throw new Error(
+          `Cannot map local absolute cwd to the remote Windows workspace: ${value}`,
+        );
+      }
     }
     if (isFullyQualifiedWindowsPath(expanded)) {
       return validateWindowsPath("working directory", expanded);
@@ -347,6 +428,172 @@ try { $inputStream.CopyTo($outputStream) } finally { $outputStream.Dispose() }
     await this.runScript(script, { input: content, signal });
   }
 
+  async listDirectory(
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<RemoteDirectoryEntry[]> {
+    const nativePath = this.fromToolPath(path);
+    const result = await this.runScript(`
+# PI_SSH_REMOTE_LS
+$path = ${utf8BytesExpression(nativePath)}
+if (-not [IO.Directory]::Exists($path)) {
+  if ([IO.File]::Exists($path)) { throw "Not a directory: $path" }
+  throw "Path not found: $path"
+}
+foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($path)) {
+  $name = [IO.Path]::GetFileName($entry)
+  $kind = $(if ([IO.Directory]::Exists($entry)) { 'D' } else { 'F' })
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($name))
+  [Console]::Out.WriteLine("$kind\`t$encoded")
+}
+`, { signal });
+    const entries: RemoteDirectoryEntry[] = [];
+    for (const line of result.stdout.toString("utf8").split(/\r?\n/)) {
+      if (!line) continue;
+      const [kind, encoded] = line.split("\t", 2);
+      if (!encoded) continue;
+      entries.push({ name: decodeUtf8Base64(encoded), isDirectory: kind === "D" });
+    }
+    return entries;
+  }
+
+  async findEntries(
+    path: string,
+    pattern: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<RemoteFindEntry[]> {
+    const nativePath = this.fromToolPath(path);
+    const result = await this.runScript(`
+# PI_SSH_REMOTE_FIND
+$root = [IO.Path]::GetFullPath(${utf8BytesExpression(nativePath)})
+if (-not [IO.Directory]::Exists($root)) { throw "Path not found: $root" }
+$pattern = ${utf8BytesExpression(pattern.replace(/\\/g, "/"))}
+$matchPath = $pattern.Contains('/')
+$matcher = New-Object System.Management.Automation.WildcardPattern($pattern, [System.Management.Automation.WildcardOptions]::IgnoreCase)
+$stack = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+$stack.Push([IO.DirectoryInfo]::new($root))
+$count = 0
+while ($stack.Count -gt 0 -and $count -lt ${limit}) {
+  $directory = $stack.Pop()
+  try { $entries = $directory.EnumerateFileSystemInfos() } catch { continue }
+  foreach ($entry in $entries) {
+    $isDirectory = ($entry.Attributes -band [IO.FileAttributes]::Directory) -ne 0
+    if ($isDirectory -and ($entry.Name -eq '.git' -or $entry.Name -eq 'node_modules')) { continue }
+    $relative = $entry.FullName.Substring($root.Length).TrimStart('\\', '/').Replace('\\', '/')
+    $target = $(if ($matchPath) { $relative } else { $entry.Name })
+    if ($matcher.IsMatch($target)) {
+      $kind = $(if ($isDirectory) { 'D' } else { 'F' })
+      $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($relative))
+      [Console]::Out.WriteLine("$kind\`t$encoded")
+      $count += 1
+      if ($count -ge ${limit}) { break }
+    }
+    if ($isDirectory -and ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+      $stack.Push([IO.DirectoryInfo]$entry)
+    }
+  }
+}
+`, { signal });
+    const entries: RemoteFindEntry[] = [];
+    for (const line of result.stdout.toString("utf8").split(/\r?\n/)) {
+      if (!line) continue;
+      const [kind, encoded] = line.split("\t", 2);
+      if (!encoded) continue;
+      entries.push({
+        path: decodeUtf8Base64(encoded).replace(/\\/g, "/"),
+        isDirectory: kind === "D",
+      });
+    }
+    return entries;
+  }
+
+  async grep(
+    path: string,
+    pattern: string,
+    options: RemoteGrepOptions,
+    signal?: AbortSignal,
+  ): Promise<RemoteGrepMatch[]> {
+    const nativePath = this.fromToolPath(path);
+    const glob = options.glob?.replace(/\\/g, "/") ?? "";
+    const result = await this.runScript(`
+# PI_SSH_REMOTE_GREP
+$root = [IO.Path]::GetFullPath(${utf8BytesExpression(nativePath)})
+if (-not [IO.Directory]::Exists($root) -and -not [IO.File]::Exists($root)) { throw "Path not found: $root" }
+$pattern = ${utf8BytesExpression(pattern)}
+$regexPattern = $(if (${options.literal ? "$true" : "$false"}) { [Regex]::Escape($pattern) } else { $pattern })
+$regexOptions = [Text.RegularExpressions.RegexOptions]::CultureInvariant
+if (${options.ignoreCase ? "$true" : "$false"}) { $regexOptions = $regexOptions -bor [Text.RegularExpressions.RegexOptions]::IgnoreCase }
+$regex = [Regex]::new($regexPattern, $regexOptions)
+$glob = ${utf8BytesExpression(glob)}
+$matchPath = $glob.Contains('/')
+$globMatcher = $(if ($glob) { New-Object System.Management.Automation.WildcardPattern($glob, [System.Management.Automation.WildcardOptions]::IgnoreCase) } else { $null })
+$files = New-Object 'System.Collections.Generic.Stack[System.IO.FileInfo]'
+if ([IO.File]::Exists($root)) {
+  $files.Push([IO.FileInfo]::new($root))
+  $searchRoot = [IO.Path]::GetDirectoryName($root)
+} else {
+  $searchRoot = $root
+  $directories = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+  $directories.Push([IO.DirectoryInfo]::new($root))
+  while ($directories.Count -gt 0) {
+    $directory = $directories.Pop()
+    try { $entries = $directory.EnumerateFileSystemInfos() } catch { continue }
+    foreach ($entry in $entries) {
+      $isDirectory = ($entry.Attributes -band [IO.FileAttributes]::Directory) -ne 0
+      if ($isDirectory) {
+        if ($entry.Name -eq '.git' -or $entry.Name -eq 'node_modules') { continue }
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $directories.Push([IO.DirectoryInfo]$entry) }
+      } else {
+        $files.Push([IO.FileInfo]$entry)
+      }
+    }
+  }
+}
+$count = 0
+while ($files.Count -gt 0 -and $count -lt ${options.limit}) {
+  $file = $files.Pop()
+  $relative = $file.FullName.Substring($searchRoot.Length).TrimStart('\\', '/').Replace('\\', '/')
+  $target = $(if ($matchPath) { $relative } else { $file.Name })
+  if ($null -ne $globMatcher -and -not $globMatcher.IsMatch($target)) { continue }
+  $lineNumber = 0
+  try {
+    foreach ($text in [IO.File]::ReadLines($file.FullName)) {
+      $lineNumber += 1
+      if ($text.IndexOf([char]0) -ge 0) { break }
+      if ($regex.IsMatch($text)) {
+        $encodedPath = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($relative))
+        $encodedFullPath = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($file.FullName))
+        $encodedText = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text))
+        [Console]::Out.WriteLine("$encodedPath\`t$lineNumber\`t$encodedText\`t$encodedFullPath")
+        $count += 1
+        if ($count -ge ${options.limit}) { break }
+      }
+    }
+  } catch { continue }
+}
+`, { signal });
+    const matches: RemoteGrepMatch[] = [];
+    for (const line of result.stdout.toString("utf8").split(/\r?\n/)) {
+      if (!line) continue;
+      const [encodedPath, rawLineNumber, encodedText, encodedFullPath] = line.split("\t", 4);
+      if (!encodedPath || !encodedText || !encodedFullPath) continue;
+      const relative = decodeUtf8Base64(encodedPath).replace(/\\/g, "/");
+      const lineNumber = Number(rawLineNumber);
+      if (!Number.isInteger(lineNumber) || lineNumber < 1) continue;
+      matches.push({
+        path: relative,
+        toolPath: encodeWindowsToolPath(
+          decodeUtf8Base64(encodedFullPath),
+          this.localPlatform,
+        ),
+        lineNumber,
+        line: decodeUtf8Base64(encodedText),
+      });
+    }
+    return matches;
+  }
+
   buildShellCommand(
     command: string,
     cwd: string,
@@ -359,7 +606,7 @@ try { $inputStream.CopyTo($outputStream) } finally { $outputStream.Dispose() }
   async runShell(
     command: string,
     cwd: string,
-    options: SshRunOptions & { env?: NodeJS.ProcessEnv },
+    options: SshRunOptions & { env?: NodeJS.ProcessEnv } = {},
   ): Promise<number | null> {
     const { env, ...runOptions } = options;
     const result = await this.executor.run(this.buildShellCommand(command, cwd, env), runOptions);

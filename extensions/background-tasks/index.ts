@@ -97,7 +97,11 @@ interface ShellResolverContext {
   projectTrusted: boolean;
 }
 
-type ShellResolver = (command: string, interactive: boolean, context?: ShellResolverContext) => ShellLaunch;
+type ShellResolver = (
+  command: string,
+  interactive: boolean,
+  context?: ShellResolverContext,
+) => ShellLaunch | undefined;
 
 interface BgTask {
   id: string;
@@ -1739,10 +1743,15 @@ export default function (pi: ExtensionAPI) {
       const stderrLogKey = taskLogKey(id, "stderr");
       const mode = params.pty ? "pty" : "pipe";
       const cwd = params.cwd || ctx.cwd;
-      const shell = resolveShell(params.command, mode === "pty", {
-        cwd,
-        projectTrusted: ctx.isProjectTrusted(),
-      });
+      const shell =
+        resolveShell(params.command, mode === "pty", {
+          cwd,
+          projectTrusted: ctx.isProjectTrusted(),
+        }) ??
+        defaultShellResolver(params.command, mode === "pty", {
+          cwd,
+          projectTrusted: ctx.isProjectTrusted(),
+        });
       const launchCwd = shell.cwd ?? cwd;
       const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
         MIN_TERMINAL_COLS,

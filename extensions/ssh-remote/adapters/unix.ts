@@ -5,7 +5,15 @@ import {
   normalizeRemoteHomePath,
   shellQuote,
 } from "../target.ts";
-import type { RemoteAdapter, RemoteWorkspace } from "./types.ts";
+import { posix, win32 } from "node:path";
+import type {
+  RemoteAdapter,
+  RemoteDirectoryEntry,
+  RemoteFindEntry,
+  RemoteGrepMatch,
+  RemoteGrepOptions,
+  RemoteWorkspace,
+} from "./types.ts";
 
 const ENV_START = "\u001ePI_SSH_UNIX_ENV\u001f";
 const CWD_START = "\u001ePI_SSH_UNIX_CWD\u001f";
@@ -22,6 +30,46 @@ const REMOTE_SESSION_ENV_KEYS = [
   "PI_MODEL",
   "PI_REASONING_LEVEL",
 ] as const;
+const WINDOWS_LOCAL_UNIX_ROOT = "C:\\__pi_ssh_remote_unix__";
+
+function encodeUnixSegment(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url");
+}
+
+function decodeUnixSegment(value: string): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error("Invalid encoded Unix path segment");
+  }
+  return Buffer.from(value, "base64url").toString("utf8");
+}
+
+function encodeUnixToolPath(nativePath: string): string {
+  const normalized = posix.normalize(validateUnixPath("path", nativePath));
+  const segments = normalized.slice(1).split("/").filter(Boolean);
+  return win32.join(
+    WINDOWS_LOCAL_UNIX_ROOT,
+    "root",
+    ...segments.map(encodeUnixSegment),
+  );
+}
+
+function decodeUnixToolPath(toolPath: string): string {
+  const normalized = win32.normalize(toolPath);
+  const relative = win32.relative(WINDOWS_LOCAL_UNIX_ROOT, normalized);
+  if (
+    !relative
+    || relative === ".."
+    || relative.startsWith(`..${win32.sep}`)
+    || win32.isAbsolute(relative)
+  ) {
+    throw new Error(`Invalid logical Unix tool path: ${toolPath}`);
+  }
+  const parts = relative.split(win32.sep).filter(Boolean);
+  if (parts.shift()?.toLowerCase() !== "root") {
+    throw new Error(`Invalid logical Unix tool path: ${toolPath}`);
+  }
+  return posix.resolve("/", ...parts.map(decodeUnixSegment));
+}
 
 function validateUnixPath(label: string, value: string): string {
   if (!value || !value.startsWith("/") || /[\0\r\n\u001e\u001f]/.test(value)) {
@@ -34,6 +82,12 @@ function parseFrame(text: string, prefix: string): string | undefined {
   const start = text.lastIndexOf(prefix);
   const end = start === -1 ? -1 : text.indexOf("\u001e", start + prefix.length);
   return start === -1 || end === -1 ? undefined : text.slice(start + prefix.length, end);
+}
+
+function splitNul(buffer: Buffer): string[] {
+  const values = buffer.toString("utf8").split("\0");
+  if (values.at(-1) === "") values.pop();
+  return values;
 }
 
 function remoteSessionExports(env: NodeJS.ProcessEnv | undefined): string {
@@ -58,7 +112,10 @@ export class UnixBashAdapter implements RemoteAdapter {
   readonly platform = "unix" as const;
   readonly shell = "bash" as const;
 
-  constructor(private readonly executor: SshExecutor) {}
+  constructor(
+    private readonly executor: SshExecutor,
+    private readonly localPlatform: NodeJS.Platform = process.platform,
+  ) {}
 
   async inspectWorkspace(requestedCwd?: string): Promise<RemoteWorkspace> {
     const environment = await this.executor.runChecked(
@@ -92,11 +149,17 @@ export class UnixBashAdapter implements RemoteAdapter {
   }
 
   toToolPath(path: string, workspace: RemoteWorkspace): string {
-    return normalizeRemoteToolPath(path, workspace.home);
+    const normalized = normalizeRemoteToolPath(path, workspace.home);
+    const nativePath = posix.resolve(workspace.cwd, normalized);
+    return this.localPlatform === "win32"
+      ? encodeUnixToolPath(nativePath)
+      : nativePath;
   }
 
   fromToolPath(path: string): string {
-    return path;
+    return this.localPlatform === "win32"
+      ? decodeUnixToolPath(path)
+      : path;
   }
 
   mapCwd(value: string, localCwd: string, workspace: RemoteWorkspace): string {
@@ -155,6 +218,208 @@ export class UnixBashAdapter implements RemoteAdapter {
     });
   }
 
+  private runBashControl(script: string, signal?: AbortSignal): Promise<Buffer> {
+    return this.executor.runChecked(
+      `exec bash -lc ${shellQuote(script)}`,
+      { signal },
+    ).then((result) => result.stdout);
+  }
+
+  async listDirectory(
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<RemoteDirectoryEntry[]> {
+    const root = this.fromToolPath(path);
+    const output = await this.runBashControl(`
+# PI_SSH_REMOTE_LS
+cd -- ${shellQuote(root)}
+shopt -s dotglob nullglob
+for entry in *; do
+  [[ "$entry" == "." || "$entry" == ".." ]] && continue
+  if [[ -d "$entry" ]]; then kind=D; else kind=F; fi
+  printf '%s\\0%s\\0' "$kind" "$entry"
+done
+`, signal);
+    const fields = splitNul(output);
+    const entries: RemoteDirectoryEntry[] = [];
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+      entries.push({ name: fields[index + 1], isDirectory: fields[index] === "D" });
+    }
+    return entries;
+  }
+
+  async findEntries(
+    path: string,
+    pattern: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<RemoteFindEntry[]> {
+    const root = this.fromToolPath(path);
+    const output = await this.runBashControl(`
+# PI_SSH_REMOTE_FIND
+cd -- ${shellQuote(root)}
+pattern=${shellQuote(pattern)}
+limit=${limit}
+count=0
+emit() {
+  local rel="$1" kind=F
+  [[ -d "$rel" ]] && kind=D
+  printf '%s\\0%s\\0' "$kind" "$rel"
+  ((count += 1))
+  ((count >= limit))
+}
+if command -v rg >/dev/null 2>&1; then
+  while IFS= read -r -d '' rel; do
+    rel="\${rel#./}"
+    emit "$rel" && break
+  done < <(rg --files --hidden -0 -g '!**/.git/**' -g '!**/node_modules/**' -g "$pattern" .)
+else
+  while IFS= read -r -d '' candidate; do
+    rel="\${candidate#./}"
+    [[ "$rel" == .git || "$rel" == .git/* || "$rel" == node_modules || "$rel" == node_modules/* || "$rel" == */.git/* || "$rel" == */node_modules/* ]] && continue
+    if [[ "$pattern" == */* ]]; then target="$rel"; else target="\${rel##*/}"; fi
+    [[ "$target" == $pattern ]] || continue
+    emit "$rel" && break
+  done < <(find . -mindepth 1 -print0)
+fi
+exit 0
+`, signal);
+    const fields = splitNul(output);
+    const entries: RemoteFindEntry[] = [];
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+      entries.push({
+        path: fields[index + 1].replace(/\\/g, "/"),
+        isDirectory: fields[index] === "D",
+      });
+    }
+    return entries;
+  }
+
+  async grep(
+    path: string,
+    pattern: string,
+    options: RemoteGrepOptions,
+    signal?: AbortSignal,
+  ): Promise<RemoteGrepMatch[]> {
+    const root = this.fromToolPath(path);
+    const rgArgs = [
+      "--json",
+      "--line-number",
+      "--color=never",
+      "--hidden",
+      "--glob",
+      "!**/.git/**",
+      "--glob",
+      "!**/node_modules/**",
+      ...(options.ignoreCase ? ["--ignore-case"] : []),
+      ...(options.literal ? ["--fixed-strings"] : []),
+      ...(options.glob ? ["--glob", options.glob] : []),
+      "--",
+      pattern,
+    ];
+    const quotedRg = rgArgs.map(shellQuote).join(" ");
+    const fallbackFlags = [
+      ...(options.ignoreCase ? ["-i"] : []),
+      ...(options.literal ? ["-F"] : []),
+    ].join(" ");
+    const glob = options.glob ?? "";
+    const output = await this.runBashControl(`
+# PI_SSH_REMOTE_GREP
+root=${shellQuote(root)}
+if [[ -d "$root" ]]; then
+  cd -- "$root"
+  target=.
+elif [[ -f "$root" ]]; then
+  cd -- "$(dirname -- "$root")"
+  target="./$(basename -- "$root")"
+else
+  printf 'Path not found: %s\\n' "$root" >&2
+  exit 1
+fi
+file_candidates() {
+  if [[ "$target" == "." ]]; then
+    find . -type d \\( -name .git -o -name node_modules \\) -prune -o -type f -print0
+  else
+    printf '%s\\0' "$target"
+  fi
+}
+if command -v rg >/dev/null 2>&1; then
+  printf 'R\\0'
+  status=0
+  rg ${quotedRg} "$target" || status=$?
+  ((status == 0 || status == 1)) || exit "$status"
+else
+  printf 'G\\0'
+  pattern=${shellQuote(pattern)}
+  glob=${shellQuote(glob)}
+  limit=${options.limit}
+  count=0
+  stop=0
+  validation=0
+  printf '' | grep ${fallbackFlags} -- "$pattern" >/dev/null 2>&1 || validation=$?
+  ((validation == 0 || validation == 1)) || { printf 'Invalid grep pattern\\n' >&2; exit 2; }
+  while IFS= read -r -d '' file; do
+    rel="\${file#./}"
+    [[ -n "$glob" && "$rel" != $glob ]] && continue
+    while IFS=: read -r line text; do
+      printf '%s\\0%s\\0%s\\0' "$rel" "$line" "$text"
+      ((count += 1))
+      if ((count >= limit)); then stop=1; break; fi
+    done < <(grep -I -n ${fallbackFlags} -- "$pattern" "$file")
+    ((stop)) && break
+  done < <(file_candidates)
+fi
+exit 0
+`, signal);
+
+    if (output.subarray(0, 2).equals(Buffer.from("R\0"))) {
+      const matches: RemoteGrepMatch[] = [];
+      const text = output.subarray(2).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        let event: any;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (event.type !== "match") continue;
+        const rawPath = event.data?.path?.text;
+        const lineNumber = event.data?.line_number;
+        const lineText = event.data?.lines?.text;
+        if (typeof rawPath !== "string" || typeof lineNumber !== "number" || typeof lineText !== "string") continue;
+        const relative = rawPath.replace(/^\.\//, "").replace(/\\/g, "/");
+        matches.push({
+          path: relative,
+          toolPath: this.localPlatform === "win32"
+            ? encodeUnixToolPath(posix.resolve(root, relative))
+            : posix.resolve(root, relative),
+          lineNumber,
+          line: lineText.replace(/\r?\n$/, ""),
+        });
+        if (matches.length >= options.limit) break;
+      }
+      return matches;
+    }
+
+    const fields = splitNul(output.subarray(2));
+    const matches: RemoteGrepMatch[] = [];
+    for (let index = 0; index + 2 < fields.length; index += 3) {
+      const relative = fields[index].replace(/\\/g, "/");
+      const lineNumber = Number(fields[index + 1]);
+      if (!Number.isInteger(lineNumber) || lineNumber < 1) continue;
+      matches.push({
+        path: relative,
+        toolPath: this.localPlatform === "win32"
+          ? encodeUnixToolPath(posix.resolve(root, relative))
+          : posix.resolve(root, relative),
+        lineNumber,
+        line: fields[index + 2],
+      });
+    }
+    return matches;
+  }
+
   buildShellCommand(
     command: string,
     cwd: string,
@@ -167,7 +432,7 @@ export class UnixBashAdapter implements RemoteAdapter {
   async runShell(
     command: string,
     cwd: string,
-    options: SshRunOptions & { env?: NodeJS.ProcessEnv },
+    options: SshRunOptions & { env?: NodeJS.ProcessEnv } = {},
   ): Promise<number | null> {
     const { env, ...runOptions } = options;
     const result = await this.executor.run(

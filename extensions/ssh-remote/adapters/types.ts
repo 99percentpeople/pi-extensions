@@ -11,6 +11,30 @@ export interface RemoteWorkspace {
   cwd: string;
 }
 
+export interface RemoteDirectoryEntry {
+  name: string;
+  isDirectory: boolean;
+}
+
+export interface RemoteFindEntry {
+  path: string;
+  isDirectory: boolean;
+}
+
+export interface RemoteGrepMatch {
+  path: string;
+  toolPath: string;
+  lineNumber: number;
+  line: string;
+}
+
+export interface RemoteGrepOptions {
+  glob?: string;
+  ignoreCase?: boolean;
+  literal?: boolean;
+  limit: number;
+}
+
 export interface RemoteAdapter {
   readonly platform: RemotePlatform;
   readonly shell: RemoteShell;
@@ -30,6 +54,19 @@ export interface RemoteAdapter {
   detectImageMimeType(path: string, signal?: AbortSignal): Promise<string | null>;
   mkdir(path: string, signal?: AbortSignal): Promise<void>;
   writeFile(path: string, content: string | Buffer, signal?: AbortSignal): Promise<void>;
+  listDirectory(path: string, signal?: AbortSignal): Promise<RemoteDirectoryEntry[]>;
+  findEntries(
+    path: string,
+    pattern: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<RemoteFindEntry[]>;
+  grep(
+    path: string,
+    pattern: string,
+    options: RemoteGrepOptions,
+    signal?: AbortSignal,
+  ): Promise<RemoteGrepMatch[]>;
 
   buildShellCommand(
     command: string,
@@ -37,10 +74,11 @@ export interface RemoteAdapter {
     env?: NodeJS.ProcessEnv,
     interactive?: boolean,
   ): string;
-  runShell(command: string, cwd: string, options: SshRunOptions & { env?: NodeJS.ProcessEnv }): Promise<number | null>;
+  runShell(command: string, cwd: string, options?: SshRunOptions & { env?: NodeJS.ProcessEnv }): Promise<number | null>;
 }
 
 export interface SelectRemoteAdapterOptions {
+  localPlatform?: NodeJS.Platform;
   preference?: SshShellPreference;
   expectedPlatform?: RemotePlatform;
   expectedShell?: RemoteShell;
