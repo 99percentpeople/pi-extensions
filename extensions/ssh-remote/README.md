@@ -265,6 +265,13 @@ job after resume.
   running on the local machine (the shared background-task backend can be
   claimed by other adapters such as `pi-pwsh-adapter`, so the block is applied
   at the tool level to stay independent of registration order).
+- On Windows, `pi-pwsh-adapter` registers the `bash` tool before this
+  extension (Pi keeps the first registration per tool name). SSH Remote
+  claims the bash tool through the `bash:delegate` event protocol instead:
+  the adapter's bash tool and `!` commands execute on the remote while the
+  SSH workspace is active, fail closed while it is unavailable, and fall back
+  to the local PowerShell backend in local sessions. Both packages must be at
+  compatible versions for the delegation to work.
 - Pi's optional standalone `grep`, `find`, and `ls` tools remain disabled by
   default. If enabled through `--tools` or the tool selector, they execute on
   the remote workspace and fail closed with the other routed tools.

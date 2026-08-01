@@ -374,6 +374,36 @@ export function createSshRemoteExtension(
           return undefined;
         },
       });
+
+      // Bash delegation protocol: on Windows, pi-pwsh-adapter registers the
+      // bash tool first (pi keeps the first registration per name), so the
+      // remote bash backend is delivered through its tool instead of a
+      // competing registration. The resolver is consulted on every execution
+      // and follows the live runtime state, so registration order does not
+      // matter: active sessions run bash on the remote, failed/connecting
+      // sessions fail closed, and sessions without SSH keep the local
+      // PowerShell backend.
+      pi.events.emit("bash:delegate", {
+        resolveOperations: () => {
+          const active = runtime;
+          if (active.kind === "active") {
+            return createRemoteBashOperations(active.adapter, (cwd) =>
+              active.adapter.mapCwd(cwd, ctx.cwd, active.workspace),
+            );
+          }
+          if (active.kind === "failed") {
+            return unavailableBashOperations(
+              `SSH remote is unavailable: ${active.error}`,
+            );
+          }
+          if (active.kind === "connecting") {
+            return unavailableBashOperations(
+              `SSH remote is still connecting to ${active.intent.target}`,
+            );
+          }
+          return undefined;
+        },
+      });
     };
 
     const connect = async (

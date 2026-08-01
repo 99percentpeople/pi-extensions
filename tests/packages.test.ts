@@ -111,7 +111,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.0.6");
+  assert.equal(pwsh.version, "1.0.7");
   assertBuiltExtensionPackage(pwsh);
   assert.deepEqual(pwsh.files, ["dist", "README.md", "LICENSE"]);
   assert.deepEqual(pwsh.os, ["win32"]);
@@ -123,7 +123,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
-  assert.equal(sshRemote.version, "0.2.0");
+  assert.equal(sshRemote.version, "0.2.1");
   assertBuiltExtensionPackage(sshRemote);
   assert.deepEqual(sshRemote.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");

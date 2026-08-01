@@ -992,6 +992,68 @@ test("bg_start is blocked while the SSH workspace is unavailable", async () => {
   assert.equal(other, undefined);
 });
 
+test("bash delegation follows the SSH runtime state", async () => {
+  // Active SSH sessions expose remote BashOperations through the
+  // bash:delegate protocol (consumed by pi-pwsh-adapter on Windows).
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ flag: "devbox:/srv/project" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async () => ({
+      adapter: new UnixBashAdapter(clients.at(-1)!, "linux"),
+      workspace: {
+        platform: "unix",
+        shell: "bash",
+        home: "/home/deploy",
+        cwd: "/srv/project",
+      },
+    }),
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+  const delegate = harness.events.find((event) => event.name === "bash:delegate");
+  assert.ok(delegate);
+  const resolveOperations = delegate.payload.resolveOperations;
+  const ops = resolveOperations();
+  assert.ok(ops, "active session must expose remote operations");
+  const execResult = await ops.exec("pwd", "/local/project", {
+    onData: () => {},
+  });
+  assert.equal(execResult.exitCode, 0);
+
+  // Failed sessions fail closed instead of silently running locally.
+  const failed = createExtensionHarness({ flag: "offline-host" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => new FakeSshClient(options),
+    selectRemote: async () => {
+      throw new Error("connection refused");
+    },
+  })(failed.pi);
+  await failed.emit("session_start", { reason: "startup" });
+  const failedDelegate = failed.events.find(
+    (event) => event.name === "bash:delegate",
+  );
+  assert.ok(failedDelegate);
+  await assert.rejects(
+    () => failedDelegate.payload.resolveOperations().exec("pwd", "/local", { onData: () => {} }),
+    /SSH remote is unavailable: connection refused/,
+  );
+
+  // Sessions without SSH never emit the delegate, so the local backend stays.
+  const local = createExtensionHarness();
+  createSshRemoteExtension({ platform: "linux" })(local.pi);
+  await local.emit("session_start", { reason: "startup" });
+  assert.equal(
+    local.events.filter((event) => event.name === "bash:delegate").length,
+    0,
+  );
+});
+
 test("extension persists, routes, prompts, and restores an SSH workspace", async () => {
   const clients: FakeSshClient[] = [];
   const extension = createSshRemoteExtension({

@@ -298,6 +298,18 @@ export default function (pi: ExtensionAPI) {
   const bgSpawn = createBgSpawnWrapper(runtime);
   const bgShell = createBgShellResolver(runtime);
 
+  // Bash delegation protocol: another extension (for example ssh-remote) can
+  // claim the bash tool for the current session by emitting "bash:delegate"
+  // with a resolver that returns its BashOperations (or undefined to fall
+  // back to the local PowerShell backend). The resolver is consulted on every
+  // execution, so the claim can follow session state without re-registration
+  // races.
+  let bashDelegate: (() => BashOperations | undefined) | undefined;
+  pi.events.on("bash:delegate", (data: unknown) => {
+    bashDelegate = (data as { resolveOperations?: () => BashOperations | undefined })
+      ?.resolveOperations;
+  });
+
   // Adapt background-tasks to use the selected PowerShell instead of /bin/sh.
   pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
 
@@ -318,6 +330,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     ...bashTemplate,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const delegated = bashDelegate?.();
+      if (delegated) {
+        return createBashToolDefinition(ctx.cwd, { operations: delegated }).execute(
+          toolCallId,
+          params,
+          signal,
+          onUpdate,
+          ctx,
+        );
+      }
       return createPowerShellBashToolDefinition(
         runtime,
         ctx.cwd,
@@ -326,8 +348,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Intercept user-entered ! and !! commands with the same PowerShell backend.
+  // Intercept user-entered ! and !! commands with the same backend, honoring
+  // the bash delegation protocol so remote sessions stay remote.
   pi.on("user_bash", () => {
-    return { operations: pwshOps };
+    const delegated = bashDelegate?.();
+    return { operations: delegated ?? pwshOps };
   });
 }
