@@ -497,6 +497,16 @@ export interface CodexUsageOptions {
   authPath?: string;
 }
 
+/**
+ * Whether a settings change should pull fresh usage data immediately:
+ * toggling status visibility on, or changing cross-provider tool access,
+ * both alter what the status area can show.
+ */
+export function usageRefreshNeeded(prev: CodexApiConfig, next: CodexApiConfig): boolean {
+  return next.usageStatus
+    && (prev.usageStatus !== next.usageStatus || prev.allowOtherProviders !== next.allowOtherProviders);
+}
+
 export function registerCodexUsageAndFast(
   pi: ExtensionAPI,
   controller: UsageController,
@@ -511,6 +521,7 @@ export function registerCodexUsageAndFast(
   let accountObserverActive = false;
   let authWatcher: FSWatcher | undefined;
   let authWatchDebounce: ReturnType<typeof setTimeout> | undefined;
+  let pollDelay: ReturnType<typeof setTimeout> | undefined;
 
   const usageEnabled = (ctx: ExtensionContext): boolean => {
     const config = controller.getConfig();
@@ -638,6 +649,42 @@ export function registerCodexUsageAndFast(
   const refreshInBackground = (ctx: ExtensionContext, force = false) => {
     latestContext = ctx;
     void refreshUsage(ctx, force).catch(() => refreshStatus(ctx));
+  };
+
+  const stopPolling = (): void => {
+    if (pollDelay) {
+      clearTimeout(pollDelay);
+      pollDelay = undefined;
+    }
+  };
+
+  /**
+   * Chain a background poll with setTimeout (not setInterval) so the interval
+   * is re-read from the latest config on every round: changing the setting
+   * takes effect without restarting anything.
+   */
+  const scheduleNextPoll = (): void => {
+    if (pollDelay) return;
+    const intervalMinutes = Math.round(controller.getConfig().usagePollInterval);
+    if (intervalMinutes <= 0) return;
+    pollDelay = setTimeout(() => {
+      pollDelay = undefined;
+      const active = latestContext;
+      const state = currentState();
+      if (active && usageEnabled(active)) {
+        const intervalMs = intervalMinutes * 60_000;
+        if (!state || state.snapshots.length === 0 || Date.now() - state.lastFetchAt >= intervalMs) {
+          void refreshUsage(active).catch(() => refreshStatus(active));
+        }
+      }
+      scheduleNextPoll();
+    }, intervalMinutes * 60_000);
+    pollDelay.unref?.();
+  };
+
+  const startPolling = (ctx: ExtensionContext): void => {
+    latestContext = ctx;
+    scheduleNextPoll();
   };
 
   const codexOAuthAvailable = (ctx: ExtensionContext, config: CodexApiConfig): boolean => {
@@ -911,12 +958,15 @@ export function registerCodexUsageAndFast(
     startAccountObserver(ctx);
     void checkCurrentAccount(ctx).catch(() => {});
     refreshInBackground(ctx, true);
+    startPolling(ctx);
   });
   pi.on("session_start", (_event, ctx) => {
     startAccountObserver(ctx);
     refreshInBackground(ctx, true);
+    startPolling(ctx);
   });
   pi.on("session_shutdown", (_event, ctx) => {
+    stopPolling();
     credentialRevision += 1;
     activeAccountId = undefined;
     usageByAccount.clear();

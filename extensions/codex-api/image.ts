@@ -183,7 +183,6 @@ function imagePhaseLabel(phase: CodexImagePhase): string {
 export function registerCodexImageTool(
   pi: ExtensionAPI,
   getConfig: () => CodexApiConfig = () => DEFAULT_CODEX_API_CONFIG,
-  refreshUsageInBackground?: (ctx: ExtensionContext) => void,
 ): void {
   pi.registerTool({
     name: "codex_image",
@@ -274,7 +273,8 @@ export function registerCodexImageTool(
       update("saving");
       await mkdir(dirname(savedPath), { recursive: true });
       await writeFile(savedPath, Buffer.from(data, "base64"));
-      refreshUsageInBackground?.(ctx);
+      // Image generation does not consume the Codex rate-limit window, so no
+      // usage refresh is needed here.
 
       return {
         content: [

@@ -9,6 +9,7 @@ import { registerCodexSearchTool } from "./search.ts";
 import { registerCodexApiSettings } from "./settings.ts";
 import {
   registerCodexUsageAndFast,
+  usageRefreshNeeded,
   type CodexUsageHandle,
 } from "./usage.ts";
 
@@ -19,6 +20,7 @@ export default function (pi: ExtensionAPI) {
   const controller = {
     getConfig: () => config,
     updateConfig: (next: CodexApiConfig, ctx: Parameters<CodexUsageHandle["refreshStatus"]>[0]) => {
+      const prev = config;
       config = next;
       try {
         saveCodexApiConfig(config);
@@ -29,6 +31,12 @@ export default function (pi: ExtensionAPI) {
         );
       }
       usageHandle?.refreshStatus(ctx);
+      // Toggling visibility or cross-provider access changes what the status
+      // area may show; pull fresh data immediately instead of waiting for the
+      // next request event (which may never come under other providers).
+      if (usageRefreshNeeded(prev, next)) {
+        void usageHandle?.refreshUsage(ctx, true).catch(() => {});
+      }
     },
   };
 
@@ -36,7 +44,7 @@ export default function (pi: ExtensionAPI) {
   const refreshUsageInBackground = (ctx: Parameters<CodexUsageHandle["refreshUsage"]>[0]) => {
     void usageHandle?.refreshUsage(ctx).catch(() => {});
   };
-  registerCodexImageTool(pi, () => config, refreshUsageInBackground);
+  registerCodexImageTool(pi, () => config);
   registerCodexSearchTool(pi, () => config, refreshUsageInBackground);
   registerCodexApiSettings(pi, controller);
 }
@@ -102,6 +110,7 @@ export {
   parseCodexRedeemCredits,
   parseCodexUsagePayload,
   registerCodexUsageAndFast,
+  usageRefreshNeeded,
   type CodexAccountSnapshot,
   type CodexCreditsSnapshot,
   type CodexRateLimitSnapshot,

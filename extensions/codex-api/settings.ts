@@ -28,6 +28,16 @@ const IMAGE_QUALITY_LABELS: Record<CodexImageQuality, string> = {
   high: "High",
 };
 
+function usagePollLabel(minutes: number): string {
+  if (minutes <= 0) return "Off";
+  return `${minutes}m`;
+}
+
+function usagePollMinutes(label: string): number {
+  const match = /^(\d+)m$/.exec(label);
+  return match ? Number(match[1]) : 0;
+}
+
 function keyForLabel<T extends string>(labels: Record<T, string>, value: string): T | undefined {
   return (Object.entries(labels) as Array<[T, string]>).find(([, label]) => label === value)?.[0];
 }
@@ -89,6 +99,13 @@ export function registerCodexApiSettings(
           currentValue: config.usageStatus ? "Show" : "Hide",
           values: ["Show", "Hide"],
         },
+        {
+          id: "usagePollInterval",
+          label: "Usage poll",
+          description: "Periodically refresh the usage status while a session is active (Off disables polling)",
+          currentValue: usagePollLabel(config.usagePollInterval),
+          values: ["Off", "1m", "5m", "15m"],
+        },
       ];
     },
     onChange: (id, value, ctx) => {
@@ -115,6 +132,8 @@ export function registerCodexApiSettings(
         }, ctx);
       } else if (id === "usageStatus") {
         controller.updateConfig({ ...config, usageStatus: value === "Show" }, ctx);
+      } else if (id === "usagePollInterval") {
+        controller.updateConfig({ ...config, usagePollInterval: usagePollMinutes(value) }, ctx);
       }
     },
   });

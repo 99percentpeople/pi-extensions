@@ -39,6 +39,7 @@ import {
   resolveSearchMode,
   saveCodexApiConfig,
   SEARCH_MODE_LABELS,
+  usageRefreshNeeded,
 } from "../extensions/codex-api/index.ts";
 
 function jwt(accountId = "acct-123"): string {
@@ -245,11 +246,9 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
     return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("png-data").toString("base64") }] }));
   };
-  const refreshedContexts: ExtensionContext[] = [];
   const tool = toolRegistry((pi) => registerCodexImageTool(
     pi,
     () => ({ ...DEFAULT_CODEX_API_CONFIG, imageQuality: "medium" }),
-    (ctx) => refreshedContexts.push(ctx),
   ));
   const imageProperties = (tool.parameters as any).properties;
   assert.deepEqual(Object.keys(imageProperties), [
@@ -290,7 +289,6 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
       generatedUpdates.map((update) => update.details.phase),
       ["preparing", "authenticating", "generating", "saving"],
     );
-    assert.equal(refreshedContexts.length, 1);
     assert.ok(generatedUpdates.every((update) => !("prompt" in update.details)));
     assert.ok(generated.details && !("prompt" in generated.details));
 
@@ -395,7 +393,6 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     assert.match(calls[1].body.images[0].image_url, /^data:image\/png;base64,/);
     assert.equal(calls[1].body.size, "1536x1024");
     assert.equal(calls[1].body.quality, "high");
-    assert.equal(refreshedContexts.length, 2);
 
     const recentPath = join(temporary, "recent-edit.png");
     const recentCtx = context(temporary) as any;
@@ -423,7 +420,6 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     );
     assert.equal(calls[2].url, "https://chatgpt.com/backend-api/codex/images/edits");
     assert.match(calls[2].body.images[0].image_url, /^data:image\/jpeg;base64,/);
-    assert.equal(refreshedContexts.length, 3);
 
     const recentCall = tool.renderCall!(
       { prompt: "edit this", num_last_images_to_include: 1 },
@@ -462,7 +458,6 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
       ),
       /Refusing to overwrite/,
     );
-    assert.equal(refreshedContexts.length, 3);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(temporary, { recursive: true, force: true });
@@ -1697,11 +1692,17 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     searchContextSize: "high",
     imageQuality: "high",
     usageStatus: false,
+    usagePollInterval: 5,
   });
   assert.deepEqual(normalizeCodexApiConfig({
     fastMode: "yes",
     searchMode: "invalid",
+    usagePollInterval: 15,
+  }), { ...DEFAULT_CODEX_API_CONFIG, usagePollInterval: 15 });
+  assert.deepEqual(normalizeCodexApiConfig({
+    usagePollInterval: -3,
   }), DEFAULT_CODEX_API_CONFIG);
+  assert.equal(normalizeCodexApiConfig({ usagePollInterval: 7.7 }).usagePollInterval, 8);
 
   const temporary = await mkdtemp(join(tmpdir(), "pi-codex-config-"));
   const path = join(temporary, "99extensions.json");
@@ -1722,10 +1723,132 @@ test("Codex API config normalizes, saves, and reloads", async () => {
       searchContextSize: "low",
       imageQuality: "low",
       usageStatus: true,
+      usagePollInterval: 5,
     });
     const document = JSON.parse(await readFile(path, "utf8"));
     assert.deepEqual(document.untouched, { enabled: true });
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
+});
+
+test("Codex usage polls on an interval, throttles inside the window, and stops on shutdown", async () => {
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: any, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-poll-"));
+  const authPath = join(temporary, "auth.json");
+  await writeFile(authPath, JSON.stringify({}));
+
+  let config = { ...DEFAULT_CODEX_API_CONFIG, usagePollInterval: 1 };
+  registerCodexUsageAndFast(pi, {
+    getConfig: () => config,
+    updateConfig: () => {},
+  }, { authPath });
+
+  // Fake timers so the minute-long poll can be driven deterministically.
+  const scheduled: Array<{ delay: number; cb: () => void }> = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  let clearedTimers = 0;
+  globalThis.setTimeout = ((cb: () => void, delay: number) => {
+    const handle = { delay, cb, unref: () => {} };
+    scheduled.push(handle);
+    return handle as unknown as ReturnType<typeof setTimeout>;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((handle: unknown) => {
+    if (handle !== undefined && handle !== null) clearedTimers += 1;
+  }) as unknown as typeof clearTimeout;
+
+  const originalFetch = globalThis.fetch;
+  let usageFetches = 0;
+  globalThis.fetch = async () => {
+    usageFetches += 1;
+    return new Response(JSON.stringify({
+      rate_limit: {
+        primary_window: {
+          used_percent: 10,
+          limit_window_seconds: 5 * 60 * 60,
+          reset_at: Math.floor(Date.now() / 1000) + 60 * 60,
+        },
+      },
+    }));
+  };
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.model = { provider: "openai-codex", id: "gpt-5.4-codex" };
+  ctx.modelRegistry.isUsingOAuth = () => true;
+  ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: jwt() });
+  ctx.ui = {
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    theme: { fg: (color: string, text: string) => `[${color}]${text}`, bold: (text: string) => `[bold]${text}` },
+    notify() {},
+  };
+
+  try {
+    // session_start force-refreshes once and starts the poll chain.
+    const start = handlers.get("session_start")!;
+    await start({}, ctx);
+    await new Promise((resolve) => setImmediate(resolve)); // fire-and-forget refresh; drain microtasks
+    assert.equal(usageFetches, 1);
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].delay, 60_000);
+
+    // Inside the 60s throttle the poll re-schedules without another fetch.
+    const firstTick = scheduled.shift()!;
+    firstTick.cb();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(usageFetches, 1);
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].delay, 60_000);
+
+    // Disabling polling stops the chain after the current round.
+    config = { ...config, usagePollInterval: 0 };
+    scheduled.shift()!.cb();
+    assert.equal(scheduled.length, 0);
+    assert.equal(usageFetches, 1);
+
+    // A fresh session with polling disabled schedules nothing.
+    const secondCtx = { ...ctx } as any;
+    const secondStatuses: Array<string | undefined> = [];
+    secondCtx.ui = { ...ctx.ui, setStatus: (_key: string, value: string | undefined) => secondStatuses.push(value) };
+    await handlers.get("session_shutdown")!({}, ctx);
+    await start({}, secondCtx as ExtensionContext);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(scheduled.length, 0);
+    assert.equal(usageFetches, 2); // force refresh still fires on session_start
+
+    // Shutdown clears the outstanding timer.
+    clearedTimers = 0;
+    config = { ...config, usagePollInterval: 5 };
+    await handlers.get("session_shutdown")!({}, secondCtx);
+    await start({}, secondCtx as ExtensionContext);
+    assert.equal(scheduled.length, 1);
+    await handlers.get("session_shutdown")!({}, secondCtx);
+    assert.ok(clearedTimers >= 1);
+    assert.equal(scheduled.length, 1); // fake timers are not removed, but no new poll is scheduled
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    globalThis.fetch = originalFetch;
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Codex usage refresh is forced when settings toggle status visibility or providers", () => {
+  const base = DEFAULT_CODEX_API_CONFIG;
+  // Showing the status that was hidden forces a refresh.
+  assert.equal(usageRefreshNeeded({ ...base, usageStatus: false }, { ...base, usageStatus: true }), true);
+  // Changing cross-provider tool access forces a refresh.
+  assert.equal(usageRefreshNeeded({ ...base, allowOtherProviders: false }, { ...base, allowOtherProviders: true }), true);
+  assert.equal(usageRefreshNeeded({ ...base, allowOtherProviders: true }, { ...base, allowOtherProviders: false }), true);
+  // Hiding the status does not fetch (the status area is cleared instead).
+  assert.equal(usageRefreshNeeded({ ...base, usageStatus: true }, { ...base, usageStatus: false }), false);
+  // Unrelated settings changes do not fetch.
+  assert.equal(usageRefreshNeeded({ ...base, fastMode: false }, { ...base, fastMode: true }), false);
+  assert.equal(usageRefreshNeeded(base, base), false);
 });

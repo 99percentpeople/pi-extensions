@@ -15,6 +15,8 @@ export interface CodexApiConfig {
   searchContextSize: CodexSearchContextSize;
   imageQuality: CodexImageQuality;
   usageStatus: boolean;
+  /** Minutes between background status refreshes; 0 disables polling. */
+  usagePollInterval: number;
 }
 
 export const CODEX_API_SETTINGS_NAMESPACE = "codex-api";
@@ -26,6 +28,7 @@ export const DEFAULT_CODEX_API_CONFIG: CodexApiConfig = {
   searchContextSize: "medium",
   imageQuality: "auto",
   usageStatus: true,
+  usagePollInterval: 5,
 };
 
 function oneOf<T extends string>(value: unknown, values: readonly T[], fallback: T): T {
@@ -60,6 +63,11 @@ export function normalizeCodexApiConfig(value: unknown): CodexApiConfig {
     usageStatus: typeof input.usageStatus === "boolean"
       ? input.usageStatus
       : DEFAULT_CODEX_API_CONFIG.usageStatus,
+    usagePollInterval: typeof input.usagePollInterval === "number"
+        && Number.isFinite(input.usagePollInterval)
+        && input.usagePollInterval > 0
+      ? Math.min(60, Math.round(input.usagePollInterval))
+      : DEFAULT_CODEX_API_CONFIG.usagePollInterval,
   };
 }
 
