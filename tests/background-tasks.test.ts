@@ -359,6 +359,53 @@ test("background tasks can pass commands through Pi's stdin shell transport", as
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
+test("shell adapters can separate a logical task cwd from the local launch cwd", async () => {
+  const { tools, lifecycle, eventBus, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  let resolverCwd: string | undefined;
+  let launchCwd: string | undefined;
+  const child = new FakeChildProcess(92_000_000);
+  eventBus.emit("bg:register", {
+    resolveShell: (
+      command: string,
+      _interactive: boolean,
+      context?: { cwd: string },
+    ) => {
+      resolverCwd = context?.cwd;
+      return {
+        file: "ssh",
+        args: ["remote", command],
+        env: { ...process.env },
+        cwd: "/local/ssh-anchor",
+      };
+    },
+    spawn: (
+      _file: string,
+      _args: readonly string[],
+      options: { cwd?: string },
+    ) => {
+      launchCwd = options.cwd;
+      return child as unknown as ChildProcess;
+    },
+  });
+
+  await bgStart.execute(
+    "remote-cwd-start",
+    { name: "remote-cwd", command: "pwd", cwd: "/srv/remote-only" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(resolverCwd, "/srv/remote-only");
+  assert.equal(launchCwd, "/local/ssh-anchor");
+
+  child.finish(0, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
 test("background task names are unique among retained tasks", async () => {
   const { tools, lifecycle, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");

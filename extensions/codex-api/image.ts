@@ -1,6 +1,9 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import {
+  collectWorkspaceFile,
+  resolveWorkspaceFiles,
+  type WorkspaceFileSystem,
+} from "@99percentpeople/pi-workspace-files";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createCodexApiClient } from "./client.ts";
@@ -91,39 +94,40 @@ export function normalizeCodexImageSize(value?: string): string {
   return `${width}x${height}`;
 }
 
-function workspacePath(cwd: string, path: string): string {
-  const root = resolve(cwd);
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(root, path);
-  const fromRoot = relative(root, absolute);
-  if (fromRoot === ".." || fromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(fromRoot)) {
-    throw new Error(`Image path must stay inside the current workspace: ${path}`);
-  }
-  return absolute;
-}
-
-function outputPath(cwd: string, toolCallId: string, requested?: string): string {
+function outputPath(
+  files: WorkspaceFileSystem,
+  toolCallId: string,
+  requested?: string,
+): string {
   const path = requested?.trim()
     ? requested.trim()
     : `output/codex-images/${sanitizeFilePart(toolCallId)}.png`;
-  const absolute = workspacePath(cwd, path);
-  return extname(absolute).toLowerCase() === ".png" ? absolute : `${absolute}.png`;
+  const absolute = files.resolvePath(path);
+  return files.extname(absolute).toLowerCase() === ".png" ? absolute : `${absolute}.png`;
 }
 
-async function assertDoesNotExist(path: string): Promise<void> {
-  try {
-    await access(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
+async function assertDoesNotExist(
+  files: WorkspaceFileSystem,
+  path: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (await files.exists(path, { signal })) {
+    throw new Error(`Refusing to overwrite existing image: ${path}`);
   }
-  throw new Error(`Refusing to overwrite existing image: ${path}`);
 }
 
-async function imageDataUrl(cwd: string, path: string): Promise<string> {
-  const absolute = workspacePath(cwd, path);
-  const mimeType = IMAGE_MIME_TYPES[extname(absolute).toLowerCase()];
+async function imageDataUrl(
+  files: WorkspaceFileSystem,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const absolute = files.resolvePath(path);
+  const mimeType = IMAGE_MIME_TYPES[files.extname(absolute).toLowerCase()];
   if (!mimeType) throw new Error(`Unsupported reference image type: ${path}`);
-  const bytes = await readFile(absolute);
+  const bytes = await collectWorkspaceFile(
+    await files.readFile(absolute, { signal }),
+    { signal },
+  );
   return `data:${mimeType};base64,${bytes.toString("base64")}`;
 }
 
@@ -231,7 +235,8 @@ export function registerCodexImageTool(
         throw new Error("Provide only one of referenced_image_paths or num_last_images_to_include");
       }
       const operation = references.length === 0 && recentImageCount === undefined ? "generate" : "edit";
-      const savedPath = outputPath(ctx.cwd, toolCallId, params.output_path);
+      const files = resolveWorkspaceFiles(pi, ctx.cwd);
+      const savedPath = outputPath(files, toolCallId, params.output_path);
       const config = getConfig();
       const quality: CodexImageQuality = params.quality ?? config.imageQuality ?? "auto";
       const size = normalizeCodexImageSize(params.size);
@@ -243,7 +248,7 @@ export function registerCodexImageTool(
         },
       });
       update("preparing");
-      await assertDoesNotExist(savedPath);
+      await assertDoesNotExist(files, savedPath, signal);
       update("authenticating");
       const client = await createCodexApiClient(ctx, {
         allowOtherProviders: config.allowOtherProviders,
@@ -252,7 +257,7 @@ export function registerCodexImageTool(
       if (references.length > 0) {
         update("reading-references");
         images = await Promise.all(
-          references.map(async (path) => ({ image_url: await imageDataUrl(ctx.cwd, path) })),
+          references.map(async (path) => ({ image_url: await imageDataUrl(files, path, signal) })),
         );
       } else if (recentImageCount !== undefined) {
         update("reading-references");
@@ -271,8 +276,12 @@ export function registerCodexImageTool(
         : await client.post<ImageResponse>("images/edits", { ...request, images }, signal);
       const data = firstImage(response);
       update("saving");
-      await mkdir(dirname(savedPath), { recursive: true });
-      await writeFile(savedPath, Buffer.from(data, "base64"));
+      await files.mkdir(files.dirname(savedPath), { signal });
+      await files.writeFile(
+        savedPath,
+        Buffer.from(data, "base64"),
+        { signal },
+      );
       // Image generation does not consume the Codex rate-limit window, so no
       // usage refresh is needed here.
 

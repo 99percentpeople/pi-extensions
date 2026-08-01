@@ -31,6 +31,7 @@ you chat, and the status widget tracks it:
 - Track task status, duration, and recent output in a compact expandable widget
 - Send text, terminal keys, stdin data, and process signals to running tasks
 - Use the same shell resolution and command syntax as Pi's built-in `bash` tool
+- Let shell adapters separate a logical task cwd from the local launcher cwd for remote backends
 
 ## Install
 
@@ -228,6 +229,11 @@ than `cmd.exe`.
 
 Installing `@99percentpeople/pi-pwsh-adapter` explicitly switches both Pi's
 built-in shell tool and background tasks to PowerShell syntax.
+
+Installing `@99percentpeople/pi-ssh-remote` registers an OpenSSH backend for
+pipe and PTY tasks while an SSH workspace is active. Background Tasks 1.2.7 and
+newer lets that adapter map an explicit `bg_start.cwd` to the remote workspace
+without requiring the same absolute directory to exist locally.
 
 Pipe-task completion follows the tracked process's `exit` event rather than the
 stdio `close` event. Launch failures are finalized by the pre-spawn `error`

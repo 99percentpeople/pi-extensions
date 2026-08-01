@@ -1,0 +1,42 @@
+{
+  "name": "@99percentpeople/pi-workspace-files",
+  "version": "0.1.0",
+  "description": "Composable binary workspace file-system protocol for Pi extensions",
+  "type": "module",
+  "main": "./dist/index.ts",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun run ../../scripts/build-package.ts && tsc -p tsconfig.build.json",
+    "prepack": "bun run build",
+    "prepublishOnly": "bun run --cwd ../.. check"
+  },
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "workspace",
+    "filesystem",
+    "extensions"
+  ],
+  "author": "99percentpeople",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/99percentpeople/pi-extensions.git",
+    "directory": "packages/workspace-files"
+  },
+  "bugs": {
+    "url": "https://github.com/99percentpeople/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

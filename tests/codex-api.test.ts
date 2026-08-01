@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import {
@@ -12,6 +13,11 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
+import {
+  collectWorkspaceFile,
+  WORKSPACE_FILES_REQUEST_CHANNEL,
+  type WorkspaceFileSystem,
+} from "@99percentpeople/pi-workspace-files";
 import {
   applyFastModePayload,
   CodexApiClient,
@@ -61,11 +67,25 @@ function formatLocalDateTime(epochMs: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())} ${offset}`;
 }
 
-function toolRegistry(register: (pi: ExtensionAPI) => void): ToolDefinition {
+function toolRegistry(
+  register: (pi: ExtensionAPI) => void,
+  configureEvents?: (events: EventEmitter) => void,
+): ToolDefinition {
   let tool: ToolDefinition | undefined;
+  const events = new EventEmitter();
+  configureEvents?.(events);
   register({
     registerTool: (value) => { tool = value; },
     on: () => {},
+    events: {
+      on: (name: string, handler: (data: unknown) => void) => {
+        events.on(name, handler);
+        return () => events.off(name, handler);
+      },
+      emit: (name: string, data: unknown) => {
+        events.emit(name, data);
+      },
+    },
   } as unknown as ExtensionAPI);
   assert.ok(tool);
   return tool;
@@ -457,6 +477,89 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
         ctx,
       ),
       /Refusing to overwrite/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("codex_image uses a claimed workspace file system for binary output and references", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-remote-files-"));
+  const originalFetch = globalThis.fetch;
+  const requests: any[] = [];
+  globalThis.fetch = async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({
+      data: [{ b64_json: Buffer.from("remote png data").toString("base64") }],
+    }));
+  };
+
+  const root = "C:\\Users\\Admin";
+  const stored = new Map<string, Buffer>([
+    ["C:\\Users\\Admin\\Desktop\\reference.jpg", Buffer.from("remote reference")],
+  ]);
+  const files: WorkspaceFileSystem = {
+    resolvePath(path) {
+      const absolute = win32.isAbsolute(path) ? win32.normalize(path) : win32.resolve(root, path);
+      const relative = win32.relative(root, absolute);
+      if (relative === ".." || relative.startsWith("..\\") || win32.isAbsolute(relative)) {
+        throw new Error(`outside remote workspace: ${path}`);
+      }
+      return absolute;
+    },
+    extname: win32.extname,
+    dirname: win32.dirname,
+    exists: async (path) => stored.has(path),
+    readFile: async (path) => {
+      const value = stored.get(path);
+      if (!value) throw new Error(`missing: ${path}`);
+      return value;
+    },
+    mkdir: async () => {},
+    writeFile: async (path, content, options) => {
+      stored.set(path, await collectWorkspaceFile(content, options));
+    },
+  };
+  const tool = toolRegistry(
+    (pi) => registerCodexImageTool(pi),
+    (events) => {
+      events.on(WORKSPACE_FILES_REQUEST_CHANNEL, (value) => {
+        (value as { claim(owner: string, files: WorkspaceFileSystem): void }).claim(
+          "test-remote-files",
+          files,
+        );
+      });
+    },
+  );
+
+  try {
+    const result = await tool.execute(
+      "remote-image",
+      {
+        prompt: "Use the remote reference",
+        referenced_image_paths: ["Desktop\\reference.jpg"],
+        output_path: "Desktop\\generated",
+      },
+      undefined,
+      undefined,
+      context(temporary),
+    );
+    const output = "C:\\Users\\Admin\\Desktop\\generated.png";
+    assert.equal((result.details as { savedPath: string }).savedPath, output);
+    assert.equal(stored.get(output)?.toString("utf8"), "remote png data");
+    assert.match(requests[0].images[0].image_url, /^data:image\/jpeg;base64,/);
+    assert.equal(requests[0].images[0].image_url.split(",")[1], Buffer.from("remote reference").toString("base64"));
+    assert.match((result.content[0] as { text: string }).text, /C:\\Users\\Admin\\Desktop\\generated\.png/);
+    await assert.rejects(
+      () => tool.execute(
+        "remote-overwrite",
+        { prompt: "overwrite", output_path: output },
+        undefined,
+        undefined,
+        context(temporary),
+      ),
+      /Refusing to overwrite existing image/,
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -1035,6 +1138,65 @@ test("Codex usage shows limit reached instead of a percentage", () => {
   assert.equal(formatCodexStatus(normalHeaderSnapshots, false, now), "Codex 5h 50% 1h");
 });
 
+test("Codex commands stay hidden until OAuth login becomes available", async () => {
+  const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+  const commands = new Map<string, unknown>();
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-command-auth-"));
+  const authPath = join(temporary, "auth.json");
+  await writeFile(authPath, "{}");
+  const pi = {
+    registerCommand(name: string, definition: unknown) {
+      commands.set(name, definition);
+    },
+    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  registerCodexUsageAndFast(pi, {
+    getConfig: () => ({
+      ...DEFAULT_CODEX_API_CONFIG,
+      usageStatus: false,
+      usagePollInterval: 0,
+    }),
+    updateConfig: () => {},
+  }, { authPath });
+
+  let loggedIn = false;
+  let autocompleteRefreshes = 0;
+  const ctx = context(process.cwd()) as any;
+  ctx.modelRegistry = {
+    isUsingOAuth: () => loggedIn,
+    getAll: () => [ctx.model],
+    getApiKeyAndHeaders: async () => ({ ok: true, apiKey: jwt() }),
+    refresh: async () => {},
+  };
+  ctx.ui = {
+    setStatus() {},
+    notify() {},
+    theme: plainTheme,
+    addAutocompleteProvider: () => { autocompleteRefreshes += 1; },
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ rate_limit: {} }));
+  try {
+    await handlers.get("session_start")?.({}, ctx);
+    assert.equal(commands.has("codex-usage"), false);
+    assert.equal(commands.has("codex-redeem"), false);
+
+    loggedIn = true;
+    await handlers.get("model_select")?.({}, ctx);
+    assert.equal(commands.has("codex-usage"), true);
+    assert.equal(commands.has("codex-redeem"), true);
+    assert.equal(autocompleteRefreshes, 1);
+
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("Codex usage refreshes directly from the official WHAM endpoint", async () => {
   const resetAt = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
   const payload = {
@@ -1084,7 +1246,7 @@ test("Codex usage refreshes directly from the official WHAM endpoint", async () 
   registerCodexUsageAndFast(pi, {
     getConfig: () => DEFAULT_CODEX_API_CONFIG,
     updateConfig: () => {},
-  });
+  }, { registerCommandsImmediately: true });
   assert.ok(command);
   assert.ok(redeemCommand);
   assert.deepEqual(commands, ["codex-usage", "codex-redeem"]);
@@ -1218,7 +1380,7 @@ test("Codex usage redeem command previews then confirms before consuming", async
   registerCodexUsageAndFast(pi, {
     getConfig: () => DEFAULT_CODEX_API_CONFIG,
     updateConfig: () => {},
-  });
+  }, { registerCommandsImmediately: true });
   const redeemCommand = commands.get("codex-redeem");
   assert.ok(redeemCommand);
 
@@ -1320,7 +1482,7 @@ test("Codex usage command wraps the notify output in muted styling", async () =>
   registerCodexUsageAndFast(pi, {
     getConfig: () => DEFAULT_CODEX_API_CONFIG,
     updateConfig: () => {},
-  });
+  }, { registerCommandsImmediately: true });
   const usageCommand = commands.get("codex-usage");
   assert.ok(usageCommand);
 
@@ -1370,7 +1532,7 @@ test("Codex usage redeem confirms via dialog when UI is available", async () => 
   registerCodexUsageAndFast(pi, {
     getConfig: () => DEFAULT_CODEX_API_CONFIG,
     updateConfig: () => {},
-  });
+  }, { registerCommandsImmediately: true });
   const redeemCommand = commands.get("codex-redeem");
   assert.ok(redeemCommand);
 
@@ -1516,7 +1678,7 @@ test("Codex usage redeem reports when no credits are available", async () => {
   registerCodexUsageAndFast(pi, {
     getConfig: () => DEFAULT_CODEX_API_CONFIG,
     updateConfig: () => {},
-  });
+  }, { registerCommandsImmediately: true });
   const redeemCommand = commands.get("codex-redeem");
   assert.ok(redeemCommand);
 

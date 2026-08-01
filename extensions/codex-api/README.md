@@ -49,7 +49,19 @@ Requirements:
 That's it — just ask *"generate an image of a neon ramen shop"* or *"search
 the web for today's Rust releases"* and the model calls the tools for you.
 
+When `@99percentpeople/pi-ssh-remote` is active, `codex_image.output_path` and
+`referenced_image_paths` resolve through `@99percentpeople/pi-workspace-files`
+and its remote binary backend. Generated
+Base64 data is written directly through the remote adapter and references are
+read directly from it, without creating local staging files.
+
 ## Commands
+
+The commands below are registered only after Pi confirms an `openai-codex`
+OAuth login. Sessions that start without Codex login do not show them; login
+and model/auth changes are detected during the session. Pi currently has no
+command-unregister API, so after logging out in the same running session use
+`/reload` (or open another session) to remove commands registered earlier.
 
 ### `/codex-usage`
 

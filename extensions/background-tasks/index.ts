@@ -87,6 +87,8 @@ interface ShellLaunch {
   file: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  /** Local cwd for the launched shell process; adapters may map context.cwd elsewhere. */
+  cwd?: string;
   initialStdin?: string;
 }
 
@@ -287,6 +289,14 @@ function defaultShellResolver(
 }
 
 let resolveShell: ShellResolver = defaultShellResolver;
+
+function resetExecutionBackend(): void {
+  spawnFn = spawn;
+  ptySpawnFn = nodePty.spawn;
+  terminalInput = process.stdin;
+  terminalOutput = process.stdout;
+  resolveShell = defaultShellResolver;
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -1568,6 +1578,11 @@ function updateWidget(): void {
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // Extension modules can survive Pi session replacement. Reset adapters here
+  // so a remote or alternate shell from the previous session cannot leak into
+  // a newly loaded local session before adapters register again.
+  resetExecutionBackend();
+
   registerExtensionSettings(pi, {
     namespace: "background-tasks",
     title: "Background Tasks",
@@ -1723,11 +1738,12 @@ export default function (pi: ExtensionAPI) {
       const stdoutLogKey = taskLogKey(id, "stdout");
       const stderrLogKey = taskLogKey(id, "stderr");
       const mode = params.pty ? "pty" : "pipe";
+      const cwd = params.cwd || ctx.cwd;
       const shell = resolveShell(params.command, mode === "pty", {
-        cwd: ctx.cwd,
+        cwd,
         projectTrusted: ctx.isProjectTrusted(),
       });
-      const cwd = params.cwd || ctx.cwd;
+      const launchCwd = shell.cwd ?? cwd;
       const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
         MIN_TERMINAL_COLS,
         Math.floor(params.cols ?? terminalOutput.columns ?? 120),
@@ -1746,13 +1762,13 @@ export default function (pi: ExtensionAPI) {
             name: shell.env.TERM || "xterm-256color",
             cols,
             rows,
-            cwd,
+            cwd: launchCwd,
             env: { ...shell.env, TERM: shell.env.TERM || "xterm-256color" },
           });
           taskProcess = { kind: "pty", pid: ptyProcess.pid, pty: ptyProcess };
         } else {
           const child = spawnFn(shell.file, shell.args, {
-            cwd,
+            cwd: launchCwd,
             stdio: ["pipe", "pipe", "pipe"],
             env: shell.env,
             detached: process.platform !== "win32",

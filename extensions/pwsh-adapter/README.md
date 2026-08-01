@@ -9,7 +9,9 @@ input/output configured automatically.
 It replaces Pi's `bash` compatibility tool and user `!`/`!!` commands with
 PowerShell, configures UTF-8 input/output, and adapts
 `@99percentpeople/pi-background-tasks` to use the same runtime when both
-packages are installed.
+packages are installed. The compatibility tool reuses Pi's built-in bash tool
+definition, preserving its optional timeout, streaming updates, output
+truncation, full-output files, elapsed-time display, and error formatting.
 
 At startup it selects PowerShell once for the whole session:
 

@@ -6,14 +6,15 @@
 [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api)
 [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect)
 [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter)
+[![ssh-remote](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-ssh-remote?label=ssh-remote)](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote)
 [![thinking-fold](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-thinking-fold?label=thinking-fold)](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold)
 [![todo](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-todo?label=todo)](https://www.npmjs.com/package/@99percentpeople/pi-todo)
 
 A focused collection of TypeScript extensions for the
 [Pi coding agent](https://pi.dev/): run and revisit background tasks, expose
 Codex subscription image and search APIs, style the main session status cursors,
-use PowerShell consistently on Windows, fold long reasoning traces, and keep
-model-authored plans visible in the TUI.
+use PowerShell consistently on Windows, route coding tools through OpenSSH,
+fold long reasoning traces, and keep model-authored plans visible in the TUI.
 
 | Extension | npm package | Purpose |
 | --- | --- | --- |
@@ -21,6 +22,7 @@ model-authored plans visible in the TUI.
 | codex-api | [`@99percentpeople/pi-codex-api`](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation/editing, first-party search, Fast mode, and subscription usage status |
 | cursor-effect | [`@99percentpeople/pi-cursor-effect`](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Selectable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
+| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi file, shell, and compatible background tools to remote Unix or Windows workspaces through OpenSSH |
 | thinking-fold | [`@99percentpeople/pi-thinking-fold`](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Live tail previews for long reasoning traces with full summaries and Ctrl+T expansion |
 | todo | [`@99percentpeople/pi-todo`](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Minimal atomic whole-plan todo writes with dependencies and a read-only list above the input |
 
@@ -79,6 +81,19 @@ For example:
 
 Operational commands such as `/bg-attach` and `/bg-kill` remain separate.
 
+## Shared workspace files
+
+`@99percentpeople/pi-workspace-files` provides the common binary workspace I/O
+protocol used by `codex-api` and `ssh-remote`. Consumers request the active file
+system and automatically fall back to a workspace-confined local Node.js
+backend. Remote extensions can register a provider for native path resolution,
+buffered or streaming binary reads/writes through the same methods, directory
+creation, existence checks, and cancellation.
+
+It is a library dependency rather than a Pi extension, so it registers no tools,
+commands, or `pi.extensions` entry. See
+[`packages/workspace-files`](packages/workspace-files/README.md).
+
 ## Highlights
 
 - Install only the capabilities you need; every extension is an independent npm
@@ -106,6 +121,14 @@ pi install npm:@99percentpeople/pi-pwsh-adapter
 
 Without the adapter, `bg_start` follows Pi's configured Bash resolution and
 command prefix, including Git Bash on Windows.
+
+Use local Pi sessions and credentials against a remote Unix or Windows workspace
+through an existing OpenSSH alias:
+
+```bash
+pi install npm:@99percentpeople/pi-ssh-remote
+pi --ssh devbox:/srv/project
+```
 
 Install Codex subscription API tools after signing in to Pi's `openai-codex`
 provider. Build local package directories before installing them from this
@@ -185,16 +208,38 @@ The adapter is a Windows-only package that:
 The startup notification and tool prompt identify the selected version so the
 model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 
+## ssh-remote
+
+`ssh-remote` keeps Pi local while routing `read`, `write`, `edit`, `bash`, user
+`!`/`!!`, and compatible `background-tasks` launches through the system
+OpenSSH client. Targets use rsync-style syntax such as
+`devbox:/srv/project`, so normal `~/.ssh/config` aliases, keys, ports,
+`ProxyJump`, and multiplexing continue to work. Unix hosts use Bash; Windows
+OpenSSH hosts use PowerShell 7 or Windows PowerShell 5.1. The resolved target,
+platform, shell, and cwd are stored as hidden Pi session state and reconnect on
+resume; failed connections block remote tools instead of falling back to local
+files. The status line shows only the themed connection state, while an
+automatic `SSH target:path (branch) • first message` session name places the
+remote location and opening request in Pi's normal footer and native `/resume`
+list without replacing the footer. When `codex-api` is installed, its image
+output and reference paths use SSH Remote's shared binary workspace backend,
+including native Windows paths, without local staging. Version 0.1.0 supports
+Linux and macOS clients with Unix or Windows
+remote hosts. See the
+[ssh-remote package documentation](extensions/ssh-remote/README.md).
+
 ## codex-api
 
 `codex-api` turns your ChatGPT subscription into Pi tools — `codex_image`
 and `codex_search` — without an OpenAI API key or MCP server. They even work
 while a third-party model (DeepSeek, Google, …) is active: enable **Other
 providers** in `/99settings` and the tools reuse Pi's logged-in
-`openai-codex` subscription. It also provides settings-controlled Fast mode,
-`/codex-usage` for quota, plan info, and earned reset cards, and
-`/codex-redeem` to confirmably redeem a reset card when you run out of
-messages. Image outputs are saved as non-overwriting PNG files and returned to
+`openai-codex` subscription. It also provides settings-controlled Fast mode.
+After Pi confirms an `openai-codex` OAuth login, it registers `/codex-usage`
+for quota, plan info, and earned reset cards, plus `/codex-redeem` to
+confirmably redeem a reset card when you run out of messages. Sessions started
+without a Codex login keep these commands hidden. Image outputs are saved as
+non-overwriting PNG files and returned to
 the model for follow-up inspection. Search supports web and image queries, page
 navigation, PDF screenshots, finance, weather, sports, and time operations,
 with Auto routing (Cached / Indexed / Live per call) or fixed user modes.
@@ -276,6 +321,7 @@ Load an extension directly from TypeScript while developing:
 ```bash
 pi -e ./extensions/background-tasks/index.ts
 pi -e ./extensions/cursor-effect/index.ts
+pi -e ./extensions/ssh-remote/index.ts --ssh devbox:/srv/project
 pi -e ./extensions/thinking-fold/index.ts
 pi -e ./extensions/todo/index.ts
 ```
@@ -297,6 +343,12 @@ extensions/
 │   ├── index.ts
 │   ├── package.json
 │   └── README.md
+├── ssh-remote/
+│   ├── index.ts
+│   ├── client.ts
+│   ├── operations.ts
+│   ├── package.json
+│   └── README.md
 ├── thinking-fold/
 │   ├── index.ts
 │   ├── renderer.ts
@@ -311,15 +363,21 @@ extensions/
     ├── package.json
     └── README.md
 packages/
-└── shared-settings/
+├── shared-settings/
+│   ├── index.ts
+│   ├── sectioned-settings-list.ts
+│   ├── package.json
+│   └── README.md
+└── workspace-files/
     ├── index.ts
-    ├── sectioned-settings-list.ts
     ├── package.json
     └── README.md
 tests/
 ├── background-tasks.test.ts
 ├── cursor-effect.test.ts
 ├── shared-settings.test.ts
+├── workspace-files.test.ts
+├── ssh-remote.test.ts
 ├── thinking-fold.test.ts
 ├── todo.test.ts
 └── packages.test.ts
@@ -332,7 +390,7 @@ Publishing with GitHub Actions OIDC. It does not require an `NPM_TOKEN` GitHub
 secret.
 
 Before the first automated release, configure a Trusted Publisher separately
-for all six npm packages:
+for all nine npm packages:
 
 - Provider: GitHub Actions
 - Organization or user: `99percentpeople`
@@ -346,14 +404,17 @@ independently:
 | Package | Tag format | Example |
 | --- | --- | --- |
 | background-tasks | `background-tasks-v<version>` | `background-tasks-v1.2.2` |
+| codex-api | `codex-api-v<version>` | `codex-api-v0.2.2` |
 | cursor-effect | `cursor-effect-v<version>` | `cursor-effect-v0.1.0` |
-| pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.2` |
+| pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.6` |
+| ssh-remote | `ssh-remote-v<version>` | `ssh-remote-v0.1.0` |
 | thinking-fold | `thinking-fold-v<version>` | `thinking-fold-v0.1.0` |
 | todo | `todo-v<version>` | `todo-v1.2.0` |
 | shared-settings | `shared-settings-v<version>` | `shared-settings-v0.1.0` |
+| workspace-files | `workspace-files-v<version>` | `workspace-files-v0.1.0` |
 
-Publish `shared-settings` before releasing an extension that requires a newer
-shared-settings version.
+Publish shared library packages before releasing an extension that requires a
+newer version of them.
 
 To publish a release:
 
@@ -376,6 +437,7 @@ package's `package.json`.
 pi remove npm:@99percentpeople/pi-background-tasks
 pi remove npm:@99percentpeople/pi-cursor-effect
 pi remove npm:@99percentpeople/pi-pwsh-adapter
+pi remove npm:@99percentpeople/pi-ssh-remote
 pi remove npm:@99percentpeople/pi-thinking-fold
 pi remove npm:@99percentpeople/pi-todo
 ```

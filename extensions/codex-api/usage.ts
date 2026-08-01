@@ -495,6 +495,8 @@ export interface CodexUsageHandle {
 export interface CodexUsageOptions {
   /** Internal/test override. Production watches Pi's agent-dir auth.json. */
   authPath?: string;
+  /** Internal/test override for command-handler tests without a session lifecycle. */
+  registerCommandsImmediately?: boolean;
 }
 
 /**
@@ -698,19 +700,31 @@ export function registerCodexUsageAndFast(
     return !!model && ctx.modelRegistry.isUsingOAuth(model);
   };
 
-  const checkCurrentAccount = (ctx: ExtensionContext): Promise<void> => {
+  const codexOAuthLoginAvailable = (ctx: ExtensionContext): boolean =>
+    (ctx.model?.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(ctx.model))
+    || (ctx.modelRegistry.getAll?.() ?? []).some((candidate) =>
+      candidate.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(candidate)
+    );
+
+  const checkCurrentAccount = (
+    ctx: ExtensionContext,
+    forceUsage = false,
+  ): Promise<void> => {
     latestContext = ctx;
     if (accountCheck) return accountCheck;
     const operation = (async () => {
       const config = controller.getConfig();
-      if (!codexOAuthAvailable(ctx, config)) {
+      const usageAvailable = codexOAuthAvailable(ctx, config);
+      if (!codexOAuthLoginAvailable(ctx)) {
         if (activeAccountId !== undefined) invalidateAuthState(ctx, "remove");
         return;
       }
       let accountId: string;
       try {
+        // Command visibility follows login state, not the active model or the
+        // cross-provider tool setting. The latter still controls execution.
         const client = await createCodexApiClient(ctx, {
-          allowOtherProviders: config.allowOtherProviders,
+          allowOtherProviders: true,
         });
         accountId = client.accountId;
       } catch {
@@ -718,8 +732,13 @@ export function registerCodexUsageAndFast(
         return;
       }
       if (!accountObserverActive || latestContext !== ctx) return;
+      registerCodexCommands(ctx);
       const accountChanged = activateAccount(accountId, ctx);
-      if (config.usageStatus && (accountChanged || (currentState()?.snapshots.length ?? 0) === 0)) {
+      if (
+        usageAvailable
+        && config.usageStatus
+        && (forceUsage || accountChanged || (currentState()?.snapshots.length ?? 0) === 0)
+      ) {
         await refreshUsage(ctx, true);
       }
     })();
@@ -760,7 +779,6 @@ export function registerCodexUsageAndFast(
     } catch {
       // The normal agent directory exists; natural usage events remain a fallback.
     }
-    void checkCurrentAccount(ctx).catch(() => {});
   };
 
   const storeHeaderSnapshots = async (
@@ -776,7 +794,7 @@ export function registerCodexUsageAndFast(
     }
   };
 
-  pi.registerCommand("codex-usage", {
+  const codexUsageCommand: Parameters<ExtensionAPI["registerCommand"]>[1] = {
     description: "Refresh and show Codex subscription usage, plan, and rate limit redeems",
     handler: async (_args, ctx) => {
       try {
@@ -807,9 +825,9 @@ export function registerCodexUsageAndFast(
       // slightly more visible. The embedded ANSI codes survive the notify path.
       ctx.ui.notify(ctx.ui.theme ? ctx.ui.theme.fg("muted", message) : message, "info");
     },
-  });
+  };
 
-  pi.registerCommand("codex-redeem", {
+  const codexRedeemCommand: Parameters<ExtensionAPI["registerCommand"]>[1] = {
     description: "Preview and redeem an earned Codex rate limit reset credit (confirmation required)",
     handler: async (_args, ctx) => {
       const config = controller.getConfig();
@@ -936,7 +954,20 @@ export function registerCodexUsageAndFast(
         ctx.ui.notify(`Failed to redeem a rate limit reset: ${message}`, "error");
       }
     },
-  });
+  };
+
+  let commandsRegistered = false;
+  const registerCodexCommands = (ctx?: ExtensionContext): void => {
+    if (commandsRegistered) return;
+    commandsRegistered = true;
+    pi.registerCommand("codex-usage", codexUsageCommand);
+    pi.registerCommand("codex-redeem", codexRedeemCommand);
+
+    // Refresh interactive autocomplete when login happens after startup.
+    ctx?.ui.addAutocompleteProvider?.((current) => current);
+  };
+
+  if (options.registerCommandsImmediately) registerCodexCommands();
 
   pi.on("before_provider_request", (event, ctx) => {
     if (ctx.model?.provider !== "openai-codex") return;
@@ -954,15 +985,14 @@ export function registerCodexUsageAndFast(
     refreshInBackground(ctx);
   });
 
-  pi.on("model_select", (_event, ctx) => {
+  pi.on("model_select", async (_event, ctx) => {
     startAccountObserver(ctx);
-    void checkCurrentAccount(ctx).catch(() => {});
-    refreshInBackground(ctx, true);
+    await checkCurrentAccount(ctx, true).catch(() => {});
     startPolling(ctx);
   });
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     startAccountObserver(ctx);
-    refreshInBackground(ctx, true);
+    await checkCurrentAccount(ctx, true).catch(() => {});
     startPolling(ctx);
   });
   pi.on("session_shutdown", (_event, ctx) => {

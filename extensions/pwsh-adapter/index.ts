@@ -1,6 +1,9 @@
 import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
-import type { ExtensionAPI, BashOperations } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import {
+  createBashToolDefinition,
+  type ExtensionAPI,
+  type BashOperations,
+} from "@earendil-works/pi-coding-agent";
 import {
   spawn,
   spawnSync,
@@ -17,6 +20,8 @@ $OutputEncoding = $utf8NoBom
 
 const PWSH_EXECUTABLE = "pwsh.exe";
 const WINDOWS_POWERSHELL_EXECUTABLE = "powershell.exe";
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
 export interface PowerShellRuntime {
   file: string;
@@ -92,19 +97,16 @@ export function selectPowerShellRuntime(
   );
 }
 
-function createBashSchema(runtime: PowerShellRuntime) {
-  return Type.Object({
-    command: Type.String({
-      description: `Command to execute with ${runtime.label}, not GNU bash.`,
-    }),
-    timeout: Type.Optional(
-      Type.Number({
-        description: "Timeout in seconds. Omit or set 0 for no timeout.",
-        minimum: 0,
-        maximum: 3600,
-      }),
-    ),
-  });
+function resolveTimeoutMs(timeout?: number): number | undefined {
+  if (timeout === undefined) return undefined;
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new Error("Invalid timeout: must be a finite number of seconds");
+  }
+  const timeoutMs = timeout * 1000;
+  if (timeoutMs > MAX_TIMEOUT_MS) {
+    throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+  }
+  return timeoutMs;
 }
 
 function killProcessTree(pid?: number) {
@@ -126,6 +128,7 @@ function createPwshBashOperations(runtime: PowerShellRuntime): BashOperations {
   return {
     exec(command, cwd, { onData, signal, timeout, env }) {
       return new Promise((resolve, reject) => {
+        const timeoutMs = resolveTimeoutMs(timeout);
         let timedOut = false;
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
@@ -163,11 +166,11 @@ function createPwshBashOperations(runtime: PowerShellRuntime): BashOperations {
         child.stdout?.on("data", onData);
         child.stderr?.on("data", onData);
 
-        if (timeout && timeout > 0) {
+        if (timeoutMs !== undefined) {
           timeoutHandle = setTimeout(() => {
             timedOut = true;
             killProcessTree(child.pid);
-          }, timeout * 1000);
+          }, timeoutMs);
         }
 
         if (signal?.aborted) {
@@ -208,6 +211,30 @@ function createPwshBashOperations(runtime: PowerShellRuntime): BashOperations {
         });
       });
     },
+  };
+}
+
+export function createPowerShellBashToolDefinition(
+  runtime: PowerShellRuntime,
+  cwd: string,
+  operations: BashOperations = createPwshBashOperations(runtime),
+): ReturnType<typeof createBashToolDefinition> {
+  const original = createBashToolDefinition(cwd, { operations });
+  return {
+    ...original,
+    description: original.description.replace(
+      "Execute a bash command in the current working directory.",
+      `Execute a command in the current working directory through ${runtime.label}. The tool is named bash for compatibility.`,
+    ),
+    promptSnippet: `Execute ${runtime.label} commands on Windows`,
+    promptGuidelines: [
+      ...(original.promptGuidelines ?? []),
+      `This tool runs through ${runtime.label} (${runtime.file}), despite being named bash.`,
+      runtime.kind === "powershell-7"
+        ? "Use PowerShell 7 syntax."
+        : "Use Windows PowerShell 5.1 syntax and avoid PowerShell 7-only features.",
+      "Do not rely on GNU bash-only features unless explicitly invoking bash yourself.",
+    ],
   };
 }
 
@@ -267,7 +294,6 @@ export default function (pi: ExtensionAPI) {
   if (process.platform !== "win32") return;
 
   const runtime = selectPowerShellRuntime();
-  const bashSchema = createBashSchema(runtime);
   const pwshOps = createPwshBashOperations(runtime);
   const bgSpawn = createBgSpawnWrapper(runtime);
   const bgShell = createBgShellResolver(runtime);
@@ -284,56 +310,23 @@ export default function (pi: ExtensionAPI) {
     );
   });
 
+  const bashTemplate = createPowerShellBashToolDefinition(
+    runtime,
+    process.cwd(),
+    pwshOps,
+  );
   pi.registerTool({
-    name: "bash",
-    label: "bash",
-    description:
-      `Execute a shell command in the current working directory through ${runtime.label}. The tool is named bash for compatibility.`,
-    promptSnippet:
-      `Run shell commands with ${runtime.label} on Windows.`,
-    promptGuidelines: [
-      `This tool runs through ${runtime.label} (${runtime.file}), despite being named bash.`,
-      runtime.kind === "powershell-7"
-        ? "Use PowerShell 7 syntax."
-        : "Use Windows PowerShell 5.1 syntax and avoid PowerShell 7-only features.",
-      "Do not rely on GNU bash-only features unless explicitly invoking bash yourself.",
-    ],
-    parameters: bashSchema,
-
-    async execute(_toolCallId, { command, timeout }, signal, onUpdate, ctx) {
-      let output = "";
-
-      if (onUpdate) {
-        onUpdate({ content: [], details: undefined });
-      }
-
-      const result = await pwshOps.exec(command, ctx.cwd, {
-        timeout,
-        signal,
-        onData(data) {
-          output += data.toString("utf8");
-
-          onUpdate?.({
-            content: [{ type: "text", text: output || "(no output yet)" }],
-            details: { progress: "running" },
-          });
-        },
-      });
-
-      if (result.exitCode !== 0 && result.exitCode !== null) {
-        throw new Error(
-          `${output || "(no output)"}\n\nCommand exited with code ${result.exitCode}`,
-        );
-      }
-
-      return {
-        content: [{ type: "text", text: output || "(no output)" }],
-        details: { exitCode: result.exitCode },
-      };
+    ...bashTemplate,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      return createPowerShellBashToolDefinition(
+        runtime,
+        ctx.cwd,
+        pwshOps,
+      ).execute(toolCallId, params, signal, onUpdate, ctx);
     },
   });
 
-  // 关键：拦截用户手动输入的 ! 和 !!
+  // Intercept user-entered ! and !! commands with the same PowerShell backend.
   pi.on("user_bash", () => {
     return { operations: pwshOps };
   });

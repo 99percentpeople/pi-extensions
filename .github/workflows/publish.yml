@@ -7,9 +7,11 @@ on:
       - "codex-api-v*"
       - "cursor-effect-v*"
       - "pwsh-adapter-v*"
+      - "ssh-remote-v*"
       - "thinking-fold-v*"
       - "todo-v*"
       - "shared-settings-v*"
+      - "workspace-files-v*"
 
 permissions:
   contents: read
@@ -58,9 +60,11 @@ jobs:
             { prefix: "codex-api-v", directory: "extensions/codex-api" },
             { prefix: "cursor-effect-v", directory: "extensions/cursor-effect" },
             { prefix: "pwsh-adapter-v", directory: "extensions/pwsh-adapter" },
+            { prefix: "ssh-remote-v", directory: "extensions/ssh-remote" },
             { prefix: "thinking-fold-v", directory: "extensions/thinking-fold" },
             { prefix: "todo-v", directory: "extensions/todo" },
             { prefix: "shared-settings-v", directory: "packages/shared-settings" },
+            { prefix: "workspace-files-v", directory: "packages/workspace-files" },
           ];
           const release = releases.find(({ prefix }) => tag.startsWith(prefix));
           if (!release) throw new Error(`Unsupported release tag: ${tag}`);

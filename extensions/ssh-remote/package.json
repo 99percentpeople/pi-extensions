@@ -1,11 +1,10 @@
 {
-  "name": "@99percentpeople/pi-codex-api",
-  "version": "0.2.2",
-  "description": "Expose Codex subscription image, search, Fast, and usage APIs as native Pi tools and commands",
+  "name": "@99percentpeople/pi-ssh-remote",
+  "version": "0.1.0",
+  "description": "Route Pi's file and shell tools to remote Unix or Windows workspaces through OpenSSH",
   "type": "module",
   "files": [
     "dist",
-    "skills",
     "README.md",
     "LICENSE"
   ],
@@ -17,43 +16,37 @@
   "pi": {
     "extensions": [
       "./dist/index.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   },
   "keywords": [
     "pi-package",
     "pi",
     "coding-agent",
-    "codex",
-    "chatgpt",
-    "image-generation",
-    "web-search"
+    "ssh",
+    "remote-development",
+    "openssh"
   ],
   "author": "99percentpeople",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/99percentpeople/pi-extensions.git",
-    "directory": "extensions/codex-api"
+    "directory": "extensions/ssh-remote"
   },
   "bugs": {
     "url": "https://github.com/99percentpeople/pi-extensions/issues"
   },
-  "homepage": "https://github.com/99percentpeople/pi-extensions#codex-api",
+  "homepage": "https://github.com/99percentpeople/pi-extensions#ssh-remote",
   "publishConfig": {
     "access": "public",
-    "registry": "https://registry.npmjs.org/"
+    "registry": "https://registry.npmjs.org"
   },
   "dependencies": {
     "@99percentpeople/pi-shared-settings": "0.1.2",
     "@99percentpeople/pi-workspace-files": "0.1.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-tui": "*"
   }
 }

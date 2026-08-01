@@ -16,7 +16,7 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.2.6",
+      "version": "1.2.7",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@xterm/addon-serialize": "0.14.0",
@@ -32,9 +32,10 @@
     },
     "extensions/codex-api": {
       "name": "@99percentpeople/pi-codex-api",
-      "version": "0.2.0",
+      "version": "0.2.2",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
+        "@99percentpeople/pi-workspace-files": "0.1.0",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -56,13 +57,25 @@
     },
     "extensions/pwsh-adapter": {
       "name": "@99percentpeople/pi-pwsh-adapter",
-      "version": "1.0.5",
+      "version": "1.0.6",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "typebox": "*",
+      },
+    },
+    "extensions/ssh-remote": {
+      "name": "@99percentpeople/pi-ssh-remote",
+      "version": "0.1.0",
+      "dependencies": {
+        "@99percentpeople/pi-shared-settings": "0.1.2",
+        "@99percentpeople/pi-workspace-files": "0.1.0",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
       },
     },
     "extensions/thinking-fold": {
@@ -98,6 +111,13 @@
         "@earendil-works/pi-tui": "*",
       },
     },
+    "packages/workspace-files": {
+      "name": "@99percentpeople/pi-workspace-files",
+      "version": "0.1.0",
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+      },
+    },
   },
   "trustedDependencies": [
     "node-pty",
@@ -113,9 +133,13 @@
 
     "@99percentpeople/pi-shared-settings": ["@99percentpeople/pi-shared-settings@workspace:packages/shared-settings"],
 
+    "@99percentpeople/pi-ssh-remote": ["@99percentpeople/pi-ssh-remote@workspace:extensions/ssh-remote"],
+
     "@99percentpeople/pi-thinking-fold": ["@99percentpeople/pi-thinking-fold@workspace:extensions/thinking-fold"],
 
     "@99percentpeople/pi-todo": ["@99percentpeople/pi-todo@workspace:extensions/todo"],
+
+    "@99percentpeople/pi-workspace-files": ["@99percentpeople/pi-workspace-files@workspace:packages/workspace-files"],
 
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.91.1", "", { "dependencies": { "json-schema-to-ts": "^3.1.1" }, "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" }, "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-LAmu761tSN9r66ixvmciswUj/ZC+1Q4iAfpedTfSVLeswRwnY3n2Nb6Tsk+cLPP28aLOPWeMgIuTuCcMC6W/iw=="],
 
