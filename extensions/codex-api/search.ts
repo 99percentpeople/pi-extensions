@@ -81,10 +81,9 @@ const SearchCommandsSchema = Type.Object({
     duration: Type.Optional(Type.Integer({ minimum: 1 })),
   }, { additionalProperties: false }), { minItems: 1 })),
   sports: Type.Optional(Type.Array(Type.Object({
-    // Required by the Codex search backend; the schema must enforce it because
-    // models routinely omit an optional field (backend replies with a schema
-    // dump instead of data when it is missing).
-    tool: Type.Literal("sports"),
+    // The Codex backend requires tool: "sports" on every sports item, but it
+    // is an API-internal constant tied to the command name, so it is hidden
+    // from the model entirely; execute() injects it before sending.
     fn: Type.Union([Type.Literal("schedule"), Type.Literal("standings")]),
     league: Type.Union([
       Type.Literal("nba"),
@@ -434,6 +433,13 @@ export function registerCodexSearchTool(
       const { search_mode: requestedMode, ...commands } = params;
       if (!hasCommand(commands as Record<string, unknown>)) {
         throw new Error("codex_search requires at least one search or lookup command");
+      }
+      // The backend requires tool: "sports" on every sports item; the field
+      // is hidden from the model schema, so inject it unconditionally here.
+      for (const item of argumentItems(commands.sports)) {
+        if (item && typeof item === "object") {
+          item.tool = "sports";
+        }
       }
       const config = getConfig();
       const effectiveMode = resolveSearchModeForCommands(
