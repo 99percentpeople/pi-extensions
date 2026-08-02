@@ -1234,7 +1234,12 @@ test("auto mode falls back to sh on ash-only hosts (OpenWrt)", async () => {
   const withBash = new FakeSshClient({ target: "devbox" });
   const bashSelection = await selectRemoteAdapter(withBash, { preference: "auto" });
   assert.equal(bashSelection.adapter.shell, "bash");
-  const control = await (bashSelection.adapter as UnixBashAdapter).listDirectory("/srv/project");
+  // Windows adapters require the encoded logical tool path, so route the
+  // directory through toToolPath like the extension's tools do.
+  const bashAdapter = bashSelection.adapter as UnixBashAdapter;
+  const control = await bashAdapter.listDirectory(
+    bashAdapter.toToolPath("/srv/project", bashSelection.workspace),
+  );
   assert.equal(control.length, 2);
   assert.ok(withBash.calls.some((call) => call.command.includes("exec sh -lc")));
 });
