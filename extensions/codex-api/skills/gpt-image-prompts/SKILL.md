@@ -133,6 +133,22 @@ When composition matters, specify:
 
 Use left/right placement only when the user or intended layout requires it.
 
+### Aspect ratio control
+
+Express the target aspect ratio with explicit composition words in the prompt,
+not with parameters:
+
+- `Wide 16:9 landscape composition, panoramic` for a landscape canvas;
+- `Tall 9:16 vertical portrait composition` for a tall vertical canvas;
+- `Square 1:1 composition` for a square canvas;
+- `Vertical 4:5 portrait composition` for a moderate portrait canvas.
+
+GPT Image 2 honors these phrases and returns output that matches the stated
+ratio. Sizing or aspect parameters exposed by the calling tool are often
+ignored by the backend, so the prompt is the reliable control. Mention the
+orientation early (purpose or composition line) rather than burying it at the
+end.
+
 ## Text inside images
 
 Text is a visual constraint, not an afterthought:

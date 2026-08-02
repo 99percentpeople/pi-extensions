@@ -196,8 +196,9 @@ export function registerCodexImageTool(
     promptSnippet: "Generate or edit raster images through the active Codex subscription",
     promptGuidelines: [
       "Use codex_image for requested raster images, illustrations, mockups, textures, or edits when the active model uses openai-codex OAuth, or Other providers is enabled in /99settings and Codex OAuth is logged in.",
+      "Load the gpt-image-prompts skill before generating or editing an image; it covers prompt structure, composition, aspect-ratio control, exact text, and edit patterns.",
       "For a new image, omit both reference fields. For an edit, use referenced_image_paths for local files or num_last_images_to_include for recent attached/generated conversation images; never provide both.",
-      "Omit size and quality unless the user explicitly requests exact dimensions, a draft, or a quality level; otherwise official automatic sizing and the user's /99settings quality default apply.",
+      "Omit size and quality unless the user explicitly requests a draft or quality level; the size and aspect_ratio parameters may be ignored by the backend — control the aspect ratio with composition words in the prompt (see the skill).",
       "Use a new output_path and do not overwrite an existing asset; report the saved path after generation.",
     ],
     parameters: Type.Object({
@@ -217,7 +218,7 @@ export function registerCodexImageTool(
       size: Type.Optional(Type.String({
         minLength: 1,
         pattern: "^(auto|[1-9][0-9]*x[1-9][0-9]*)$",
-        description: "Exact GPT Image 2 output size as WIDTHxHEIGHT only when required. Edges must be divisible by 16 and at most 3840px, aspect ratio 1:3 to 3:1, total 655360 to 8294400 pixels",
+        description: "Exact GPT Image 2 output size as WIDTHxHEIGHT only when required. Edges must be divisible by 16 and at most 3840px, aspect ratio 1:3 to 3:1, total 655360 to 8294400 pixels. May be ignored by the backend; control the aspect ratio with composition words in the prompt (see the gpt-image-prompts skill).",
       })),
       quality: Type.Optional(ImageQualitySchema),
       output_path: Type.Optional(Type.String({

@@ -5,7 +5,7 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createCodexApiClient } from "./client.ts";
+import { createCodexApiClient, type CodexApiClient } from "./client.ts";
 import type { CodexApiConfig } from "./config.ts";
 import {
   reusableText,
@@ -62,7 +62,7 @@ const SearchCommandsSchema = Type.Object({
     pattern: Type.String({ minLength: 1 }),
   }, { additionalProperties: false }), { minItems: 1 })),
   screenshot: Type.Optional(Type.Array(Type.Object({
-    ref_id: Type.String({ minLength: 1, description: "PDF reference ID or URL" }),
+    ref_id: Type.String({ minLength: 1, description: "Reference ID returned by a prior open call; direct PDF URLs are also accepted and auto-opened first" }),
     pageno: Type.Integer({ minimum: 0, description: "Zero-indexed PDF page number" }),
   }, { additionalProperties: false }), { minItems: 1 })),
   finance: Type.Optional(Type.Array(Type.Object({
@@ -81,7 +81,10 @@ const SearchCommandsSchema = Type.Object({
     duration: Type.Optional(Type.Integer({ minimum: 1 })),
   }, { additionalProperties: false }), { minItems: 1 })),
   sports: Type.Optional(Type.Array(Type.Object({
-    tool: Type.Optional(Type.Literal("sports")),
+    // Required by the Codex search backend; the schema must enforce it because
+    // models routinely omit an optional field (backend replies with a schema
+    // dump instead of data when it is missing).
+    tool: Type.Literal("sports"),
     fn: Type.Union([Type.Literal("schedule"), Type.Literal("standings")]),
     league: Type.Union([
       Type.Literal("nba"),
@@ -145,6 +148,161 @@ export function resolveSearchMode(
   requested?: CodexEffectiveSearchMode,
 ): CodexEffectiveSearchMode {
   return configured === "auto" ? requested ?? "indexed" : configured;
+}
+
+/**
+ * Modes each command family is known to work with.
+ *
+ * Verified against the live backend on 2026-08-02:
+ *   - search_query / image_query / open / time: OK in cached, indexed, live
+ *   - finance / weather: OK in indexed, live; FAIL in cached
+ *     ("Found no tool response")
+ *   - sports: OK only in indexed; FAIL in cached AND live
+ *     ("Found no tool response")
+ *   - click / find / screenshot: same family as open (operate on an already
+ *     fetched page) so they inherit its full-mode support; inferred, not
+ *     separately exercised.
+ */
+export const COMMAND_SUPPORTED_MODES: Readonly<
+  Record<string, readonly CodexEffectiveSearchMode[]>
+> = {
+  search_query: ["cached", "indexed", "live"],
+  image_query: ["cached", "indexed", "live"],
+  open: ["cached", "indexed", "live"],
+  click: ["cached", "indexed", "live"],
+  find: ["cached", "indexed", "live"],
+  screenshot: ["cached", "indexed", "live"],
+  time: ["cached", "indexed", "live"],
+  finance: ["indexed", "live"],
+  weather: ["indexed", "live"],
+  sports: ["indexed"],
+};
+
+/**
+ * Intersect the supported modes of every command present in the request.
+ * `indexed` is supported by every family, so the intersection of a non-empty
+ * command set always contains it (kept as an explicit fallback for future
+ * families that may not share it).
+ */
+function supportedModesFor(
+  commands: Record<string, unknown>,
+): readonly CodexEffectiveSearchMode[] {
+  const requested = Object.keys(commands).filter((key) =>
+    key in COMMAND_SUPPORTED_MODES
+    && Array.isArray(commands[key])
+    && (commands[key] as unknown[]).length > 0
+  );
+  if (requested.length === 0) return ["cached", "indexed", "live"];
+  let modes = COMMAND_SUPPORTED_MODES[requested[0]];
+  for (const key of requested.slice(1)) {
+    const next = COMMAND_SUPPORTED_MODES[key];
+    modes = modes.filter((mode) => next.includes(mode));
+    if (modes.length === 0) break;
+  }
+  return modes.length > 0 ? modes : ["indexed"];
+}
+
+/**
+ * Pick the effective search mode for a request. When the user's mode cannot
+ * serve every requested command (e.g. sports with a fixed cached/live
+ * setting), fall back to the least permissive mode that still works instead
+ * of letting the backend fail with a misleading "Found no tool response".
+ */
+export function resolveSearchModeForCommands(
+  configured: CodexApiConfig["searchMode"],
+  requested: CodexEffectiveSearchMode | undefined,
+  commands: Record<string, unknown>,
+): CodexEffectiveSearchMode {
+  const mode = resolveSearchMode(configured, requested);
+  const supported = supportedModesFor(commands);
+  if (supported.includes(mode)) return mode;
+  return supported.includes("indexed") ? "indexed" : supported[0];
+}
+
+/** Reference IDs produced by the search backend for open/screenshot results. */
+const TURN_REF_PATTERN = /^turn\d+view\d+$/;
+
+function extractTurnRef(output: string): string | undefined {
+  return /turn\d+view\d+/.exec(output)?.[0];
+}
+
+/**
+ * The search backend rejects screenshot calls that reference a direct PDF URL
+ * ("content type is not application/pdf" despite the URL being a valid PDF)
+ * and only accepts the ref_id of a PDF opened earlier in the same session.
+ * Prime such URLs with an open call so the screenshot can resolve.
+ */
+export async function primeScreenshotRefs(
+  client: CodexApiClient,
+  sessionId: string,
+  screenshotItems: any[],
+  effectiveMode: CodexEffectiveSearchMode,
+  searchContextSize: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  let primedAny = false;
+  for (const item of screenshotItems) {
+    const refId = typeof item?.ref_id === "string" ? item.ref_id : "";
+    if (!refId || TURN_REF_PATTERN.test(refId)) continue;
+    try {
+      const primed = await client.post<SearchResponse>("alpha/search", {
+        id: sessionId,
+        model: client.modelId,
+        commands: {
+          open: [{ ref_id: refId, lineno: 0 }],
+          response_length: "short",
+        },
+        settings: {
+          search_context_size: searchContextSize,
+          allowed_callers: ["direct"],
+          external_web_access: externalWebAccess(effectiveMode),
+        },
+        max_output_tokens: 12_000,
+      }, signal);
+      const output = typeof primed.output === "string"
+        ? primed.output
+        : JSON.stringify(primed.output ?? "");
+      const turnRef = extractTurnRef(output);
+      if (turnRef) {
+        item.ref_id = turnRef;
+        primedAny = true;
+      }
+    } catch {
+      // Leave the original ref_id in place so the backend reports the error.
+    }
+  }
+  return primedAny;
+}
+
+/**
+ * Explain backend failures that have a verified, actionable workaround.
+ * Only stable, reproducible cases get hints (all verified 2026-08-02):
+ *   - sports schedule + team/opponent: rejected for some leagues (NBA)
+ *   - finance type "index": never served, use fund/equity instead
+ *   - finance type "equity": rejects ETF tickers, use type "fund"
+ * Everything else (timeouts, transient "Found no tool response", stale
+ * ref_ids, direct-URL screenshots) is already handled elsewhere or is
+ * self-evident from the error text, so no hint is attached.
+ */
+function failureHint(
+  output: string,
+  commands: Record<string, unknown>,
+): string | undefined {
+  if (!/Found no tool response/.test(output)) return undefined;
+  const scheduleWithTeam = argumentItems(commands.sports).some((item) =>
+    item?.fn === "schedule" && (item?.team || item?.opponent)
+  );
+  if (scheduleWithTeam) {
+    return "Tip: sports schedule with team/opponent is rejected for some leagues (NBA fails, NFL works); retry without team/opponent or use date_from/date_to with num_games instead.";
+  }
+  const financeItems = argumentItems(commands.finance);
+  if (financeItems.some((item) => item?.type === "index")) {
+    return "Tip: the backend does not serve index quotes (type \"index\"); use a fund ETF (e.g. SPY) or an equity ticker instead.";
+  }
+  if (financeItems.some((item) => item?.type === "equity")) {
+    return "Tip: if the ticker is an ETF (e.g. VOO), use type \"fund\" instead of \"equity\"; otherwise verify the ticker spelling.";
+  }
+  return undefined;
 }
 
 function externalWebAccess(mode: CodexEffectiveSearchMode): boolean | "indexed" {
@@ -267,6 +425,8 @@ export function registerCodexSearchTool(
       "Prefer search_query for web research and image_query only when actual image search results are needed.",
       "Request search_mode by task: cached for stable facts or known references, indexed for recent documentation and announcements, and live for same-day, breaking, or real-time information. The request is honored only when the user's Search mode is Auto; a fixed user mode always wins.",
       "For same-day or breaking news, include the user's exact calendar date in q and set recency to 1; if results still predate it, report possible Cached/Indexed freshness and source-timezone limits instead of claiming no news exists.",
+      "Sports, finance, and weather lookups are served through indexed web access (the extension picks a working mode automatically when the user's fixed Search mode cannot serve them).",
+      "For screenshot, pass the reference ID returned by a prior open call of the PDF (direct URLs are auto-opened by the extension but can fail); keep PDFs small, and retry once if the render times out.",
     ],
     parameters: SearchCommandsSchema,
     executionMode: "parallel",
@@ -276,7 +436,13 @@ export function registerCodexSearchTool(
         throw new Error("codex_search requires at least one search or lookup command");
       }
       const config = getConfig();
-      const effectiveMode = resolveSearchMode(config.searchMode, requestedMode);
+      const effectiveMode = resolveSearchModeForCommands(
+        config.searchMode,
+        requestedMode,
+        commands as Record<string, unknown>,
+      );
+      const sessionId = ctx.sessionManager.getSessionId();
+      const screenshotItems = argumentItems(commands.screenshot);
       onUpdate?.({
         content: [{ type: "text", text: "Authenticating with Codex…" }],
         details: { mode: effectiveMode, phase: "authenticating" },
@@ -284,12 +450,26 @@ export function registerCodexSearchTool(
       const client = await createCodexApiClient(ctx, {
         allowOtherProviders: config.allowOtherProviders,
       });
+      if (screenshotItems.some((item) => !TURN_REF_PATTERN.test(String(item?.ref_id ?? "")))) {
+        onUpdate?.({
+          content: [{ type: "text", text: "Opening PDF to resolve screenshot reference…" }],
+          details: { mode: effectiveMode, phase: "searching" },
+        });
+        await primeScreenshotRefs(
+          client,
+          sessionId,
+          screenshotItems,
+          effectiveMode,
+          config.searchContextSize,
+          signal,
+        );
+      }
       onUpdate?.({
         content: [{ type: "text", text: "Waiting for Codex search…" }],
         details: { mode: effectiveMode, phase: "searching" },
       });
       const response = await client.post<SearchResponse>("alpha/search", {
-        id: ctx.sessionManager.getSessionId(),
+        id: sessionId,
         model: client.modelId,
         commands,
         settings: {
@@ -302,10 +482,11 @@ export function registerCodexSearchTool(
       const output = typeof response.output === "string"
         ? response.output
         : JSON.stringify(response.output ?? response.results ?? {}, null, 2);
+      const hint = failureHint(output, commands as Record<string, unknown>);
       const results = Array.isArray(response.results) ? response.results : undefined;
       refreshUsageInBackground?.(ctx);
       return {
-        content: [{ type: "text", text: output }],
+        content: [{ type: "text", text: hint ? `${output}\n\n${hint}` : output }],
         details: {
           mode: effectiveMode,
           phase: "completed",
@@ -315,7 +496,11 @@ export function registerCodexSearchTool(
     },
     renderCall(args, theme, context) {
       const text = reusableText(context);
-      const effectiveMode = resolveSearchMode(getConfig().searchMode, args.search_mode);
+      const effectiveMode = resolveSearchModeForCommands(
+        getConfig().searchMode,
+        args.search_mode,
+        args as Record<string, unknown>,
+      );
       const parameterParts = formatSearchArgumentParts(
         args as Record<string, any>,
         effectiveMode,
