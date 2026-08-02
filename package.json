@@ -53,6 +53,7 @@
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "26.1.2",
+    "@types/ssh2": "1.15.5",
     "tsx": "latest",
     "typebox": "latest",
     "typescript": "^5.0.0"

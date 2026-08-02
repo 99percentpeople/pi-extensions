@@ -18,6 +18,7 @@ const shell = (process.argv[3] ?? "pwsh") as "pwsh" | "powershell" | "auto";
 const client = new OpenSshClient({
   target: host,
   executable: "ssh.exe",
+  multiplex: false,
   connectTimeoutSeconds: 10,
   batchMode: true,
 });

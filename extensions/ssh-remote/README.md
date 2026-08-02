@@ -3,19 +3,24 @@
 Use the local [Pi coding agent](https://pi.dev/) against a remote Unix or
 Windows workspace. The extension routes Pi's built-in `read`, `write`, `edit`,
 and `bash` tools plus the optional `grep`, `find`, and `ls` tools and user
-`!`/`!!` commands through the system OpenSSH client while leaving the Pi UI,
-model credentials, packages, and session files on the local machine.
+`!`/`!!` commands through a selectable OpenSSH or `ssh2` transport while
+leaving the Pi UI, model credentials, packages, and session files on the local
+machine.
 
-Version 0.2.0 supports Linux, macOS, and Windows clients connected to:
+The extension supports Linux, macOS, and Windows clients connected to:
 
 - Unix hosts with Bash and the usual POSIX utilities;
 - Windows OpenSSH hosts with PowerShell 7 or Windows PowerShell 5.1.
 
 ## Features
 
-- Reuses OpenSSH aliases and the normal `~/.ssh/config` automatically
-- Supports `User`, `Port`, `IdentityFile`, `ProxyJump`, `Include`, `Match`, and
-  OpenSSH connection multiplexing without reimplementing SSH configuration
+- Provides `auto`, `openssh`, and `ssh2` transports through `/99settings` or
+  `--ssh-transport`
+- Reuses one authenticated connection by default: managed OpenSSH multiplexing
+  on Linux/macOS and persistent `ssh2` channels on Windows
+- Resolves aliases and effective settings through the normal OpenSSH config;
+  both transports support single- and multi-hop `ProxyJump`, while OpenSSH
+  mode retains arbitrary `ProxyCommand` and other advanced client behavior
 - Accepts rsync-style targets such as `host:/srv/project` and `user@host:path`
 - Auto-detects remote Unix/Bash or Windows/PowerShell environments
 - Keeps Pi's native tool schemas, truncation, diffs, rendering, and mutation
@@ -31,6 +36,49 @@ Version 0.2.0 supports Linux, macOS, and Windows clients connected to:
 - Adapts `@99percentpeople/pi-background-tasks` through its `bg:register`
   backend when that extension is installed
 
+## Quick start
+
+```bash
+# 1. Install
+pi install npm:@99percentpeople/pi-ssh-remote
+
+# 2. Start a session against a remote Unix or Windows workspace.
+# The default transport is auto: multiplexed OpenSSH on Linux/macOS,
+# persistent ssh2 on Windows.
+pi --ssh devbox:/srv/project
+pi --ssh 'winuser@winbox:C:\Users\winuser\project'
+
+# 3. Check the active connection and the effective transport
+/ssh-status            # target, platform, shell, transport, remote cwd/home
+/ssh-reconnect         # reconnect / apply a transport change
+```
+
+Common options:
+
+```bash
+--ssh-shell bash|pwsh|powershell|auto   # remote shell (default auto-detect)
+--ssh-transport auto|openssh|ssh2       # transport preference
+--ssh-config <path>                     # alternate local OpenSSH config
+```
+
+Jump hosts work through the normal OpenSSH config with either transport:
+
+```sshconfig
+Host devbox
+    HostName 10.0.0.20
+    User deploy
+    IdentityFile ~/.ssh/company
+    ProxyJump bastion
+```
+
+```bash
+pi --ssh devbox:/srv/project
+```
+
+See [SSH transport](#ssh-transport) for transport details, [Remote shell
+selection](#remote-shell-selection) for shell detection, and [Commands](#commands)
+for the session commands.
+
 ## Install
 
 ```bash
@@ -45,15 +93,56 @@ bun run --cwd extensions/ssh-remote build
 pi -e ./extensions/ssh-remote/index.ts --ssh devbox:/srv/project
 ```
 
-## OpenSSH configuration
+> **Bun on Windows**: installing the package with `bun add`/`bun install` may
+> block `ssh2`'s postinstall scripts (Bun prints `Blocked N postinstalls`).
+> That skips the native build of ssh2's bundled AES-GCM/ChaCha20-Poly1305
+> binding (`lib/protocol/crypto`) and the persistent `ssh2` transport can hang
+> at connection setup. Run `bun pm untrusted` to allow the scripts (or install
+> with `npm i`) before using `ssh2` mode.
+
+## SSH transport
+
+The default is `auto`:
+
+| Local platform | Foreground transport | Connection behavior |
+| --- | --- | --- |
+| Linux / macOS | OpenSSH | Extension-managed `ControlMaster` and `ControlPersist` |
+| Windows | `ssh2` | One persistent TCP/authentication connection with an exec channel per operation |
+
+Choose explicitly from **SSH Remote → Transport** in `/99settings`, or on the
+command line:
+
+```bash
+pi --ssh devbox:/srv/project --ssh-transport auto
+pi --ssh devbox:/srv/project --ssh-transport openssh
+pi --ssh devbox:/srv/project --ssh-transport ssh2
+```
+
+A saved setting applies to the next remote connection; use `/ssh-reconnect` to
+apply it to an active workspace. A command-line value overrides the saved
+setting. `/ssh-status` reports the effective transport and whether it is reused.
+
+In `auto` mode on Windows, an unsupported `ssh2` configuration or connection
+setup automatically falls back to single-use OpenSSH and displays the reason.
+Explicit `ssh2` mode fails instead, allowing configuration incompatibilities to
+be diagnosed rather than hidden.
+
+### OpenSSH mode
 
 The extension invokes the system `ssh` executable (`ssh.exe` on Windows) with
 its destination alias unchanged. Without `--ssh-config`, OpenSSH automatically
 reads its normal user and system configuration, including `~/.ssh/config`.
 
-On Windows, install or enable the Windows OpenSSH Client capability and ensure
-`ssh.exe` is available on `PATH`. The same user SSH config and `ssh-agent`
-credentials used by a manual PowerShell `ssh <host>` command are reused.
+On Linux and macOS, the extension supplies a private, short-lived ControlPath
+and closes its ControlMaster during session shutdown. Each operation still
+spawns a lightweight `ssh` process, but it opens a channel on the existing TCP
+and authenticated SSH connection. This works with either Unix or Windows
+remote hosts.
+
+The native Windows OpenSSH client does not reliably support ControlMaster, so
+OpenSSH mode forces `ControlMaster=no` and executes each foreground operation
+through a separate connection. Install or enable the Windows OpenSSH Client
+capability and ensure `ssh.exe` is available on `PATH`.
 
 ```sshconfig
 Host devbox
@@ -62,9 +151,6 @@ Host devbox
     Port 2222
     IdentityFile ~/.ssh/company
     ProxyJump bastion
-    ControlMaster auto
-    ControlPersist 10m
-    ControlPath ~/.ssh/control-%C
 ```
 
 ```bash
@@ -72,9 +158,43 @@ ssh devbox
 pi --ssh devbox:/srv/project
 ```
 
-The extension enables `BatchMode=yes` and a ten-second connection timeout, so
-password, passphrase, and new-host prompts do not corrupt the Pi TUI. Load keys
-into an SSH agent and accept a new host key before starting Pi.
+### ssh2 mode and OpenSSH compatibility
+
+`ssh2` mode runs `ssh -G` to resolve aliases, `Include`, `Match`, host, user,
+port, identity files, agent location, keepalives, effective algorithm lists,
+and each `ProxyJump` endpoint. It verifies every jump and final server key
+against direct entries in the configured OpenSSH `known_hosts` files and
+supports unencrypted private keys plus Unix, Windows OpenSSH named-pipe,
+Cygwin, or Pageant agents where `ssh2` supports them.
+
+`ProxyJump jump1,jump2` is implemented entirely through ssh2 `direct-tcpip`
+channels: every hop has its own authenticated SSH connection, and the next
+connection uses the previous hop's channel as its socket. No `ssh`, `nc`, or
+`socat` executable is required on a jump server. Each jump server must permit
+TCP forwarding to the next host (for OpenSSH servers, check
+`AllowTcpForwarding` and `PermitOpen`), and destination names are resolved from
+the preceding jump server's network.
+
+The following effective OpenSSH features require `openssh` mode and produce a
+clear compatibility error: arbitrary `ProxyCommand`, `KnownHostsCommand`,
+`RemoteCommand`, `CertificateFile`, `@cert-authority`, `PKCS11Provider`, and
+multi-step `AuthenticationMethods`. Password, keyboard-interactive, and GSSAPI
+login, security-key/FIDO identities, and encrypted keys combined with
+`IdentitiesOnly=yes` are also unsupported. `ControlMaster`, `ControlPersist`,
+and `ControlPath` are unnecessary and ignored because `ssh2` owns the persistent
+connection itself. Paths containing spaces in a multi-file
+`UserKnownHostsFile`/`GlobalKnownHostsFile` value may not be reproduced; select
+OpenSSH for those configurations.
+
+The negotiated cipher list is filtered at runtime: Bun does not currently
+implement the `chacha20-poly1305` cipher in `node:crypto`
+(oven-sh/bun#8072), so that cipher is dropped automatically and the
+connection uses AES-GCM/CTR instead of failing.
+
+Both transports are non-interactive. The extension enables `BatchMode=yes` for
+OpenSSH and a ten-second connection timeout, so password, passphrase, and
+new-host prompts do not corrupt the Pi TUI. Load keys into an SSH agent and
+accept a new host key with the system OpenSSH client before starting Pi.
 
 Use a different local config file only when needed:
 
@@ -176,7 +296,7 @@ between sessions.
 ## Commands
 
 ```text
-/ssh-status      Show target, platform, shell, remote cwd/home, and config source
+/ssh-status      Show target, platform, shell, transport, remote cwd/home, and config source
 /ssh-reconnect   Retry the target stored in the current session
 ```
 
@@ -244,6 +364,12 @@ remote shell backend for both pipe and PTY jobs. Background Tasks 1.2.7 or newer
 also honors the adapter's local launch cwd, allowing `bg_start.cwd` to name a
 remote-only Unix or Windows directory.
 
+Background jobs require a real local process/PTY and therefore always launch
+the system OpenSSH client rather than an `ssh2` foreground channel. With the
+OpenSSH transport on Linux/macOS they receive the same managed ControlPath and
+reuse its connection. With `ssh2`—including Windows `auto`—background jobs use
+separate OpenSSH connections.
+
 Running jobs are still owned by the current Pi process. Session replacement or
 shutdown terminates the local SSH process and does not attempt to reattach the
 job after resume.
@@ -252,6 +378,10 @@ job after resume.
 
 - `todo`, `thinking-fold`, `cursor-effect`, and `codex_search` remain local and
   work normally.
+- `ssh2` intentionally implements only the compatibility subset documented in
+  [ssh2 mode and OpenSSH compatibility](#ssh2-mode-and-openssh-compatibility).
+  Use explicit OpenSSH mode for advanced routing, certificates, hardware keys,
+  or interactive authentication.
 - On Windows clients, local sessions are left untouched so
   `pi-pwsh-adapter` can continue to own the local `bash` tool. SSH Remote
   registers its tool overrides only for sessions that request, resume, or
@@ -291,11 +421,14 @@ job after resume.
 
 ## Security
 
-The package executes the system `ssh` binary and remote shell commands with the
-same account permissions as a manual SSH login. File paths are embedded only in
-encoded control scripts or shell-quoted Unix commands, and file contents travel
-through stdin/stdout. Model-provided shell commands are intentionally executable
-code. Review the package and use a restricted remote account when appropriate.
+The package executes either the system `ssh` binary or the bundled `ssh2`
+protocol client and runs remote shell commands with the same account permissions
+as a manual SSH login. `ssh2` refuses unknown or changed host keys and does not
+implement automatic trust enrollment; establish trust with system OpenSSH
+first. File paths are embedded only in encoded control scripts or shell-quoted
+Unix commands, and file contents travel through SSH channels. Model-provided
+shell commands are intentionally executable code. Review the package and use a
+restricted remote account when appropriate.
 
 ## License
 

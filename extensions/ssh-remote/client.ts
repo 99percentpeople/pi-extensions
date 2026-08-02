@@ -6,6 +6,7 @@ import {
 import {
   closeSync,
   fstatSync,
+  mkdtempSync,
   openSync,
   readSync,
   rmSync,
@@ -14,12 +15,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+export type SshTransportPreference = "auto" | "openssh" | "ssh2";
+export type SshTransportKind = Exclude<SshTransportPreference, "auto">;
+
 export interface SshClientOptions {
   target: string;
   configFile?: string;
   executable?: string;
   connectTimeoutSeconds?: number;
   batchMode?: boolean;
+  /** Internal OpenSSH policy. true manages a ControlMaster; false forces one connection per process. */
+  multiplex?: boolean;
+  /** Internal ControlMaster socket path shared with background OpenSSH launches. */
+  controlPath?: string;
 }
 
 export interface SshRunOptions {
@@ -45,7 +53,15 @@ export interface SshExecutor {
 
 export interface SshRemoteClient extends SshExecutor {
   readonly options: Readonly<SshClientOptions>;
-  dispose(): void;
+  /** Effective foreground transport. Optional for third-party/test implementations. */
+  readonly transport?: SshTransportKind;
+  /** Whether foreground commands share one authenticated SSH transport. */
+  readonly reusesConnection?: boolean;
+  /** Set when auto mode had to switch away from its preferred transport. */
+  readonly fallbackReason?: string;
+  /** Non-fatal OpenSSH options or identities that ssh2 could not reproduce. */
+  readonly compatibilityWarnings?: readonly string[];
+  dispose(): void | Promise<void>;
 }
 
 export type SpawnFunction = (
@@ -71,7 +87,7 @@ function boundedErrorText(buffer: Buffer): string {
  *   temp file handle instead of an anonymous pipe.
  */
 function isWindowsSshExecutable(executable: string | undefined): boolean {
-  return executable === "ssh.exe";
+  return typeof executable === "string" && /(^|[\\/])ssh\.exe$/i.test(executable);
 }
 
 let stdinTempCounter = 0;
@@ -121,6 +137,23 @@ export function buildSshArguments(
 
   const args: string[] = [];
   if (options.configFile) args.push("-F", options.configFile);
+  if (options.multiplex === true) {
+    if (!options.controlPath) {
+      throw new Error("OpenSSH multiplexing requires a control path");
+    }
+    args.push(
+      "-o",
+      "ControlMaster=auto",
+      "-o",
+      "ControlPersist=10m",
+      "-S",
+      options.controlPath,
+    );
+  } else if (options.multiplex === false) {
+    // Native Windows OpenSSH does not support ControlMaster. Command-line
+    // values also prevent an incompatible setting inherited from ssh_config.
+    args.push("-o", "ControlMaster=no", "-o", "ControlPath=none");
+  }
   args.push(
     "-o",
     `BatchMode=${options.batchMode === false ? "no" : "yes"}`,
@@ -135,12 +168,23 @@ export function buildSshArguments(
 
 export class OpenSshClient implements SshRemoteClient {
   readonly options: Readonly<SshClientOptions>;
+  readonly transport = "openssh" as const;
+  readonly reusesConnection: boolean;
   private readonly spawnFn: SpawnFunction;
   private readonly children = new Set<ChildProcess>();
+  private readonly controlDirectory?: string;
   private disposed = false;
 
   constructor(options: SshClientOptions, spawnFn: SpawnFunction = spawn) {
-    this.options = { ...options };
+    let controlDirectory: string | undefined;
+    let controlPath = options.controlPath;
+    if (options.multiplex === true && !controlPath) {
+      controlDirectory = mkdtempSync(join(tmpdir(), "pi-ssh-control-"));
+      controlPath = join(controlDirectory, "mux");
+    }
+    this.options = { ...options, controlPath };
+    this.reusesConnection = options.multiplex === true;
+    this.controlDirectory = controlDirectory;
     this.spawnFn = spawnFn;
   }
 
@@ -358,7 +402,7 @@ export class OpenSshClient implements SshRemoteClient {
     );
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     for (const child of this.children) {
@@ -367,5 +411,59 @@ export class OpenSshClient implements SshRemoteClient {
       } catch {}
     }
     this.children.clear();
+
+    const controlPath = this.options.controlPath;
+    if (this.options.multiplex === true && controlPath) {
+      const executable = this.options.executable ?? "ssh";
+      const args: string[] = [];
+      if (this.options.configFile) args.push("-F", this.options.configFile);
+      args.push(
+        "-o",
+        `BatchMode=${this.options.batchMode === false ? "no" : "yes"}`,
+        "-S",
+        controlPath,
+        "-O",
+        "exit",
+        this.options.target,
+      );
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        try {
+          const child = this.spawnFn(executable, args, {
+            env: process.env,
+            stdio: "ignore",
+            windowsHide: true,
+          });
+          const timeout = setTimeout(() => {
+            try {
+              child.kill("SIGKILL");
+            } catch {}
+            finish();
+          }, 1_500);
+          timeout.unref?.();
+          child.once("error", () => {
+            clearTimeout(timeout);
+            finish();
+          });
+          child.once("close", () => {
+            clearTimeout(timeout);
+            finish();
+          });
+        } catch {
+          finish();
+        }
+      });
+    }
+
+    if (this.controlDirectory) {
+      try {
+        rmSync(this.controlDirectory, { recursive: true, force: true });
+      } catch {}
+    }
   }
 }

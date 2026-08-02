@@ -13,8 +13,9 @@ bun run test:integration # Windows integration tests (see below)
 
 - `*.test.ts` — unit tests. They use fake SSH executors, in-memory harnesses,
   and pure-function assertions; no network access. `ssh-remote.test.ts` covers
-  the ssh-remote extension's adapters, client, path mapping, session state,
-  and background-shell resolver.
+  the ssh-remote extension's adapters, OpenSSH multiplexing, persistent ssh2
+  channels, recursive ProxyJump/config compatibility, path mapping, session
+  state, and background-shell resolver.
 - `ssh-remote-windows-integration.test.ts` — integration tests against a real
   Windows host over OpenSSH. They are **skipped automatically** when no host
   is configured, so `bun run check` stays safe in CI.

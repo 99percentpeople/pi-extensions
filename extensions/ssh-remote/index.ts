@@ -1,4 +1,3 @@
-import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -27,7 +26,14 @@ import {
   OpenSshClient,
   type SshClientOptions,
   type SshRemoteClient,
+  type SshTransportKind,
+  type SshTransportPreference,
 } from "./client.ts";
+import {
+  loadSshRemoteConfig,
+  saveSshRemoteConfig,
+  type SshRemoteConfig,
+} from "./config.ts";
 import {
   createRemoteBashOperations,
   createRemoteEditOperations,
@@ -55,6 +61,8 @@ import {
   parseSshTarget,
   type ParsedSshTarget,
 } from "./target.ts";
+import { registerSshRemoteSettings } from "./settings.ts";
+import { createSshTransportClient } from "./transport.ts";
 
 const STATUS_KEY = "ssh-remote";
 const CONNECT_TIMEOUT_SECONDS = 10;
@@ -89,6 +97,8 @@ export interface SshRemoteExtensionDependencies {
   createClient?: (options: SshClientOptions) => SshRemoteClient;
   selectRemote?: typeof selectRemoteAdapter;
   loadPreviousSessionState?: (path: string) => SshSessionState | undefined;
+  loadConfig?: () => SshRemoteConfig;
+  saveConfig?: (config: SshRemoteConfig) => void;
 }
 
 function defaultLoadPreviousSessionState(
@@ -96,6 +106,15 @@ function defaultLoadPreviousSessionState(
 ): SshSessionState | undefined {
   const manager = SessionManager.open(path);
   return findSshSessionState(manager.getBranch());
+}
+
+function parseTransportPreference(
+  value: unknown,
+  fallback: SshTransportPreference,
+): SshTransportPreference {
+  if (value === undefined || value === "") return fallback;
+  if (value === "auto" || value === "openssh" || value === "ssh2") return value;
+  throw new Error("--ssh-transport must be one of: auto, openssh, ssh2");
 }
 
 function parseShellPreference(value: unknown): SshShellPreference {
@@ -278,18 +297,30 @@ export function createSshRemoteExtension(
   dependencies: SshRemoteExtensionDependencies = {},
 ): (pi: ExtensionAPI) => void {
   const platform = dependencies.platform ?? process.platform;
-  const createClient =
-    dependencies.createClient ??
-    ((options: SshClientOptions) => new OpenSshClient(options));
   const selectRemote = dependencies.selectRemote ?? selectRemoteAdapter;
   const loadPreviousSessionState =
     dependencies.loadPreviousSessionState ?? defaultLoadPreviousSessionState;
 
   return function sshRemoteExtension(pi: ExtensionAPI): void {
-    registerExtensionSettings(pi, {
-      namespace: "ssh-remote",
-      title: "SSH Remote",
-      settings: () => [],
+    let config = (dependencies.loadConfig ?? loadSshRemoteConfig)();
+    const saveConfig = dependencies.saveConfig ?? saveSshRemoteConfig;
+    registerSshRemoteSettings(pi, {
+      getConfig: () => config,
+      updateConfig: (next, ctx) => {
+        config = next;
+        try {
+          saveConfig(config);
+          ctx.ui.notify(
+            "SSH transport saved; use /ssh-reconnect to apply it to an active workspace",
+            "info",
+          );
+        } catch (error) {
+          ctx.ui.notify(
+            `Failed to save SSH Remote settings: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
+        }
+      },
     });
 
     pi.registerFlag("ssh", {
@@ -303,6 +334,10 @@ export function createSshRemoteExtension(
     });
     pi.registerFlag("ssh-shell", {
       description: "Remote shell: auto, bash, pwsh, or powershell",
+      type: "string",
+    });
+    pi.registerFlag("ssh-transport", {
+      description: "SSH transport: auto, openssh, or ssh2",
       type: "string",
     });
 
@@ -410,19 +445,26 @@ export function createSshRemoteExtension(
       intent: ConnectionIntent,
       ctx: ExtensionContext,
     ): Promise<void> => {
-      if (runtime.kind === "active") runtime.client.dispose();
+      if (runtime.kind === "active") await runtime.client.dispose();
       runtime = { kind: "connecting", intent };
       updateStatus(ctx);
 
       let client: SshRemoteClient | undefined;
       try {
-        client = createClient({
+        const transport = parseTransportPreference(
+          pi.getFlag("ssh-transport"),
+          config.transport,
+        );
+        const clientOptions: SshClientOptions = {
           target: intent.target,
           configFile: intent.configFile,
           executable: platform === "win32" ? "ssh.exe" : undefined,
           connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
           batchMode: true,
-        });
+        };
+        client = dependencies.createClient
+          ? dependencies.createClient(clientOptions)
+          : createSshTransportClient(clientOptions, { platform, preference: transport });
         const requestedCwd =
           intent.storedState?.remoteCwd ?? intent.requestedCwd;
         const selected = await selectRemote(client, {
@@ -497,12 +539,28 @@ export function createSshRemoteExtension(
           );
           pi.setSessionName(autoSessionName);
         }
+        if (client.fallbackReason) {
+          ctx.ui.notify(
+            `SSH transport auto fell back to OpenSSH: ${client.fallbackReason}`,
+            "warning",
+          );
+        }
+        for (const warning of client.compatibilityWarnings ?? []) {
+          ctx.ui.notify(`ssh2 compatibility: ${warning}`, "warning");
+        }
+        const transportLabel = client.transport === "ssh2"
+          ? "ssh2/persistent"
+          : client.transport === "openssh"
+            ? client.reusesConnection
+              ? "OpenSSH/multiplexed"
+              : "OpenSSH/single-use"
+            : "custom transport";
         ctx.ui.notify(
-          `SSH remote active: ${formatRemoteLocation(session)} (${session.remotePlatform}/${session.remoteShell})`,
+          `SSH remote active: ${formatRemoteLocation(session)} (${session.remotePlatform}/${session.remoteShell}; ${transportLabel})`,
           "info",
         );
       } catch (error) {
-        client?.dispose();
+        await client?.dispose();
         fail(ctx, error, intent);
       }
     };
@@ -611,6 +669,10 @@ export function createSshRemoteExtension(
                 `SSH target: ${runtime.session.target}`,
                 `platform: ${runtime.session.remotePlatform}`,
                 `shell: ${runtime.session.remoteShell}`,
+                `transport: ${runtime.client.transport ?? "custom"}${runtime.client.reusesConnection === undefined ? "" : runtime.client.reusesConnection ? " (reused)" : " (single-use)"}`,
+                runtime.client.fallbackReason
+                  ? `transport fallback: ${runtime.client.fallbackReason}`
+                  : undefined,
                 `cwd: ${runtime.session.remoteCwd}`,
                 `home: ${runtime.session.remoteHome}`,
                 runtime.session.configFile
@@ -1013,7 +1075,7 @@ export function createSshRemoteExtension(
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
-      if (runtime.kind === "active") runtime.client.dispose();
+      if (runtime.kind === "active") await runtime.client.dispose();
       ctx.ui.setStatus(STATUS_KEY, undefined);
       runtime = { kind: "disabled" };
     });
@@ -1063,10 +1125,32 @@ export default createSshRemoteExtension();
 
 export {
   createSshBackgroundShellResolver,
+  createSshTransportClient,
   OpenSshClient,
   parseSshTarget,
   selectRemoteAdapter,
 };
+export { Ssh2Client, Ssh2ConnectionError } from "./ssh2-client.ts";
+export {
+  Ssh2CompatibilityError,
+  expandProxyJumpTokens,
+  parseKnownHostSearchOutput,
+  parseOpenSshConfig,
+  parseProxyJump,
+  resolveSsh2Connection,
+  type ParsedProxyJump,
+  type ResolvedSsh2Connection,
+  type ResolvedSsh2Endpoint,
+} from "./ssh2-config.ts";
+export {
+  DEFAULT_SSH_REMOTE_CONFIG,
+  SSH_REMOTE_SETTINGS_NAMESPACE,
+  getSshRemoteConfigPath,
+  loadSshRemoteConfig,
+  normalizeSshRemoteConfig,
+  saveSshRemoteConfig,
+  type SshRemoteConfig,
+} from "./config.ts";
 export type {
   RemoteAdapter,
   RemoteWorkspace,
@@ -1074,4 +1158,6 @@ export type {
   SshRemoteClient,
   SshSessionState,
   SshShellPreference,
+  SshTransportKind,
+  SshTransportPreference,
 };

@@ -13,7 +13,7 @@
 A focused collection of TypeScript extensions for the
 [Pi coding agent](https://pi.dev/): run and revisit background tasks, expose
 Codex subscription image and search APIs, style the main session status cursors,
-use PowerShell consistently on Windows, route coding tools through OpenSSH,
+use PowerShell consistently on Windows, route coding tools through reusable SSH,
 fold long reasoning traces, and keep model-authored plans visible in the TUI.
 
 | Extension | npm package | Purpose |
@@ -22,7 +22,7 @@ fold long reasoning traces, and keep model-authored plans visible in the TUI.
 | codex-api | [`@99percentpeople/pi-codex-api`](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation/editing, first-party search, Fast mode, and subscription usage status |
 | cursor-effect | [`@99percentpeople/pi-cursor-effect`](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Selectable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
-| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi file and shell tools to remote Unix or Windows workspaces through OpenSSH |
+| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi file and shell tools to remote Unix or Windows workspaces through reusable OpenSSH or ssh2 transports |
 | thinking-fold | [`@99percentpeople/pi-thinking-fold`](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Live tail previews for long reasoning traces with full summaries and Ctrl+T expansion |
 | todo | [`@99percentpeople/pi-todo`](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Minimal atomic whole-plan todo writes with dependencies and a read-only list above the input |
 
@@ -123,7 +123,7 @@ Without the adapter, `bg_start` follows Pi's configured Bash resolution and
 command prefix, including Git Bash on Windows.
 
 Use local Pi sessions and credentials against a remote Unix or Windows workspace
-through an existing OpenSSH alias:
+through an existing OpenSSH alias and an automatically selected reusable transport:
 
 ```bash
 pi install npm:@99percentpeople/pi-ssh-remote
@@ -211,20 +211,24 @@ model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
 ## ssh-remote
 
 `ssh-remote` keeps Pi local while routing `read`, `write`, `edit`, `bash`, the
-optional `grep`, `find`, and `ls` tools, and user `!`/`!!` commands through the
-system OpenSSH client. Targets use rsync-style syntax such as
-`devbox:/srv/project`, so normal `~/.ssh/config` aliases, keys, ports,
-`ProxyJump`, and multiplexing continue to work. Unix hosts use Bash; Windows
-OpenSSH hosts use PowerShell 7 or Windows PowerShell 5.1. The resolved target,
-platform, shell, and cwd are stored as hidden Pi session state and reconnect on
-resume; failed connections block remote tools instead of falling back to local
-files. The status line shows only the themed connection state, while an
-automatic `SSH target:path (branch) • first message` session name places the
-remote location and opening request in Pi's normal footer and native `/resume`
-list without replacing the footer. When `codex-api` is installed, its image
-output and reference paths use SSH Remote's shared binary workspace backend,
-including native Windows paths, without local staging. Version 0.2.0 supports
-Linux, macOS, and Windows clients with Unix or Windows remote hosts. See the
+optional `grep`, `find`, and `ls` tools, and user `!`/`!!` commands through a
+selectable `auto`, `openssh`, or `ssh2` transport. Auto mode uses managed
+OpenSSH multiplexing on Linux/macOS and a persistent `ssh2` connection on
+Windows, with compatibility fallback to single-use OpenSSH. Targets retain
+rsync-style syntax such as `devbox:/srv/project`; both transports support
+single- and multi-hop `ProxyJump`, while explicit OpenSSH mode additionally
+supports arbitrary `ProxyCommand` behavior. `ssh2` resolves its documented
+configuration subset through `ssh -G`. Unix hosts use Bash; Windows OpenSSH
+hosts use PowerShell 7 or Windows PowerShell 5.1. The resolved target,
+platform, shell, and cwd are stored as hidden Pi session state and reconnect
+on resume; failed connections block remote tools instead of falling back to
+local files. The
+status line shows only the themed connection state, while an automatic
+`SSH target:path (branch) • first message` session name places the remote
+location and opening request in Pi's normal footer and native `/resume` list
+without replacing the footer. When `codex-api` is installed, its image output
+and reference paths use SSH Remote's shared binary workspace backend, including
+native Windows paths, without local staging. See the
 [ssh-remote package documentation](extensions/ssh-remote/README.md).
 
 ## codex-api

@@ -74,10 +74,11 @@ user's home and removed afterwards.
 
 ## Scenario B — Pi running on Windows
 
-When Pi itself runs on Windows, the Windows OpenSSH client requires temp-file
-stdio: anonymous pipes wedge `ssh.exe` (see `client.ts`). This scenario
-exercises the Windows-local code paths unit tests cannot reach — `ssh.exe`
-spawning with the stdio workaround, the win32 logical path namespace
+When Pi itself runs on Windows, `auto` uses one persistent `ssh2` connection;
+explicit OpenSSH mode remains single-use because native `ssh.exe` has no
+reliable ControlMaster support. The OpenSSH client also requires temp-file
+stdio because anonymous pipes wedge `ssh.exe` (see `client.ts`). This scenario
+exercises both transports, the win32 logical path namespace
 (`C:\__pi_ssh_remote_windows__\...`), and the interactive session surface
 (status bar, `/ssh-status`, `/ssh-reconnect`, `!` commands).
 
@@ -85,8 +86,9 @@ spawning with the stdio workaround, the win32 logical path namespace
 
 - Pi installed (`bun add -g @earendil-works/pi-coding-agent`), OpenSSH Server
   running, and PowerShell 7 or Windows PowerShell 5.1.
-- The extension build copied to the machine (or run from a clone of this
-  repo). If `node_modules` contains workspace symlinks, replace them with real
+- The extension build and its production `ssh2` dependency copied to the
+  machine (or run from a clone of this repo). If `node_modules` contains
+  workspace symlinks, replace them with real
   copies of the `packages/*` sources — tar-created symlinks fail with `EPERM`
   on Windows.
 - Loopback SSH auth for `--ssh localhost`:
@@ -111,17 +113,22 @@ long-command gzip path all pass in ~1s per operation.
 
 ```powershell
 pi -e <path-to-extension>\dist\index.ts `
-  --ssh localhost:C:\Users\<you>\remote-test-dir --ssh-shell pwsh
+  --ssh localhost:C:\Users\<you>\remote-test-dir --ssh-shell pwsh `
+  --ssh-transport auto
 ```
 
 | Step | Expected |
 | --- | --- |
 | Status bar | `SSH: Connected` (green) |
-| `/ssh-status` | target/platform/shell/cwd/home of the remote session |
+| `/ssh-status` | target/platform/shell/transport/cwd/home; transport is `ssh2 (reused)` |
 | `! Get-Location; whoami` | executes on the remote (remote cwd + remote user) |
 | Ask the model to read/write/edit/bash/grep/find/ls | results land on the remote filesystem |
 | `/ssh-reconnect` | reconnects to the same target |
 | Exit (`ctrl+d`) | clean shutdown, status indicator disappears |
+
+Repeat once with `--ssh-transport openssh`; `/ssh-status` should report
+`openssh (single-use)` and all operations should still pass through the
+Windows temp-file stdio workaround.
 
 ### 3. Non-interactive model pass
 
@@ -133,7 +140,8 @@ pi -p --no-session -e <path-to-extension>\dist\index.ts `
 
 ### Known Windows pitfalls (all fixed in the extension)
 
-1. **ssh.exe wedges with anonymous pipes.** The Windows OpenSSH client stops
+1. **ssh.exe wedges with anonymous pipes.** This affects explicit OpenSSH,
+   auto fallback, and background jobs—not persistent `ssh2`. The Windows OpenSSH client stops
    exiting after the remote command produces output when spawned with piped
    stdio. `OpenSshClient` uses temp-file stdio on Windows (`-n` + stdin file
    for input, stdout/stderr files polled for streaming). Do not revert to

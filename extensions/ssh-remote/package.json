@@ -1,7 +1,7 @@
 {
   "name": "@99percentpeople/pi-ssh-remote",
-  "version": "0.2.1",
-  "description": "Route Pi's file and shell tools to remote Unix or Windows workspaces through OpenSSH",
+  "version": "0.3.0",
+  "description": "Route Pi's file and shell tools to remote Unix or Windows workspaces through reusable OpenSSH or ssh2 transports",
   "type": "module",
   "files": [
     "dist",
@@ -24,7 +24,8 @@
     "coding-agent",
     "ssh",
     "remote-development",
-    "openssh"
+    "openssh",
+    "ssh2"
   ],
   "author": "99percentpeople",
   "license": "MIT",
@@ -43,7 +44,8 @@
   },
   "dependencies": {
     "@99percentpeople/pi-shared-settings": "0.1.2",
-    "@99percentpeople/pi-workspace-files": "0.1.0"
+    "@99percentpeople/pi-workspace-files": "0.1.0",
+    "ssh2": "1.17.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

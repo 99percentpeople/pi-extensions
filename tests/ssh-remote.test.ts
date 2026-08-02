@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { gunzipSync } from "node:zlib";
@@ -40,7 +41,23 @@ import {
   type SshRunOptions,
   type SshRunResult,
 } from "../extensions/ssh-remote/client.ts";
+import {
+  DEFAULT_SSH_REMOTE_CONFIG,
+  normalizeSshRemoteConfig,
+  saveSshRemoteConfig,
+  loadSshRemoteConfig,
+} from "../extensions/ssh-remote/config.ts";
 import { createSshRemoteExtension } from "../extensions/ssh-remote/index.ts";
+import { Ssh2Client, Ssh2ConnectionError } from "../extensions/ssh-remote/ssh2-client.ts";
+import {
+  expandProxyJumpTokens,
+  parseKnownHostSearchOutput,
+  parseOpenSshConfig,
+  parseProxyJump,
+  resolveSsh2Connection,
+  Ssh2CompatibilityError,
+} from "../extensions/ssh-remote/ssh2-config.ts";
+import { createSshTransportClient } from "../extensions/ssh-remote/transport.ts";
 import {
   buildRemoteBashCommand,
   createRemoteEditOperations,
@@ -222,6 +239,59 @@ test("OpenSSH arguments preserve config aliases and run non-interactively", () =
   );
 });
 
+test("OpenSSH multiplex arguments reuse Unix connections and disable Windows ControlMaster", () => {
+  const multiplexed = buildSshArguments({
+    target: "devbox",
+    multiplex: true,
+    controlPath: "/tmp/pi-ssh/mux",
+  });
+  assert.ok(multiplexed.includes("ControlMaster=auto"));
+  assert.ok(multiplexed.includes("ControlPersist=10m"));
+  assert.ok(multiplexed.includes("/tmp/pi-ssh/mux"));
+
+  const singleUse = buildSshArguments({ target: "winbox", multiplex: false });
+  assert.ok(singleUse.includes("ControlMaster=no"));
+  assert.ok(singleUse.includes("ControlPath=none"));
+});
+
+test("OpenSSH client owns and closes its generated ControlMaster", async () => {
+  class FakeProcess extends EventEmitter {
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    kill(): boolean {
+      queueMicrotask(() => this.emit("close", null));
+      return true;
+    }
+  }
+
+  const spawned: string[][] = [];
+  const spawn = (
+    _file: string,
+    args: readonly string[],
+    _options: SpawnOptions,
+  ): ChildProcess => {
+    spawned.push([...args]);
+    const child = new FakeProcess();
+    queueMicrotask(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", 0);
+    });
+    return child as unknown as ChildProcess;
+  };
+
+  const client = new OpenSshClient({ target: "devbox", multiplex: true }, spawn);
+  assert.ok(client.options.controlPath);
+  assert.equal(client.reusesConnection, true);
+  await client.run("echo ok");
+  await client.dispose();
+  assert.ok(spawned[0].includes("ControlMaster=auto"));
+  assert.ok(spawned[0].includes(client.options.controlPath!));
+  assert.ok(spawned[1].includes("-O"));
+  assert.ok(spawned[1].includes("exit"));
+});
+
 test("Windows ssh.exe adds -n for no-stdin commands and uses a temp file for input", async () => {
   class FakeProcess extends EventEmitter {
     readonly stdin = new PassThrough();
@@ -275,6 +345,455 @@ test("Windows ssh.exe adds -n for no-stdin commands and uses a temp file for inp
     name.startsWith("pi-ssh-stdin-"),
   );
   assert.deepEqual(leftovers, []);
+});
+
+test("SSH Remote transport settings normalize and persist", () => {
+  assert.deepEqual(normalizeSshRemoteConfig(undefined), DEFAULT_SSH_REMOTE_CONFIG);
+  assert.deepEqual(normalizeSshRemoteConfig({ transport: "ssh2" }), { transport: "ssh2" });
+  assert.deepEqual(normalizeSshRemoteConfig({ transport: "invalid" }), { transport: "auto" });
+
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-settings-test-"));
+  const path = join(directory, "settings.json");
+  try {
+    writeFileSync(path, JSON.stringify({ unrelated: { enabled: true } }));
+    saveSshRemoteConfig({ transport: "openssh" }, path);
+    assert.deepEqual(loadSshRemoteConfig(path), { transport: "openssh" });
+    const document = JSON.parse(readFileSync(path, "utf8"));
+    assert.deepEqual(document.unrelated, { enabled: true });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ssh2 config uses ssh -G, OpenSSH known_hosts, agent auth, and algorithm intersections", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh2-config-test-"));
+  const knownHosts = join(directory, "known_hosts");
+  writeFileSync(knownHosts, "placeholder\n");
+  const hostKey = Buffer.from("test-host-key-blob");
+  const encodedHostKey = hostKey.toString("base64");
+  const calls: Array<{ executable: string; args: readonly string[] }> = [];
+  try {
+    const resolved = await resolveSsh2Connection(
+      { target: "alias", connectTimeoutSeconds: 10 },
+      {
+        platform: "linux",
+        home: directory,
+        env: { SSH_AUTH_SOCK: "/tmp/test-agent" },
+        runLocal: async (executable, args) => {
+          calls.push({ executable, args });
+          if (args.includes("-G")) {
+            return {
+              stdout: Buffer.from([
+                "user deploy",
+                "hostname server.example.test",
+                "port 2222",
+                "identityagent SSH_AUTH_SOCK",
+                `userknownhostsfile ${knownHosts}`,
+                "globalknownhostsfile none",
+                "kexalgorithms curve25519-sha256,sntrup761x25519-sha512",
+                "ciphers aes256-ctr",
+                "macs hmac-sha2-256",
+                "hostkeyalgorithms ssh-ed25519,sk-ssh-ed25519@openssh.com",
+                "compression no",
+                "connecttimeout 10",
+                "serveraliveinterval 15",
+                "serveralivecountmax 2",
+                "pubkeyauthentication true",
+                "identitiesonly no",
+              ].join("\n") + "\n"),
+              stderr: Buffer.alloc(0),
+              exitCode: 0,
+            };
+          }
+          return {
+            stdout: Buffer.from(`[server.example.test]:2222 ssh-ed25519 ${encodedHostKey}\n`),
+            stderr: Buffer.alloc(0),
+            exitCode: 0,
+          };
+        },
+      },
+    );
+
+    assert.equal(resolved.config.host, "server.example.test");
+    assert.equal(resolved.config.port, 2222);
+    assert.equal(resolved.config.username, "deploy");
+    assert.equal(resolved.config.readyTimeout, 10_000);
+    assert.equal(resolved.config.keepaliveInterval, 15_000);
+    assert.deepEqual(resolved.config.algorithms?.kex, ["curve25519-sha256"]);
+    assert.deepEqual(resolved.config.algorithms?.serverHostKey, ["ssh-ed25519"]);
+    assert.ok(Array.isArray(resolved.config.authHandler));
+    const verify = resolved.config.hostVerifier as (key: Buffer) => boolean;
+    assert.equal(verify(hostKey), true);
+    assert.equal(verify(Buffer.from("different-host-key")), false);
+    assert.match(resolved.verification.rejection ?? "", /does not match/);
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0].args.includes("-G"));
+    assert.ok(calls[1].args.includes("-F"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ssh2 resolves multi-hop ProxyJump endpoints with per-hop OpenSSH settings", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh2-jump-config-test-"));
+  const knownHosts = join(directory, "known_hosts");
+  writeFileSync(knownHosts, "placeholder\n");
+  const configCalls: string[][] = [];
+  try {
+    const resolved = await resolveSsh2Connection(
+      { target: "private-host", connectTimeoutSeconds: 12 },
+      {
+        platform: "linux",
+        home: directory,
+        env: { SSH_AUTH_SOCK: "/tmp/test-agent" },
+        runLocal: async (_executable, args) => {
+          if (args.includes("-G")) {
+            configCalls.push([...args]);
+            const target = args.at(-1);
+            const common = [
+              `userknownhostsfile ${knownHosts}`,
+              "globalknownhostsfile none",
+              "identityagent SSH_AUTH_SOCK",
+              "pubkeyauthentication true",
+              "identitiesonly no",
+            ];
+            if (target === "private-host") {
+              return {
+                stdout: Buffer.from([
+                  "host private-host",
+                  "user deploy",
+                  "hostname private.internal",
+                  "port 22",
+                  "proxyjump jumpuser@jump:2200,jump2",
+                  ...common,
+                ].join("\n") + "\n"),
+                stderr: Buffer.alloc(0),
+                exitCode: 0,
+              };
+            }
+            if (target === "jump") {
+              return {
+                stdout: Buffer.from([
+                  "host jump",
+                  "user jumpuser",
+                  "hostname jump.internal",
+                  "port 2200",
+                  "proxyjump none",
+                  ...common,
+                ].join("\n") + "\n"),
+                stderr: Buffer.alloc(0),
+                exitCode: 0,
+              };
+            }
+            return {
+              stdout: Buffer.from([
+                "host jump2",
+                "user relay",
+                "hostname jump2.internal",
+                "port 22",
+                "proxyjump none",
+                ...common,
+              ].join("\n") + "\n"),
+              stderr: Buffer.alloc(0),
+              exitCode: 0,
+            };
+          }
+
+          const lookup = args[args.indexOf("-F") + 1];
+          const key = Buffer.from(`host-key:${lookup}`).toString("base64");
+          return {
+            stdout: Buffer.from(`${lookup} ssh-ed25519 ${key}\n`),
+            stderr: Buffer.alloc(0),
+            exitCode: 0,
+          };
+        },
+      },
+    );
+
+    assert.equal(resolved.hostLabel, "deploy@private.internal:22");
+    assert.equal(resolved.proxyJumps?.length, 2);
+    assert.equal(resolved.proxyJumps?.[0].hostLabel, "jumpuser@jump.internal:2200");
+    assert.equal(resolved.proxyJumps?.[1].hostLabel, "relay@jump2.internal:22");
+    assert.equal(resolved.proxyJumps?.[0].config.port, 2200);
+    assert.ok(configCalls[1].includes("ProxyJump=none"));
+    assert.deepEqual(configCalls[1].slice(-5), ["-l", "jumpuser", "-p", "2200", "jump"]);
+    assert.ok(configCalls[2].includes("ProxyJump=none"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ssh2 reports unsupported arbitrary OpenSSH proxy commands before connecting", async () => {
+  await assert.rejects(
+    () => resolveSsh2Connection(
+      { target: "private-host" },
+      {
+        platform: "linux",
+        runLocal: async () => ({
+          stdout: Buffer.from("user deploy\nhostname private.example\nport 22\nproxycommand nc proxy 22\n"),
+          stderr: Buffer.alloc(0),
+          exitCode: 0,
+        }),
+      },
+    ),
+    (error: unknown) => error instanceof Ssh2CompatibilityError
+      && error.unsupported.includes("ProxyCommand"),
+  );
+});
+
+test("OpenSSH config, ProxyJump, and known_hosts parsers preserve effective values", () => {
+  const config = parseOpenSshConfig("identityfile ~/.ssh/a\nidentityfile ~/.ssh/b key\nuser deploy\n");
+  assert.deepEqual(config.get("identityfile"), ["~/.ssh/a", "~/.ssh/b key"]);
+  assert.deepEqual(config.get("user"), ["deploy"]);
+
+  assert.deepEqual(parseProxyJump("alice@jump:2200,ssh://bob@[2001:db8::1]:2222"), [
+    { host: "jump", username: "alice", port: 2200, source: "alice@jump:2200" },
+    { host: "2001:db8::1", username: "bob", port: 2222, source: "ssh://bob@[2001:db8::1]:2222" },
+  ]);
+  assert.equal(expandProxyJumpTokens("%r@jump-%n,ssh://relay@[%h]:%p,percent-%%", {
+    host: "private.internal",
+    originalHost: "private-host",
+    port: 2222,
+    username: "deploy",
+  }), "deploy@jump-private-host,ssh://relay@[private.internal]:2222,percent-%");
+  assert.throws(() => parseProxyJump("jump:invalid"), /Invalid ProxyJump port/);
+
+  const parsed = parseKnownHostSearchOutput([
+    "host ssh-ed25519 aG9zdC1rZXk=",
+    "@revoked host ssh-rsa cmV2b2tlZA==",
+    "@cert-authority *.example ssh-ed25519 Y2E=",
+  ].join("\n"));
+  assert.ok(parsed.accepted.has("aG9zdC1rZXk="));
+  assert.ok(parsed.revoked.has("cmV2b2tlZA=="));
+  assert.equal(parsed.hasCertificateAuthority, true);
+});
+
+class FakeSsh2Channel extends EventEmitter {
+  readonly stderr = new PassThrough();
+  readonly signals: string[] = [];
+  input = Buffer.alloc(0);
+  private closed = false;
+
+  end(input?: string | Buffer): void {
+    this.input = input === undefined
+      ? Buffer.alloc(0)
+      : Buffer.isBuffer(input) ? input : Buffer.from(input);
+    queueMicrotask(() => {
+      if (this.closed) return;
+      this.emit("data", Buffer.from("stdout:"));
+      this.stderr.write(Buffer.from("stderr:"));
+      this.emit("exit", 0);
+      this.closed = true;
+      this.emit("close");
+    });
+  }
+
+  signal(value: string): void {
+    this.signals.push(value);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    queueMicrotask(() => this.emit("close"));
+  }
+}
+
+class FakeSsh2Tunnel extends PassThrough {
+  close(): void {
+    this.destroy();
+  }
+}
+
+class FakeRawSsh2Client extends EventEmitter {
+  readonly channels: FakeSsh2Channel[] = [];
+  readonly connectConfigs: Array<Record<string, unknown>> = [];
+  readonly forwardCalls: Array<{
+    sourceHost: string;
+    sourcePort: number;
+    destinationHost: string;
+    destinationPort: number;
+    channel: FakeSsh2Tunnel;
+  }> = [];
+  connectCalls = 0;
+  closed = false;
+
+  connect(config: Record<string, unknown> = {}): void {
+    this.connectCalls++;
+    this.connectConfigs.push(config);
+    queueMicrotask(() => this.emit("ready"));
+  }
+
+  forwardOut(
+    sourceHost: string,
+    sourcePort: number,
+    destinationHost: string,
+    destinationPort: number,
+    callback: (error: Error | undefined, channel: FakeSsh2Tunnel) => void,
+  ): void {
+    const channel = new FakeSsh2Tunnel();
+    this.forwardCalls.push({ sourceHost, sourcePort, destinationHost, destinationPort, channel });
+    queueMicrotask(() => callback(undefined, channel));
+  }
+
+  exec(_command: string, callback: (error: Error | undefined, channel: FakeSsh2Channel) => void): void {
+    const channel = new FakeSsh2Channel();
+    this.channels.push(channel);
+    callback(undefined, channel);
+  }
+
+  end(): void {
+    if (this.closed) return;
+    this.closed = true;
+    queueMicrotask(() => this.emit("close"));
+  }
+
+  destroy(): void {
+    this.end();
+  }
+}
+
+test("Ssh2Client reuses one authenticated connection for multiple command channels", async () => {
+  const raw = new FakeRawSsh2Client();
+  let created = 0;
+  const client = new Ssh2Client(
+    { target: "devbox" },
+    {
+      createClient: () => {
+        created++;
+        return raw as any;
+      },
+      resolveConnection: async () => ({
+        config: { host: "devbox", username: "deploy" },
+        hostLabel: "deploy@devbox:22",
+        warnings: [],
+        verification: {},
+      }),
+    },
+  );
+  const streamed: string[] = [];
+  const first = await client.run("one", {
+    input: Buffer.from("payload"),
+    onStdout: (data) => streamed.push(data.toString("utf8")),
+  });
+  const second = await client.run("two");
+
+  assert.equal(created, 1);
+  assert.equal(raw.connectCalls, 1);
+  assert.equal(raw.channels.length, 2);
+  assert.equal(raw.channels[0].input.toString("utf8"), "payload");
+  assert.equal(first.stdout.toString("utf8"), "stdout:");
+  assert.equal(first.stderr.toString("utf8"), "stderr:");
+  assert.equal(second.exitCode, 0);
+  assert.deepEqual(streamed, ["stdout:"]);
+  await client.dispose();
+  assert.equal(raw.closed, true);
+});
+
+test("Ssh2Client builds and disposes a recursive ProxyJump connection chain", async () => {
+  const rawClients = Array.from({ length: 6 }, () => new FakeRawSsh2Client());
+  let created = 0;
+  const endpoint = (host: string, username: string) => ({
+    config: { host, port: 22, username },
+    hostLabel: `${username}@${host}:22`,
+    warnings: [],
+    verification: {},
+  });
+  const client = new Ssh2Client(
+    { target: "target" },
+    {
+      createClient: () => rawClients[created++] as any,
+      resolveConnection: async () => ({
+        ...endpoint("target.internal", "deploy"),
+        proxyJumps: [
+          endpoint("jump1.internal", "relay1"),
+          endpoint("jump2.internal", "relay2"),
+        ],
+      }),
+    },
+  );
+
+  const result = await client.run("echo through jumps");
+  const second = await client.run("echo reuse chain");
+  assert.equal(result.exitCode, 0);
+  assert.equal(second.exitCode, 0);
+  assert.equal(created, 3);
+  assert.equal(rawClients[2].channels.length, 2);
+  assert.equal(rawClients[0].forwardCalls[0].destinationHost, "jump2.internal");
+  assert.equal(rawClients[1].forwardCalls[0].destinationHost, "target.internal");
+  assert.equal(rawClients[0].forwardCalls[0].destinationPort, 22);
+  assert.equal(rawClients[0].connectConfigs[0].sock, undefined);
+  assert.equal(rawClients[1].connectConfigs[0].sock, rawClients[0].forwardCalls[0].channel);
+  assert.equal(rawClients[2].connectConfigs[0].sock, rawClients[1].forwardCalls[0].channel);
+
+  rawClients[0].end();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(rawClients.slice(0, 3).map((raw) => raw.closed), [true, true, true]);
+
+  assert.equal((await client.run("echo reconnect chain")).exitCode, 0);
+  assert.equal(created, 6);
+  await client.dispose();
+  assert.deepEqual(rawClients.map((raw) => raw.closed), [true, true, true, true, true, true]);
+});
+
+test("transport auto selects multiplexed OpenSSH on Unix and falls back on Windows ssh2 setup errors", async () => {
+  const unixOptions: SshClientOptions[] = [];
+  const unixClient = new FakeSshClient({ target: "devbox" });
+  const unix = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: (options) => {
+        unixOptions.push(options);
+        return unixClient;
+      },
+    },
+  );
+  assert.equal(unix, unixClient);
+  assert.equal(unixOptions[0].multiplex, true);
+
+  let openSshRuns = 0;
+  const failedSsh2: SshRemoteClient = {
+    options: { target: "winbox", executable: "ssh.exe", multiplex: false },
+    transport: "ssh2",
+    reusesConnection: true,
+    run: async () => { throw new Ssh2ConnectionError("agent unavailable"); },
+    runChecked: async () => { throw new Ssh2ConnectionError("agent unavailable"); },
+    dispose: () => {},
+  };
+  const fallbackOpenSsh: SshRemoteClient = {
+    options: { target: "winbox", executable: "ssh.exe", multiplex: false },
+    transport: "openssh",
+    reusesConnection: false,
+    run: async () => {
+      openSshRuns++;
+      return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+    },
+    runChecked: async () => {
+      openSshRuns++;
+      return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+    },
+    dispose: () => {},
+  };
+  const windows = createSshTransportClient(
+    { target: "winbox" },
+    {
+      platform: "win32",
+      preference: "auto",
+      createSsh2: () => failedSsh2,
+      createOpenSsh: (options) => {
+        assert.equal(options.multiplex, false);
+        return fallbackOpenSsh;
+      },
+    },
+  );
+  const result = await windows.run("echo ok");
+  assert.equal(result.stdout.toString("utf8"), "ok");
+  assert.equal(windows.transport, "openssh");
+  assert.match(windows.fallbackReason ?? "", /agent unavailable/);
+  assert.equal(openSshRuns, 1);
+  await windows.dispose();
 });
 
 test("OpenSSH client probes remote home and canonical cwd through framed output", async () => {
@@ -655,6 +1174,7 @@ test("remote adapter auto-detects Windows PowerShell and streams file content ov
 interface HarnessOptions {
   flag?: string;
   configFlag?: string;
+  transportFlag?: string;
   branch?: unknown[];
   sessionName?: string;
   cwd?: string;
@@ -677,6 +1197,7 @@ function createExtensionHarness(options: HarnessOptions = {}) {
   let activeTools = [...(options.activeTools ?? ["read", "bash", "edit", "write"])];
   if (options.flag) flags.set("ssh", options.flag);
   if (options.configFlag) flags.set("ssh-config", options.configFlag);
+  if (options.transportFlag) flags.set("ssh-transport", options.transportFlag);
 
   const pi = {
     registerFlag: (name: string, definition: { default?: unknown }) => {
@@ -786,6 +1307,28 @@ test("SSH commands stay hidden in local sessions", async () => {
   assert.equal(harness.tools.has("ls"), false);
   assert.equal(harness.commands.has("ssh-status"), false);
   assert.equal(harness.commands.has("ssh-reconnect"), false);
+});
+
+test("invalid SSH transport flags fail closed before creating a client", async () => {
+  let clients = 0;
+  const harness = createExtensionHarness({
+    flag: "devbox",
+    transportFlag: "invalid",
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      clients++;
+      return new FakeSshClient(options);
+    },
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(clients, 0);
+  assert.match(
+    harness.notifications.at(-1)?.message ?? "",
+    /--ssh-transport must be one of: auto, openssh, ssh2/,
+  );
 });
 
 test("SSH commands appear for remote sessions and reconnect the active target", async () => {

@@ -43,7 +43,8 @@ export function createSshBackgroundShellResolver(
     // Non-interactive launches on Windows add -n so ssh.exe does not wedge
     // when spawned with piped stdio (see client.ts). Interactive launches
     // keep stdin for user input.
-    const windowsClient = options.ssh.executable === "ssh.exe";
+    const windowsClient = typeof options.ssh.executable === "string"
+      && /(^|[\\/])ssh\.exe$/i.test(options.ssh.executable);
     return {
       file: options.ssh.executable ?? "ssh",
       args: [
