@@ -138,8 +138,10 @@ async function shellCandidates(
       return ["pwsh", "powershell"];
     }
     // Unix without a Zsh login shell, or an unknown host: deterministic
-    // order with Bash first.
-    return ["bash", "pwsh", "powershell"];
+    // order with Bash first, then sh for ash-only hosts (OpenWrt, Alpine,
+    // busybox containers). Control scripts run through sh on every host,
+    // so the sh candidate fails only when inspectWorkspace can't run.
+    return ["bash", "sh", "pwsh", "powershell"];
   }
 
   // Explicit preference: probe existence, fall back, and warn. An unknown

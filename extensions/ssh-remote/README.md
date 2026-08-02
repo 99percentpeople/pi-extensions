@@ -233,8 +233,16 @@ falling back to the `sh` symlink target on systems without `getent`, both
 inside `sh -c` so the remote default shell syntax does not matter). Zsh
 accounts get Zsh for the `bash` tool, `!` commands, and background jobs. A
 Zsh login shell implies zsh is installed, so no separate existence check is
-needed. Everything else keeps the deterministic order: Unix Bash, PowerShell
-7, then Windows PowerShell 5.1.
+needed. Everything else keeps the deterministic order: Unix Bash, then
+`sh` for ash-only hosts, PowerShell 7, then Windows PowerShell 5.1.
+
+Control operations (HOME/cwd probe, paths, file/search tools) are POSIX `sh`
+scripts, so every Unix host works even without Bash: OpenWrt, Alpine, and
+busybox containers all get full read/write/edit/grep/find/ls support through
+`ash`. Commands entered by the model run in the detected shell (`sh` on such
+hosts), so they use POSIX syntax. Known POSIX trade-offs: filenames
+containing newlines are not handled, and grep/find glob patterns containing
+`)` are not supported.
 
 Choose a shell explicitly:
 
@@ -247,10 +255,7 @@ pi --ssh winbox --ssh-shell powershell
 
 An explicit shell is probed for existence first. If it is missing, the
 extension warns and falls back: `zsh`/`bash` to `sh` on Unix, `pwsh` to
-PowerShell 5.1 (and vice versa) on Windows. Control operations (HOME/cwd
-probe, paths, file/search tools) always run through Bash on Unix and through
-the selected PowerShell on Windows, so only shells that can host the full
-feature set are offered.
+PowerShell 5.1 (and vice versa) on Windows.
 
 On Windows, PowerShell control scripts and user PowerShell commands use encoded
 UTF-16LE payloads, so content is not exposed in the SSH process arguments.
@@ -266,9 +271,9 @@ pi --ssh devbox:/srv/project
 ```
 
 The `bash` tool and user `!` commands execute the remote shell (Bash, Zsh,
-or PowerShell). Workspace control operations (paths, file probes) run through
-Bash on Unix and the selected PowerShell on Windows regardless of that
-selection.
+`sh`, or PowerShell). Workspace control operations (paths, file probes) run
+through POSIX `sh` on Unix and the selected PowerShell on Windows regardless
+of that selection.
 
 ## Windows workspaces
 

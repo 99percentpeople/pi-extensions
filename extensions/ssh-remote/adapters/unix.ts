@@ -124,8 +124,12 @@ export class UnixBashAdapter implements RemoteAdapter {
   }
 
   async inspectWorkspace(requestedCwd?: string): Promise<RemoteWorkspace> {
+    // Validate the user shell the adapter will exec for commands; the
+    // control scripts themselves are POSIX and run through `sh`, so only
+    // the user shell needs to exist (and sh always does).
+    const required = this.shell === "sh" ? "sh" : this.shell;
     const environment = await this.executor.runChecked(
-      `command -v bash >/dev/null 2>&1 || { printf 'Remote bash is required\\n' >&2; exit 127; }; `
+      `command -v ${required} >/dev/null 2>&1 || { printf 'Remote ${required} is required\\n' >&2; exit 127; }; `
         + `printf '\\036PI_SSH_UNIX_ENV\\037%s\\037%s\\036' "$HOME" "$(pwd -P)"`,
       { timeoutSeconds: 15 },
     );
@@ -224,12 +228,11 @@ export class UnixBashAdapter implements RemoteAdapter {
     });
   }
 
-  private runBashControl(script: string, signal?: AbortSignal): Promise<Buffer> {
-    // Control scripts use Bash syntax (shopt, [[ ]], dotglob) and therefore
-    // always run through Bash regardless of the user's default shell; only
-    // user-entered commands go through the detected default shell.
+  private runControl(script: string, signal?: AbortSignal): Promise<Buffer> {
+    // Control scripts are POSIX sh (no bashisms) and therefore run through
+    // `sh` on every Unix host: dash, bash, busybox ash, or macOS bash.
     return this.executor.runChecked(
-      `exec bash -lc ${shellQuote(script)}`,
+      `exec sh -lc ${shellQuote(script)}`,
       { signal },
     ).then((result) => result.stdout);
   }
@@ -239,13 +242,15 @@ export class UnixBashAdapter implements RemoteAdapter {
     signal?: AbortSignal,
   ): Promise<RemoteDirectoryEntry[]> {
     const root = this.fromToolPath(path);
-    const output = await this.runBashControl(`
+    // POSIX: .* + * covers dotfiles (dotglob) and empty dirs collapse to a
+    // literal * that fails -e/-L, which the case arms then skip.
+    const output = await this.runControl(`
 # PI_SSH_REMOTE_LS
-cd -- ${shellQuote(root)}
-shopt -s dotglob nullglob
-for entry in *; do
-  [[ "$entry" == "." || "$entry" == ".." ]] && continue
-  if [[ -d "$entry" ]]; then kind=D; else kind=F; fi
+cd -- ${shellQuote(root)} || exit 1
+for entry in .* *; do
+  [ -e "$entry" ] || [ -L "$entry" ] || continue
+  case "$entry" in .|..) continue ;; esac
+  if [ -d "$entry" ]; then kind=D; else kind=F; fi
   printf '%s\\0%s\\0' "$kind" "$entry"
 done
 `, signal);
@@ -264,32 +269,35 @@ done
     signal?: AbortSignal,
   ): Promise<RemoteFindEntry[]> {
     const root = this.fromToolPath(path);
-    const output = await this.runBashControl(`
+    // POSIX has no process substitution or read -d; producers stream
+    // through tr (filenames containing newlines are a known limitation),
+    // and the { ...; exit 0; } group pins the pipeline exit status.
+    const output = await this.runControl(`
 # PI_SSH_REMOTE_FIND
-cd -- ${shellQuote(root)}
+cd -- ${shellQuote(root)} || exit 1
 pattern=${shellQuote(pattern)}
 limit=${limit}
 count=0
 emit() {
-  local rel="$1" kind=F
-  [[ -d "$rel" ]] && kind=D
+  rel="$1"
+  kind=F
+  [ -d "$rel" ] && kind=D
   printf '%s\\0%s\\0' "$kind" "$rel"
-  ((count += 1))
-  ((count >= limit))
+  count=$((count + 1))
+  [ "$count" -ge "$limit" ]
 }
 if command -v rg >/dev/null 2>&1; then
-  while IFS= read -r -d '' rel; do
+  rg --files --hidden -0 -g '!**/.git/**' -g '!**/node_modules/**' -g "$pattern" . | tr '\\0' '\\n' | { while IFS= read -r rel; do
     rel="\${rel#./}"
     emit "$rel" && break
-  done < <(rg --files --hidden -0 -g '!**/.git/**' -g '!**/node_modules/**' -g "$pattern" .)
+  done; exit 0; }
 else
-  while IFS= read -r -d '' candidate; do
+  find . -mindepth 1 -print0 | tr '\\0' '\\n' | { while IFS= read -r candidate; do
     rel="\${candidate#./}"
-    [[ "$rel" == .git || "$rel" == .git/* || "$rel" == node_modules || "$rel" == node_modules/* || "$rel" == */.git/* || "$rel" == */node_modules/* ]] && continue
-    if [[ "$pattern" == */* ]]; then target="$rel"; else target="\${rel##*/}"; fi
-    [[ "$target" == $pattern ]] || continue
-    emit "$rel" && break
-  done < <(find . -mindepth 1 -print0)
+    case "$rel" in .git|.git/*|node_modules|node_modules/*|*/.git/*|*/node_modules/*) continue ;; esac
+    if [ "$pattern" != "\${pattern%/*}" ]; then target="$rel"; else target="\${rel##*/}"; fi
+    case "$target" in $pattern) emit "$rel" && break ;; esac
+  done; exit 0; }
 fi
 exit 0
 `, signal);
@@ -332,21 +340,21 @@ exit 0
       ...(options.literal ? ["-F"] : []),
     ].join(" ");
     const glob = options.glob ?? "";
-    const output = await this.runBashControl(`
+    const output = await this.runControl(`
 # PI_SSH_REMOTE_GREP
 root=${shellQuote(root)}
-if [[ -d "$root" ]]; then
-  cd -- "$root"
+if [ -d "$root" ]; then
+  cd -- "$root" || exit 1
   target=.
-elif [[ -f "$root" ]]; then
-  cd -- "$(dirname -- "$root")"
+elif [ -f "$root" ]; then
+  cd -- "$(dirname -- "$root")" || exit 1
   target="./$(basename -- "$root")"
 else
   printf 'Path not found: %s\\n' "$root" >&2
   exit 1
 fi
 file_candidates() {
-  if [[ "$target" == "." ]]; then
+  if [ "$target" = "." ]; then
     find . -type d \\( -name .git -o -name node_modules \\) -prune -o -type f -print0
   else
     printf '%s\\0' "$target"
@@ -356,27 +364,34 @@ if command -v rg >/dev/null 2>&1; then
   printf 'R\\0'
   status=0
   rg ${quotedRg} "$target" || status=$?
-  ((status == 0 || status == 1)) || exit "$status"
+  [ "$status" -eq 0 ] || [ "$status" -eq 1 ] || exit "$status"
 else
   printf 'G\\0'
   pattern=${shellQuote(pattern)}
   glob=${shellQuote(glob)}
   limit=${options.limit}
   count=0
-  stop=0
   validation=0
   printf '' | grep ${fallbackFlags} -- "$pattern" >/dev/null 2>&1 || validation=$?
-  ((validation == 0 || validation == 1)) || { printf 'Invalid grep pattern\\n' >&2; exit 2; }
-  while IFS= read -r -d '' file; do
+  [ "$validation" -eq 0 ] || [ "$validation" -eq 1 ] || { printf 'Invalid grep pattern\\n' >&2; exit 2; }
+  # POSIX: no process substitution or read -d; the file loop and the
+  # line loop are separate pipeline stages so count survives in one
+  # shell. A temp file buffers each grep so empty results emit nothing
+  # (paths containing colons mis-split, same as before).
+  tmp=/tmp/pi-ssh-grep.$$
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  file_candidates | tr '\\0' '\\n' | { while IFS= read -r file; do
     rel="\${file#./}"
-    [[ -n "$glob" && "$rel" != $glob ]] && continue
-    while IFS=: read -r line text; do
-      printf '%s\\0%s\\0%s\\0' "$rel" "$line" "$text"
-      ((count += 1))
-      if ((count >= limit)); then stop=1; break; fi
-    done < <(grep -I -n ${fallbackFlags} -- "$pattern" "$file")
-    ((stop)) && break
-  done < <(file_candidates)
+    if [ -n "$glob" ]; then case "$rel" in $glob) ;; *) continue ;; esac; fi
+    grep -I -n ${fallbackFlags} -- "$pattern" "$file" > "$tmp"
+    if [ -s "$tmp" ]; then
+      awk -v r="$rel" '{ print r ":" $0 }' "$tmp"
+    fi
+  done; } | { while IFS=: read -r rel line text; do
+    printf '%s\\0%s\\0%s\\0' "$rel" "$line" "$text"
+    count=$((count + 1))
+    if [ "$count" -ge "$limit" ]; then break; fi
+  done; exit 0; }
 fi
 exit 0
 `, signal);

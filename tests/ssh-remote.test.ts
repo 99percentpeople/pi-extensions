@@ -96,6 +96,12 @@ class FakeSshClient implements SshRemoteClient {
   getentUnavailable = false;
   /** Simulated `readlink -f /bin/sh` basename used by the fallback probe. */
   shTarget = "bash";
+  /**
+   * Shells that pass the adapter's `command -v` existence check during
+   * inspectWorkspace. Defaults to a normal Unix host; clear "bash" to
+   * simulate an ash-only host (OpenWrt/busybox).
+   */
+  inspectShells = new Set(["bash", "sh", "zsh"]);
 
   constructor(
     readonly options: Readonly<SshClientOptions>,
@@ -127,6 +133,27 @@ class FakeSshClient implements SshRemoteClient {
         stdout: Buffer.from(`unix:${this.userShell}`),
         stderr: Buffer.alloc(0),
         exitCode: 0,
+      };
+    }
+    // inspectWorkspace validates the adapter shell with a bare command -v
+    // (no sh -c wrapper, unlike the probe regex above) and carries the
+    // HOME/cwd payload on the same command.
+    const shellCheck = /^command -v ([a-z0-9_.-]+) >/.exec(command);
+    if (shellCheck) {
+      const present = this.inspectShells.has(shellCheck[1]);
+      if (command.includes("PI_SSH_UNIX_ENV")) {
+        return {
+          stdout: Buffer.from(
+            `\u001ePI_SSH_UNIX_ENV\u001f${this.workspace.home}\u001f${this.workspace.cwd}\u001e`,
+          ),
+          stderr: Buffer.alloc(0),
+          exitCode: present ? 0 : 127,
+        };
+      }
+      return {
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+        exitCode: present ? 0 : 127,
       };
     }
     if (command.includes("PI_SSH_UNIX_ENV")) {
@@ -1188,6 +1215,28 @@ test("auto mode falls back to the sh symlink target when getent is missing", asy
   const zshFallback = await selectRemoteAdapter(shToZsh, { preference: "auto" });
   assert.equal(zshFallback.adapter.shell, "zsh");
   assert.equal(zshFallback.warnings?.length ?? 0, 0);
+});
+
+test("auto mode falls back to sh on ash-only hosts (OpenWrt)", async () => {
+  // No bash or zsh anywhere: the deterministic order tries bash, fails,
+  // and lands on the POSIX control shell sh.
+  const openWrt = new FakeSshClient({ target: "router" });
+  openWrt.userShell = "ash";
+  openWrt.inspectShells = new Set(["sh"]);
+  const selected = await selectRemoteAdapter(openWrt, { preference: "auto" });
+  assert.equal(selected.adapter.shell, "sh");
+  assert.equal(selected.workspace.shell, "sh");
+  assert.match(selected.adapter.buildShellCommand("echo $0", "/etc"), /exec sh -lc/);
+  assert.equal(selected.warnings?.length ?? 0, 0);
+
+  // Control scripts run through sh on every Unix host, even when the user
+  // shell is bash.
+  const withBash = new FakeSshClient({ target: "devbox" });
+  const bashSelection = await selectRemoteAdapter(withBash, { preference: "auto" });
+  assert.equal(bashSelection.adapter.shell, "bash");
+  const control = await (bashSelection.adapter as UnixBashAdapter).listDirectory("/srv/project");
+  assert.equal(control.length, 2);
+  assert.ok(withBash.calls.some((call) => call.command.includes("exec sh -lc")));
 });
 
 test("explicit --ssh-shell probes existence and falls back to sh", async () => {
