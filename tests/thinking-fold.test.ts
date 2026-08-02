@@ -7,8 +7,10 @@ import { test } from "node:test";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   AssistantMessageComponent,
+  getMarkdownTheme,
   initTheme,
 } from "@earendil-works/pi-coding-agent";
+import { Markdown } from "@earendil-works/pi-tui";
 import {
   BUILT_IN_MODEL_BEHAVIORS,
   createThinkingCursorLabel,
@@ -75,6 +77,28 @@ function thinkingText(message: AssistantMessage): string {
 
 function streamingDisplay(startedAt = 1_000, now = 3_450): ThinkingDisplayState {
   return { timing: { startedAt }, now };
+}
+
+function cleanRenderedLines(lines: string[], pad = 1): string[] {
+  return lines
+    .map(stripVTControlCharacters)
+    .map((line) => line.replace(new RegExp(`^ {0,${pad}}`), "").trimEnd());
+}
+
+/** Render source text through the same Markdown implementation Pi uses. */
+function renderThinkingLines(text: string, width = 80, pad = 1): string[] {
+  return cleanRenderedLines(
+    new Markdown(text, pad, 0, getMarkdownTheme(), undefined).render(width),
+    pad,
+  );
+}
+
+function renderAssistantLines(
+  component: AssistantMessageComponent,
+  width = 80,
+  pad = 1,
+): string[] {
+  return cleanRenderedLines(component.render(width), pad);
 }
 
 test("auto mode follows the built-in model behavior configuration", () => {
@@ -253,6 +277,125 @@ test("trailing newlines do not make the folded preview jump rows", () => {
   assert.equal(thinkingText(trailingBlanks), plainText);
   assert.match(plainText, /\nline 4\nline 5\nline 6$/);
   assert.doesNotMatch(plainText, /\n\n$/);
+});
+
+test("markdown is rendered before the trace preview is folded", () => {
+  const traces = [
+    "start\n```python\nimport os\nprint('x')\n```\nmore\n",
+    "start\n# Heading\nparagraph\nmore text\nlast line\n",
+    "start\n| a | b |\n|---|---|\n| 1 | 2 |\nnext\n",
+    "start\n\n    indented = 1\n    more = 2\n\nfinish\n",
+    "start\n> quote\n> more quote\nplain\nlast line\n",
+    "start\n- one\n- two\n- three\nlast\n",
+    "start\n1. one\n2. two\n3. three\nlast\n",
+    "start\n***\nplain\nlast line\nmore\n",
+    "start\n[1]: http://example.com\nplain\nmore lines\nlast line\n",
+  ];
+  const patch = installThinkingFoldPatch({ ...options, previewLines: 3 });
+  try {
+    traces.forEach((trace, index) => {
+      const source = assistant(trace, "openai-completions", "", 10_000 + index);
+      patch.beginMessage(source, 1_000);
+      patch.tick(3_450);
+      const component = new AssistantMessageComponent(source);
+      const actual = renderAssistantLines(component).slice(1);
+      const fullMarkdown = renderThinkingLines(trace.trim());
+      assert.deepEqual(actual, [
+        `Thinking 2.5s${fullMarkdown.length > 3 ? "  (ctrl+t to expand)" : ""}`,
+        ...fullMarkdown.slice(-3),
+      ]);
+      assert.equal(actual.length <= 4, true, `${JSON.stringify(trace.slice(0, 24))} exceeded 4 rows`);
+    });
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("the folded preview height stays pinned while markdown streams", () => {
+  const trace = [
+    "# Analyzing the request",
+    "Let me break this down:",
+    "```python",
+    "import os",
+    "print(os.getcwd())",
+    "```",
+    "",
+    "| step | result |",
+    "|------|--------|",
+    "| 1    | ok     |",
+    "| 2    | fail   |",
+    "",
+    "> **Note:** retry needed",
+    "",
+    "    retries = 3",
+    "    timeout = 30",
+    "",
+    "- first attempt",
+    "- second attempt",
+    "- third attempt",
+    "",
+    "## Summary",
+    "Done with analysis",
+  ];
+  const first = assistant(trace[0]!, "openai-completions", "", 20_000);
+  const patch = installThinkingFoldPatch({ ...options, previewLines: 3 });
+  try {
+    patch.beginMessage(first, 1_000);
+    patch.tick(3_450);
+    const component = new AssistantMessageComponent(first);
+    let previousHeight = 0;
+    for (let end = 1; end <= trace.length; end++) {
+      component.updateContent(
+        assistant(trace.slice(0, end).join("\n"), "openai-completions", "", 20_000),
+      );
+      const height = component.render(80).length - 1; // native leading assistant spacer
+      assert.ok(height <= 4, `folded height ${height} exceeds 4 rows at line ${end}`);
+      if (previousHeight >= 4) {
+        assert.equal(height, 4, `folded height dropped from 4 to ${height} at line ${end}`);
+      }
+      previousHeight = height;
+    }
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("rendered markdown overflow controls the hint and expansion", () => {
+  // Three source rows fit the raw threshold, but a native Markdown table renders
+  // five terminal rows. The post-render fold must hide two rows and advertise
+  // expansion; Ctrl+T must restore the exact native table.
+  const trace = "| name | value |\n|---|---|\n| alpha | beta |";
+  const source = assistant(trace, "openai-completions", "", 30_000);
+  const nativeTable = renderThinkingLines(trace);
+  assert.ok(nativeTable.length > 3);
+  assert.ok(nativeTable.some((line) => line.includes("┌")));
+
+  const patch = installThinkingFoldPatch({ ...options, previewLines: 3 });
+  try {
+    patch.beginMessage(source, 1_000);
+    patch.tick(3_450);
+    const component = new AssistantMessageComponent(source);
+    const folded = renderAssistantLines(component).slice(1);
+    assert.deepEqual(folded, [
+      "Thinking 2.5s  (ctrl+t to expand)",
+      ...nativeTable.slice(-3),
+    ]);
+    assert.doesNotMatch(folded.join("\n"), /\|---\||thinking-fold:/);
+    assert.equal(thinkingText(source), trace, "display markers must never modify source content");
+
+    component.invalidate();
+    assert.deepEqual(
+      renderAssistantLines(component).slice(1),
+      folded,
+      "native invalidation must rebuild from source rather than marker text",
+    );
+
+    patch.setExpanded(true);
+    const expanded = renderAssistantLines(component).slice(1);
+    assert.deepEqual(expanded, nativeTable);
+  } finally {
+    patch.dispose();
+  }
 });
 
 test("automatic streaming hides summaries while the cursor shows their headline", () => {

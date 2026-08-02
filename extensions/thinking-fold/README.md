@@ -50,6 +50,12 @@ Additional behavior:
 
 - The `preview` strategy shows the latest 5 visual lines by default, for traces
   and summaries alike.
+- Preview content keeps Pi's native Markdown formatting. Each thinking section
+  is rendered at the current terminal width first, then the preview retains its
+  final terminal-visible rows. Fences, headings, tables, quotes, lists, syntax
+  highlighting, wrapping, and future Markdown behavior therefore need no
+  syntax-specific handling, while the folded height stays fixed as formatted
+  constructs enter or leave the tail window.
 - Pi's normalized `thinking_start` / `thinking_delta` / `thinking_end` events
   drive streaming and timing, so model IDs never need per-model adapters.
 - **While thinking** defaults to `auto`: summaries show only the timer while
@@ -186,10 +192,12 @@ data declarative and leaves provider/model names out of rendering code.
 Pi currently exports `AssistantMessageComponent` but does not provide an
 extension hook for replacing normal assistant-message rendering. This package
 therefore installs a guarded compatibility patch around the component's public
-`updateContent()` and `render()` methods. It verifies those methods at startup,
-prevents duplicate patches across reloads, and restores the originals during
-session shutdown.
+`updateContent()` method. It lets Pi create its native thinking `Markdown`
+component, then wraps that display-only child so `render(width)` is evaluated
+before its output is folded. The patch prevents duplicates across reloads and
+restores the original method during session shutdown.
 
-The package was developed against Pi 0.82.1. If Pi changes the component API,
-the extension disables itself and reports a warning instead of modifying
-messages or failing the session.
+The package is tested against Pi 0.83.0. If the public component API is missing,
+the extension disables itself and reports a warning. If Pi changes only the
+internal child layout, an affected message safely falls back to complete native
+rendering instead of exposing markers or modifying source content.
