@@ -85,7 +85,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
-  assert.equal(codexApi.version, "0.2.2");
+  assert.equal(codexApi.version, "0.2.3");
   assertBuiltExtensionPackage(codexApi);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
   assert.deepEqual(codexApi.files, [
@@ -123,7 +123,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
-  assert.equal(sshRemote.version, "0.3.0");
+  assert.equal(sshRemote.version, "0.4.0");
   assertBuiltExtensionPackage(sshRemote);
   assert.deepEqual(sshRemote.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
