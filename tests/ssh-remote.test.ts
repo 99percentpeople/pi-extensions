@@ -87,6 +87,15 @@ class FakeSshClient implements SshRemoteClient {
   readonly calls: RecordedRun[] = [];
   disposed = false;
   remoteFileExists = false;
+  userShell = "";
+  /** When set, `command -v <value>` probes answer yes for this command name. */
+  availableCommands = new Set<string>();
+  /** When set, existence probes fail (for example no sh on a Windows host). */
+  probeFails = false;
+  /** When set, `getent` is unavailable and the probe falls back to `sh`'s target. */
+  getentUnavailable = false;
+  /** Simulated `readlink -f /bin/sh` basename used by the fallback probe. */
+  shTarget = "bash";
 
   constructor(
     readonly options: Readonly<SshClientOptions>,
@@ -96,6 +105,30 @@ class FakeSshClient implements SshRemoteClient {
 
   async run(command: string, options?: SshRunOptions): Promise<SshRunResult> {
     this.calls.push({ command, options, checked: false });
+    const probe = /sh -c 'command -v ([a-z0-9_.-]+) /.exec(command);
+    if (probe) {
+      if (this.probeFails) throw new Error("probe failed");
+      return {
+        stdout: Buffer.from(this.availableCommands.has(probe[1]) ? "ok" : ""),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
+    if (command.includes("getent passwd")) {
+      if (this.getentUnavailable) {
+        // No getent on the host: the probe falls back to the sh symlink target.
+        return {
+          stdout: Buffer.from(`unix:${this.shTarget}`),
+          stderr: Buffer.alloc(0),
+          exitCode: 0,
+        };
+      }
+      return {
+        stdout: Buffer.from(`unix:${this.userShell}`),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    }
     if (command.includes("PI_SSH_UNIX_ENV")) {
       return {
         stdout: Buffer.from(`\u001ePI_SSH_UNIX_ENV\u001f${this.workspace.home}\u001f${this.workspace.cwd}\u001e`),
@@ -941,6 +974,8 @@ class FakeWindowsSshClient implements SshRemoteClient {
   readonly calls: RecordedRun[] = [];
   disposed = false;
   remoteFileExists = false;
+  /** Commands reported by the PowerShell Get-Command probe. */
+  availablePowerShellCommands = new Set<string>();
 
   constructor(readonly options: Readonly<SshClientOptions> = { target: "winbox" }) {}
 
@@ -948,6 +983,18 @@ class FakeWindowsSshClient implements SshRemoteClient {
     this.calls.push({ command, options, checked: false });
     if (command.startsWith("command -v bash")) {
       return { stdout: Buffer.alloc(0), stderr: Buffer.from("bash missing"), exitCode: 127 };
+    }
+    if (command.includes("getent passwd") || /sh -c 'command -v [a-z0-9_.-]+ /.test(command)) {
+      // A Windows host without sh cannot run POSIX probes: exit 1, no output.
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 1 };
+    }
+    const psProbe = /powershell -NoProfile -NonInteractive -Command "if \(Get-Command '([a-z0-9_.-]+)'/.exec(command);
+    if (psProbe) {
+      return {
+        stdout: Buffer.from(this.availablePowerShellCommands.has(psProbe[1]) ? "ok" : ""),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
     }
     const script = decodePowerShellInvocation(command);
     if (script.includes("PI_SSH_WINDOWS_ENV")) {
@@ -1107,6 +1154,81 @@ test("PowerShell scripts use EncodedCommand and keep user commands out of SSH ar
   const decoded = decodePowerShellInvocation(shellCommand);
   assert.match(decoded, /PI_SESSION_ID/);
   assert.doesNotMatch(decoded, /PI_SESSION_FILE|local\/session/);
+});
+
+test("auto mode reuses the remote login shell (zsh)", async () => {
+  const zshClient = new FakeSshClient({ target: "devbox" });
+  zshClient.userShell = "zsh";
+  const zshSelection = await selectRemoteAdapter(zshClient, { preference: "auto" });
+  assert.equal(zshSelection.adapter.shell, "zsh");
+  assert.equal(zshSelection.workspace.shell, "zsh");
+  assert.equal(zshSelection.warnings?.length ?? 0, 0);
+  assert.match(
+    zshSelection.adapter.buildShellCommand("echo $0", "/srv/project"),
+    /exec zsh -lc/,
+  );
+
+  // Unknown login shells keep the deterministic Bash-first order.
+  const plainClient = new FakeSshClient({ target: "devbox" });
+  const selected = await selectRemoteAdapter(plainClient, { preference: "auto" });
+  assert.equal(selected.adapter.shell, "bash");
+});
+
+test("auto mode falls back to the sh symlink target when getent is missing", async () => {
+  // No getent (Alpine/busybox): the probe uses readlink -f /bin/sh instead.
+  const busyboxLike = new FakeSshClient({ target: "devbox" });
+  busyboxLike.getentUnavailable = true;
+  const selected = await selectRemoteAdapter(busyboxLike, { preference: "auto" });
+  assert.equal(selected.adapter.shell, "bash");
+
+  // sh points at zsh: the fallback still detects a Zsh login shell.
+  const shToZsh = new FakeSshClient({ target: "devbox" });
+  shToZsh.getentUnavailable = true;
+  shToZsh.shTarget = "zsh";
+  const zshFallback = await selectRemoteAdapter(shToZsh, { preference: "auto" });
+  assert.equal(zshFallback.adapter.shell, "zsh");
+  assert.equal(zshFallback.warnings?.length ?? 0, 0);
+});
+
+test("explicit --ssh-shell probes existence and falls back to sh", async () => {
+  // zsh installed: used directly.
+  const zshClient = new FakeSshClient({ target: "devbox" });
+  zshClient.availableCommands.add("zsh");
+  const zshSelection = await selectRemoteAdapter(zshClient, { preference: "zsh" });
+  assert.equal(zshSelection.adapter.shell, "zsh");
+
+  // zsh missing: warning plus sh fallback keeps the session usable.
+  const missing = new FakeSshClient({ target: "devbox" });
+  const fallback = await selectRemoteAdapter(missing, { preference: "zsh" });
+  assert.equal(fallback.adapter.shell, "sh");
+  assert.ok(
+    (fallback.warnings ?? []).some((warning) => /does not provide zsh/.test(warning)),
+  );
+
+  // Windows PowerShell: pwsh missing falls back to powershell with a warning.
+  const windows = new FakeWindowsSshClient({ target: "winbox" });
+  const pwshFallback = await selectRemoteAdapter(windows, { preference: "pwsh" });
+  assert.equal(pwshFallback.adapter.shell, "powershell");
+  assert.ok(
+    (pwshFallback.warnings ?? []).some((warning) => /falling back to powershell/.test(warning)),
+  );
+
+  // Windows without sh: the POSIX probe cannot run and the PowerShell probe
+  // answers; the preference stays in charge and inspectWorkspace validates it.
+  const noSh = new FakeWindowsSshClient({ target: "winbox" });
+  noSh.availablePowerShellCommands.add("pwsh");
+  const noShSelection = await selectRemoteAdapter(noSh, { preference: "pwsh" });
+  assert.equal(noShSelection.adapter.shell, "pwsh");
+  assert.equal(noShSelection.warnings?.length ?? 0, 0);
+
+  // Windows without sh and without the command: PowerShell probe says no,
+  // the fallback fires with a warning.
+  const noShMissing = new FakeWindowsSshClient({ target: "winbox" });
+  const missingSelection = await selectRemoteAdapter(noShMissing, { preference: "pwsh" });
+  assert.equal(missingSelection.adapter.shell, "powershell");
+  assert.ok(
+    (missingSelection.warnings ?? []).some((warning) => /falling back to powershell/.test(warning)),
+  );
 });
 
 test("remote adapter auto-detects Windows PowerShell and streams file content over stdin", async () => {

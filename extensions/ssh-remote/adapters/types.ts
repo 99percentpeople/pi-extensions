@@ -1,7 +1,7 @@
 import type { SshRunOptions } from "../client.ts";
 
 export type RemotePlatform = "unix" | "windows";
-export type RemoteShell = "bash" | "pwsh" | "powershell";
+export type RemoteShell = "bash" | "zsh" | "sh" | "pwsh" | "powershell";
 export type SshShellPreference = "auto" | RemoteShell;
 
 export interface RemoteWorkspace {

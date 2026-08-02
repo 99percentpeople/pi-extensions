@@ -9,7 +9,7 @@ machine.
 
 The extension supports Linux, macOS, and Windows clients connected to:
 
-- Unix hosts with Bash and the usual POSIX utilities;
+- Unix hosts with Bash or Zsh;
 - Windows OpenSSH hosts with PowerShell 7 or Windows PowerShell 5.1.
 
 ## Features
@@ -22,7 +22,12 @@ The extension supports Linux, macOS, and Windows clients connected to:
   both transports support single- and multi-hop `ProxyJump`, while OpenSSH
   mode retains arbitrary `ProxyCommand` and other advanced client behavior
 - Accepts rsync-style targets such as `host:/srv/project` and `user@host:path`
-- Auto-detects remote Unix/Bash or Windows/PowerShell environments
+- Auto-detects the remote account's login shell (Zsh accounts get Zsh), or
+  selects a shell explicitly via `--ssh-shell`; no per-target settings files
+  are needed
+- Shell selection is one flag: automatic login-shell detection by default, or
+  explicit `--ssh-shell` with a sh/PowerShell fallback and warning when
+  missing; probing failure keeps the deterministic Bash/PowerShell order
 - Keeps Pi's native tool schemas, truncation, diffs, rendering, and mutation
   queue behavior; `grep`, `find`, and `ls` retain Pi's default disabled state
 - Streams file contents over SSH stdin/stdout instead of putting them in
@@ -49,16 +54,16 @@ pi --ssh devbox:/srv/project
 pi --ssh 'winuser@winbox:C:\Users\winuser\project'
 
 # 3. Check the active connection and the effective transport
-/ssh-status            # target, platform, shell, transport, remote cwd/home
+/ssh-status            # target, platform, shell, transport, cwd/home
 /ssh-reconnect         # reconnect / apply a transport change
 ```
 
 Common options:
 
 ```bash
---ssh-shell bash|pwsh|powershell|auto   # remote shell (default auto-detect)
---ssh-transport auto|openssh|ssh2       # transport preference
---ssh-config <path>                     # alternate local OpenSSH config
+--ssh-shell auto|bash|zsh|pwsh|powershell   # remote shell (default auto-detect)
+--ssh-transport auto|openssh|ssh2           # transport preference
+--ssh-config <path>                                      # alternate local OpenSSH config
 ```
 
 Jump hosts work through the normal OpenSSH config with either transport:
@@ -223,19 +228,33 @@ The default is automatic detection:
 pi --ssh devbox --ssh-shell auto
 ```
 
-Detection tries Unix Bash, PowerShell 7, then Windows PowerShell 5.1. Override
-it when a host exposes more than one environment:
+On Unix hosts, auto probes the remote account's login shell (`getent passwd`,
+falling back to the `sh` symlink target on systems without `getent`, both
+inside `sh -c` so the remote default shell syntax does not matter). Zsh
+accounts get Zsh for the `bash` tool, `!` commands, and background jobs. A
+Zsh login shell implies zsh is installed, so no separate existence check is
+needed. Everything else keeps the deterministic order: Unix Bash, PowerShell
+7, then Windows PowerShell 5.1.
+
+Choose a shell explicitly:
 
 ```bash
 pi --ssh devbox --ssh-shell bash
+pi --ssh devbox --ssh-shell zsh
 pi --ssh winbox --ssh-shell pwsh
 pi --ssh winbox --ssh-shell powershell
 ```
 
-`cmd.exe` by itself is not supported. On Windows, the extension starts
-PowerShell through `-NoProfile -NonInteractive -EncodedCommand`, so it works
-even when Windows OpenSSH's DefaultShell is `cmd.exe`. Control scripts are
-encoded, while file data is still transferred as binary stdin/stdout.
+An explicit shell is probed for existence first. If it is missing, the
+extension warns and falls back: `zsh`/`bash` to `sh` on Unix, `pwsh` to
+PowerShell 5.1 (and vice versa) on Windows. Control operations (HOME/cwd
+probe, paths, file/search tools) always run through Bash on Unix and through
+the selected PowerShell on Windows, so only shells that can host the full
+feature set are offered.
+
+On Windows, PowerShell control scripts and user PowerShell commands use encoded
+UTF-16LE payloads, so content is not exposed in the SSH process arguments.
+File data continues to travel as binary stdin/stdout.
 
 ## Unix workspaces
 
@@ -246,7 +265,10 @@ pi --ssh devbox:~/project
 pi --ssh devbox:/srv/project
 ```
 
-The `bash` tool and user `!` commands execute Bash syntax.
+The `bash` tool and user `!` commands execute the remote shell (Bash, Zsh,
+or PowerShell). Workspace control operations (paths, file probes) run through
+Bash on Unix and the selected PowerShell on Windows regardless of that
+selection.
 
 ## Windows workspaces
 
@@ -263,8 +285,9 @@ Windows user profile and working directory. Drive-relative paths such as
 `C:folder` and `~other` paths are rejected because their meaning is ambiguous.
 
 The tool remains named `bash` for Pi compatibility, but its prompt and session
-context tell the model to use PowerShell syntax. User `!`/`!!` commands use the
-same remote PowerShell runtime.
+context tell the model to use the configured PowerShell or Zsh syntax. User
+`!`/`!!` commands use the same remote shell, and paths and file operations
+continue through the same remote shell.
 
 ## Session resume
 
@@ -272,18 +295,19 @@ Pi conversations remain in the local Pi session directory. The extension adds
 a hidden, branch-aware entry containing only:
 
 - the SSH destination or alias;
-- the detected remote platform and shell;
+- the resolved remote platform and shell;
 - the resolved remote cwd and home;
 - the optional local OpenSSH config path.
 
 It never copies private keys, passwords, SSH config contents, or remote file
-contents into this state. Version 1 Unix session entries are migrated in memory
-to Unix/Bash version 2 state, so existing conversations continue to resume.
+contents into this state. Version 1 Unix/Bash and version 2 platform/Shell
+entries are migrated in memory to execution-profile version 3 state, so
+existing conversations continue to resume.
 
 A resumed session reconnects its stored target even when Pi was started without
-`--ssh`. Passing a different target, config, cwd, or explicit shell while
-resuming is rejected to prevent an old conversation from modifying another
-machine.
+`--ssh`. Passing a different target, config, cwd, or conflicting explicit
+profile while resuming is rejected to prevent an old conversation from
+modifying another machine.
 
 Pi groups sessions by its local cwd. Start each remote project from a stable
 local anchor directory and name important sessions. In `/resume`, press Tab to
@@ -296,7 +320,7 @@ between sessions.
 ## Commands
 
 ```text
-/ssh-status      Show target, platform, shell, transport, remote cwd/home, and config source
+/ssh-status      Show target, profile source, platform/Shells, transport, cwd/home
 /ssh-reconnect   Retry the target stored in the current session
 ```
 
@@ -387,11 +411,12 @@ job after resume.
   registers its tool overrides only for sessions that request, resume, or
   inherit an SSH workspace.
 - A failed remote connection (unreachable host, missing remote directory, or
-  no supported remote shell) reports the error and leaves the session in a
-  `Disconnected` state: tools fail closed with the probe error, while
+  an unavailable remote shell) reports the error and leaves the
+  session in a `Disconnected` state: tools fail closed with the initialization
+  error, while
   `/ssh-status` and `/ssh-reconnect` stay available for recovery.
 - Background tasks follow the same rule: while the SSH workspace is
-  unavailable, `bg_start` is blocked with the probe error instead of silently
+  unavailable, `bg_start` is blocked with the initialization error instead of silently
   running on the local machine (the shared background-task backend can be
   claimed by other adapters such as `pi-pwsh-adapter`, so the block is applied
   at the tool level to stay independent of registration order).
@@ -416,8 +441,11 @@ job after resume.
 - `edit` serializes mutations inside the current Pi process, but cannot prevent
   another process on the remote host from changing a file between read and
   write steps.
-- Remote shell commands export safe Pi model/session identifiers but do not
-  export `PI_SESSION_FILE`, because that path exists only on the local host.
+- Remote command Shells inherit safe Pi model/session identifiers but never
+  receive `PI_SESSION_FILE`, because that path exists only on the local host.
+- An explicitly requested shell is probed for existence; a missing Bash/Zsh
+  falls back to `sh`, and a missing `pwsh`/`powershell` falls back to the
+  other PowerShell, with a warning.
 
 ## Security
 

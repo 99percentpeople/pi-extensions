@@ -56,12 +56,12 @@ import {
   SSH_SESSION_STATE_VERSION,
   type SshSessionState,
 } from "./session-state.ts";
+import { registerSshRemoteSettings } from "./settings.ts";
 import {
   expandLocalPath,
   parseSshTarget,
   type ParsedSshTarget,
 } from "./target.ts";
-import { registerSshRemoteSettings } from "./settings.ts";
 import { createSshTransportClient } from "./transport.ts";
 
 const STATUS_KEY = "ssh-remote";
@@ -71,7 +71,7 @@ interface ConnectionIntent {
   target: string;
   requestedCwd?: string;
   configFile?: string;
-  shellPreference: SshShellPreference;
+  shellPreference?: SshShellPreference;
   storedState?: SshSessionState;
   persistOnSuccess: boolean;
 }
@@ -120,30 +120,29 @@ function parseTransportPreference(
 function parseShellPreference(value: unknown): SshShellPreference {
   if (value === undefined || value === "") return "auto";
   if (
-    value === "auto" ||
-    value === "bash" ||
-    value === "pwsh" ||
-    value === "powershell"
+    value === "auto"
+    || value === "bash"
+    || value === "zsh"
+    || value === "pwsh"
+    || value === "powershell"
   ) {
     return value;
   }
-  throw new Error("--ssh-shell must be one of: auto, bash, pwsh, powershell");
+  throw new Error(
+    "--ssh-shell must be one of: auto, bash, zsh, pwsh, powershell",
+  );
 }
 
 function sameStoredTarget(
   parsed: ParsedSshTarget,
   configFile: string | undefined,
-  shellPreference: SshShellPreference,
   stored: SshSessionState,
 ): boolean {
-  if (parsed.target !== stored.target || configFile !== stored.configFile)
-    return false;
-  if (shellPreference !== "auto" && shellPreference !== stored.remoteShell)
-    return false;
+  if (parsed.target !== stored.target || configFile !== stored.configFile) return false;
   if (!parsed.requestedCwd) return true;
   return (
-    parsed.requestedCwd === stored.requestedCwd ||
-    parsed.requestedCwd === stored.remoteCwd
+    parsed.requestedCwd === stored.requestedCwd
+    || parsed.requestedCwd === stored.remoteCwd
   );
 }
 
@@ -333,7 +332,7 @@ export function createSshRemoteExtension(
       type: "string",
     });
     pi.registerFlag("ssh-shell", {
-      description: "Remote shell: auto, bash, pwsh, or powershell",
+      description: "Remote shell: auto, bash, zsh, pwsh, or powershell",
       type: "string",
     });
     pi.registerFlag("ssh-transport", {
@@ -462,18 +461,21 @@ export function createSshRemoteExtension(
           connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
           batchMode: true,
         };
+        let shellPreference = intent.shellPreference;
         client = dependencies.createClient
           ? dependencies.createClient(clientOptions)
           : createSshTransportClient(clientOptions, { platform, preference: transport });
-        const requestedCwd =
-          intent.storedState?.remoteCwd ?? intent.requestedCwd;
+        const requestedCwd = intent.storedState?.remoteCwd ?? intent.requestedCwd;
         const selected = await selectRemote(client, {
           localPlatform: platform,
-          preference: intent.shellPreference,
+          preference: shellPreference,
           expectedPlatform: intent.storedState?.remotePlatform,
           expectedShell: intent.storedState?.remoteShell,
           requestedCwd,
         });
+        for (const warning of selected.warnings ?? []) {
+          ctx.ui.notify(warning, "warning");
+        }
         const session: SshSessionState = {
           version: SSH_SESSION_STATE_VERSION,
           target: intent.target,
@@ -484,12 +486,10 @@ export function createSshRemoteExtension(
           requestedCwd: intent.storedState?.requestedCwd ?? intent.requestedCwd,
           configFile: intent.configFile,
         };
-        if (intent.persistOnSuccess)
-          pi.appendEntry(SSH_SESSION_STATE_TYPE, session);
+        if (intent.persistOnSuccess) pi.appendEntry(SSH_SESSION_STATE_TYPE, session);
         const activeIntent: ConnectionIntent = {
           ...intent,
           storedState: session,
-          shellPreference: session.remoteShell,
           persistOnSuccess: false,
         };
         const active: ActiveConnection = {
@@ -556,7 +556,8 @@ export function createSshRemoteExtension(
               : "OpenSSH/single-use"
             : "custom transport";
         ctx.ui.notify(
-          `SSH remote active: ${formatRemoteLocation(session)} (${session.remotePlatform}/${session.remoteShell}; ${transportLabel})`,
+          `SSH remote active: ${formatRemoteLocation(session)} `
+            + `(${session.remotePlatform}/${session.remoteShell}; ${transportLabel})`,
           "info",
         );
       } catch (error) {
@@ -576,34 +577,29 @@ export function createSshRemoteExtension(
         ? expandLocalPath(configFlag, ctx.cwd)
         : undefined;
       const shellPreference = parseShellPreference(pi.getFlag("ssh-shell"));
-
       if (stored) {
+        const explicitShell = shellPreference !== "auto"
+          ? shellPreference
+          : undefined;
         if (sshFlag) {
           const parsed = parseSshTarget(sshFlag);
           const effectiveConfig = configFile ?? stored.configFile;
-          if (
-            !sameStoredTarget(parsed, effectiveConfig, shellPreference, stored)
-          ) {
+          if (!sameStoredTarget(parsed, effectiveConfig, stored)) {
             throw new Error(
-              `The resumed session is bound to ${formatRemoteLocation(stored)}; ` +
-                "the current --ssh arguments select a different workspace or shell.",
+              `The resumed session is bound to ${formatRemoteLocation(stored)}; `
+                + "the current --ssh arguments select a different workspace.",
             );
           }
         } else if (configFile && configFile !== stored.configFile) {
-          throw new Error(
-            "The resumed session uses a different OpenSSH config file",
-          );
-        } else if (
-          shellPreference !== "auto" &&
-          shellPreference !== stored.remoteShell
-        ) {
+          throw new Error("The resumed session uses a different OpenSSH config file");
+        } else if (explicitShell && explicitShell !== stored.remoteShell) {
           throw new Error("The resumed session uses a different remote shell");
         }
         return {
           target: stored.target,
           requestedCwd: stored.remoteCwd,
           configFile: stored.configFile,
-          shellPreference: stored.remoteShell,
+          shellPreference: explicitShell ?? stored.remoteShell,
           storedState: stored,
           persistOnSuccess: false,
         };
@@ -635,16 +631,16 @@ export function createSshRemoteExtension(
               configFile: inherited.configFile,
               shellPreference: inherited.remoteShell,
               storedState: inherited,
-              persistOnSuccess: true,
+              persistOnSuccess: false,
             };
           }
         } catch {
           // A missing or unreadable previous session should not prevent /new.
         }
       }
-
       return undefined;
     };
+
 
     let sshCommandsRegistered = false;
     const registerSshCommands = (): void => {
@@ -974,7 +970,7 @@ export function createSshRemoteExtension(
       ...bashTemplate,
       description: bashTemplate.description.replace(
         "Execute a bash command in the current working directory.",
-        "Execute a command in the active workspace shell. Local and remote Unix workspaces use Bash; remote Windows workspaces use PowerShell.",
+                "Execute a command in the active workspace shell. Local and remote Unix workspaces use the detected default shell (Bash, Zsh); remote Windows workspaces use PowerShell.",
       ),
       promptSnippet:
         "Execute commands in the active local or remote workspace shell",
@@ -1108,7 +1104,9 @@ export function createSshRemoteExtension(
       const shellGuidance =
         runtime.session.remotePlatform === "windows"
           ? "The bash tool and user ! commands execute PowerShell syntax, not Bash syntax."
-          : "The bash tool and user ! commands execute Bash syntax.";
+          : runtime.session.remoteShell === "zsh"
+            ? "The bash tool and user ! commands execute Zsh syntax."
+            : "The bash tool and user ! commands execute Bash syntax.";
       return {
         systemPrompt:
           `${base}\n\nSSH remote workspace is active at ${location} ` +
@@ -1153,11 +1151,15 @@ export {
 } from "./config.ts";
 export type {
   RemoteAdapter,
+  RemotePlatform,
+  RemoteShell,
   RemoteWorkspace,
+  SshShellPreference,
+} from "./adapters/index.ts";
+export type {
   SshClientOptions,
   SshRemoteClient,
-  SshSessionState,
-  SshShellPreference,
   SshTransportKind,
   SshTransportPreference,
-};
+} from "./client.ts";
+export type { SshSessionState } from "./session-state.ts";

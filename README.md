@@ -71,6 +71,9 @@ For example:
       }
     }
   },
+  "ssh-remote": {
+    "transport": "auto"
+  },
   "thinking-fold": {
     "foldThreshold": 5,
     "streamingBehavior": "auto",
@@ -218,11 +221,13 @@ Windows, with compatibility fallback to single-use OpenSSH. Targets retain
 rsync-style syntax such as `devbox:/srv/project`; both transports support
 single- and multi-hop `ProxyJump`, while explicit OpenSSH mode additionally
 supports arbitrary `ProxyCommand` behavior. `ssh2` resolves its documented
-configuration subset through `ssh -G`. Unix hosts use Bash; Windows OpenSSH
-hosts use PowerShell 7 or Windows PowerShell 5.1. The resolved target,
-platform, shell, and cwd are stored as hidden Pi session state and reconnect
-on resume; failed connections block remote tools instead of falling back to
-local files. The
+configuration subset through `ssh -G`. Shell selection is one flag:
+`--ssh-shell` chooses Bash, Zsh, PowerShell 7, or Windows PowerShell 5.1
+explicitly, or auto mode detects the remote account's login shell (Zsh
+accounts get Zsh) with a sh/PowerShell fallback and warning when the chosen
+shell is missing. The resolved target, platform, shell, and cwd are stored as
+hidden Pi session state and reconnect on resume; failed connections block
+remote tools instead of falling back to local files. The
 status line shows only the themed connection state, while an automatic
 `SSH target:path (branch) • first message` session name places the remote
 location and opening request in Pi's normal footer and native `/resume` list

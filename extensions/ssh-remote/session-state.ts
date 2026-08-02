@@ -70,11 +70,11 @@ export function normalizeSshSessionState(value: unknown): SshSessionState | unde
 
   if (value.version !== SSH_SESSION_STATE_VERSION) return undefined;
   if (value.remotePlatform !== "unix" && value.remotePlatform !== "windows") return undefined;
-  if (value.remoteShell !== "bash" && value.remoteShell !== "pwsh" && value.remoteShell !== "powershell") {
+  if (value.remoteShell !== "bash" && value.remoteShell !== "zsh" && value.remoteShell !== "pwsh" && value.remoteShell !== "powershell") {
     return undefined;
   }
   if (value.remotePlatform === "unix") {
-    if (value.remoteShell !== "bash") return undefined;
+    if (value.remoteShell !== "bash" && value.remoteShell !== "zsh") return undefined;
     if (!isValidUnixPath(value.remoteCwd as string) || !isValidUnixPath(value.remoteHome as string)) {
       return undefined;
     }

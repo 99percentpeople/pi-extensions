@@ -100,22 +100,28 @@ function remoteSessionExports(env: NodeJS.ProcessEnv | undefined): string {
   return assignments.length > 0 ? `export ${assignments.join(" ")}; ` : "";
 }
 
+export type UnixUserShell = "bash" | "zsh" | "sh";
+
 export function buildUnixBashCommand(
   command: string,
   cwd: string,
   env?: NodeJS.ProcessEnv,
+  shell: UnixUserShell = "bash",
 ): string {
-  return `cd -- ${shellQuote(cwd)} && ${remoteSessionExports(env)}exec bash -lc ${shellQuote(command)}`;
+  return `cd -- ${shellQuote(cwd)} && ${remoteSessionExports(env)}exec ${shell} -lc ${shellQuote(command)}`;
 }
 
 export class UnixBashAdapter implements RemoteAdapter {
   readonly platform = "unix" as const;
-  readonly shell = "bash" as const;
+  readonly shell: UnixUserShell;
 
   constructor(
     private readonly executor: SshExecutor,
     private readonly localPlatform: NodeJS.Platform = process.platform,
-  ) {}
+    shell: UnixUserShell = "bash",
+  ) {
+    this.shell = shell;
+  }
 
   async inspectWorkspace(requestedCwd?: string): Promise<RemoteWorkspace> {
     const environment = await this.executor.runChecked(
@@ -219,6 +225,9 @@ export class UnixBashAdapter implements RemoteAdapter {
   }
 
   private runBashControl(script: string, signal?: AbortSignal): Promise<Buffer> {
+    // Control scripts use Bash syntax (shopt, [[ ]], dotglob) and therefore
+    // always run through Bash regardless of the user's default shell; only
+    // user-entered commands go through the detected default shell.
     return this.executor.runChecked(
       `exec bash -lc ${shellQuote(script)}`,
       { signal },
@@ -426,7 +435,7 @@ exit 0
     env?: NodeJS.ProcessEnv,
     _interactive = false,
   ): string {
-    return buildUnixBashCommand(command, cwd, env);
+    return buildUnixBashCommand(command, cwd, env, this.shell);
   }
 
   async runShell(
