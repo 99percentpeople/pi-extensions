@@ -54,7 +54,7 @@ export function registerSshRemoteSettings(
     }, {
       id: "persistPasswords",
       label: "Persist passwords",
-      description: "Save entered passwords to a 0600 secrets file so -r resumes reuse them without re-asking",
+      description: "Save entered passwords to a restricted secrets file so -r resumes reuse them without re-asking",
       currentValue: booleanLabel(controller.getConfig().persistPasswords),
       values: ["On", "Off"],
     }],

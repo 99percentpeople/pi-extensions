@@ -3623,10 +3623,13 @@ test("password resolver caches, persists, rejects, and forgets", async () => {
   assert.equal(await resolver.resolvePassword(endpoint), "pw1");
   assert.deepEqual(prompts, ["SSH password for deploy@devbox:22"]);
 
-  // Secrets file is written with 0600 and readable by a fresh resolver
-  // (simulates a -r restart reusing the password).
-  const mode = statSync(secretsPath).mode & 0o777;
-  assert.equal(mode, 0o600);
+  // POSIX creates the secrets file with 0600. Windows uses inherited ACLs
+  // and Node reports synthetic POSIX mode bits, so only persistence is
+  // portable there.
+  if (process.platform !== "win32") {
+    const mode = statSync(secretsPath).mode & 0o777;
+    assert.equal(mode, 0o600);
+  }
   const fresh = new SshPasswordResolver({ persistPasswords: true, secretsPath });
   assert.equal(fresh.cachedPassword(endpoint), "pw1");
 

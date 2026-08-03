@@ -224,9 +224,11 @@ prompt attempt keeps the retry loop in the extension. Without sshpass,
 explicit `openssh` reports the missing tool or falls back to `ssh2` on
 `auto`. The password is held in memory for the process, so `/resume`,
 reconnects, and extra channels reuse it without re-asking; with
-`persistPasswords` enabled (default) it is also saved to a 0600
-`ssh-remote-secrets.json` next to Pi's settings so `-r` restarts reuse it
-too. Public keys and the agent always win; passwords never enter SSH command
+`persistPasswords` enabled (default) it is also saved to
+`ssh-remote-secrets.json` next to Pi's settings so `-r` restarts reuse it.
+The file uses mode 0600 on POSIX; Windows relies on the inherited user-profile
+ACL because Node does not expose POSIX permission bits there. Public keys and
+the agent always win; passwords never enter SSH command
 arguments and are passed only through ssh2 or the `SSHPASS` environment. A
 wrong password re-prompts until cancelled or the retry safety limit is reached.
 Clear all cached passwords with `/ssh-forget-passwords`, disable prompting in

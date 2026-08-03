@@ -510,8 +510,8 @@ export function createSshRemoteExtension(
           batchMode: true,
         };
         // Wire the TUI password prompt into the ssh2 auth retry loop. The
-        // resolver keeps per-process memory plus an optional 0600 secrets
-        // file so /resume and -r reuse the password without re-asking.
+        // resolver keeps per-process memory plus an optional restricted
+        // secrets file so /resume and -r reuse the password without re-asking.
         passwordResolver.setUI(ctx.hasUI
           ? {
               prompt: (title) => ctx.ui.input(title),

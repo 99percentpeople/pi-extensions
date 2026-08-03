@@ -41,7 +41,7 @@ export class SshPasswordFailedError extends Error {
 }
 
 export interface SshPasswordResolverOptions {
-  /** Persist passwords to the 0600 secrets file (for -r cross-process reuse). */
+  /** Persist passwords to the restricted secrets file (for -r cross-process reuse). */
   persistPasswords: boolean;
   /** Override the secrets file path (tests). */
   secretsPath?: string;
@@ -75,7 +75,7 @@ function writeSecrets(path: string, secrets: Record<string, string>): void {
 }
 
 /**
- * Resolves SSH passwords in order: in-process memory, the 0600 secrets
+ * Resolves SSH passwords in order: in-process memory, the restricted secrets
  * file, then the TUI prompt. Rejected passwords are removed from all
  * sources so the next attempt re-asks instead of looping on a bad secret.
  */

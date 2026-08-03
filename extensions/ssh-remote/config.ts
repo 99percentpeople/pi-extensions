@@ -9,7 +9,7 @@ export interface SshRemoteConfig {
   transport: SshTransportPreference;
   /** Ask for an SSH password in the TUI when key/agent auth fails. */
   passwordPrompt: boolean;
-  /** Persist entered passwords to a 0600 secrets file for -r resumes. */
+  /** Persist entered passwords to a restricted secrets file for -r resumes. */
   persistPasswords: boolean;
 }
 
