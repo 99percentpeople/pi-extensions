@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -49,6 +49,7 @@ import {
 } from "../extensions/ssh-remote/config.ts";
 import { createSshRemoteExtension } from "../extensions/ssh-remote/index.ts";
 import { Ssh2Client, Ssh2ConnectionError } from "../extensions/ssh-remote/ssh2-client.ts";
+import { SshPasswordResolver } from "../extensions/ssh-remote/password-resolver.ts";
 import {
   expandProxyJumpTokens,
   parseKnownHostSearchOutput,
@@ -409,15 +410,32 @@ test("Windows ssh.exe adds -n for no-stdin commands and uses a temp file for inp
 
 test("SSH Remote transport settings normalize and persist", () => {
   assert.deepEqual(normalizeSshRemoteConfig(undefined), DEFAULT_SSH_REMOTE_CONFIG);
-  assert.deepEqual(normalizeSshRemoteConfig({ transport: "ssh2" }), { transport: "ssh2" });
-  assert.deepEqual(normalizeSshRemoteConfig({ transport: "invalid" }), { transport: "auto" });
+  assert.deepEqual(normalizeSshRemoteConfig({ transport: "ssh2" }), {
+    transport: "ssh2",
+    passwordPrompt: true,
+    persistPasswords: true,
+  });
+  assert.deepEqual(normalizeSshRemoteConfig({ transport: "invalid" }), {
+    transport: "auto",
+    passwordPrompt: true,
+    persistPasswords: true,
+  });
+  assert.deepEqual(normalizeSshRemoteConfig({
+    transport: "ssh2",
+    passwordPrompt: false,
+    persistPasswords: false,
+  }), { transport: "ssh2", passwordPrompt: false, persistPasswords: false });
 
   const directory = mkdtempSync(join(tmpdir(), "pi-ssh-settings-test-"));
   const path = join(directory, "settings.json");
   try {
     writeFileSync(path, JSON.stringify({ unrelated: { enabled: true } }));
     saveSshRemoteConfig({ transport: "openssh" }, path);
-    assert.deepEqual(loadSshRemoteConfig(path), { transport: "openssh" });
+    assert.deepEqual(loadSshRemoteConfig(path), {
+      transport: "openssh",
+      passwordPrompt: true,
+      persistPasswords: true,
+    });
     const document = JSON.parse(readFileSync(path, "utf8"));
     assert.deepEqual(document.unrelated, { enabled: true });
   } finally {
@@ -713,6 +731,24 @@ class FakeRawSsh2Client extends EventEmitter {
   }
 }
 
+class FakeAuthFailClient extends FakeRawSsh2Client {
+  constructor(readonly failAuthTimes = 1) {
+    super();
+  }
+
+  connect(config: Record<string, unknown> = {}): void {
+    this.connectCalls++;
+    this.connectConfigs.push(config);
+    if (this.connectCalls <= this.failAuthTimes) {
+      const error = new Error("All configured authentication methods failed");
+      (error as { level?: string }).level = "client-authentication";
+      queueMicrotask(() => this.emit("error", error));
+      return;
+    }
+    queueMicrotask(() => this.emit("ready"));
+  }
+}
+
 test("Ssh2Client reuses one authenticated connection for multiple command channels", async () => {
   const raw = new FakeRawSsh2Client();
   let created = 0;
@@ -748,6 +784,115 @@ test("Ssh2Client reuses one authenticated connection for multiple command channe
   assert.deepEqual(streamed, ["stdout:"]);
   await client.dispose();
   assert.equal(raw.closed, true);
+});
+
+test("Ssh2Client asks for a password on authentication failure and retries", async () => {
+  const raw = new FakeAuthFailClient();
+  let created = 0;
+  const prompts: string[] = [];
+  const cachedPasswords = new Map<string, string>();
+  const endpoint = {
+    hostLabel: "deploy@devbox:22",
+    username: "deploy",
+    host: "devbox",
+    port: 22,
+  };
+  const client = new Ssh2Client(
+    { target: "devbox" },
+    {
+      createClient: () => {
+        created++;
+        return raw as any;
+      },
+      resolverOptions: {
+        passwordFor: async (ep) => cachedPasswords.get(ep.hostLabel),
+      },
+      resolveConnection: async (_options, resolverOptions) => {
+        const password = resolverOptions.passwordFor
+          ? await resolverOptions.passwordFor(endpoint)
+          : undefined;
+        return {
+          config: {
+            host: "devbox",
+            username: "deploy",
+            authHandler: password
+              ? [
+                  { type: "none", username: "deploy" },
+                  { type: "password", username: "deploy", password },
+                ]
+              : [{ type: "none", username: "deploy" }],
+          },
+          hostLabel: "deploy@devbox:22",
+          warnings: [],
+          verification: {},
+        };
+      },
+      promptPassword: async (ep) => {
+        prompts.push(ep.hostLabel);
+        cachedPasswords.set(ep.hostLabel, "s3cret");
+        return "s3cret";
+      },
+    },
+  );
+  await client.run("whoami");
+
+  assert.equal(created, 2);
+  assert.equal(raw.connectCalls, 2);
+  assert.deepEqual(prompts, ["deploy@devbox:22"]);
+  const retried = raw.connectConfigs[1].authHandler as Array<Record<string, unknown>>;
+  assert.ok(retried.some((method) => method.type === "password" && method.password === "s3cret"));
+});
+
+test("Ssh2Client reports cancellation when the password prompt is dismissed", async () => {
+  const raw = new FakeAuthFailClient();
+  const client = new Ssh2Client(
+    { target: "devbox" },
+    {
+      createClient: () => raw as any,
+      resolveConnection: async () => ({
+        config: { host: "devbox", username: "deploy" },
+        hostLabel: "deploy@devbox:22",
+        warnings: [],
+        verification: {},
+      }),
+      promptPassword: async () => undefined,
+    },
+  );
+  await assert.rejects(client.run("whoami"), /password authentication was cancelled/);
+  assert.equal(raw.connectCalls, 1);
+});
+
+class FakeHostKeyFailClient extends FakeRawSsh2Client {
+  connect(config: Record<string, unknown> = {}): void {
+    this.connectCalls++;
+    this.connectConfigs.push(config);
+    queueMicrotask(() => this.emit("error", new Error("Host verification failed")));
+  }
+}
+
+test("Ssh2Client does not ask for a password on host key failures", async () => {
+  const raw = new FakeHostKeyFailClient();
+  let prompts = 0;
+  const client = new Ssh2Client(
+    { target: "devbox" },
+    {
+      createClient: () => raw as any,
+      resolveConnection: async () => ({
+        config: { host: "devbox", username: "deploy" },
+        hostLabel: "deploy@devbox:22",
+        warnings: [],
+        verification: { rejection: "host key mismatch" },
+      }),
+      promptPassword: async () => {
+        prompts++;
+        return "x";
+      },
+    },
+  );
+  const error = await client.run("whoami").then(() => undefined, (e: unknown) => e);
+  assert.ok(error instanceof Ssh2ConnectionError);
+  assert.match(error.message, /host key mismatch/);
+  assert.equal(prompts, 0);
 });
 
 test("Ssh2Client builds and disposes a recursive ProxyJump connection chain", async () => {
@@ -796,6 +941,134 @@ test("Ssh2Client builds and disposes a recursive ProxyJump connection chain", as
   assert.deepEqual(rawClients.map((raw) => raw.closed), [true, true, true, true, true, true]);
 });
 
+test("Unix auto falls back to ssh2 for passwords when OpenSSH auth fails", async () => {
+  let openSshRuns = 0;
+  let ssh2Runs = 0;
+  const failingOpenSsh: SshRemoteClient = {
+    options: { target: "devbox", multiplex: true },
+    transport: "openssh",
+    reusesConnection: true,
+    run: async () => {
+      openSshRuns++;
+      throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+    },
+    runChecked: async () => {
+      openSshRuns++;
+      throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+    },
+    dispose: () => {},
+  };
+  const passwordSsh2: SshRemoteClient = {
+    options: { target: "devbox" },
+    transport: "ssh2",
+    reusesConnection: true,
+    run: async () => {
+      ssh2Runs++;
+      return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+    },
+    runChecked: async () => {
+      ssh2Runs++;
+      return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+    },
+    dispose: () => {},
+  };
+  const provider = { cached: () => "pw", retry: async () => "pw" };
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: () => failingOpenSsh,
+      createSsh2: () => passwordSsh2,
+      passwordProvider: provider,
+    },
+  );
+
+  assert.equal(client.transport, "openssh");
+  const result = await client.runChecked("whoami");
+  assert.equal(result.exitCode, 0);
+  assert.equal(openSshRuns, 1);
+  assert.equal(ssh2Runs, 1);
+  assert.equal(client.transport, "ssh2");
+  assert.match(client.fallbackReason ?? "", /Permission denied/);
+  await client.dispose();
+});
+
+test("Unix auto does not fall back without a password provider or on non-auth errors", async () => {
+  const providerless = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: () => ({
+        options: { target: "devbox" },
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => { throw new Error("SSH command failed (255): Permission denied"); },
+        runChecked: async () => { throw new Error("SSH command failed (255): Permission denied"); },
+        dispose: () => {},
+      }),
+      createSsh2: () => ({
+        options: { target: "devbox" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => { throw new Error("should not run"); },
+        runChecked: async () => { throw new Error("should not run"); },
+        dispose: () => {},
+      }),
+    },
+  );
+  await assert.rejects(providerless.runChecked("whoami"), /Permission denied/);
+  assert.equal(providerless.fallbackReason, undefined);
+
+  const networkError = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: () => ({
+        options: { target: "devbox" },
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => { throw new Error("ssh: connect to host devbox port 22: Connection refused"); },
+        runChecked: async () => { throw new Error("ssh: connect to host devbox port 22: Connection refused"); },
+        dispose: () => {},
+      }),
+      createSsh2: () => ({
+        options: { target: "devbox" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => { throw new Error("should not run"); },
+        runChecked: async () => { throw new Error("should not run"); },
+        dispose: () => {},
+      }),
+      passwordProvider: { cached: () => "pw", retry: async () => "pw" },
+    },
+  );
+  await assert.rejects(networkError.runChecked("whoami"), /Connection refused/);
+  assert.equal(networkError.fallbackReason, undefined);
+});
+
+test("transport wires the password provider into the ssh2 client", async () => {
+  const provider = {
+    cached: (endpoint: { hostLabel: string }) => endpoint.hostLabel === "u@h:22" ? "cached-pw" : undefined,
+    retry: async () => "fresh-pw",
+  };
+  const client = createSshTransportClient(
+    { target: "h" },
+    { platform: "win32", preference: "ssh2", passwordProvider: provider },
+  ) as unknown as { promptPassword?: unknown; resolverOptions?: { passwordFor?: unknown } };
+  assert.equal(typeof client.promptPassword, "function");
+  assert.equal(typeof client.resolverOptions?.passwordFor, "function");
+  assert.equal(
+    await (client.resolverOptions!.passwordFor as (ep: { hostLabel: string }) => string | undefined)(
+      { hostLabel: "u@h:22", username: "u", host: "h", port: 22 },
+    ),
+    "cached-pw",
+  );
+  await client.dispose();
+});
+
 test("transport auto selects multiplexed OpenSSH on Unix and falls back on Windows ssh2 setup errors", async () => {
   const unixOptions: SshClientOptions[] = [];
   const unixClient = new FakeSshClient({ target: "devbox" });
@@ -810,7 +1083,9 @@ test("transport auto selects multiplexed OpenSSH on Unix and falls back on Windo
       },
     },
   );
-  assert.equal(unix, unixClient);
+  // Unix auto wraps OpenSSH so an authentication failure can fall back
+  // to ssh2 for the TUI password prompt.
+  assert.equal((unix as { delegate?: SshRemoteClient }).delegate, unixClient);
   assert.equal(unixOptions[0].multiplex, true);
 
   let openSshRuns = 0;
@@ -2188,4 +2463,86 @@ test("resumed sessions reconnect without --ssh and reject a different target", a
     /SSH remote is unavailable/,
   );
   await conflicting.emit("session_shutdown", { reason: "quit" });
+});
+
+test("password resolver caches, persists, rejects, and forgets", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-secrets-test-"));
+  const secretsPath = join(directory, "secrets.json");
+  const endpoint = {
+    hostLabel: "deploy@devbox:22",
+    username: "deploy",
+    host: "devbox",
+    port: 22,
+  };
+  const prompts: string[] = [];
+  const resolver = new SshPasswordResolver({ persistPasswords: true, secretsPath });
+  resolver.setUI({
+    prompt: async (title) => {
+      prompts.push(title);
+      return "pw1";
+    },
+    notify: () => {},
+  });
+
+  // Prompt on first use, then serve from memory.
+  assert.equal(await resolver.resolvePassword(endpoint), "pw1");
+  assert.equal(resolver.cachedPassword(endpoint), "pw1");
+  assert.deepEqual(prompts, ["SSH password for deploy@devbox:22"]);
+  assert.equal(await resolver.resolvePassword(endpoint), "pw1");
+  assert.deepEqual(prompts, ["SSH password for deploy@devbox:22"]);
+
+  // Secrets file is written with 0600 and readable by a fresh resolver
+  // (simulates a -r restart reusing the password).
+  const mode = statSync(secretsPath).mode & 0o777;
+  assert.equal(mode, 0o600);
+  const fresh = new SshPasswordResolver({ persistPasswords: true, secretsPath });
+  assert.equal(fresh.cachedPassword(endpoint), "pw1");
+
+  // Rejecting clears memory and the file so the next attempt re-asks.
+  resolver.rejectPassword(endpoint);
+  assert.equal(resolver.cachedPassword(endpoint), undefined);
+  assert.equal(fresh.cachedPassword(endpoint), undefined);
+
+  // retryPassword rejects then re-prompts with the fresh secret.
+  resolver.setUI({
+    prompt: async () => "pw2",
+    notify: () => {},
+  });
+  assert.equal(await resolver.retryPassword(endpoint), "pw2");
+  assert.equal(resolver.cachedPassword(endpoint), "pw2");
+
+  // forgetAll clears everything, including the persisted file.
+  resolver.forgetAll();
+  assert.equal(resolver.cachedPassword(endpoint), undefined);
+  assert.deepEqual(
+    JSON.parse(readFileSync(secretsPath, "utf8")),
+    {},
+  );
+  rmSync(directory, { recursive: true, force: true });
+});
+
+test("password resolver stays silent without a UI or when persistence is off", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-secrets-test-"));
+  const secretsPath = join(directory, "secrets.json");
+  const endpoint = {
+    hostLabel: "deploy@devbox:22",
+    username: "deploy",
+    host: "devbox",
+    port: 22,
+  };
+
+  // No UI (headless): resolve never prompts and returns undefined.
+  const headless = new SshPasswordResolver({ persistPasswords: true, secretsPath });
+  assert.equal(await headless.resolvePassword(endpoint), undefined);
+  assert.equal(headless.hasUI, false);
+
+  // Persistence off: passwords stay in memory only, no file is written.
+  const memoryOnly = new SshPasswordResolver({ persistPasswords: false, secretsPath });
+  memoryOnly.setUI({ prompt: async () => "tmp", notify: () => {} });
+  assert.equal(await memoryOnly.resolvePassword(endpoint), "tmp");
+  assert.equal(memoryOnly.cachedPassword(endpoint), "tmp");
+  const fresh = new SshPasswordResolver({ persistPasswords: false, secretsPath });
+  assert.equal(fresh.cachedPassword(endpoint), undefined);
+  assert.equal(existsSync(secretsPath), false);
+  rmSync(directory, { recursive: true, force: true });
 });

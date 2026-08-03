@@ -14,6 +14,7 @@ import {
   type ResolvedSsh2Endpoint,
   type Ssh2ConfigResolverOptions,
 } from "./ssh2-config.ts";
+import type { SshPasswordEndpoint } from "./password-resolver.ts";
 
 const { Client } = ssh2;
 
@@ -24,6 +25,21 @@ function boundedErrorText(buffer: Buffer): string {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAuthenticationFailure(
+  error: Ssh2ConnectionError,
+  endpoint: ResolvedSsh2Endpoint | SshPasswordEndpoint,
+): boolean {
+  // Host key problems are resolved before authentication; never ask for a
+  // password for them.
+  if ("verification" in endpoint && endpoint.verification.rejection) return false;
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause && typeof cause === "object") {
+    const level = (cause as { level?: unknown }).level;
+    if (level === "client-authentication") return true;
+  }
+  return /all configured authentication methods failed|authentication failed/i.test(error.message);
 }
 
 export class Ssh2ConnectionError extends Error {
@@ -38,6 +54,14 @@ export interface Ssh2ClientDependencies {
   resolveConnection?: typeof resolveSsh2Connection;
   resolverOptions?: Ssh2ConfigResolverOptions;
   maxChannels?: number;
+  /**
+   * Called when an endpoint's authentication fails. Returns a password to
+   * retry with, or undefined to abort (cancelled / no UI).
+   */
+  promptPassword?: (
+    endpoint: SshPasswordEndpoint,
+    error: Ssh2ConnectionError,
+  ) => Promise<string | undefined>;
 }
 
 interface ChannelWaiter {
@@ -55,6 +79,7 @@ export class Ssh2Client implements SshRemoteClient {
   private readonly resolveConnection: typeof resolveSsh2Connection;
   private readonly resolverOptions: Ssh2ConfigResolverOptions;
   private readonly maxChannels: number;
+  private readonly promptPassword: Ssh2ClientDependencies["promptPassword"];
   private readonly channels = new Set<ClientChannel>();
   private readonly tunnelChannels = new Set<ClientChannel>();
   private readonly connectionClients = new Set<RawSsh2Client>();
@@ -72,6 +97,7 @@ export class Ssh2Client implements SshRemoteClient {
     this.resolveConnection = dependencies.resolveConnection ?? resolveSsh2Connection;
     this.resolverOptions = dependencies.resolverOptions ?? {};
     this.maxChannels = dependencies.maxChannels ?? 8;
+    this.promptPassword = dependencies.promptPassword;
     if (!Number.isInteger(this.maxChannels) || this.maxChannels < 1 || this.maxChannels > 64) {
       throw new Error("ssh2 maxChannels must be an integer from 1 to 64");
     }
@@ -212,6 +238,42 @@ export class Ssh2Client implements SshRemoteClient {
   }
 
   private async openConnection(): Promise<RawSsh2Client> {
+    // One-shot connect chain. On authentication failure the optional
+    // promptPassword callback supplies a password (asking the user when
+    // nothing is cached) and the whole chain is rebuilt and retried until
+    // success, cancellation, or the attempt cap.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.openConnectionAttempt();
+      } catch (error) {
+        const failedEndpoint = (error as Ssh2ConnectionError & { ssh2Endpoint?: SshPasswordEndpoint })
+          .ssh2Endpoint;
+        if (
+          !(error instanceof Ssh2ConnectionError)
+          || !this.promptPassword
+          || !failedEndpoint
+          || !isAuthenticationFailure(error, failedEndpoint)
+        ) {
+          throw error;
+        }
+        if (attempt >= 20) {
+          throw new Ssh2ConnectionError(
+            `ssh2 connection to ${failedEndpoint.hostLabel} failed: too many password retries`,
+            { cause: error },
+          );
+        }
+        const password = await this.promptPassword(failedEndpoint, error);
+        if (password === undefined) {
+          throw new Ssh2ConnectionError(
+            `ssh2 connection to ${failedEndpoint.hostLabel} failed: password authentication was cancelled`,
+            { cause: error },
+          );
+        }
+      }
+    }
+  }
+
+  private async openConnectionAttempt(): Promise<RawSsh2Client> {
     let resolved: ResolvedSsh2Connection;
     try {
       resolved = await this.resolveConnection(this.options, this.resolverOptions);
@@ -234,7 +296,20 @@ export class Ssh2Client implements SshRemoteClient {
     try {
       for (let index = 0; index < endpoints.length; index++) {
         const endpoint = endpoints[index];
-        const client = await this.connectEndpoint(endpoint, socket);
+        let client: RawSsh2Client;
+        try {
+          client = await this.connectEndpoint(endpoint, socket);
+        } catch (error) {
+          if (error instanceof Ssh2ConnectionError) {
+            (error as Ssh2ConnectionError & { ssh2Endpoint?: SshPasswordEndpoint }).ssh2Endpoint = {
+              hostLabel: endpoint.hostLabel,
+              username: endpoint.config.username ?? "",
+              host: endpoint.config.host ?? "",
+              port: endpoint.config.port ?? 22,
+            };
+          }
+          throw error;
+        }
         clients.push(client);
         const next = endpoints[index + 1];
         if (next) socket = await this.openForward(client, endpoint, next);

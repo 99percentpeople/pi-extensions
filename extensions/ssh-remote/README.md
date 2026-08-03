@@ -197,9 +197,26 @@ implement the `chacha20-poly1305` cipher in `node:crypto`
 connection uses AES-GCM/CTR instead of failing.
 
 Both transports are non-interactive. The extension enables `BatchMode=yes` for
-OpenSSH and a ten-second connection timeout, so password, passphrase, and
-new-host prompts do not corrupt the Pi TUI. Load keys into an SSH agent and
-accept a new host key with the system OpenSSH client before starting Pi.
+OpenSSH and a ten-second connection timeout, so passphrase and new-host
+prompts do not corrupt the Pi TUI. Load keys into an SSH agent and accept a
+new host key with the system OpenSSH client before starting Pi.
+
+### Password authentication
+
+When public-key or agent authentication fails, the TUI asks for a password
+(plain-text input until Pi gains a masked input API) and retries. On Unix,
+`auto` tries multiplexed OpenSSH first and falls back to `ssh2` when the host
+rejects key/agent auth, so password hosts work everywhere; explicit `openssh`
+mode stays non-interactive and rejects password auth. `ssh2` mode (and Windows
+`auto`) prompts directly. The password is held in memory for the process, so `/resume`,
+reconnects, and extra channels reuse it without re-asking; with
+`persistPasswords` enabled (default) it is also saved to a 0600
+`ssh-remote-secrets.json` next to Pi's settings so `-r` restarts reuse it
+too. Public keys and the agent always win, the password is only ever passed
+inside the ssh2 library, and a wrong password re-prompts until cancelled.
+Clear all cached passwords with `/ssh-forget-passwords`, disable prompting in
+`/99settings` (Password prompt), or disable persistence (Persist passwords).
+Explicit `openssh` mode and headless sessions never prompt.
 
 Use a different local config file only when needed:
 
@@ -325,8 +342,9 @@ between sessions.
 ## Commands
 
 ```text
-/ssh-status      Show target, profile source, platform/Shells, transport, cwd/home
-/ssh-reconnect   Retry the target stored in the current session
+/ssh-status             Show target, platform, shell, transport, cwd/home
+/ssh-reconnect          Retry the target stored in the current session
+/ssh-forget-passwords   Clear cached SSH passwords (memory and secrets file)
 ```
 
 These commands are registered only when the current session requests, resumes,
@@ -408,9 +426,10 @@ job after resume.
 - `todo`, `thinking-fold`, `cursor-effect`, and `codex_search` remain local and
   work normally.
 - `ssh2` intentionally implements only the compatibility subset documented in
-  [ssh2 mode and OpenSSH compatibility](#ssh2-mode-and-openssh-compatibility).
-  Use explicit OpenSSH mode for advanced routing, certificates, hardware keys,
-  or interactive authentication.
+  [ssh2 mode and OpenSSH compatibility](#ssh2-mode-and-openssh-compatibility),
+  plus TUI password authentication for the final hop. Use explicit OpenSSH
+  mode for advanced routing, certificates, hardware keys, keyboard-
+  interactive or GSSAPI authentication.
 - On Windows clients, local sessions are left untouched so
   `pi-pwsh-adapter` can continue to own the local `bash` tool. SSH Remote
   registers its tool overrides only for sessions that request, resume, or

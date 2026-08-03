@@ -22,6 +22,16 @@ function transportForLabel(value: string): SshTransportPreference | undefined {
     .find(([, label]) => label === value)?.[0];
 }
 
+function booleanForLabel(value: string): boolean | undefined {
+  if (value === "On") return true;
+  if (value === "Off") return false;
+  return undefined;
+}
+
+function booleanLabel(value: boolean): string {
+  return value ? "On" : "Off";
+}
+
 export function registerSshRemoteSettings(
   pi: ExtensionAPI,
   controller: SshRemoteSettingsController,
@@ -35,12 +45,32 @@ export function registerSshRemoteSettings(
       description: "Auto uses multiplexed OpenSSH on Unix and persistent ssh2 on Windows",
       currentValue: TRANSPORT_LABELS[controller.getConfig().transport],
       values: Object.values(TRANSPORT_LABELS),
+    }, {
+      id: "passwordPrompt",
+      label: "Password prompt",
+      description: "Ask for an SSH password in the TUI when key/agent authentication fails (ssh2 transport only)",
+      currentValue: booleanLabel(controller.getConfig().passwordPrompt),
+      values: ["On", "Off"],
+    }, {
+      id: "persistPasswords",
+      label: "Persist passwords",
+      description: "Save entered passwords to a 0600 secrets file so -r resumes reuse them without re-asking",
+      currentValue: booleanLabel(controller.getConfig().persistPasswords),
+      values: ["On", "Off"],
     }],
     onChange: (id, value, ctx) => {
-      if (id !== "transport") return;
-      const transport = transportForLabel(value);
-      if (!transport) return;
-      controller.updateConfig({ ...controller.getConfig(), transport }, ctx);
+      const config = controller.getConfig();
+      if (id === "transport") {
+        const transport = transportForLabel(value);
+        if (transport) controller.updateConfig({ ...config, transport }, ctx);
+        return;
+      }
+      if (id === "passwordPrompt" || id === "persistPasswords") {
+        const enabled = booleanForLabel(value);
+        if (enabled !== undefined) {
+          controller.updateConfig({ ...config, [id]: enabled }, ctx);
+        }
+      }
     },
   });
 }

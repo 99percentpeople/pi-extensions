@@ -14,6 +14,7 @@ import ssh2, {
   type ServerHostKeyAlgorithm,
 } from "ssh2";
 import type { SshClientOptions } from "./client.ts";
+import type { SshPasswordEndpoint } from "./password-resolver.ts";
 
 const { createAgent, utils } = ssh2;
 const MAX_LOCAL_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -103,6 +104,11 @@ export interface Ssh2ConfigResolverOptions {
   env?: NodeJS.ProcessEnv;
   home?: string;
   runLocal?: LocalCommandRunner;
+  /**
+   * Supplies a password for an endpoint from cache (never prompts).
+   * Called during config resolution so key/agent auth still runs first.
+   */
+  passwordFor?: (endpoint: SshPasswordEndpoint) => Promise<string | undefined> | string | undefined;
 }
 
 export interface ResolvedSsh2Endpoint {
@@ -560,13 +566,16 @@ async function buildAuthentication(
   env: NodeJS.ProcessEnv,
   home: string,
   username: string,
+  password?: string,
 ): Promise<{ methods: AnyAuthMethod[]; warnings: string[] }> {
   if (first(config, "pubkeyauthentication") === "false"
       || first(config, "pubkeyauthentication") === "no") {
-    throw new Ssh2CompatibilityError(
-      "ssh2 mode requires public-key or SSH-agent authentication; PubkeyAuthentication is disabled",
-      ["PubkeyAuthentication=no", "password/keyboard-interactive/GSSAPI authentication"],
-    );
+    if (!password) {
+      throw new Ssh2CompatibilityError(
+        "ssh2 mode requires public-key or SSH-agent authentication; PubkeyAuthentication is disabled",
+        ["PubkeyAuthentication=no", "password/keyboard-interactive/GSSAPI authentication"],
+      );
+    }
   }
 
   const methods: AnyAuthMethod[] = [{ type: "none", username }];
@@ -610,6 +619,11 @@ async function buildAuthentication(
     );
   }
 
+  if (password) {
+    // Password auth runs last so public keys and the agent still win.
+    methods.push({ type: "password", username, password });
+  }
+
   if (methods.length === 1) {
     const reason = encryptedKeys > 0
       ? "configured private keys are encrypted and no compatible SSH agent is available"
@@ -630,6 +644,7 @@ interface ResolverContext {
   runLocal: LocalCommandRunner;
   executable: string;
   connectTimeout: number;
+  passwordFor?: Ssh2ConfigResolverOptions["passwordFor"];
 }
 
 interface EndpointRequest {
@@ -724,12 +739,16 @@ async function resolveSsh2Endpoint(
     );
   }
 
+  const password = context.passwordFor
+    ? await context.passwordFor({ hostLabel: `${username}@${host}:${port}`, username, host, port })
+    : undefined;
   const authentication = await buildAuthentication(
     openSsh,
     context.platform,
     context.env,
     context.home,
     username,
+    password,
   );
   const verification: { rejection?: string } = {};
   const addressFamily = first(openSsh, "addressfamily");
@@ -792,6 +811,7 @@ export async function resolveSsh2Connection(
     runLocal: resolverOptions.runLocal ?? runLocalCommand,
     executable: options.executable ?? (platform === "win32" ? "ssh.exe" : "ssh"),
     connectTimeout,
+    passwordFor: resolverOptions.passwordFor,
   };
   const target = await resolveSsh2Endpoint(context, {
     target: options.target,

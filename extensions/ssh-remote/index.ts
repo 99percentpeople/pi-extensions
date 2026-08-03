@@ -62,7 +62,8 @@ import {
   parseSshTarget,
   type ParsedSshTarget,
 } from "./target.ts";
-import { createSshTransportClient } from "./transport.ts";
+import { createSshTransportClient, type SshPasswordProvider } from "./transport.ts";
+import { SshPasswordResolver } from "./password-resolver.ts";
 
 const STATUS_KEY = "ssh-remote";
 const CONNECT_TIMEOUT_SECONDS = 10;
@@ -99,6 +100,8 @@ export interface SshRemoteExtensionDependencies {
   loadPreviousSessionState?: (path: string) => SshSessionState | undefined;
   loadConfig?: () => SshRemoteConfig;
   saveConfig?: (config: SshRemoteConfig) => void;
+  /** Override the password secrets file path (tests). */
+  secretsPath?: string;
 }
 
 function defaultLoadPreviousSessionState(
@@ -303,10 +306,15 @@ export function createSshRemoteExtension(
   return function sshRemoteExtension(pi: ExtensionAPI): void {
     let config = (dependencies.loadConfig ?? loadSshRemoteConfig)();
     const saveConfig = dependencies.saveConfig ?? saveSshRemoteConfig;
+    const passwordResolver = new SshPasswordResolver({
+      persistPasswords: config.persistPasswords,
+      secretsPath: dependencies.secretsPath,
+    });
     registerSshRemoteSettings(pi, {
       getConfig: () => config,
       updateConfig: (next, ctx) => {
         config = next;
+        passwordResolver.setPersistPasswords(next.persistPasswords);
         try {
           saveConfig(config);
           ctx.ui.notify(
@@ -461,10 +469,29 @@ export function createSshRemoteExtension(
           connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
           batchMode: true,
         };
+        // Wire the TUI password prompt into the ssh2 auth retry loop. The
+        // resolver keeps per-process memory plus an optional 0600 secrets
+        // file so /resume and -r reuse the password without re-asking.
+        passwordResolver.setUI(ctx.hasUI
+          ? {
+              prompt: (title) => ctx.ui.input(title),
+              notify: (message, type) => ctx.ui.notify(message, type),
+            }
+          : undefined);
+        const passwordProvider: SshPasswordProvider | undefined = config.passwordPrompt
+          ? {
+              cached: (endpoint) => passwordResolver.cachedPassword(endpoint),
+              retry: (endpoint) => passwordResolver.retryPassword(endpoint),
+            }
+          : undefined;
         let shellPreference = intent.shellPreference;
         client = dependencies.createClient
           ? dependencies.createClient(clientOptions)
-          : createSshTransportClient(clientOptions, { platform, preference: transport });
+          : createSshTransportClient(clientOptions, {
+              platform,
+              preference: transport,
+              passwordProvider,
+            });
         const requestedCwd = intent.storedState?.remoteCwd ?? intent.requestedCwd;
         const selected = await selectRemote(client, {
           localPlatform: platform,
@@ -698,6 +725,14 @@ export function createSshRemoteExtension(
             { ...intent, persistOnSuccess: intent.persistOnSuccess },
             ctx,
           );
+        },
+      });
+
+      pi.registerCommand("ssh-forget-passwords", {
+        description: "Forget cached SSH passwords (memory and secrets file)",
+        handler: async (_args, ctx) => {
+          passwordResolver.forgetAll();
+          ctx.ui.notify("SSH passwords cleared", "info");
         },
       });
     };
