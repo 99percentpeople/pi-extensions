@@ -205,10 +205,22 @@ new host key with the system OpenSSH client before starting Pi.
 
 When public-key or agent authentication fails, the TUI asks for a password
 (plain-text input until Pi gains a masked input API) and retries. On Unix,
-`auto` tries multiplexed OpenSSH first and falls back to `ssh2` when the host
-rejects key/agent auth, so password hosts work everywhere; explicit `openssh`
-mode stays non-interactive and rejects password auth. `ssh2` mode (and Windows
-`auto`) prompts directly. The password is held in memory for the process, so `/resume`,
+`auto` tries multiplexed OpenSSH first, retrying a rejected password in place
+through `sshpass` when it is installed (cached secrets first, no re-ask), and
+falls back to `ssh2` only when sshpass is missing (ssh2 is the remaining
+password-capable transport). If the user cancels the prompt or every password
+attempt is rejected, the connection fails outright — ssh2 would reject the
+same secret, so there is nothing to fall back to. `ssh2` mode (and Windows
+`auto`) prompts directly. Every rejected attempt is surfaced verbatim in a
+warning plus the prompt title (for example `Permission denied
+(publickey,password)`), so the user sees the actual server response. Explicit `openssh` mode uses the
+system `sshpass` when installed (`apt install sshpass` on Debian/Ubuntu,
+`pacman -S sshpass` in Git Bash on Windows, or a standalone `sshpass.exe`):
+the password travels only in the `SSHPASS` environment variable, the remote
+side stays PTY-free (`-T`) so binary file data is untouched, and a single
+prompt attempt keeps the retry loop in the extension. Without sshpass,
+explicit `openssh` reports the missing tool or falls back to `ssh2` on
+`auto`. The password is held in memory for the process, so `/resume`,
 reconnects, and extra channels reuse it without re-asking; with
 `persistPasswords` enabled (default) it is also saved to a 0600
 `ssh-remote-secrets.json` next to Pi's settings so `-r` restarts reuse it
@@ -216,7 +228,7 @@ too. Public keys and the agent always win, the password is only ever passed
 inside the ssh2 library, and a wrong password re-prompts until cancelled.
 Clear all cached passwords with `/ssh-forget-passwords`, disable prompting in
 `/99settings` (Password prompt), or disable persistence (Persist passwords).
-Explicit `openssh` mode and headless sessions never prompt.
+Headless sessions never prompt.
 
 Use a different local config file only when needed:
 

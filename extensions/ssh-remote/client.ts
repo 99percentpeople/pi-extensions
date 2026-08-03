@@ -28,6 +28,13 @@ export interface SshClientOptions {
   multiplex?: boolean;
   /** Internal ControlMaster socket path shared with background OpenSSH launches. */
   controlPath?: string;
+  /**
+   * Internal: run ssh through `sshpass -e` with this password so hosts
+   * that require password auth work non-interactively. The sshpass PTY is
+   * raw and `-T` keeps the remote side PTY-free, so binary stdin/stdout
+   * round-trips intact. Never set from user configuration.
+   */
+  sshpassPassword?: string;
 }
 
 export interface SshRunOptions {
@@ -195,17 +202,29 @@ export class OpenSshClient implements SshRemoteClient {
     if (this.disposed) throw new Error("SSH client is closed");
     if (options.signal?.aborted) throw new Error("aborted");
 
-    const executable = this.options.executable ?? "ssh";
+    const sshProgram = this.options.executable ?? "ssh";
     const hasInput = options.input !== undefined;
     const windowsClient = isWindowsSshExecutable(this.options.executable);
+    // sshpass mode: run `sshpass -e ssh ...` with the password in the
+    // SSHPASS environment variable (never in argv). BatchMode must be off
+    // or ssh will not offer password auth, and a single prompt attempt
+    // keeps the retry loop inside this extension instead of ssh repeating
+    // the same password. Works with sshpass.exe on Windows too.
+    const sshpassMode = !!this.options.sshpassPassword;
+    const effectiveOptions = sshpassMode ? { ...this.options, batchMode: false } : this.options;
+    const executable = sshpassMode ? "sshpass" : sshProgram;
     const args = [
+      ...(sshpassMode ? ["-e", sshProgram, "-o", "NumberOfPasswordPrompts=1"] : []),
       ...buildSshArguments(
-        this.options,
+        effectiveOptions,
         false,
         windowsClient && !hasInput,
       ),
       command,
     ];
+    const env = sshpassMode
+      ? { ...process.env, SSHPASS: this.options.sshpassPassword }
+      : process.env;
     // Windows OpenSSH's ssh.exe can wedge when spawned with anonymous pipes:
     // the client stops exiting once the remote command produces output, and
     // piped stdin can hang it entirely. For the Windows client, drive stdio
@@ -233,7 +252,7 @@ export class OpenSshClient implements SshRemoteClient {
       stderrTempFile = err.path;
     }
     const child = this.spawnFn(executable, args, {
-      env: process.env,
+      env,
       stdio: windowsClient
         ? [stdinFd ?? "ignore", stdoutFd!, stderrFd!]
         : ["pipe", "pipe", "pipe"],

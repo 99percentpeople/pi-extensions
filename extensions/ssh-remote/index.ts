@@ -481,7 +481,10 @@ export function createSshRemoteExtension(
         const passwordProvider: SshPasswordProvider | undefined = config.passwordPrompt
           ? {
               cached: (endpoint) => passwordResolver.cachedPassword(endpoint),
-              retry: (endpoint) => passwordResolver.retryPassword(endpoint),
+              retry: (endpoint, error) => passwordResolver.retryPassword(
+                endpoint,
+                error instanceof Error ? error.message : undefined,
+              ),
             }
           : undefined;
         let shellPreference = intent.shellPreference;
@@ -567,8 +570,15 @@ export function createSshRemoteExtension(
           pi.setSessionName(autoSessionName);
         }
         if (client.fallbackReason) {
+          // Unix auto falls back to ssh2; Windows auto falls back to
+          // OpenSSH. Name the actual delegate transport.
+          const fallbackTransport = client.transport === "ssh2"
+            ? "ssh2"
+            : client.transport === "openssh"
+              ? "OpenSSH"
+              : "another transport";
           ctx.ui.notify(
-            `SSH transport auto fell back to OpenSSH: ${client.fallbackReason}`,
+            `SSH transport auto fell back to ${fallbackTransport}: ${client.fallbackReason}`,
             "warning",
           );
         }

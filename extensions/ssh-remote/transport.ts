@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import {
   OpenSshClient,
   type SshClientOptions,
@@ -8,13 +9,23 @@ import {
 } from "./client.ts";
 import { Ssh2Client, Ssh2ConnectionError, type Ssh2ClientDependencies } from "./ssh2-client.ts";
 import { Ssh2CompatibilityError } from "./ssh2-config.ts";
-import type { SshPasswordEndpoint } from "./password-resolver.ts";
+import {
+  SshPasswordCancelledError,
+  SshPasswordFailedError,
+  type SshPasswordEndpoint,
+} from "./password-resolver.ts";
+
+export { SshPasswordCancelledError, SshPasswordFailedError } from "./password-resolver.ts";
 
 export interface SshPasswordProvider {
   /** Cached password for config resolution; keys still win at auth time. */
   cached(endpoint: SshPasswordEndpoint): string | undefined;
-  /** Fresh password after an authentication failure (rejects stale caches). */
-  retry(endpoint: SshPasswordEndpoint): Promise<string | undefined>;
+  /**
+   * Fresh password after an authentication failure (rejects stale
+   * caches). `error` carries the transport's real rejection message so
+   * the prompt can tell the user what went wrong.
+   */
+  retry(endpoint: SshPasswordEndpoint, error?: unknown): Promise<string | undefined>;
 }
 
 export interface SshTransportFactoryOptions {
@@ -24,6 +35,48 @@ export interface SshTransportFactoryOptions {
   createSsh2?: (options: SshClientOptions) => SshRemoteClient;
   /** Password provider wired into the ssh2 client's auth retry loop. */
   passwordProvider?: SshPasswordProvider;
+  /** Override the local `sshpass` availability probe (tests). */
+  detectSshpass?: () => Promise<boolean>;
+}
+
+function detectSshpassDefault(platform: NodeJS.Platform): Promise<boolean> {
+  if (platform === "win32") {
+    // Windows has no sh; `where` resolves sshpass.exe from PATH.
+    return new Promise((resolve) => {
+      const child = spawn("where", ["sshpass"]);
+      child.once("error", () => resolve(false));
+      child.once("close", (code) => resolve(code === 0));
+    });
+  }
+  return new Promise((resolve) => {
+    const child = spawn("sh", ["-c", "command -v sshpass >/dev/null 2>&1"]);
+    child.once("error", () => resolve(false));
+    child.once("close", (code) => resolve(code === 0));
+  });
+}
+
+/**
+ * Secret key for an OpenSSH target, matching the ssh2 resolver's
+ * `user@host:port` format so one entered password is reused across both
+ * transports. Targets without an explicit user keep the raw target (the
+ * effective user is only known to ssh -G).
+ */
+function opensshHostLabel(target: string): string {
+  let user: string | undefined;
+  let rest = target;
+  const at = rest.lastIndexOf("@");
+  if (at !== -1) {
+    user = rest.slice(0, at);
+    rest = rest.slice(at + 1);
+  }
+  const colon = rest.lastIndexOf(":");
+  let host = rest;
+  let port = 22;
+  if (colon !== -1 && /^\d+$/.test(rest.slice(colon + 1))) {
+    host = rest.slice(0, colon);
+    port = Number(rest.slice(colon + 1));
+  }
+  return user ? `${user}@${host}:${port}` : target;
 }
 
 function boundedReason(error: unknown): string {
@@ -32,13 +85,29 @@ function boundedReason(error: unknown): string {
   return singleLine.length <= 500 ? singleLine : `${singleLine.slice(0, 500)}…`;
 }
 
-function checkedResult(result: SshRunResult): SshRunResult {
-  if (result.exitCode === 0) return result;
+/**
+ * OpenSSH reports rejected authentication as
+ * `Permission denied (publickey,password).` — the parenthesized list is the
+ * set of methods the server actually accepts. Only prompt (or fall back to
+ * ssh2) when password or keyboard-interactive is in that list; otherwise a
+ * prompt could never succeed.
+ */
+function serverAcceptsPassword(text: string): boolean {
+  const match = /permission denied \(([^)]*)\)/i.exec(text);
+  if (!match) return false;
+  const methods = match[1].toLowerCase().split(",").map((method) => method.trim());
+  return methods.includes("password") || methods.includes("keyboard-interactive");
+}
+
+function checkedFailureText(result: SshRunResult): string {
   const detail = result.stderr.toString("utf8").trim();
   const bounded = detail.length <= 4_000 ? detail : `${detail.slice(0, 4_000)}…`;
-  throw new Error(
-    `SSH command failed (${result.exitCode ?? "signal"})${bounded ? `: ${bounded}` : ""}`,
-  );
+  return `SSH command failed (${result.exitCode ?? "signal"})${bounded ? `: ${bounded}` : ""}`;
+}
+
+function checkedResult(result: SshRunResult): SshRunResult {
+  if (result.exitCode === 0) return result;
+  throw new Error(checkedFailureText(result));
 }
 
 class AutoWindowsSshClient implements SshRemoteClient {
@@ -139,6 +208,196 @@ class AutoWindowsSshClient implements SshRemoteClient {
   }
 }
 
+class SshpassRetryClient implements SshRemoteClient {
+  private readonly openSshOptionsValue: SshClientOptions;
+  private readonly createOpenSsh: (options: SshClientOptions) => SshRemoteClient;
+  private readonly passwordProvider?: SshPasswordProvider;
+  private readonly detectSshpass: () => Promise<boolean>;
+  private delegate: SshRemoteClient;
+  private openedChannel = false;
+  private sshpassAvailable?: boolean;
+  private tryCached = true;
+  private cancelled = false;
+  private triedPassword = false;
+  private disposed = false;
+
+  constructor(
+    openSshOptions: SshClientOptions,
+    createOpenSsh: (options: SshClientOptions) => SshRemoteClient,
+    passwordProvider: SshPasswordProvider | undefined,
+    detectSshpass: () => Promise<boolean>,
+  ) {
+    this.delegate = createOpenSsh(openSshOptions);
+    this.openSshOptionsValue = openSshOptions;
+    this.createOpenSsh = createOpenSsh;
+    this.passwordProvider = passwordProvider;
+    this.detectSshpass = detectSshpass;
+  }
+
+  get options(): Readonly<SshClientOptions> {
+    return this.delegate.options;
+  }
+
+  get transport() {
+    return this.delegate.transport;
+  }
+
+  get reusesConnection(): boolean | undefined {
+    return this.delegate.reusesConnection;
+  }
+
+  get compatibilityWarnings(): readonly string[] | undefined {
+    return this.delegate.compatibilityWarnings;
+  }
+
+  private endpoint(): SshPasswordEndpoint {
+    const label = opensshHostLabel(this.openSshOptionsValue.target);
+    return {
+      hostLabel: label,
+      username: label.includes("@") ? label.slice(0, label.lastIndexOf("@")) : "",
+      host: this.openSshOptionsValue.target,
+      port: 22,
+    };
+  }
+
+  /** A cached password makes the sshpass retry start without prompting. */
+  private cachedPassword(): string | undefined {
+    return this.passwordProvider?.cached(this.endpoint());
+  }
+
+  private async promptPassword(error: unknown): Promise<string | undefined> {
+    // Authentication failures arrive either as thrown errors (runChecked)
+    // or as 255 results (run). Normalize the result so the resolver can
+    // surface the real ssh rejection in the next prompt.
+    const failure = error instanceof Error
+      ? error
+      : error && typeof error === "object" && "exitCode" in error
+        ? new Error(checkedFailureText(error as SshRunResult))
+        : undefined;
+    return this.passwordProvider?.retry(this.endpoint(), failure);
+  }
+
+  private canRetry(error: unknown): boolean {
+    if (this.cancelled || this.openedChannel || !this.passwordProvider) return false;
+    if (this.sshpassAvailable === false) return false;
+    const message = boundedReason(error);
+    return /permission denied/i.test(message) && serverAcceptsPassword(message);
+  }
+
+  private canRetryResult(result: SshRunResult): boolean {
+    if (this.cancelled || this.openedChannel || !this.passwordProvider) return false;
+    if (this.sshpassAvailable === false) return false;
+    const stderr = result.stderr.toString("utf8");
+    return result.exitCode !== 0
+      && /permission denied/i.test(stderr)
+      && serverAcceptsPassword(stderr);
+  }
+
+  private async retryWithPassword(error: unknown): Promise<boolean> {
+    // Returns true when a retry delegate was rebuilt; throws when the
+    // user cancels or sshpass is missing.
+    if (this.sshpassAvailable === undefined) {
+      this.sshpassAvailable = await this.detectSshpass();
+      if (!this.sshpassAvailable) {
+        throw new Error(
+          "The remote host requires a password, but sshpass is not installed; "
+            + "install it for your platform (apt install sshpass, or pacman -S sshpass "
+            + "in Git Bash on Windows) or use --ssh-transport ssh2",
+          { cause: error },
+        );
+      }
+    }
+    if (this.tryCached) {
+      this.tryCached = false;
+      const cached = this.cachedPassword();
+      if (cached !== undefined) {
+        await this.rebuildWithPassword(cached);
+        this.triedPassword = true;
+        return true;
+      }
+    }
+    const password = await this.promptPassword(error);
+    if (password === undefined) {
+      this.cancelled = true;
+      throw new SshPasswordCancelledError(
+        `OpenSSH password authentication for ${this.openSshOptionsValue.target} was cancelled`,
+        { cause: error },
+      );
+    }
+    await this.rebuildWithPassword(password);
+    this.triedPassword = true;
+    return true;
+  }
+
+  private async rebuildWithPassword(password: string): Promise<void> {
+    const previous = this.delegate;
+    await previous.dispose();
+    if (this.disposed) throw new Error("SSH client is closed");
+    if (this.delegate === previous) {
+      this.delegate = this.createOpenSsh({
+        ...this.openSshOptionsValue,
+        sshpassPassword: password,
+      });
+    }
+  }
+
+  async run(command: string, options?: SshRunOptions): Promise<SshRunResult> {
+    if (this.disposed) throw new Error("SSH client is closed");
+    for (let attempt = 0; ; attempt++) {
+      if (this.cancelled) {
+        // The user dismissed the prompt: fail fast so no later candidate
+        // (or the ssh2 fallback) prompts again.
+        throw new SshPasswordCancelledError(
+          `OpenSSH password authentication for ${this.openSshOptionsValue.target} was cancelled; reconnect with /ssh-reconnect to try again`,
+        );
+      }
+      const selected = this.delegate;
+      try {
+        const result = await selected.run(command, options);
+        if (!this.canRetryResult(result)) {
+          this.openedChannel = true;
+          return result;
+        }
+        // OpenSshClient resolves authentication failures as a 255 result
+        // (only runChecked throws), so treat them like the catch branch.
+        if (attempt >= 20) {
+          if (this.triedPassword) {
+            throw new SshPasswordFailedError(
+              `OpenSSH password authentication for ${this.openSshOptionsValue.target} was rejected after ${attempt} attempts`,
+              { cause: result },
+            );
+          }
+          return result;
+        }
+        await this.retryWithPassword(result);
+      } catch (error) {
+        if (selected !== this.delegate) continue;
+        if (!this.canRetry(error)) throw error;
+        if (attempt >= 20) {
+          if (this.triedPassword) {
+            throw new SshPasswordFailedError(
+              `OpenSSH password authentication for ${this.openSshOptionsValue.target} was rejected after ${attempt} attempts`,
+              { cause: error },
+            );
+          }
+          throw error;
+        }
+        await this.retryWithPassword(error);
+      }
+    }
+  }
+
+  async runChecked(command: string, options?: SshRunOptions): Promise<SshRunResult> {
+    return checkedResult(await this.run(command, options));
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    await this.delegate.dispose();
+  }
+}
+
 class AutoUnixSshClient implements SshRemoteClient {
   private readonly openSshOptionsValue: SshClientOptions;
   private readonly createSsh2: (options: SshClientOptions) => SshRemoteClient;
@@ -154,8 +413,17 @@ class AutoUnixSshClient implements SshRemoteClient {
     createOpenSsh: (options: SshClientOptions) => SshRemoteClient,
     createSsh2: (options: SshClientOptions) => SshRemoteClient,
     passwordProvider?: SshPasswordProvider,
+    detectSshpass?: () => Promise<boolean>,
   ) {
-    this.delegate = createOpenSsh(openSshOptions);
+    // The OpenSSH delegate itself retries a rejected password through
+    // sshpass (cached secret first, then a prompt). Only when that fails
+    // or is unavailable does this client fall back to ssh2.
+    this.delegate = new SshpassRetryClient(
+      openSshOptions,
+      createOpenSsh,
+      passwordProvider,
+      detectSshpass ?? (() => Promise.resolve(false)),
+    );
     this.openSshOptionsValue = openSshOptions;
     this.createSsh2 = createSsh2;
     this.passwordProvider = passwordProvider;
@@ -182,14 +450,27 @@ class AutoUnixSshClient implements SshRemoteClient {
   }
 
   private canFallback(error: unknown): boolean {
-    // OpenSSH never prompts for a password (BatchMode=yes), so a
-    // Permission denied from the first command means key/agent auth
-    // failed. Fall back to ssh2, which can prompt for a password, but
-    // only while password prompting is enabled and no OpenSSH channel has
-    // opened yet (authentication would already have succeeded then).
+    // A Permission denied or missing sshpass means key/agent auth failed
+    // and the password flow could not complete in place; ssh2 is the
+    // remaining password-capable transport. Never after an OpenSSH
+    // channel has opened (authentication already succeeded then), after
+    // password attempts were rejected (ssh2 would fail the same way), or
+    // when the server does not accept password auth at all (ssh2 would
+    // only prompt in a loop).
+    const message = boundedReason(error);
     return !this.opensshOpenedChannel
       && !!this.passwordProvider
-      && /permission denied/i.test(boundedReason(error));
+      && ((/permission denied/i.test(message) && serverAcceptsPassword(message))
+        || /sshpass is not installed/i.test(message));
+  }
+
+  private canFallbackResult(result: SshRunResult): boolean {
+    const stderr = result.stderr.toString("utf8");
+    return !this.opensshOpenedChannel
+      && !!this.passwordProvider
+      && result.exitCode !== 0
+      && /permission denied/i.test(stderr)
+      && serverAcceptsPassword(stderr);
   }
 
   private async fallback(error: unknown): Promise<void> {
@@ -214,12 +495,30 @@ class AutoUnixSshClient implements SshRemoteClient {
     const selected = this.delegate;
     try {
       const result = await selected.run(command, options);
+      if (this.canFallbackResult(result)) {
+        // OpenSshClient resolves authentication failures as a 255 result
+        // (only runChecked throws); route them through the same fallback.
+        await this.fallback(new Error(
+          `SSH command failed (${result.exitCode ?? "signal"}): ${result.stderr.toString("utf8").trim()}`,
+        ));
+        return await this.delegate.run(command, options);
+      }
       if (selected.transport === "openssh") this.opensshOpenedChannel = true;
       return result;
     } catch (error) {
       if (selected !== this.delegate && this.reason) {
         await this.fallbackPromise?.catch(() => {});
         return this.delegate.run(command, options);
+      }
+      if (error instanceof SshPasswordCancelledError) {
+        // The user dismissed the password prompt; another transport would
+        // only prompt again.
+        throw error;
+      }
+      if (error instanceof SshPasswordFailedError) {
+        // Every password attempt was rejected; ssh2 would fail with the
+        // same secret, so stop instead of falling back.
+        throw error;
       }
       if (!this.canFallback(error)) throw error;
       await this.fallback(error);
@@ -257,6 +556,7 @@ export function createSshTransportClient(
     resolverOptions: {
       platform,
       passwordFor: factoryOptions.passwordProvider?.cached,
+      allowPasswordPrompt: factoryOptions.passwordProvider !== undefined,
     },
     promptPassword: factoryOptions.passwordProvider?.retry,
   }));
@@ -276,17 +576,26 @@ export function createSshTransportClient(
   const createSsh2ForFallback = (value: SshClientOptions): SshRemoteClient => createSsh2(value);
 
   if (preference === "auto" && platform !== "win32") {
-    // Unix auto: multiplexed OpenSSH first, falling back to ssh2 when the
-    // host rejects key/agent auth so the TUI password prompt can run.
+    // Unix auto: multiplexed OpenSSH first, retrying a rejected password
+    // through sshpass when installed, and only then falling back to ssh2.
     return new AutoUnixSshClient(
       openSshOptions,
       createOpenSsh,
       createSsh2ForFallback,
       factoryOptions.passwordProvider,
+      factoryOptions.detectSshpass ?? (() => detectSshpassDefault(platform)),
     );
   }
   if (preference === "openssh") {
-    return createOpenSsh(openSshOptions);
+    // Explicit OpenSSH stays non-interactive; with sshpass installed the
+    // wrapper retries a failed authentication with a prompted password
+    // (sshpass.exe exists for Windows via MSYS2/Git Bash/Cygwin).
+    return new SshpassRetryClient(
+      openSshOptions,
+      createOpenSsh,
+      factoryOptions.passwordProvider,
+      factoryOptions.detectSshpass ?? (() => detectSshpassDefault(platform)),
+    );
   }
 
   const ssh2 = createSsh2(ssh2Options);

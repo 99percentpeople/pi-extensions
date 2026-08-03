@@ -109,6 +109,9 @@ export interface Ssh2ConfigResolverOptions {
    * Called during config resolution so key/agent auth still runs first.
    */
   passwordFor?: (endpoint: SshPasswordEndpoint) => Promise<string | undefined> | string | undefined;
+  /** True when a password prompt callback exists; key-less hosts then get
+   *  an empty-password placeholder instead of an early rejection. */
+  allowPasswordPrompt?: boolean;
 }
 
 export interface ResolvedSsh2Endpoint {
@@ -566,11 +569,12 @@ async function buildAuthentication(
   env: NodeJS.ProcessEnv,
   home: string,
   username: string,
-  password?: string,
+  password: string | undefined,
+  allowPasswordPrompt: boolean,
 ): Promise<{ methods: AnyAuthMethod[]; warnings: string[] }> {
   if (first(config, "pubkeyauthentication") === "false"
       || first(config, "pubkeyauthentication") === "no") {
-    if (!password) {
+    if (!password && !allowPasswordPrompt) {
       throw new Ssh2CompatibilityError(
         "ssh2 mode requires public-key or SSH-agent authentication; PubkeyAuthentication is disabled",
         ["PubkeyAuthentication=no", "password/keyboard-interactive/GSSAPI authentication"],
@@ -625,6 +629,15 @@ async function buildAuthentication(
   }
 
   if (methods.length === 1) {
+    if (allowPasswordPrompt) {
+      // No key, agent, or cached password: put an empty-password method in
+      // so the connection reaches the auth phase. It fails there, the
+      // client's retry loop calls the password prompt, and the next
+      // resolve picks the real password up through passwordFor. Without
+      // this, no prompt would ever appear on key-less hosts.
+      methods.push({ type: "password", username, password: "" });
+      return { methods, warnings };
+    }
     const reason = encryptedKeys > 0
       ? "configured private keys are encrypted and no compatible SSH agent is available"
       : "no readable private key or SSH agent is available";
@@ -645,6 +658,7 @@ interface ResolverContext {
   executable: string;
   connectTimeout: number;
   passwordFor?: Ssh2ConfigResolverOptions["passwordFor"];
+  allowPasswordPrompt: boolean;
 }
 
 interface EndpointRequest {
@@ -749,6 +763,7 @@ async function resolveSsh2Endpoint(
     context.home,
     username,
     password,
+    context.allowPasswordPrompt,
   );
   const verification: { rejection?: string } = {};
   const addressFamily = first(openSsh, "addressfamily");
@@ -812,6 +827,7 @@ export async function resolveSsh2Connection(
     executable: options.executable ?? (platform === "win32" ? "ssh.exe" : "ssh"),
     connectTimeout,
     passwordFor: resolverOptions.passwordFor,
+    allowPasswordPrompt: resolverOptions.allowPasswordPrompt === true,
   };
   const target = await resolveSsh2Endpoint(context, {
     target: options.target,

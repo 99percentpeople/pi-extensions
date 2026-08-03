@@ -1,3 +1,7 @@
+import {
+  SshPasswordCancelledError,
+  SshPasswordFailedError,
+} from "../password-resolver.ts";
 import type { SshExecutor } from "../client.ts";
 import { UnixBashAdapter } from "./unix.ts";
 import type {
@@ -109,7 +113,14 @@ async function probeRemoteHost(executor: SshExecutor): Promise<RemoteHostProbe> 
   if (result.exitCode === 0 && match) {
     return { kind: "unix", loginShell: match[1] };
   }
+  const stderr = result.stderr.toString("utf8");
   if (result.exitCode !== 0 && text === "") {
+    if (/permission denied|authentication failed|no supported authentication/i.test(stderr)) {
+      // The host rejected the connection before the probe could run
+      // (password required). Treat it as unknown so the full candidate
+      // list is tried; inspectWorkspace then triggers the password flow.
+      return unknown;
+    }
     // The probe could not run: no sh on this host (Windows).
     return { kind: "windows", loginShell: "" };
   }
@@ -199,6 +210,15 @@ export async function selectRemoteAdapter(
       const workspace = await adapter.inspectWorkspace(options.requestedCwd);
       return { adapter, workspace, warnings };
     } catch (error) {
+      // Password prompt cancellations and rejected-password failures end
+      // the whole selection: the next candidate would hit the same wall
+      // and the aggregated probe list would just repeat the message.
+      if (error instanceof SshPasswordCancelledError || error instanceof SshPasswordFailedError) {
+        throw error;
+      }
+      if (error instanceof Error && /password authentication was cancelled/.test(error.message)) {
+        throw error;
+      }
       failures.push(`${shell}: ${boundedProbeError(error)}`);
     }
   }

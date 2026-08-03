@@ -786,6 +786,66 @@ test("Ssh2Client reuses one authenticated connection for multiple command channe
   assert.equal(raw.closed, true);
 });
 
+test("Ssh2Client prompts on key-less hosts via the empty-password placeholder", async () => {
+  // No keys, no agent, no cached password: buildAuthentication must not
+  // reject early; the empty password method reaches the auth phase, fails,
+  // and the retry loop prompts.
+  const raw = new FakeAuthFailClient();
+  let created = 0;
+  const prompts: string[] = [];
+  const cachedPasswords = new Map<string, string>();
+  const endpoint = {
+    hostLabel: "root@router:22",
+    username: "root",
+    host: "router",
+    port: 22,
+  };
+  const client = new Ssh2Client(
+    { target: "router" },
+    {
+      createClient: () => {
+        created++;
+        return raw as any;
+      },
+      resolverOptions: {
+        passwordFor: async (ep) => cachedPasswords.get(ep.hostLabel),
+        allowPasswordPrompt: true,
+      },
+      resolveConnection: async (_options, resolverOptions) => {
+        const password = resolverOptions.passwordFor
+          ? await resolverOptions.passwordFor(endpoint)
+          : undefined;
+        return {
+          config: {
+            host: "router",
+            username: "root",
+            authHandler: [
+              { type: "none", username: "root" },
+              // The placeholder arrives when nothing is available; the
+              // retry resolves the real password afterwards.
+              { type: "password", username: "root", password: password ?? "" },
+            ],
+          },
+          hostLabel: "root@router:22",
+          warnings: [],
+          verification: {},
+        };
+      },
+      promptPassword: async (ep) => {
+        prompts.push(ep.hostLabel);
+        cachedPasswords.set(ep.hostLabel, "real-pw");
+        return "real-pw";
+      },
+    },
+  );
+  const result = await client.run("probe");
+  assert.equal(result.exitCode, 0);
+  assert.equal(created, 2);
+  assert.deepEqual(prompts, ["root@router:22"]);
+  const retried = raw.connectConfigs[1].authHandler as Array<Record<string, unknown>>;
+  assert.ok(retried.some((method) => method.type === "password" && method.password === "real-pw"));
+});
+
 test("Ssh2Client asks for a password on authentication failure and retries", async () => {
   const raw = new FakeAuthFailClient();
   let created = 0;
@@ -841,6 +901,71 @@ test("Ssh2Client asks for a password on authentication failure and retries", asy
   assert.deepEqual(prompts, ["deploy@devbox:22"]);
   const retried = raw.connectConfigs[1].authHandler as Array<Record<string, unknown>>;
   assert.ok(retried.some((method) => method.type === "password" && method.password === "s3cret"));
+});
+
+test("cancelled password prompts do not re-prompt for later candidates", async () => {
+  // ssh2 path: after cancellation the client fails fast instead of asking
+  // again for the next shell candidate.
+  const raw = new FakeAuthFailClient();
+  let prompts = 0;
+  const client = new Ssh2Client(
+    { target: "devbox" },
+    {
+      createClient: () => raw as any,
+      resolveConnection: async () => ({
+        config: { host: "devbox", username: "deploy" },
+        hostLabel: "deploy@devbox:22",
+        warnings: [],
+        verification: {},
+      }),
+      promptPassword: async () => {
+        prompts++;
+        return undefined;
+      },
+    },
+  );
+  await assert.rejects(client.run("whoami"), /cancelled/);
+  await assert.rejects(client.run("whoami"), /cancelled/);
+  assert.equal(prompts, 1);
+});
+
+test("explicit openssh does not re-prompt after the user cancelled", async () => {
+  let prompts = 0;
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: () => ({
+        options: { target: "devbox" },
+        transport: "openssh",
+        reusesConnection: false,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("Permission denied (publickey,password)."),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: {
+        cached: () => undefined,
+        retry: async () => {
+          prompts++;
+          return undefined;
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  await assert.rejects(client.runChecked("whoami"), /cancelled/);
+  // After cancellation every later call fails fast with the same
+  // cancellation; it must not return the 255 result (which would make the
+  // auto fallback prompt again) nor re-prompt.
+  await assert.rejects(client.runChecked("whoami"), /cancelled/);
+  assert.equal(prompts, 1);
 });
 
 test("Ssh2Client reports cancellation when the password prompt is dismissed", async () => {
@@ -941,6 +1066,722 @@ test("Ssh2Client builds and disposes a recursive ProxyJump connection chain", as
   assert.deepEqual(rawClients.map((raw) => raw.closed), [true, true, true, true, true, true]);
 });
 
+test("explicit openssh wraps sshpass retry on Windows too", async () => {
+  const created: Array<{ sshpassPassword?: string }> = [];
+  const client = createSshTransportClient(
+    { target: "winbox" },
+    {
+      platform: "win32",
+      preference: "openssh",
+      createOpenSsh: (options) => {
+        created.push(options);
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: false,
+          run: async () => {
+            if (!sshpassPassword) throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            if (!sshpassPassword) throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          dispose: () => {},
+        };
+      },
+      passwordProvider: { cached: () => "win-pw", retry: async () => "win-pw" },
+      detectSshpass: async () => true,
+    },
+  );
+  const result = await client.runChecked("whoami");
+  assert.equal(result.exitCode, 0);
+  assert.equal(created.length, 2);
+  assert.equal(created[1].sshpassPassword, "win-pw");
+  assert.equal(created[1].executable, "ssh.exe");
+  await client.dispose();
+});
+
+test("OpenSshClient runs sshpass -e with SSHPASS and a single prompt when a password is set", async () => {
+  class FakeProcess extends EventEmitter {
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    kill(): boolean {
+      queueMicrotask(() => this.emit("close", null));
+      return true;
+    }
+  }
+
+  const spawned: Array<{ file: string; args: readonly string[]; env?: NodeJS.ProcessEnv }> = [];
+  const spawn = (
+    file: string,
+    args: readonly string[],
+    options: SpawnOptions,
+  ): ChildProcess => {
+    spawned.push({ file, args, env: options.env });
+    const child = new FakeProcess();
+    queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from("ok\n"));
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  const client = new OpenSshClient({ target: "devbox", sshpassPassword: "s3cret" }, spawn);
+  const result = await client.runChecked("whoami");
+  assert.equal(result.exitCode, 0);
+
+  assert.equal(spawned.length, 1);
+  const call = spawned[0];
+  assert.equal(call.file, "sshpass");
+  assert.equal(call.args[0], "-e");
+  assert.equal(call.args[1], "ssh");
+  assert.ok(call.args.includes("-o"));
+  assert.ok(call.args.includes("NumberOfPasswordPrompts=1"));
+  assert.ok(call.args.includes("BatchMode=no"));
+  assert.ok(call.args.includes("-T"));
+  assert.equal(call.env?.SSHPASS, "s3cret");
+});
+
+test("255-result rejections surface the ssh error in the retry callback", async () => {
+  const received: unknown[] = [];
+  const client = createSshTransportClient(
+    { target: "root@router" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: (options) => {
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: false,
+          run: async () => {
+            if (!sshpassPassword) {
+              return {
+                stdout: Buffer.alloc(0),
+                stderr: Buffer.from("root@router: Permission denied (publickey,password)."),
+                exitCode: 255,
+              };
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            if (!sshpassPassword) {
+              throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          dispose: () => {},
+        };
+      },
+      passwordProvider: {
+        cached: () => undefined,
+        retry: async (_endpoint, error) => {
+          received.push(error);
+          return "pw";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  await client.runChecked("whoami");
+  assert.equal(received.length, 1);
+  assert.ok(received[0] instanceof Error);
+  assert.match((received[0] as Error).message, /Permission denied \(publickey,password\)/);
+});
+
+test("explicit openssh retries when auth failure arrives as a 255 result, not an exception", async () => {
+  const prompts: string[] = [];
+  const created: Array<{ sshpassPassword?: string }> = [];
+  const client = createSshTransportClient(
+    { target: "root@router" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: (options) => {
+        created.push(options);
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: false,
+          run: async () => {
+            if (!sshpassPassword) {
+              return {
+                stdout: Buffer.alloc(0),
+                stderr: Buffer.from("root@router: Permission denied (publickey,password)."),
+                exitCode: 255,
+              };
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            if (!sshpassPassword) {
+              throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          dispose: () => {},
+        };
+      },
+      passwordProvider: {
+        cached: () => undefined,
+        retry: async (endpoint) => {
+          prompts.push(endpoint.hostLabel);
+          return "pw";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  // runChecked throws on the 255 result; the retry must still happen.
+  const result = await client.runChecked("probe");
+  assert.equal(result.exitCode, 0);
+  // The secret key matches the ssh2 format (user@host:port) so both
+  // transports share one cached password.
+  assert.deepEqual(prompts, ["root@router:22"]);
+  assert.equal(created[1].sshpassPassword, "pw");
+});
+
+test("Unix auto falls back on a 255 permission-denied result", async () => {
+  let ssh2Runs = 0;
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      detectSshpass: async () => false,
+      createOpenSsh: () => ({
+        options: { target: "devbox", multiplex: true },
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("devbox: Permission denied (publickey,password)."),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+        },
+        dispose: () => {},
+      }),
+      createSsh2: () => ({
+        options: { target: "devbox" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: { cached: () => "pw", retry: async () => "pw" },
+    },
+  );
+  const result = await client.runChecked("probe");
+  assert.equal(result.exitCode, 0);
+  assert.equal(ssh2Runs, 1);
+  assert.match(client.fallbackReason ?? "", /sshpass is not installed|Permission denied/);
+  assert.equal(client.transport, "ssh2");
+});
+
+test("selectRemoteAdapter aborts on password cancellation instead of repeating it per candidate", async () => {
+  const client = new FakeSshClient({ target: "router" });
+  const originalRunChecked = client.runChecked.bind(client);
+  (client as any).runChecked = async (command: string, options?: SshRunOptions) => {
+    if (command.includes("PI_SSH_UNIX_ENV")) {
+      throw new Error("password authentication was cancelled; reconnect with /ssh-reconnect to try again");
+    }
+    return originalRunChecked(command, options);
+  };
+  await assert.rejects(
+    selectRemoteAdapter(client, { preference: "auto" }),
+    /password authentication was cancelled/,
+  );
+});
+
+test("probeRemoteHost reports unknown (not windows) when authentication is rejected", async () => {
+  const rejected = new FakeSshClient({ target: "router" });
+  // sh probe returns 255 + Permission denied stderr (password host, no sh run).
+  const probeCmd = "sh -c 'p=$(getent passwd";
+  const originalRun = rejected.run.bind(rejected);
+  (rejected as any).run = async (command: string, options?: SshRunOptions) => {
+    if (command.startsWith(probeCmd)) {
+      return {
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.from("root@router: Permission denied (publickey,password)."),
+        exitCode: 255,
+      };
+    }
+    return originalRun(command, options);
+  };
+  const selected = await selectRemoteAdapter(rejected, { preference: "auto" });
+  // Unknown probe -> full candidate list; the fake host has bash, so the
+  // adapter is bash rather than the Windows-only PowerShell pair.
+  assert.equal(selected.adapter.shell, "bash");
+});
+
+test("explicit openssh retries a rejected password through sshpass and prompts until cancelled", async () => {
+  const prompts: string[] = [];
+  const provider = {
+    cached: () => undefined,
+    retry: async (endpoint: { hostLabel: string }) => {
+      prompts.push(endpoint.hostLabel);
+      return "pw1";
+    },
+  };
+  const created: Array<{ sshpassPassword?: string }> = [];
+  let authFails = 1;
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: (options) => {
+        created.push(options);
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: false,
+          run: async () => {
+            if (!sshpassPassword && authFails-- > 0) {
+              throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            if (!sshpassPassword && authFails-- > 0) {
+              throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          dispose: () => {},
+        };
+      },
+      passwordProvider: provider,
+      detectSshpass: async () => true,
+    },
+  );
+
+  const result = await client.runChecked("whoami");
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(prompts, ["devbox"]);
+  // First client without a password, then one rebuilt with the secret.
+  assert.equal(created.length, 2);
+  assert.equal(created[0].sshpassPassword, undefined);
+  assert.equal(created[1].sshpassPassword, "pw1");
+  await client.dispose();
+});
+
+test("explicit openssh uses a cached password without prompting", async () => {
+  const prompts: string[] = [];
+  const created: Array<{ sshpassPassword?: string }> = [];
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: (options) => {
+        created.push(options);
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: false,
+          run: async () => {
+            if (!sshpassPassword) throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            if (!sshpassPassword) throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          dispose: () => {},
+        };
+      },
+      passwordProvider: {
+        cached: () => "cached-pw",
+        retry: async () => {
+          prompts.push("should not prompt");
+          return "x";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  await client.runChecked("whoami");
+  assert.deepEqual(prompts, []);
+  assert.equal(created[1].sshpassPassword, "cached-pw");
+});
+
+test("servers that reject password auth never trigger the prompt or the ssh2 fallback", async () => {
+  // OpenSSH reports the accepted methods in parentheses; without password
+  // or keyboard-interactive a prompt could never succeed.
+  let prompts = 0;
+  let ssh2Runs = 0;
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: () => ({
+        options: { target: "devbox", multiplex: true },
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("devbox: Permission denied (publickey)."),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error("SSH command failed (255): devbox: Permission denied (publickey).");
+        },
+        dispose: () => {},
+      }),
+      createSsh2: () => ({
+        options: { target: "devbox" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: {
+        cached: () => undefined,
+        retry: async () => {
+          prompts++;
+          return "pw";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  await assert.rejects(client.runChecked("probe"), /Permission denied \(publickey\)/);
+  assert.equal(prompts, 0, "no prompt when the server does not accept passwords");
+  assert.equal(ssh2Runs, 0, "no ssh2 fallback when it could only prompt in a loop");
+  assert.equal(client.fallbackReason, undefined);
+});
+
+test("keyboard-interactive counts as password support", async () => {
+  let prompts = 0;
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: (options) => {
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: false,
+          run: async () => {
+            if (!sshpassPassword) {
+              return {
+                stdout: Buffer.alloc(0),
+                stderr: Buffer.from("devbox: Permission denied (gssapi-keyex,gssapi-with-mic,publickey,keyboard-interactive)."),
+                exitCode: 255,
+              };
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            if (!sshpassPassword) {
+              throw new Error("SSH command failed (255): Permission denied (keyboard-interactive).");
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          dispose: () => {},
+        };
+      },
+      passwordProvider: {
+        cached: () => undefined,
+        retry: async () => {
+          prompts++;
+          return "pw";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  const result = await client.runChecked("probe");
+  assert.equal(result.exitCode, 0);
+  assert.equal(prompts, 1);
+});
+
+test("explicit openssh explains when sshpass is missing and cancels cleanly", async () => {
+  const missing = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: () => ({
+        options: { target: "devbox" },
+        transport: "openssh",
+        reusesConnection: false,
+        run: async () => { throw new Error("SSH command failed (255): Permission denied (publickey,password)"); },
+        runChecked: async () => { throw new Error("SSH command failed (255): Permission denied (publickey,password)"); },
+        dispose: () => {},
+      }),
+      passwordProvider: { cached: () => undefined, retry: async () => "x" },
+      detectSshpass: async () => false,
+    },
+  );
+  await assert.rejects(missing.runChecked("whoami"), /sshpass is not installed.*ssh2/);
+
+  const cancelled = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: () => ({
+        options: { target: "devbox" },
+        transport: "openssh",
+        reusesConnection: false,
+        run: async () => { throw new Error("SSH command failed (255): Permission denied (publickey,password)"); },
+        runChecked: async () => { throw new Error("SSH command failed (255): Permission denied (publickey,password)"); },
+        dispose: () => {},
+      }),
+      passwordProvider: { cached: () => undefined, retry: async () => undefined },
+      detectSshpass: async () => true,
+    },
+  );
+  await assert.rejects(cancelled.runChecked("whoami"), /was cancelled/);
+});
+
+test("Unix auto reports rejected passwords instead of falling back to ssh2", async () => {
+  // sshpass installed, prompts answered, but the server keeps rejecting:
+  // ssh2 would fail with the same secret, so the flow must stop.
+  let ssh2Runs = 0;
+  let prompts = 0;
+  const client = createSshTransportClient(
+    { target: "root@router" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: () => ({
+        options: { target: "root@router", multiplex: true },
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("root@router: Permission denied (publickey,password)."),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+        },
+        dispose: () => {},
+      }),
+      createSsh2: () => ({
+        options: { target: "root@router" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: {
+        cached: () => "stale-pw",
+        retry: async () => {
+          prompts++;
+          return "fresh-pw";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  await assert.rejects(client.runChecked("probe"), /was rejected after 20 attempts/);
+  assert.equal(ssh2Runs, 0, "rejected passwords must not fall back to ssh2");
+  assert.ok(prompts >= 1, "the stale cached password triggered a re-prompt");
+});
+
+test("Unix auto retries OpenSSH through sshpass before falling back to ssh2", async () => {
+  // Cached password + sshpass installed: the OpenSSH delegate is rebuilt
+  // with the secret and succeeds; ssh2 never runs.
+  let ssh2Runs = 0;
+  let prompts = 0;
+  const created: Array<{ sshpassPassword?: string }> = [];
+  const client = createSshTransportClient(
+    { target: "root@router" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: (options) => {
+        created.push(options);
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: true,
+          run: async () => {
+            if (!sshpassPassword) {
+              return {
+                stdout: Buffer.alloc(0),
+                stderr: Buffer.from("root@router: Permission denied (publickey,password)."),
+                exitCode: 255,
+              };
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            if (!sshpassPassword) {
+              throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          dispose: () => {},
+        };
+      },
+      createSsh2: () => ({
+        options: { target: "root@router" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("should not run"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("should not run"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: {
+        cached: () => "cached-pw",
+        retry: async () => {
+          prompts++;
+          return "never";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  const result = await client.runChecked("probe");
+  assert.equal(result.exitCode, 0);
+  assert.equal(ssh2Runs, 0, "ssh2 must not run when sshpass succeeds");
+  assert.equal(prompts, 0, "cached password must not prompt");
+  assert.equal(created[1].sshpassPassword, "cached-pw");
+  assert.equal(client.fallbackReason, undefined);
+  assert.equal(client.transport, "openssh");
+});
+
+test("Unix auto stays cancelled for later calls after the user dismissed the prompt", async () => {
+  let ssh2Runs = 0;
+  let prompts = 0;
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: () => ({
+        options: { target: "devbox", multiplex: true },
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("Permission denied (publickey,password)."),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+        },
+        dispose: () => {},
+      }),
+      createSsh2: () => ({
+        options: { target: "devbox" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: { cached: () => undefined, retry: async () => {
+        prompts++;
+        return undefined;
+      } },
+      detectSshpass: async () => true,
+    },
+  );
+  // First call: prompt once, user cancels, flow aborts.
+  await assert.rejects(client.runChecked("probe"), /was cancelled/);
+  // The shell candidate loop keeps calling the same client; every later
+  // call must fail fast with the cancellation, never falling back to ssh2
+  // (which would prompt again) and never re-prompting.
+  await assert.rejects(client.runChecked("probe"), /was cancelled/);
+  await assert.rejects(client.runChecked("probe"), /was cancelled/);
+  assert.equal(ssh2Runs, 0);
+  assert.equal(prompts, 1);
+});
+
+test("Unix auto does not fall back to ssh2 after the user cancelled the password prompt", async () => {
+  let ssh2Runs = 0;
+  const client = createSshTransportClient(
+    { target: "devbox" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: () => ({
+        options: { target: "devbox", multiplex: true },
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("Permission denied (publickey,password)."),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+        },
+        dispose: () => {},
+      }),
+      createSsh2: () => ({
+        options: { target: "devbox" },
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("x"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: { cached: () => undefined, retry: async () => undefined },
+      detectSshpass: async () => true,
+    },
+  );
+  await assert.rejects(client.runChecked("probe"), /was cancelled/);
+  assert.equal(ssh2Runs, 0, "cancellation must abort the whole flow");
+});
+
 test("Unix auto falls back to ssh2 for passwords when OpenSSH auth fails", async () => {
   let openSshRuns = 0;
   let ssh2Runs = 0;
@@ -978,6 +1819,7 @@ test("Unix auto falls back to ssh2 for passwords when OpenSSH auth fails", async
     {
       platform: "linux",
       preference: "auto",
+      detectSshpass: async () => false,
       createOpenSsh: () => failingOpenSsh,
       createSsh2: () => passwordSsh2,
       passwordProvider: provider,
@@ -987,10 +1829,12 @@ test("Unix auto falls back to ssh2 for passwords when OpenSSH auth fails", async
   assert.equal(client.transport, "openssh");
   const result = await client.runChecked("whoami");
   assert.equal(result.exitCode, 0);
+  // No sshpass on this host: the failure falls straight back to ssh2
+  // without a retry loop.
   assert.equal(openSshRuns, 1);
   assert.equal(ssh2Runs, 1);
   assert.equal(client.transport, "ssh2");
-  assert.match(client.fallbackReason ?? "", /Permission denied/);
+  assert.match(client.fallbackReason ?? "", /sshpass is not installed|Permission denied/);
   await client.dispose();
 });
 
@@ -1004,8 +1848,8 @@ test("Unix auto does not fall back without a password provider or on non-auth er
         options: { target: "devbox" },
         transport: "openssh",
         reusesConnection: true,
-        run: async () => { throw new Error("SSH command failed (255): Permission denied"); },
-        runChecked: async () => { throw new Error("SSH command failed (255): Permission denied"); },
+        run: async () => { throw new Error("SSH command failed (255): Permission denied (publickey,password)"); },
+        runChecked: async () => { throw new Error("SSH command failed (255): Permission denied (publickey,password)"); },
         dispose: () => {},
       }),
       createSsh2: () => ({
@@ -1083,9 +1927,12 @@ test("transport auto selects multiplexed OpenSSH on Unix and falls back on Windo
       },
     },
   );
-  // Unix auto wraps OpenSSH so an authentication failure can fall back
-  // to ssh2 for the TUI password prompt.
-  assert.equal((unix as { delegate?: SshRemoteClient }).delegate, unixClient);
+  // Unix auto wraps OpenSSH (inside an sshpass retry layer) so a rejected
+  // password is retried in place before falling back to ssh2.
+  const unixDelegate = (unix as { delegate?: SshRemoteClient }).delegate as unknown as {
+    delegate?: SshRemoteClient;
+  };
+  assert.equal(unixDelegate.delegate, unixClient);
   assert.equal(unixOptions[0].multiplex, true);
 
   let openSshRuns = 0;
@@ -2519,6 +3366,73 @@ test("password resolver caches, persists, rejects, and forgets", async () => {
     {},
   );
   rmSync(directory, { recursive: true, force: true });
+});
+
+test("password resolver surfaces the transport rejection in the prompt and a notify", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-secrets-test-"));
+  const secretsPath = join(directory, "secrets.json");
+  const endpoint = {
+    hostLabel: "root@router:22",
+    username: "root",
+    host: "router",
+    port: 22,
+  };
+  const prompts: string[] = [];
+  const notifications: Array<[string, string | undefined]> = [];
+  const resolver = new SshPasswordResolver({ persistPasswords: false, secretsPath });
+  resolver.setUI({
+    prompt: async (title) => {
+      prompts.push(title);
+      return "pw";
+    },
+    notify: (message, type) => notifications.push([message, type]),
+  });
+  // First failure: nothing was tried yet, so no "rejected" notify and a
+  // clean prompt title.
+  await resolver.retryPassword(
+    endpoint,
+    "root@router: Permission denied (publickey,password).",
+  );
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0], "SSH password for root@router:22");
+  assert.equal(notifications.length, 0);
+
+  // Second failure: the typed password was rejected, so the rejection is
+  // surfaced before the next prompt.
+  await resolver.retryPassword(
+    endpoint,
+    "root@router: Permission denied (publickey,password).",
+  );
+  assert.ok(
+    notifications.some(
+      ([message, type]) => type === "warning" && /SSH password rejected:.*Permission denied/.test(message),
+    ),
+  );
+  rmSync(directory, { recursive: true, force: true });
+});
+
+test("password rejection messages reach the provider retry callback", async () => {
+  const raw = new FakeAuthFailClient();
+  const errors: unknown[] = [];
+  const client = new Ssh2Client(
+    { target: "devbox" },
+    {
+      createClient: () => raw as any,
+      resolveConnection: async () => ({
+        config: { host: "devbox", username: "deploy" },
+        hostLabel: "deploy@devbox:22",
+        warnings: [],
+        verification: {},
+      }),
+      promptPassword: async (_endpoint, error) => {
+        errors.push(error);
+        return "pw";
+      },
+    },
+  );
+  await client.run("whoami");
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0] instanceof Ssh2ConnectionError);
 });
 
 test("password resolver stays silent without a UI or when persistence is off", async () => {

@@ -89,6 +89,7 @@ export class Ssh2Client implements SshRemoteClient {
   private connectPromise?: Promise<RawSsh2Client>;
   private activeChannels = 0;
   private warningList: string[] = [];
+  private passwordPromptCancelled = false;
   private disposed = false;
 
   constructor(options: SshClientOptions, dependencies: Ssh2ClientDependencies = {}) {
@@ -243,6 +244,11 @@ export class Ssh2Client implements SshRemoteClient {
     // nothing is cached) and the whole chain is rebuilt and retried until
     // success, cancellation, or the attempt cap.
     for (let attempt = 0; ; attempt++) {
+      if (this.passwordPromptCancelled) {
+        throw new Ssh2ConnectionError(
+          "password authentication was cancelled; reconnect with /ssh-reconnect to try again",
+        );
+      }
       try {
         return await this.openConnectionAttempt();
       } catch (error) {
@@ -264,6 +270,7 @@ export class Ssh2Client implements SshRemoteClient {
         }
         const password = await this.promptPassword(failedEndpoint, error);
         if (password === undefined) {
+          this.passwordPromptCancelled = true;
           throw new Ssh2ConnectionError(
             `ssh2 connection to ${failedEndpoint.hostLabel} failed: password authentication was cancelled`,
             { cause: error },

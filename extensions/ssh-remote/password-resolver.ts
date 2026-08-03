@@ -20,6 +20,26 @@ export interface SshPasswordPromptUI {
   notify(message: string, type?: "info" | "warning" | "error"): void;
 }
 
+/** Thrown when the user dismisses a password prompt; aborts the whole
+ *  connection flow (auto must not then fall back to another transport
+ *  that would prompt again). */
+export class SshPasswordCancelledError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SshPasswordCancelledError";
+  }
+}
+
+/** Thrown when password attempts were made but every one was rejected.
+ *  Another transport would try the same secret and fail the same way, so
+ *  the connection flow must stop instead of falling back. */
+export class SshPasswordFailedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SshPasswordFailedError";
+  }
+}
+
 export interface SshPasswordResolverOptions {
   /** Persist passwords to the 0600 secrets file (for -r cross-process reuse). */
   persistPasswords: boolean;
@@ -63,7 +83,6 @@ export class SshPasswordResolver {
   private readonly memory = new Map<string, string>();
   private readonly secretsPath: string;
   private ui?: SshPasswordPromptUI;
-  private warnedAboutVisibility = false;
   private persist: boolean;
 
   constructor(private readonly options: SshPasswordResolverOptions) {
@@ -94,16 +113,20 @@ export class SshPasswordResolver {
 
   /**
    * Returns a usable password for the endpoint, prompting when nothing is
-   * cached. Returns undefined when the user cancels or no UI is available.
+   * cached. `failureInfo` (the transport's real rejection message) is
+   * surfaced in the prompt so the user knows the previous attempt failed.
+   * Returns undefined when the user cancels or no UI is available.
    */
-  async resolvePassword(endpoint: SshPasswordEndpoint): Promise<string | undefined> {
+  async resolvePassword(
+    endpoint: SshPasswordEndpoint,
+    failureInfo?: string,
+  ): Promise<string | undefined> {
     const cached = this.cachedPassword(endpoint);
     if (cached !== undefined) return cached;
     if (!this.ui) return undefined;
-    if (!this.warnedAboutVisibility) {
-      this.warnedAboutVisibility = true;
+    if (failureInfo) {
       this.ui.notify(
-        "SSH password input is plain text until Pi gains a masked input API",
+        `SSH password rejected: ${failureInfo.replace(/\s+/g, " ").trim().slice(0, 500)}`,
         "warning",
       );
     }
@@ -139,9 +162,16 @@ export class SshPasswordResolver {
    * the endpoint, then resolves a fresh password (prompting if needed).
    * Returns undefined when the user cancels or no UI is available.
    */
-  async retryPassword(endpoint: SshPasswordEndpoint): Promise<string | undefined> {
+  async retryPassword(
+    endpoint: SshPasswordEndpoint,
+    failureInfo?: string,
+  ): Promise<string | undefined> {
+    // Surface the rejection only when a secret was actually tried (typed
+    // by the user or a cached one): the first prompt on a key-less host
+    // has nothing to reject yet.
+    const hadSecret = this.cachedPassword(endpoint) !== undefined;
     this.rejectPassword(endpoint);
-    return this.resolvePassword(endpoint);
+    return this.resolvePassword(endpoint, hadSecret ? failureInfo : undefined);
   }
 
   /** Clears every password (memory and secrets file). */

@@ -48,7 +48,7 @@ export function registerSshRemoteSettings(
     }, {
       id: "passwordPrompt",
       label: "Password prompt",
-      description: "Ask for an SSH password in the TUI when key/agent authentication fails (ssh2 transport only)",
+      description: "Ask for an SSH password in the TUI when key/agent authentication fails",
       currentValue: booleanLabel(controller.getConfig().passwordPrompt),
       values: ["On", "Off"],
     }, {
