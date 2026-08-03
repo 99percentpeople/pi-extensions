@@ -15,6 +15,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
   selectRemoteAdapter,
   type RemoteAdapter,
@@ -26,7 +27,6 @@ import {
   OpenSshClient,
   type SshClientOptions,
   type SshRemoteClient,
-  type SshTransportKind,
   type SshTransportPreference,
 } from "./client.ts";
 import {
@@ -255,6 +255,46 @@ function replacePath(
   return value.includes(toolPath)
     ? value.split(toolPath).join(displayPath)
     : value;
+}
+
+function isInsideLocalPath(root: string, value: string): boolean {
+  const fromRoot = relative(root, value);
+  return fromRoot === "" || (
+    fromRoot !== ".."
+    && !fromRoot.startsWith(`..${sep}`)
+    && !isAbsolute(fromRoot)
+  );
+}
+
+/**
+ * Skills are discovered and expanded by Pi on the local client. Their system-
+ * prompt locations are therefore local absolute paths even in an SSH session.
+ * Keep only registered skill directories on the local read backend; every
+ * other path continues to target the remote workspace.
+ */
+function resolveLocalSkillReadPath(
+  value: string,
+  cwd: string,
+  pi: Pick<ExtensionAPI, "getCommands">,
+): string | undefined {
+  const rawPath = value.startsWith("@") ? value.slice(1) : value;
+  if (
+    !isAbsolute(rawPath)
+    && rawPath !== "~"
+    && !rawPath.startsWith("~/")
+    && !rawPath.startsWith("~\\")
+  ) {
+    return undefined;
+  }
+  const localPath = expandLocalPath(rawPath, cwd);
+  for (const command of pi.getCommands()) {
+    if (command.source !== "skill") continue;
+    const skillFile = command.sourceInfo.path;
+    if (!skillFile || skillFile.startsWith("<")) continue;
+    const skillRoot = resolve(dirname(skillFile));
+    if (isInsideLocalPath(skillRoot, localPath)) return localPath;
+  }
+  return undefined;
 }
 
 function restoreToolResultPath<T extends AgentToolResult<unknown>>(
@@ -785,6 +825,20 @@ export function createSshRemoteExtension(
     const remoteReadTool: typeof readTemplate = {
       ...readTemplate,
       async execute(id, params, signal, onUpdate, ctx) {
+        const localSkillPath = resolveLocalSkillReadPath(
+          params.path,
+          ctx.cwd,
+          pi,
+        );
+        if (runtime.kind === "disabled" || localSkillPath) {
+          return createReadToolDefinition(ctx.cwd).execute(
+            id,
+            localSkillPath ? { ...params, path: localSkillPath } : params,
+            signal,
+            onUpdate,
+            ctx,
+          );
+        }
         const active = requireActive();
         if (!active) {
           return createReadToolDefinition(ctx.cwd).execute(
@@ -1151,7 +1205,9 @@ export function createSshRemoteExtension(
           ? "The bash tool and user ! commands execute PowerShell syntax, not Bash syntax."
           : runtime.session.remoteShell === "zsh"
             ? "The bash tool and user ! commands execute Zsh syntax."
-            : "The bash tool and user ! commands execute Bash syntax.";
+            : runtime.session.remoteShell === "sh"
+              ? "The bash tool and user ! commands execute POSIX sh syntax."
+              : "The bash tool and user ! commands execute Bash syntax.";
       return {
         systemPrompt:
           `${base}\n\nSSH remote workspace is active at ${location} ` +

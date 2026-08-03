@@ -30,6 +30,7 @@ const REMOTE_SESSION_ENV_KEYS = [
   "PI_MODEL",
   "PI_REASONING_LEVEL",
 ] as const;
+const VIRTUAL_UNIX_ROOT = "/__pi_ssh_remote_unix__";
 const WINDOWS_LOCAL_UNIX_ROOT = "C:\\__pi_ssh_remote_unix__";
 
 function encodeUnixSegment(value: string): string {
@@ -40,31 +41,45 @@ function decodeUnixSegment(value: string): string {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new Error("Invalid encoded Unix path segment");
   }
-  return Buffer.from(value, "base64url").toString("utf8");
+  const decoded = Buffer.from(value, "base64url").toString("utf8");
+  if (
+    !decoded
+    || decoded === "."
+    || decoded === ".."
+    || decoded.includes("/")
+    || /[\0\r\n\u001e\u001f]/.test(decoded)
+    || encodeUnixSegment(decoded) !== value
+  ) {
+    throw new Error("Invalid encoded Unix path segment");
+  }
+  return decoded;
 }
 
-function encodeUnixToolPath(nativePath: string): string {
+function encodeUnixToolPath(
+  nativePath: string,
+  localPlatform: NodeJS.Platform,
+): string {
   const normalized = posix.normalize(validateUnixPath("path", nativePath));
   const segments = normalized.slice(1).split("/").filter(Boolean);
-  return win32.join(
-    WINDOWS_LOCAL_UNIX_ROOT,
-    "root",
-    ...segments.map(encodeUnixSegment),
-  );
+  const encoded = segments.map(encodeUnixSegment);
+  return localPlatform === "win32"
+    ? win32.join(WINDOWS_LOCAL_UNIX_ROOT, "root", ...encoded)
+    : posix.join(VIRTUAL_UNIX_ROOT, "root", ...encoded);
 }
 
 function decodeUnixToolPath(toolPath: string): string {
-  const normalized = win32.normalize(toolPath);
-  const relative = win32.relative(WINDOWS_LOCAL_UNIX_ROOT, normalized);
-  if (
-    !relative
-    || relative === ".."
-    || relative.startsWith(`..${win32.sep}`)
-    || win32.isAbsolute(relative)
-  ) {
+  let normalized = toolPath.replace(/\\/g, "/");
+  const windowsLocal = /^[A-Za-z]:(\/__pi_ssh_remote_unix__(?:\/|$).*)$/i.exec(
+    normalized,
+  );
+  if (windowsLocal) normalized = windowsLocal[1];
+  if (!normalized.startsWith(`${VIRTUAL_UNIX_ROOT}/`)) {
     throw new Error(`Invalid logical Unix tool path: ${toolPath}`);
   }
-  const parts = relative.split(win32.sep).filter(Boolean);
+  const parts = normalized
+    .slice(VIRTUAL_UNIX_ROOT.length + 1)
+    .split("/")
+    .filter(Boolean);
   if (parts.shift()?.toLowerCase() !== "root") {
     throw new Error(`Invalid logical Unix tool path: ${toolPath}`);
   }
@@ -161,15 +176,11 @@ export class UnixBashAdapter implements RemoteAdapter {
   toToolPath(path: string, workspace: RemoteWorkspace): string {
     const normalized = normalizeRemoteToolPath(path, workspace.home);
     const nativePath = posix.resolve(workspace.cwd, normalized);
-    return this.localPlatform === "win32"
-      ? encodeUnixToolPath(nativePath)
-      : nativePath;
+    return encodeUnixToolPath(nativePath, this.localPlatform);
   }
 
   fromToolPath(path: string): string {
-    return this.localPlatform === "win32"
-      ? decodeUnixToolPath(path)
-      : path;
+    return decodeUnixToolPath(path);
   }
 
   mapCwd(value: string, localCwd: string, workspace: RemoteWorkspace): string {
@@ -401,9 +412,16 @@ exit 0
       const text = output.subarray(2).toString("utf8");
       for (const line of text.split("\n")) {
         if (!line.trim()) continue;
-        let event: any;
+        let event: {
+          type?: unknown;
+          data?: {
+            path?: { text?: unknown };
+            line_number?: unknown;
+            lines?: { text?: unknown };
+          };
+        };
         try {
-          event = JSON.parse(line);
+          event = JSON.parse(line) as typeof event;
         } catch {
           continue;
         }
@@ -415,9 +433,10 @@ exit 0
         const relative = rawPath.replace(/^\.\//, "").replace(/\\/g, "/");
         matches.push({
           path: relative,
-          toolPath: this.localPlatform === "win32"
-            ? encodeUnixToolPath(posix.resolve(root, relative))
-            : posix.resolve(root, relative),
+          toolPath: encodeUnixToolPath(
+            posix.resolve(root, relative),
+            this.localPlatform,
+          ),
           lineNumber,
           line: lineText.replace(/\r?\n$/, ""),
         });
@@ -434,9 +453,10 @@ exit 0
       if (!Number.isInteger(lineNumber) || lineNumber < 1) continue;
       matches.push({
         path: relative,
-        toolPath: this.localPlatform === "win32"
-          ? encodeUnixToolPath(posix.resolve(root, relative))
-          : posix.resolve(root, relative),
+        toolPath: encodeUnixToolPath(
+          posix.resolve(root, relative),
+          this.localPlatform,
+        ),
         lineNumber,
         line: fields[index + 2],
       });

@@ -85,7 +85,7 @@ export class SshPasswordResolver {
   private ui?: SshPasswordPromptUI;
   private persist: boolean;
 
-  constructor(private readonly options: SshPasswordResolverOptions) {
+  constructor(options: SshPasswordResolverOptions) {
     this.secretsPath = options.secretsPath ?? DEFAULT_SECRETS_FILE();
     this.persist = options.persistPasswords;
   }

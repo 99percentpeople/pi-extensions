@@ -17,8 +17,6 @@ import type {
   RemoteWorkspace,
 } from "./types.ts";
 
-const WINDOWS_ENV_START = "\u001ePI_SSH_WINDOWS_ENV\u001f";
-const WINDOWS_CWD_START = "\u001ePI_SSH_WINDOWS_CWD\u001f";
 const VIRTUAL_WINDOWS_ROOT = "/__pi_ssh_remote_windows__";
 const WINDOWS_LOCAL_WINDOWS_ROOT = "C:\\__pi_ssh_remote_windows__";
 const REMOTE_SESSION_ENV_KEYS = [

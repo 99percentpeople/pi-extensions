@@ -69,7 +69,7 @@
     },
     "extensions/ssh-remote": {
       "name": "@99percentpeople/pi-ssh-remote",
-      "version": "0.3.3",
+      "version": "0.3.4",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@99percentpeople/pi-workspace-files": "0.1.0",

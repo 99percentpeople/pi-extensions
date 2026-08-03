@@ -9,7 +9,7 @@ machine.
 
 The extension supports Linux, macOS, and Windows clients connected to:
 
-- Unix hosts with Bash or Zsh;
+- Unix hosts with POSIX `sh`, including Bash, Zsh, ash, and BusyBox;
 - Windows OpenSSH hosts with PowerShell 7 or Windows PowerShell 5.1.
 
 ## Features
@@ -70,7 +70,7 @@ Jump hosts work through the normal OpenSSH config with either transport:
 
 ```sshconfig
 Host devbox
-    HostName 10.0.0.20
+    HostName 192.0.2.20
     User deploy
     IdentityFile ~/.ssh/company
     ProxyJump bastion
@@ -151,7 +151,7 @@ capability and ensure `ssh.exe` is available on `PATH`.
 
 ```sshconfig
 Host devbox
-    HostName 10.0.0.20
+    HostName 192.0.2.20
     User deploy
     Port 2222
     IdentityFile ~/.ssh/company
@@ -183,9 +183,10 @@ the preceding jump server's network.
 The following effective OpenSSH features require `openssh` mode and produce a
 clear compatibility error: arbitrary `ProxyCommand`, `KnownHostsCommand`,
 `RemoteCommand`, `CertificateFile`, `@cert-authority`, `PKCS11Provider`, and
-multi-step `AuthenticationMethods`. Password, keyboard-interactive, and GSSAPI
-login, security-key/FIDO identities, and encrypted keys combined with
-`IdentitiesOnly=yes` are also unsupported. `ControlMaster`, `ControlPersist`,
+multi-step `AuthenticationMethods`. Keyboard-interactive and GSSAPI login,
+security-key/FIDO identities, and encrypted keys combined with
+`IdentitiesOnly=yes` are also unsupported; direct password authentication is
+available through the TUI. `ControlMaster`, `ControlPersist`,
 and `ControlPath` are unnecessary and ignored because `ssh2` owns the persistent
 connection itself. Paths containing spaces in a multi-file
 `UserKnownHostsFile`/`GlobalKnownHostsFile` value may not be reproduced; select
@@ -211,10 +212,11 @@ falls back to `ssh2` only when sshpass is missing (ssh2 is the remaining
 password-capable transport). If the user cancels the prompt or every password
 attempt is rejected, the connection fails outright — ssh2 would reject the
 same secret, so there is nothing to fall back to. `ssh2` mode (and Windows
-`auto`) prompts directly. Every rejected attempt is surfaced verbatim in a
-warning plus the prompt title (for example `Permission denied
-(publickey,password)`), so the user sees the actual server response. Explicit `openssh` mode uses the
-system `sshpass` when installed (`apt install sshpass` on Debian/Ubuntu,
+`auto`) prompts directly. After a password was actually tried, a rejection is
+surfaced verbatim in a warning before the next prompt (for example `Permission
+denied (publickey,password)`). OpenSSH's advertised authentication-method list
+is checked first, so publickey-only servers fail directly without a pointless
+password prompt. Explicit `openssh` mode uses the system `sshpass` when installed (`apt install sshpass` on Debian/Ubuntu,
 `pacman -S sshpass` in Git Bash on Windows, or a standalone `sshpass.exe`):
 the password travels only in the `SSHPASS` environment variable, the remote
 side stays PTY-free (`-T`) so binary file data is untouched, and a single
@@ -224,8 +226,9 @@ explicit `openssh` reports the missing tool or falls back to `ssh2` on
 reconnects, and extra channels reuse it without re-asking; with
 `persistPasswords` enabled (default) it is also saved to a 0600
 `ssh-remote-secrets.json` next to Pi's settings so `-r` restarts reuse it
-too. Public keys and the agent always win, the password is only ever passed
-inside the ssh2 library, and a wrong password re-prompts until cancelled.
+too. Public keys and the agent always win; passwords never enter SSH command
+arguments and are passed only through ssh2 or the `SSHPASS` environment. A
+wrong password re-prompts until cancelled or the retry safety limit is reached.
 Clear all cached passwords with `/ssh-forget-passwords`, disable prompting in
 `/99settings` (Password prompt), or disable persistence (Persist passwords).
 Headless sessions never prompt.
@@ -319,9 +322,9 @@ Windows user profile and working directory. Drive-relative paths such as
 `C:folder` and `~other` paths are rejected because their meaning is ambiguous.
 
 The tool remains named `bash` for Pi compatibility, but its prompt and session
-context tell the model to use the configured PowerShell or Zsh syntax. User
-`!`/`!!` commands use the same remote shell, and paths and file operations
-continue through the same remote shell.
+context tell the model to use PowerShell, Zsh, Bash, or POSIX `sh` syntax as
+appropriate. User `!`/`!!` commands use the same remote shell, and paths and
+file operations continue through the same remote shell.
 
 ## Session resume
 
@@ -334,14 +337,14 @@ a hidden, branch-aware entry containing only:
 - the optional local OpenSSH config path.
 
 It never copies private keys, passwords, SSH config contents, or remote file
-contents into this state. Version 1 Unix/Bash and version 2 platform/Shell
-entries are migrated in memory to execution-profile version 3 state, so
-existing conversations continue to resume.
+contents into this state. Version 1 Unix/Bash entries are migrated in memory to
+the version 2 platform/shell state, so existing conversations continue to
+resume.
 
 A resumed session reconnects its stored target even when Pi was started without
-`--ssh`. Passing a different target, config, cwd, or conflicting explicit
-profile while resuming is rejected to prevent an old conversation from
-modifying another machine.
+`--ssh`. Passing a different target, config, cwd, or conflicting explicit shell
+while resuming is rejected to prevent an old conversation from modifying
+another machine.
 
 Pi groups sessions by its local cwd. Start each remote project from a stable
 local anchor directory and name important sessions. In `/resume`, press Tab to
@@ -439,9 +442,9 @@ job after resume.
   work normally.
 - `ssh2` intentionally implements only the compatibility subset documented in
   [ssh2 mode and OpenSSH compatibility](#ssh2-mode-and-openssh-compatibility),
-  plus TUI password authentication for the final hop. Use explicit OpenSSH
-  mode for advanced routing, certificates, hardware keys, keyboard-
-  interactive or GSSAPI authentication.
+  plus TUI password authentication for the destination and `ProxyJump` hops.
+  Use explicit OpenSSH mode for advanced routing, certificates, hardware keys,
+  keyboard-interactive, or GSSAPI authentication.
 - On Windows clients, local sessions are left untouched so
   `pi-pwsh-adapter` can continue to own the local `bash` tool. SSH Remote
   registers its tool overrides only for sessions that request, resume, or
@@ -470,10 +473,15 @@ job after resume.
   POSIX fallback and the native Windows implementation always exclude `.git`
   and `node_modules` but do not parse every `.gitignore` rule.
 - Remote project discovery is not virtualized. Local `AGENTS.md`, `.pi`, skills,
-  and project settings still come from Pi's local anchor directory.
+  and project settings still come from Pi's local anchor directory. Registered
+  skill files and references below their skill directories are therefore read
+  locally; all other `read` paths remain remote.
 - `read` downloads a complete remote file before applying Pi's line and byte
   truncation. Avoid using it on very large files; use the remote shell to select
   a range.
+- Remote file paths are encoded into a reserved local logical namespace before
+  Pi's file tools run, then restored in tool output. This keeps Pi's local
+  mutation queue from resolving remote-only paths such as `/root` or `/etc`.
 - `edit` serializes mutations inside the current Pi process, but cannot prevent
   another process on the remote host from changing a file between read and
   write steps.

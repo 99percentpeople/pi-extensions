@@ -7,7 +7,7 @@ import {
   type SshRunResult,
   type SshTransportPreference,
 } from "./client.ts";
-import { Ssh2Client, Ssh2ConnectionError, type Ssh2ClientDependencies } from "./ssh2-client.ts";
+import { Ssh2Client, Ssh2ConnectionError } from "./ssh2-client.ts";
 import { Ssh2CompatibilityError } from "./ssh2-config.ts";
 import {
   SshPasswordCancelledError,

@@ -41,7 +41,7 @@ async function remoteCommandExists(
   executor: SshExecutor,
   command: string,
 ): Promise<boolean | undefined> {
-  const shProbe = await runUnchecked(executor, () =>
+  const shProbe = await runUnchecked(() =>
     executor.run(
       `sh -c 'command -v ${command} >/dev/null 2>&1 && printf ok || printf no'`,
       { timeoutSeconds: 10 },
@@ -52,7 +52,7 @@ async function remoteCommandExists(
   }
   // The probe did not run: no sh on this host (Windows), or a transport
   // failure. Ask PowerShell; its absence on Unix yields undefined.
-  const psProbe = await runUnchecked(executor, () =>
+  const psProbe = await runUnchecked(() =>
     executor.run(
       `powershell -NoProfile -NonInteractive -Command "if (Get-Command '${command}' -ErrorAction SilentlyContinue) { Write-Output ok }"`,
       { timeoutSeconds: 10 },
@@ -66,7 +66,6 @@ async function remoteCommandExists(
 
 /** Run a probe, mapping transport failures to `undefined`. */
 async function runUnchecked<T>(
-  executor: SshExecutor,
   run: () => Promise<T>,
 ): Promise<T | undefined> {
   try {
@@ -99,7 +98,7 @@ interface RemoteHostProbe {
  */
 async function probeRemoteHost(executor: SshExecutor): Promise<RemoteHostProbe> {
   const unknown = { kind: "unknown", loginShell: "" } as const;
-  const result = await runUnchecked(executor, () =>
+  const result = await runUnchecked(() =>
     executor.run(
       `sh -c 'p=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); `
         + `[ -n "$p" ] || p=$(readlink -f /bin/sh 2>/dev/null); `

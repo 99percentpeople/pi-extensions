@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -12,6 +12,7 @@ import {
   resolveWorkspaceFiles,
 } from "@99percentpeople/pi-workspace-files";
 import {
+  createEditToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
   type ExtensionAPI,
@@ -2026,40 +2027,62 @@ test("OpenSSH client probes remote home and canonical cwd through framed output"
   client.dispose();
 });
 
-test("remote Unix paths use a Windows-safe logical namespace", () => {
-  const adapter = new UnixBashAdapter(
-    new FakeSshClient({ target: "devbox" }),
-    "win32",
-  );
+test("remote Unix paths use platform-safe logical namespaces", () => {
+  const client = new FakeSshClient({ target: "devbox" });
   const workspace: RemoteWorkspace = {
     platform: "unix",
     shell: "bash",
     home: "/home/deploy",
     cwd: "/srv/project",
   };
-  const logical = adapter.toToolPath("src/a file.ts", workspace);
-  assert.match(logical, /^C:\\__pi_ssh_remote_unix__\\root\\/);
-  assert.equal(adapter.fromToolPath(logical), "/srv/project/src/a file.ts");
+
+  const posixAdapter = new UnixBashAdapter(client, "linux");
+  const posixLogical = posixAdapter.toToolPath("src/a file.ts", workspace);
+  assert.match(posixLogical, /^\/__pi_ssh_remote_unix__\/root\//);
+  assert.doesNotMatch(posixLogical, /\/srv\/project/);
   assert.equal(
-    adapter.fromToolPath(adapter.toToolPath("~/notes.txt", workspace)),
+    posixAdapter.fromToolPath(posixLogical),
+    "/srv/project/src/a file.ts",
+  );
+  assert.equal(
+    posixAdapter.fromToolPath(posixAdapter.toToolPath("~/notes.txt", workspace)),
     "/home/deploy/notes.txt",
+  );
+  assert.throws(
+    () => posixAdapter.fromToolPath("/srv/project/src/a file.ts"),
+    /Invalid logical Unix tool path/,
+  );
+
+  const windowsAdapter = new UnixBashAdapter(client, "win32");
+  const windowsLogical = windowsAdapter.toToolPath("src/a file.ts", workspace);
+  assert.match(windowsLogical, /^C:\\__pi_ssh_remote_unix__\\root\\/);
+  assert.equal(
+    windowsAdapter.fromToolPath(windowsLogical),
+    "/srv/project/src/a file.ts",
   );
 });
 
-test("remote file operations quote paths and stream write content over stdin", async () => {
+test("remote file operations decode logical paths, quote native paths, and stream writes", async () => {
   const client = new FakeSshClient({ target: "devbox" });
   const adapter = new UnixBashAdapter(client, "linux");
+  const workspace: RemoteWorkspace = {
+    platform: "unix",
+    shell: "bash",
+    home: "/home/deploy",
+    cwd: "/srv/project",
+  };
+  const toolPath = (path: string): string => adapter.toToolPath(path, workspace);
   const read = createRemoteReadOperations(adapter);
   const write = createRemoteWriteOperations(adapter);
   const edit = createRemoteEditOperations(adapter);
 
-  assert.equal((await read.readFile("/srv/a file.txt")).toString(), "remote contents\n");
-  assert.equal(await adapter.fileExists("/srv/missing.png"), false);
-  await read.access("/srv/a file.txt");
-  assert.equal(await read.detectImageMimeType?.("/srv/a file.txt"), null);
-  await write.mkdir("/srv/new dir");
-  await write.writeFile("/srv/new dir/value.txt", "secret ' content");
-  await edit.access("/srv/edit.ts");
+  assert.equal((await read.readFile(toolPath("/srv/a file.txt"))).toString(), "remote contents\n");
+  assert.equal(await adapter.fileExists(toolPath("/srv/missing.png")), false);
+  await read.access(toolPath("/srv/a file.txt"));
+  assert.equal(await read.detectImageMimeType?.(toolPath("/srv/a file.txt")), null);
+  await write.mkdir(toolPath("/srv/new dir"));
+  await write.writeFile(toolPath("/srv/new dir/value.txt"), "secret ' content");
+  await edit.access(toolPath("/srv/edit.ts"));
 
   const writeCall = client.calls.find((call) => call.command.startsWith("cat >"));
   assert.ok(writeCall);
@@ -2067,6 +2090,200 @@ test("remote file operations quote paths and stream write content over stdin", a
   assert.doesNotMatch(writeCall.command, /secret/);
   assert.match(writeCall.command, /'\/srv\/new dir\/value\.txt'/);
   assert.match(client.calls.find((call) => call.command.startsWith("test -r"))?.command ?? "", /'\/srv\/a file\.txt'/);
+});
+
+test("Pi write and edit mutation queues never realpath protected Unix remote paths locally", async () => {
+  const client = new FakeSshClient(
+    { target: "router" },
+    { home: "/root", cwd: "/root" },
+  );
+  const adapter = new UnixBashAdapter(client, "linux");
+  const workspace: RemoteWorkspace = {
+    platform: "unix",
+    shell: "sh",
+    home: "/root",
+    cwd: "/root",
+  };
+  const logicalCwd = adapter.toToolPath(workspace.cwd, workspace);
+  const logicalPath = adapter.toToolPath("/root/tool-test.txt", workspace);
+  assert.match(logicalPath, /^\/__pi_ssh_remote_unix__\/root\//);
+  assert.doesNotMatch(logicalPath, /^\/root\//);
+
+  const harness = createExtensionHarness();
+  const writeResult = await createWriteToolDefinition(logicalCwd, {
+    operations: createRemoteWriteOperations(adapter),
+  }).execute(
+    "write-protected-remote",
+    { path: logicalPath, content: "new contents\n" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(writeResult.content[0].text, /Successfully wrote/);
+
+  const editResult = await createEditToolDefinition(logicalCwd, {
+    operations: createRemoteEditOperations(adapter),
+  }).execute(
+    "edit-protected-remote",
+    {
+      path: logicalPath,
+      edits: [{ oldText: "remote contents", newText: "updated contents" }],
+    },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(editResult.content[0].text, /Successfully replaced 1 block/);
+  assert.ok(
+    client.calls.some((call) => call.command.includes("'/root/tool-test.txt'")),
+  );
+  assert.ok(
+    client.calls.every((call) => !call.command.includes("__pi_ssh_remote_unix__")),
+  );
+});
+
+test("extension writes and edits protected Unix paths without exposing its logical namespace", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ flag: "router:/root" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(
+        options,
+        { home: "/root", cwd: "/root" },
+      );
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async () => ({
+      adapter: new UnixBashAdapter(clients.at(-1)!, "linux", "sh"),
+      workspace: {
+        platform: "unix",
+        shell: "sh",
+        home: "/root",
+        cwd: "/root",
+      },
+    }),
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  const writeResult = await harness.tools.get("write").execute(
+    "write-root-remote",
+    { path: "/root/tool-test.txt", content: "new contents\n" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(
+    writeResult.content[0].text,
+    "Successfully wrote 13 bytes to /root/tool-test.txt",
+  );
+
+  const editResult = await harness.tools.get("edit").execute(
+    "edit-root-remote",
+    {
+      path: "/root/tool-test.txt",
+      edits: [{ oldText: "remote contents", newText: "updated contents" }],
+    },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(
+    editResult.content[0].text,
+    "Successfully replaced 1 block(s) in /root/tool-test.txt.",
+  );
+  assert.doesNotMatch(
+    `${writeResult.content[0].text}\n${editResult.content[0].text}\n${editResult.details?.patch ?? ""}`,
+    /__pi_ssh_remote_unix__/,
+  );
+  assert.ok(
+    clients[0].calls.some((call) => call.command.includes("'/root/tool-test.txt'")),
+  );
+});
+
+test("registered skill files and references stay local in SSH sessions", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-skill-test-"));
+  const references = join(directory, "references");
+  const skillPath = join(directory, "SKILL.md");
+  const referencePath = join(references, "guide.md");
+  mkdirSync(references);
+  writeFileSync(
+    skillPath,
+    "---\nname: test-skill\ndescription: Test local skill routing\n---\n\nLocal skill body\n",
+  );
+  writeFileSync(referencePath, "Local reference body\n");
+
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({
+    flag: "router:/root",
+    skillPaths: [skillPath],
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(
+        options,
+        { home: "/root", cwd: "/root" },
+      );
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async () => ({
+      adapter: new UnixBashAdapter(clients.at(-1)!, "linux", "sh"),
+      workspace: {
+        platform: "unix",
+        shell: "sh",
+        home: "/root",
+        cwd: "/root",
+      },
+    }),
+  })(harness.pi);
+
+  try {
+    await harness.emit("session_start", { reason: "startup" });
+    const read = harness.tools.get("read");
+    const callsBeforeSkillReads = clients[0].calls.length;
+
+    const skillResult = await read.execute(
+      "read-local-skill",
+      { path: `@${skillPath}` },
+      undefined,
+      undefined,
+      harness.ctx,
+    );
+    assert.match(skillResult.content[0].text, /Local skill body/);
+
+    const referenceResult = await read.execute(
+      "read-local-skill-reference",
+      { path: referencePath },
+      undefined,
+      undefined,
+      harness.ctx,
+    );
+    assert.equal(referenceResult.content[0].text, "Local reference body\n");
+    assert.equal(
+      clients[0].calls.length,
+      callsBeforeSkillReads,
+      "skill reads must not open a remote SSH channel",
+    );
+
+    const remoteResult = await read.execute(
+      "read-remote-file",
+      { path: "/root/remote.txt" },
+      undefined,
+      undefined,
+      harness.ctx,
+    );
+    assert.equal(remoteResult.content[0].text, "remote contents\n");
+    assert.ok(
+      clients[0].calls.some((call) => call.command.includes("'/root/remote.txt'")),
+      "non-skill reads must remain remote",
+    );
+  } finally {
+    await harness.emit("session_shutdown", { reason: "quit" });
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("remote Bash exports safe session metadata but not the local session path", () => {
@@ -2477,6 +2694,7 @@ interface HarnessOptions {
   sessionName?: string;
   cwd?: string;
   activeTools?: string[];
+  skillPaths?: string[];
 }
 
 function createExtensionHarness(options: HarnessOptions = {}) {
@@ -2503,6 +2721,18 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     },
     getFlag: (name: string) => flags.get(name),
     registerTool: (tool: any) => tools.set(tool.name, tool),
+    getCommands: () => (options.skillPaths ?? []).map((path, index) => ({
+      name: `skill:test-${index}`,
+      description: "Test skill",
+      source: "skill",
+      sourceInfo: {
+        path,
+        source: "local",
+        scope: "user",
+        origin: "top-level",
+        baseDir: join(path, ".."),
+      },
+    })),
     getActiveTools: () => [...activeTools],
     setActiveTools: (names: string[]) => { activeTools = [...names]; },
     registerCommand: (name: string, command: any) => commands.set(name, command),
@@ -3251,6 +3481,61 @@ test("session state migrates Unix v1 entries and validates Windows v2 paths", ()
     remoteCwd: "C:\\Users\\Admin",
     remoteHome: "C:\\Users\\Admin",
   }), undefined);
+  assert.equal(normalizeSshSessionState({
+    version: 2,
+    target: "winbox",
+    remotePlatform: "windows",
+    remoteShell: "zsh",
+    remoteCwd: "C:\\Users\\Admin",
+    remoteHome: "C:\\Users\\Admin",
+  }), undefined);
+  assert.equal(normalizeSshSessionState({
+    version: 2,
+    target: "router",
+    remotePlatform: "unix",
+    remoteShell: "sh",
+    remoteCwd: "/etc",
+    remoteHome: "/root",
+  })?.remoteShell, "sh");
+});
+
+test("ash-only sh sessions survive resume", async () => {
+  const stored: SshSessionState = {
+    version: 2,
+    target: "router",
+    remotePlatform: "unix",
+    remoteShell: "sh",
+    remoteCwd: "/etc",
+    remoteHome: "/root",
+  };
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ branch: [sessionEntry(stored)] });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(
+        options,
+        { home: "/root", cwd: "/etc" },
+      );
+      client.inspectShells = new Set(["sh"]);
+      clients.push(client);
+      return client;
+    },
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "resume" });
+  assert.equal(clients.length, 1);
+  assert.ok(
+    clients[0].calls.some((call) => call.command.startsWith("command -v sh")),
+  );
+  assert.equal(findSshSessionState(harness.entries)?.remoteShell, "sh");
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
+  const prompt = await harness.emit("before_agent_start", {
+    systemPrompt: "Current working directory: /local/project",
+  }) as { systemPrompt: string };
+  assert.match(prompt.systemPrompt, /POSIX sh syntax/);
+  assert.doesNotMatch(prompt.systemPrompt, /execute Bash syntax/);
+  await harness.emit("session_shutdown", { reason: "quit" });
 });
 
 test("resumed sessions reconnect without --ssh and reject a different target", async () => {
