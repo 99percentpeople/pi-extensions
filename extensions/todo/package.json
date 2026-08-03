@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-todo",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "A minimal atomic todo tool with omission-based deletion, compaction-safe state, dependencies, and a read-only Pi widget",
   "type": "module",
   "files": [

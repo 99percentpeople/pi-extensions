@@ -43,12 +43,6 @@ The extension is a no-op when loaded directly on a non-Windows platform.
 
 [Pi coding agent]: https://pi.dev/
 
-## Shared settings
-
-Installing this plugin participates in the shared `/99settings` infrastructure,
-but PowerShell Adapter is omitted from the menu while it has no configurable
-values.
-
 ## License
 
 MIT

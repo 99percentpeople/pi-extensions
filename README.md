@@ -31,7 +31,8 @@ not install or enable any of the others.
 
 ## Shared settings
 
-Installing any extension in this collection enables one configuration command:
+Extensions in this collection that expose configurable values share one
+configuration command:
 
 ```text
 /99settings
@@ -49,6 +50,10 @@ For example:
 
 ```json
 {
+  "background-tasks": {
+    "collapsedTaskLimit": 0,
+    "outputPreview": "finished"
+  },
   "codex-api": {
     "fastMode": false,
     "allowOtherProviders": false,
@@ -78,6 +83,10 @@ For example:
     "foldThreshold": 5,
     "streamingBehavior": "auto",
     "completedBehavior": "auto"
+  },
+  "todo": {
+    "collapsedTaskLimit": 3,
+    "showDependencyNumbers": true
   }
 }
 ```
@@ -193,7 +202,9 @@ Same-task calls in one model response execute in source order, so
 run in parallel. The same sequence works for pipe and PTY tasks.
 
 PTY support uses `node-pty`. If no compatible native binary is available,
-installation may require a C/C++ toolchain. See the
+installation may require a C/C++ toolchain. `/99settings` controls how many task
+rows appear in the collapsed widget and which pipe tasks show latest-output
+previews. See the
 [background-tasks package documentation](extensions/background-tasks/README.md)
 for details.
 
@@ -289,12 +300,12 @@ rejected, and invalid dependency graphs do not partially mutate state. Deleted
 tasks leave no cancelled status or archived record.
 
 The extension deliberately registers no todo-specific slash commands or interactive manager.
-It participates in the shared settings runtime but stays hidden from `/99settings`
-until it exposes configurable values.
-A read-only widget above the input shows the current task when collapsed and the
-complete list when expanded with Pi's standard `Ctrl+O` binding. Task keys stay
-model-only; tasks participating in dependencies receive compact, display-only
-numbers after their names, such as `○ Implement #2 ← #1`, while independent
+A read-only widget above the input shows a configurable number of tasks when
+collapsed and the complete list when expanded with Pi's standard `Ctrl+O`
+binding. Configure the collapsed-item limit and dependency-number visibility
+through `/99settings`. In-progress task labels are bold. Task keys stay
+model-only; when dependency numbers are enabled, participating tasks receive
+compact display-only references such as `○ Implement #2 ← #1`, while independent
 tasks remain unnumbered. The tool call itself remains a compact progress
 confirmation. Completed tasks stay
 visible for the current response, then are automatically removed before the
@@ -306,8 +317,8 @@ for the schema.
 ## Development
 
 The repository uses a private root package as a Bun 1.3.14 workspace. Each
-extension directory is independently publishable and depends on the small
-`pi-shared-settings` infrastructure package.
+extension directory is independently publishable. Extensions with configurable
+values depend on the small `pi-shared-settings` infrastructure package.
 
 ```bash
 bun install --frozen-lockfile

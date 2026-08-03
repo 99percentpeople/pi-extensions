@@ -130,11 +130,13 @@ still retained.
 ## Status widget
 
 Pi displays background tasks below the editor with their status, duration, and
-latest pipe output. The collapsed widget shows only the task totals so it stays
-out of the way by default. Pi's standard tool expansion shortcut (`Ctrl+O` by
-default) reveals the complete task list. Finished pipe tasks include their
-latest output in the expanded view; finished PTY tasks keep the list compact
-because their final screen remains available through attach or explicit logs.
+optional latest pipe output. The collapsed widget shows only the task totals by
+default, or it can show 1, 3, or 5 prioritized task rows. Running tasks are
+selected before the most recently finished tasks while preserving task order.
+Pi's standard tool expansion shortcut (`Ctrl+O` by default) reveals the complete
+task list. Output previews can be disabled or limited to failures, finished
+pipe tasks, or all pipe tasks. Finished PTY tasks stay compact because their
+final screen remains available through attach or explicit logs.
 
 The header uses separate colors for the total, running, and finished counts so
 active work stands out without making the whole widget look like a warning.
@@ -253,9 +255,10 @@ runtime, but `node-pty` is still installed as a package dependency.
 
 ## Shared settings
 
-Installing this plugin participates in the shared `/99settings` infrastructure,
-but Background Tasks is omitted from the menu while it has no configurable
-values. Operational commands such as `/bg-attach` and `/bg-kill` remain separate.
+Use the shared `/99settings` menu to configure the number of task rows shown in
+the collapsed widget and which pipe tasks include their latest output. Defaults
+preserve the compact summary-only widget and finished-task output previews.
+Operational commands such as `/bg-attach` and `/bg-kill` remain separate.
 
 ## License
 

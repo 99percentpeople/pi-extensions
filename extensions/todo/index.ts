@@ -1,4 +1,3 @@
-import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   keyHint,
@@ -8,6 +7,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import {
+  DEFAULT_TODO_CONFIG,
+  loadTodoConfig,
+  normalizeTodoConfig,
+  saveTodoConfig,
+  type TodoConfig,
+} from "./config.ts";
+import { registerTodoSettings } from "./settings.ts";
 import {
   MAX_TODO_TASKS,
   TODO_SCHEMA_VERSION,
@@ -25,7 +32,11 @@ import {
 } from "./state.ts";
 
 const WIDGET_KEY = "pi-todo-widget";
-const COLLAPSED_TASK_LIMIT = 3;
+
+export interface TodoExtensionDependencies {
+  loadConfig?: () => TodoConfig;
+  saveConfig?: (config: TodoConfig) => void;
+}
 
 interface TodoDisplayTask {
   subject: string;
@@ -100,10 +111,16 @@ function formatChange(details: TodoState): string {
   return `Todo plan revision ${details.revision}:\n${lines.join("\n")}`;
 }
 
-function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
+function renderTaskLine(
+  task: TodoDisplayTask,
+  theme: Theme,
+  showDependencyNumbers: boolean,
+): string {
   const number =
-    task.displayNumber !== undefined ? ` #${task.displayNumber}` : "";
-  const dependencies = task.dependencyNumbers?.length
+    showDependencyNumbers && task.displayNumber !== undefined
+      ? ` #${task.displayNumber}`
+      : "";
+  const dependencies = showDependencyNumbers && task.dependencyNumbers?.length
     ? ` ← ${task.dependencyNumbers.map((dependency) => `#${dependency}`).join(", ")}`
     : "";
   const relationship =
@@ -126,24 +143,26 @@ function renderTaskLine(task: TodoDisplayTask, theme: Theme): string {
     task.subject,
   );
   if (task.status === "completed") subject = theme.strikethrough(subject);
+  else if (task.status === "in_progress") subject = theme.bold(subject);
   else if (task.status === "pending") subject = theme.fg("muted", subject);
   return `${theme.fg(color, glyph)} ${subject}${relationship}`;
 }
 
 function getCollapsedTodoTasks<T extends TodoDisplayTask>(
   tasks: readonly T[],
+  collapsedTaskLimit: number,
 ): T[] {
-  if (tasks.length <= COLLAPSED_TASK_LIMIT) return [...tasks];
+  if (tasks.length <= collapsedTaskLimit) return [...tasks];
   if (tasks.every((task) => task.status === "completed")) {
-    return tasks.slice(-COLLAPSED_TASK_LIMIT);
+    return tasks.slice(-collapsedTaskLimit);
   }
   const activeIndex = tasks.findIndex((task) => task.status === "in_progress");
-  if (activeIndex < 0) return tasks.slice(0, COLLAPSED_TASK_LIMIT);
+  if (activeIndex < 0) return tasks.slice(0, collapsedTaskLimit);
   const start = Math.min(
-    Math.max(0, activeIndex - 1),
-    tasks.length - COLLAPSED_TASK_LIMIT,
+    Math.max(0, activeIndex - Math.floor(collapsedTaskLimit / 2)),
+    tasks.length - collapsedTaskLimit,
   );
-  return tasks.slice(start, start + COLLAPSED_TASK_LIMIT);
+  return tasks.slice(start, start + collapsedTaskLimit);
 }
 
 function isTodoStatus(value: unknown): value is TodoStatus {
@@ -244,6 +263,8 @@ function renderTodoWidget(
   state: TodoState,
   width: number,
   expanded: boolean,
+  collapsedTaskLimit: number,
+  showDependencyNumbers: boolean,
   theme: Theme,
 ): string[] {
   const tasks = getTodoTasks(state);
@@ -252,8 +273,8 @@ function renderTodoWidget(
   const displayTasks = toDisplayTasks(tasks);
   const displayed = expanded
     ? displayTasks
-    : getCollapsedTodoTasks(displayTasks);
-  const canExpand = tasks.length > COLLAPSED_TASK_LIMIT;
+    : getCollapsedTodoTasks(displayTasks, collapsedTaskLimit);
+  const canExpand = tasks.length > collapsedTaskLimit;
   const hint = canExpand ? renderExpandHint(expanded, theme) : "";
   const lines = [
     theme.fg(
@@ -264,18 +285,21 @@ function renderTodoWidget(
       hint,
   ];
 
-  lines.push(...displayed.map((task) => renderTaskLine(task, theme)));
+  lines.push(...displayed.map((task) =>
+    renderTaskLine(task, theme, showDependencyNumbers)
+  ));
 
   return lines.map((line) => truncateToWidth(line, width, "…"));
 }
 
-export default function todoExtension(pi: ExtensionAPI): void {
-  registerExtensionSettings(pi, {
-    namespace: "todo",
-    title: "Todo",
-    settings: () => [],
-  });
-
+export default function todoExtension(
+  pi: ExtensionAPI,
+  dependencies: TodoExtensionDependencies = {},
+): void {
+  let config = normalizeTodoConfig(
+    (dependencies.loadConfig ?? loadTodoConfig)(),
+  );
+  const persistConfig = dependencies.saveConfig ?? saveTodoConfig;
   let state = createEmptyTodoState();
   let uiContext: ExtensionContext | undefined;
   let widgetRegistered = false;
@@ -310,6 +334,8 @@ export default function todoExtension(pi: ExtensionAPI): void {
                 state,
                 width,
                 uiContext?.ui.getToolsExpanded() ?? false,
+                config.collapsedTaskLimit,
+                config.showDependencyNumbers,
                 theme,
               ),
             invalidate: () => {},
@@ -325,6 +351,22 @@ export default function todoExtension(pi: ExtensionAPI): void {
       widgetTui?.requestRender();
     }
   };
+
+  registerTodoSettings(pi, {
+    getConfig: () => config,
+    updateConfig: (next, ctx) => {
+      config = normalizeTodoConfig(next);
+      try {
+        persistConfig(config);
+      } catch (error) {
+        ctx.ui.notify(
+          `Failed to save Todo settings: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
+      updateWidget(ctx);
+    },
+  });
 
   pi.registerTool({
     name: TODO_TOOL_NAME,
@@ -361,8 +403,10 @@ export default function todoExtension(pi: ExtensionAPI): void {
       const tasks = resolveDraftTodoTasks(args.tasks, state);
       const hasTaskList = Array.isArray(args.tasks);
       const count = hasTaskList ? args.tasks.length : 0;
-      const canExpand = tasks.length > COLLAPSED_TASK_LIMIT;
-      const displayed = context.expanded ? tasks : getCollapsedTodoTasks(tasks);
+      const canExpand = tasks.length > config.collapsedTaskLimit;
+      const displayed = context.expanded
+        ? tasks
+        : getCollapsedTodoTasks(tasks, config.collapsedTaskLimit);
       const hint = canExpand ? renderExpandHint(context.expanded, theme) : "";
       const summary = hasTaskList
         ? theme.fg("accent", `${count} task${count === 1 ? "" : "s"}`)
@@ -373,7 +417,9 @@ export default function todoExtension(pi: ExtensionAPI): void {
           .join(" ") + hint,
       ];
       if (displayed.length > 0) {
-        lines.push(...displayed.map((task) => renderTaskLine(task, theme)));
+        lines.push(...displayed.map((task) =>
+          renderTaskLine(task, theme, config.showDependencyNumbers)
+        ));
       }
       text.setText(lines.join("\n"));
       return text;
@@ -464,4 +510,17 @@ export default function todoExtension(pi: ExtensionAPI): void {
   });
 }
 
+export {
+  DEFAULT_TODO_CONFIG,
+  getTodoConfigPath,
+  loadTodoConfig,
+  normalizeTodoConfig,
+  saveTodoConfig,
+  TODO_COLLAPSED_TASK_LIMIT_MAX,
+  TODO_COLLAPSED_TASK_LIMIT_MIN,
+  TODO_COLLAPSED_TASK_LIMIT_PRESETS,
+  TODO_SETTINGS_NAMESPACE,
+  type TodoConfig,
+} from "./config.ts";
+export { registerTodoSettings } from "./settings.ts";
 export { TODO_SCHEMA_VERSION };

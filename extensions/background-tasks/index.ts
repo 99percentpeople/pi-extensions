@@ -22,7 +22,6 @@
  *   Or: pi -e ./background-tasks/
  */
 
-import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
@@ -43,6 +42,15 @@ import { Text, truncateToWidth, type Component, type TUI } from "@earendil-works
 import * as nodePty from "node-pty";
 import type { Terminal as XtermTerminal } from "@xterm/headless";
 import type { SerializeAddon as XtermSerializeAddon } from "@xterm/addon-serialize";
+import {
+  DEFAULT_BACKGROUND_TASKS_CONFIG,
+  loadBackgroundTasksConfig,
+  normalizeBackgroundTasksConfig,
+  saveBackgroundTasksConfig,
+  type BackgroundOutputPreview,
+  type BackgroundTasksConfig,
+} from "./config.ts";
+import { registerBackgroundTasksSettings } from "./settings.ts";
 
 const cjsRequire = createRequire(import.meta.url);
 const { Terminal: HeadlessTerminal } = cjsRequire("@xterm/headless") as typeof import("@xterm/headless");
@@ -177,6 +185,11 @@ type PersistedTaskEvent = PersistedTaskUpsert | PersistedTaskReconcile;
 interface BgWaitRenderState {
   startedAt?: number;
   interval?: ReturnType<typeof setInterval>;
+}
+
+export interface BackgroundTasksExtensionDependencies {
+  loadConfig?: () => BackgroundTasksConfig;
+  saveConfig?: (config: BackgroundTasksConfig) => void;
 }
 
 interface StoredLog {
@@ -1396,6 +1409,7 @@ async function attachTask(task: BgTask, ctx: ExtensionContext): Promise<void> {
 
 const WIDGET_KEY = "bg-tasks-widget";
 const WIDGET_REFRESH_INTERVAL_MS = 1000;
+let backgroundTasksConfig = { ...DEFAULT_BACKGROUND_TASKS_CONFIG };
 let uiCtx: ExtensionContext | null = null;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let widgetTui: TUI | null = null;
@@ -1463,9 +1477,44 @@ function formatWidgetDuration(ms: number): string {
   return `${seconds}s`;
 }
 
+function getCollapsedBackgroundTasks(
+  visible: readonly BgTask[],
+  collapsedTaskLimit: number,
+): BgTask[] {
+  if (collapsedTaskLimit <= 0) return [];
+  if (visible.length <= collapsedTaskLimit) return [...visible];
+
+  const selected = new Set(
+    visible
+      .filter((task) => task.status === "running")
+      .slice(-collapsedTaskLimit),
+  );
+  const remaining = collapsedTaskLimit - selected.size;
+  if (remaining > 0) {
+    for (const task of visible
+      .filter((candidate) => candidate.status !== "running")
+      .slice(-remaining)) {
+      selected.add(task);
+    }
+  }
+  return visible.filter((task) => selected.has(task));
+}
+
+function shouldShowOutputPreview(
+  task: BgTask,
+  outputPreview: BackgroundOutputPreview,
+): boolean {
+  if (task.mode !== "pipe" || outputPreview === "off") return false;
+  if (outputPreview === "all") return true;
+  if (outputPreview === "finished") return task.status !== "running";
+  return task.status === "failed";
+}
+
 function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expanded = false): string[] {
   const visible = getVisibleTasks();
-  const displayed = expanded ? visible : [];
+  const displayed = expanded
+    ? visible
+    : getCollapsedBackgroundTasks(visible, backgroundTasksConfig.collapsedTaskLimit);
   const runningCount = getRunningTasks().length;
   const finishedCount = visible.length - runningCount;
   const now = Date.now();
@@ -1482,18 +1531,17 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
       lines.push(theme
         ? `${theme.fg("dim", branch)} ${theme.fg("warning", "◐")} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg("muted", duration)} ${theme.fg("dim", output)}`
         : `${branch} ◐ ${task.name} (${task.id}) ${duration} ${output}`);
-      continue;
+    } else {
+      const glyph = task.status === "completed" ? "✓" : task.status === "failed" ? "×" : "■";
+      const color = task.status === "completed" ? "success" : task.status === "failed" ? "error" : "warning";
+      const exit = task.exitCode !== null ? ` exit=${task.exitCode}` : "";
+      const signal = task.signal ? ` signal=${task.signal}` : "";
+      lines.push(theme
+        ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}`
+        : `${branch} ${glyph} ${task.name} (${task.id}) ${task.status} ${duration}${exit}${signal}`);
     }
 
-    const glyph = task.status === "completed" ? "✓" : task.status === "failed" ? "×" : "■";
-    const color = task.status === "completed" ? "success" : task.status === "failed" ? "error" : "warning";
-    const exit = task.exitCode !== null ? ` exit=${task.exitCode}` : "";
-    const signal = task.signal ? ` signal=${task.signal}` : "";
-    lines.push(theme
-      ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}`
-      : `${branch} ${glyph} ${task.name} (${task.id}) ${task.status} ${duration}${exit}${signal}`);
-
-    if (task.mode === "pipe") {
+    if (shouldShowOutputPreview(task, backgroundTasksConfig.outputPreview)) {
       const latestLog = task.latestLog;
       const output = latestLog
         ? `[${latestLog.stream}] ${truncateText(latestLog.text, MAX_DISPLAY_LOG_CHARS)}`
@@ -1506,7 +1554,7 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
   }
 
   const hintDescription = expanded ? "to collapse" : "to expand";
-  const hint = visible.length > 0
+  const hint = visible.length > backgroundTasksConfig.collapsedTaskLimit
     ? theme
       ? theme.fg("muted", " · ") + keyHint("app.tools.expand", hintDescription)
       : ` · ${keyText("app.tools.expand")} ${hintDescription}`
@@ -1581,16 +1629,34 @@ function updateWidget(): void {
 
 // ── Extension ──────────────────────────────────────────────────────────
 
-export default function (pi: ExtensionAPI) {
+export default function (
+  pi: ExtensionAPI,
+  dependencies: BackgroundTasksExtensionDependencies = {},
+) {
   // Extension modules can survive Pi session replacement. Reset adapters here
   // so a remote or alternate shell from the previous session cannot leak into
   // a newly loaded local session before adapters register again.
   resetExecutionBackend();
+  backgroundTasksConfig = normalizeBackgroundTasksConfig(
+    (dependencies.loadConfig ?? loadBackgroundTasksConfig)(),
+  );
+  const persistConfig = dependencies.saveConfig ?? saveBackgroundTasksConfig;
 
-  registerExtensionSettings(pi, {
-    namespace: "background-tasks",
-    title: "Background Tasks",
-    settings: () => [],
+  registerBackgroundTasksSettings(pi, {
+    getConfig: () => backgroundTasksConfig,
+    updateConfig: (next, ctx) => {
+      backgroundTasksConfig = normalizeBackgroundTasksConfig(next);
+      try {
+        persistConfig(backgroundTasksConfig);
+      } catch (error) {
+        ctx.ui.notify(
+          `Failed to save Background Tasks settings: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
+      uiCtx = ctx;
+      updateWidget();
+    },
   });
 
   const snapshotAppender = (event: PersistedTaskEvent) => {
@@ -2804,3 +2870,21 @@ export default function (pi: ExtensionAPI) {
     },
   });
 }
+
+export {
+  BACKGROUND_COLLAPSED_TASK_LIMIT_MAX,
+  BACKGROUND_COLLAPSED_TASK_LIMIT_MIN,
+  BACKGROUND_COLLAPSED_TASK_LIMIT_PRESETS,
+  BACKGROUND_TASKS_SETTINGS_NAMESPACE,
+  DEFAULT_BACKGROUND_TASKS_CONFIG,
+  getBackgroundTasksConfigPath,
+  loadBackgroundTasksConfig,
+  normalizeBackgroundTasksConfig,
+  saveBackgroundTasksConfig,
+  type BackgroundOutputPreview,
+  type BackgroundTasksConfig,
+} from "./config.ts";
+export {
+  OUTPUT_PREVIEW_LABELS,
+  registerBackgroundTasksSettings,
+} from "./settings.ts";

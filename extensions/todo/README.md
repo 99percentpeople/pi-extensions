@@ -161,8 +161,10 @@ model on the next prompt.
 The task list is rendered in a read-only widget above Pi's input box. It follows
 Pi's standard tool-output expansion state (`Ctrl+O` by default):
 
-- collapsed: overall progress and up to three tasks;
-- expanded: the complete todo list with status glyphs, task names, and resolved prerequisites.
+- collapsed: overall progress and a configurable number of tasks (three by
+  default);
+- expanded: the complete todo list with status glyphs, task names, and resolved
+  prerequisites.
 
 While the model is streaming a `todo` call, the tool row updates in place and
 shows each task name and its compact dependency references as they are written
@@ -170,25 +172,27 @@ instead of only showing a task count.
 Sparse updates reuse the current task name and status until their changed fields
 arrive. Fields that are not yet known are omitted: a new task appears after its
 subject is written, and its status glyph appears only after its status is
-available. This live preview also shows up to three tasks when collapsed and
+available. This live preview uses the configured collapsed-item limit and shows
 all tasks when expanded. After a successful write, the result renderer stays
 empty because the completed tool call already contains the final list;
 validation errors are still displayed below the attempted list.
 
-Tasks always keep their plan order. When collapsed, the widget prefers a
-three-task window containing the item before the first `in_progress` task, the
-active task itself, and the following item. If no task is active, it shows the
-first three tasks. Once every task is completed, it shows the last three tasks
-instead so the most recently finished work remains visible. The expand/collapse
-hint is shown only when more than three tasks are visible.
+Tasks always keep their plan order. When collapsed, the widget selects a window
+around the first `in_progress` task where possible. If no task is active, it
+shows the first configured number of tasks. Once every task is completed, it
+shows the last configured number instead so the most recently finished work
+remains visible. The expand/collapse hint is shown only when the complete list
+exceeds that limit.
 
-The model-facing result includes keys, dependencies, and descriptions. In the
-user-facing live tool call and widget, tasks participating in the dependency
-graph receive plan-order display numbers after their names, such as
-`○ Inspect #1` and `○ Implement #2 ← #1`. Independent tasks stay unnumbered,
-multiple prerequisites use `← #1, #2`, and stable task keys remain hidden. These
-numbers are display-only and may be reassigned when the plan changes. The
-shortcut respects the user's `app.tools.expand` keybinding.
+`in_progress` task labels are rendered in bold in both the live tool call and
+widget. The model-facing result still includes keys, dependencies, and
+descriptions. In the user-facing display, dependency numbering can be shown or
+hidden. When shown, tasks participating in the dependency graph receive
+plan-order display numbers after their names, such as `○ Inspect #1` and
+`○ Implement #2 ← #1`. Independent tasks stay unnumbered, multiple prerequisites
+use `← #1, #2`, and stable task keys remain hidden. These numbers are
+display-only and may be reassigned when the plan changes. The shortcut respects
+the user's `app.tools.expand` keybinding.
 
 ## Persistence
 
@@ -206,8 +210,11 @@ keys, dependencies, and revision numbers without triggering an extra model turn.
 
 ## Shared settings
 
-Installing this plugin participates in the shared `/99settings` infrastructure,
-but Todo is omitted from the menu while it has no configurable values.
+Use the shared `/99settings` menu to choose how many Todo items are shown while
+the widget and streaming tool call are collapsed, and whether display-only
+dependency numbers are shown. Collapsed-item presets are 1, 2, 3, 5, 8, and 10;
+the default remains 3. Dependency numbers default to shown. Values are stored
+under the `todo` namespace in `~/.pi/agent/99extensions.json`.
 
 ## License
 

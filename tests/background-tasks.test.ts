@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
-import { constants as osConstants } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
@@ -11,7 +13,16 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { IPty } from "node-pty";
-import backgroundTasks, { MemoryLogStore } from "../extensions/background-tasks/index.ts";
+import backgroundTasks, {
+  BACKGROUND_COLLAPSED_TASK_LIMIT_PRESETS,
+  DEFAULT_BACKGROUND_TASKS_CONFIG,
+  MemoryLogStore,
+  OUTPUT_PREVIEW_LABELS,
+  loadBackgroundTasksConfig,
+  normalizeBackgroundTasksConfig,
+  saveBackgroundTasksConfig,
+  type BackgroundTasksConfig,
+} from "../extensions/background-tasks/index.ts";
 
 initTheme("dark", false);
 
@@ -169,7 +180,9 @@ afterEach(async () => {
   await Promise.all(cleanups.map((cleanup) => cleanup()));
 });
 
-function createHarness() {
+function createHarness(
+  config: BackgroundTasksConfig = DEFAULT_BACKGROUND_TASKS_CONFIG,
+) {
   const tools = new Map<string, RegisteredTool>();
   const commands = new Map<string, any>();
   const lifecycle = new Map<string, (...args: any[]) => Promise<void> | void>();
@@ -219,7 +232,10 @@ function createHarness() {
     },
   } as unknown as ExtensionContext;
 
-  backgroundTasks(pi);
+  backgroundTasks(pi, {
+    loadConfig: () => ({ ...config }),
+    saveConfig: () => {},
+  });
   eventBus.emit("bg:register", {
     spawn: () => {
       const child = new FakeChildProcess(90_000_000 + children.length);
@@ -329,6 +345,51 @@ test("memory log store retains only its configured capacity", () => {
   logStore.delete(key);
   assert.equal(logStore.read(key), "");
   assert.throws(() => new MemoryLogStore(0), /positive integer/);
+});
+
+test("background task settings normalize and persist widget display options", async () => {
+  assert.deepEqual(BACKGROUND_COLLAPSED_TASK_LIMIT_PRESETS, [0, 1, 3, 5]);
+  assert.deepEqual(OUTPUT_PREVIEW_LABELS, {
+    off: "Off",
+    failures: "Failures",
+    finished: "Finished",
+    all: "All pipe tasks",
+  });
+  assert.deepEqual(
+    normalizeBackgroundTasksConfig(undefined),
+    DEFAULT_BACKGROUND_TASKS_CONFIG,
+  );
+  assert.deepEqual(normalizeBackgroundTasksConfig({
+    collapsedTaskLimit: 3,
+    outputPreview: "all",
+  }), {
+    collapsedTaskLimit: 3,
+    outputPreview: "all",
+  });
+  assert.deepEqual(normalizeBackgroundTasksConfig({
+    collapsedTaskLimit: 11,
+    outputPreview: "unknown",
+  }), DEFAULT_BACKGROUND_TASKS_CONFIG);
+
+  const directory = await mkdtemp(join(tmpdir(), "pi-background-settings-"));
+  const path = join(directory, "99extensions.json");
+  try {
+    await writeFile(path, '{"unknown":{"keep":true}}\n', "utf8");
+    saveBackgroundTasksConfig({ collapsedTaskLimit: 1, outputPreview: "failures" }, path);
+    assert.deepEqual(loadBackgroundTasksConfig(path), {
+      collapsedTaskLimit: 1,
+      outputPreview: "failures",
+    });
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+      unknown: { keep: true },
+      "background-tasks": {
+        collapsedTaskLimit: 1,
+        outputPreview: "failures",
+      },
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("background tasks can pass commands through Pi's stdin shell transport", async () => {
@@ -1317,6 +1378,59 @@ test("background task widget hides entries until expanded and preserves task ord
 
   children[3].finish(0, null);
   children[4].finish(0, null);
+  await lifecycle.get("session_shutdown")?.({}, widgetCtx);
+});
+
+test("background task settings control collapsed rows and running output previews", async () => {
+  const { tools, lifecycle, children, widgets, ctx, setToolsExpanded } = createHarness({
+    collapsedTaskLimit: 1,
+    outputPreview: "all",
+  });
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  const widgetCtx = { ...ctx, hasUI: true } as ExtensionContext;
+  await lifecycle.get("session_start")?.({}, widgetCtx);
+  await bgStart.execute(
+    "settings-first",
+    { name: "settings-first", command: "fake first" },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  await bgStart.execute(
+    "settings-second",
+    { name: "settings-second", command: "fake second" },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+  children[0].stdout.write("first output\n");
+  children[1].stderr.write("second output\n");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const widgetFactory = widgets.get("bg-tasks-widget");
+  assert.ok(widgetFactory);
+  const plainTheme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  const component = widgetFactory({ requestRender: () => {} }, plainTheme);
+  const collapsed = component.render(200).join("\n");
+  assert.match(collapsed, /2 background tasks · 2 running.*to expand/);
+  assert.match(collapsed, /settings-second/);
+  assert.match(collapsed, /\[stderr\] second output/);
+  assert.doesNotMatch(collapsed, /settings-first|first output/);
+
+  setToolsExpanded(true);
+  const expanded = component.render(200).join("\n");
+  assert.match(expanded, /settings-first/);
+  assert.match(expanded, /\[stdout\] first output/);
+  assert.match(expanded, /settings-second/);
+  assert.match(expanded, /\[stderr\] second output/);
+
+  children[0].finish(0, null);
+  children[1].finish(0, null);
   await lifecycle.get("session_shutdown")?.({}, widgetCtx);
 });
 

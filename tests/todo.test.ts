@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import todoExtension from "../extensions/todo/index.ts";
+import todoExtension, {
+  DEFAULT_TODO_CONFIG,
+  loadTodoConfig,
+  normalizeTodoConfig,
+  saveTodoConfig,
+  TODO_COLLAPSED_TASK_LIMIT_PRESETS,
+  type TodoConfig,
+} from "../extensions/todo/index.ts";
 import {
   TODO_SCHEMA_VERSION,
   TodoValidationError,
@@ -331,6 +341,48 @@ test("todo detects when compaction requires a fresh model-facing checkpoint", ()
   assert.equal(needsTodoContextCheckpoint([result, compact, checkpoint]), false);
 });
 
+test("todo settings normalize and persist display preferences", async () => {
+  assert.deepEqual(TODO_COLLAPSED_TASK_LIMIT_PRESETS, [1, 2, 3, 5, 8, 10]);
+  assert.deepEqual(normalizeTodoConfig(undefined), DEFAULT_TODO_CONFIG);
+  assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 1 }), {
+    collapsedTaskLimit: 1,
+    showDependencyNumbers: true,
+  });
+  assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 4 }), {
+    collapsedTaskLimit: 4,
+    showDependencyNumbers: true,
+  });
+  assert.deepEqual(normalizeTodoConfig({ showDependencyNumbers: false }), {
+    collapsedTaskLimit: 3,
+    showDependencyNumbers: false,
+  });
+  assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 0 }), DEFAULT_TODO_CONFIG);
+  assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 11 }), DEFAULT_TODO_CONFIG);
+
+  const directory = await mkdtemp(join(tmpdir(), "pi-todo-settings-"));
+  const path = join(directory, "99extensions.json");
+  try {
+    await writeFile(path, '{"unknown":{"keep":true}}\n', "utf8");
+    saveTodoConfig({
+      collapsedTaskLimit: 5,
+      showDependencyNumbers: false,
+    }, path);
+    assert.deepEqual(loadTodoConfig(path), {
+      collapsedTaskLimit: 5,
+      showDependencyNumbers: false,
+    });
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+      unknown: { keep: true },
+      todo: {
+        collapsedTaskLimit: 5,
+        showDependencyNumbers: false,
+      },
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 interface RegisteredTool {
   name: string;
   executionMode?: string;
@@ -341,7 +393,10 @@ interface RegisteredTool {
   renderResult?: (...args: any[]) => any;
 }
 
-function createHarness(initialBranch: unknown[] = []) {
+function createHarness(
+  initialBranch: unknown[] = [],
+  config: TodoConfig = DEFAULT_TODO_CONFIG,
+) {
   const tools = new Map<string, RegisteredTool>();
   const commands = new Map<string, unknown>();
   const handlers = new Map<string, (...args: any[]) => any>();
@@ -378,7 +433,10 @@ function createHarness(initialBranch: unknown[] = []) {
     },
   } as unknown as ExtensionContext;
 
-  todoExtension(pi);
+  todoExtension(pi, {
+    loadConfig: () => ({ ...config }),
+    saveConfig: () => {},
+  });
   return {
     tools,
     commands,
@@ -422,7 +480,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.deepEqual(
     [...commands.keys()],
     ["99settings"],
-    "todo exposes only the shared settings menu, not a todo-specific command",
+    "todo exposes the shared settings menu but no todo-specific command",
   );
   assert.deepEqual([...handlers.keys()].sort(), [
     "before_agent_start",
@@ -731,6 +789,131 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.match(lastActiveCollapsed, /Implement the core API/);
   assert.match(lastActiveCollapsed, /Verify the completed system/);
   assert.doesNotMatch(lastActiveCollapsed, /Design the database schema|Initialize the project scaffold/);
+});
+
+test("todo collapsed item setting controls widget and tool-call previews", async () => {
+  const harness = createHarness([], {
+    collapsedTaskLimit: 1,
+    showDependencyNumbers: true,
+  });
+  const tool = harness.tools.get("todo");
+  assert.ok(tool);
+  await harness.handlers.get("session_start")?.({}, harness.ctx);
+
+  const tasks: TodoTaskInput[] = [
+    { key: "done", subject: "Finished setup", status: "completed" },
+    {
+      key: "active",
+      subject: "Implement active work",
+      status: "in_progress",
+      dependsOn: ["done"],
+    },
+    {
+      key: "later",
+      subject: "Verify later work",
+      status: "pending",
+      dependsOn: ["active"],
+    },
+  ];
+  await tool.execute(
+    "todo-collapsed-limit",
+    { tasks, baseRevision: 0 },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+
+  initTheme("dark", false);
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+    strikethrough: (text: string) => text,
+  };
+  const widgetFactory = harness.widgets.get("pi-todo-widget") as
+    | ((tui: unknown, theme: unknown) => { render(width: number): string[] })
+    | undefined;
+  assert.ok(widgetFactory);
+  const widget = widgetFactory({ requestRender: () => {} }, theme);
+  const collapsedWidget = widget.render(160).join("\n");
+  assert.match(collapsedWidget, /Implement active work/);
+  assert.doesNotMatch(collapsedWidget, /Finished setup|Verify later work/);
+  assert.match(collapsedWidget, /to expand/);
+
+  const collapsedCall = tool.renderCall?.(
+    { tasks },
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: true },
+  );
+  assert.ok(collapsedCall);
+  const collapsedCallText = collapsedCall.render(160).join("\n");
+  assert.match(collapsedCallText, /Implement active work/);
+  assert.doesNotMatch(collapsedCallText, /Finished setup|Verify later work/);
+
+  harness.setToolsExpanded(true);
+  const expandedWidget = widget.render(160).join("\n");
+  assert.match(expandedWidget, /Finished setup/);
+  assert.match(expandedWidget, /Implement active work/);
+  assert.match(expandedWidget, /Verify later work/);
+});
+
+test("todo bolds the active label and can hide dependency numbers", async () => {
+  const harness = createHarness([], {
+    collapsedTaskLimit: 3,
+    showDependencyNumbers: false,
+  });
+  const tool = harness.tools.get("todo");
+  assert.ok(tool);
+  await harness.handlers.get("session_start")?.({}, harness.ctx);
+
+  const tasks: TodoTaskInput[] = [
+    { key: "done", subject: "Finished setup", status: "completed" },
+    {
+      key: "active",
+      subject: "Implement active work",
+      status: "in_progress",
+      dependsOn: ["done"],
+    },
+    {
+      key: "later",
+      subject: "Verify later work",
+      status: "pending",
+      dependsOn: ["active"],
+    },
+  ];
+  await tool.execute(
+    "todo-hidden-dependencies",
+    { tasks, baseRevision: 0 },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+
+  initTheme("dark", false);
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => `<b>${text}</b>`,
+    strikethrough: (text: string) => `<s>${text}</s>`,
+  };
+  const widgetFactory = harness.widgets.get("pi-todo-widget") as
+    | ((tui: unknown, theme: unknown) => { render(width: number): string[] })
+    | undefined;
+  assert.ok(widgetFactory);
+  const widgetText = widgetFactory({ requestRender: () => {} }, theme)
+    .render(160)
+    .join("\n");
+  assert.match(widgetText, /<b>Implement active work<\/b>/);
+  assert.doesNotMatch(widgetText, /<b>Finished setup<\/b>|<b>Verify later work<\/b>/);
+  assert.doesNotMatch(widgetText, /#\d|←/);
+
+  const call = tool.renderCall?.(
+    { tasks },
+    theme,
+    { lastComponent: undefined, expanded: false, argsComplete: true },
+  );
+  assert.ok(call);
+  const callText = call.render(160).join("\n");
+  assert.match(callText, /<b>Implement active work<\/b>/);
+  assert.doesNotMatch(callText, /#\d|←/);
 });
 
 test("todo removes previous-turn completions atomically and replays them across reload and tree changes", async () => {

@@ -17,7 +17,7 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.2.8",
+      "version": "1.2.9",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@xterm/addon-serialize": "0.14.0",
@@ -33,7 +33,7 @@
     },
     "extensions/codex-api": {
       "name": "@99percentpeople/pi-codex-api",
-      "version": "0.2.2",
+      "version": "0.2.4",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@99percentpeople/pi-workspace-files": "0.1.0",
@@ -58,10 +58,7 @@
     },
     "extensions/pwsh-adapter": {
       "name": "@99percentpeople/pi-pwsh-adapter",
-      "version": "1.0.6",
-      "dependencies": {
-        "@99percentpeople/pi-shared-settings": "0.1.2",
-      },
+      "version": "1.0.8",
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "typebox": "*",
@@ -94,7 +91,7 @@
     },
     "extensions/todo": {
       "name": "@99percentpeople/pi-todo",
-      "version": "1.2.4",
+      "version": "1.2.5",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
       },

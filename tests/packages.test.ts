@@ -76,7 +76,7 @@ test("extensions are independently publishable workspace packages", async () => 
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "1.2.8");
+  assert.equal(background.version, "1.2.9");
   assertBuiltExtensionPackage(background);
   assert.deepEqual(background.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
@@ -111,7 +111,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.0.7");
+  assert.equal(pwsh.version, "1.0.8");
   assertBuiltExtensionPackage(pwsh);
   assert.deepEqual(pwsh.files, ["dist", "README.md", "LICENSE"]);
   assert.deepEqual(pwsh.os, ["win32"]);
@@ -119,7 +119,7 @@ test("extensions are independently publishable workspace packages", async () => 
     pwsh.dependencies?.["@99percentpeople/pi-background-tasks"],
     undefined,
   );
-  assert.equal(pwsh.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
+  assert.equal(pwsh.dependencies?.["@99percentpeople/pi-shared-settings"], undefined);
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
@@ -139,7 +139,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.2.4");
+  assert.equal(todo.version, "1.2.5");
   assertBuiltExtensionPackage(todo);
   assert.deepEqual(todo.files, ["dist", "README.md", "LICENSE"]);
   assert.equal(todo.publishConfig?.access, "public");
