@@ -9,9 +9,11 @@ import {
   AssistantMessageComponent,
   getMarkdownTheme,
   initTheme,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown } from "@earendil-works/pi-tui";
-import {
+import thinkingFoldExtension, {
   BUILT_IN_MODEL_BEHAVIORS,
   createThinkingCursorLabel,
   createThinkingDisplayMessage,
@@ -211,6 +213,61 @@ test("actual output events end thinking even when provider thinking_end is late"
   assert.equal(endsThinkingPhase("text_delta"), true);
   assert.equal(endsThinkingPhase("toolcall_start"), true);
   assert.equal(endsThinkingPhase("thinking_end"), true);
+});
+
+test("trace and summary models without visible reasoning use the normal responding row", async () => {
+  const handlers = new Map<
+    string,
+    Array<(event: any, ctx: ExtensionContext) => unknown>
+  >();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: any, ctx: ExtensionContext) => unknown) {
+      const registered = handlers.get(name) ?? [];
+      registered.push(handler);
+      handlers.set(name, registered);
+    },
+  } as unknown as ExtensionAPI;
+  const workingMessages: Array<string | undefined> = [];
+  const statuses: Array<[string, string | undefined]> = [];
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    model: { reasoning: true },
+    ui: {
+      setWorkingMessage: (message?: string) => workingMessages.push(message),
+      setStatus: (key: string, value?: string) => statuses.push([key, value]),
+    },
+  } as unknown as ExtensionContext;
+  const emit = async (name: string, event: unknown) => {
+    for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
+  };
+
+  thinkingFoldExtension(pi);
+  try {
+    for (const api of ["openai-completions", "openai-responses"] as const) {
+      const message: AssistantMessage = {
+        ...assistant("", api),
+        content: [{ type: "text", text: "answer" }],
+      };
+      await emit("message_start", { message });
+      await emit("message_update", {
+        message,
+        assistantMessageEvent: { type: "text_delta" },
+      });
+
+      assert.equal(workingMessages.at(-1), "Responding...");
+      assert.deepEqual(statuses, []);
+      await emit("message_end", { message });
+    }
+  } finally {
+    await emit("session_shutdown", {});
+  }
+
+  assert.doesNotMatch(
+    workingMessages.filter((message): message is string => message !== undefined).join("\n"),
+    /reasoning details unavailable/,
+  );
 });
 
 test("trace Item shows a timed header while the cursor keeps a Thinking... label", () => {

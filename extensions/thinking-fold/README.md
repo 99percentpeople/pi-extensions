@@ -11,10 +11,19 @@ after-thinking strategies).
 
 ## Demo
 
-Reasoning collapses to a stable tail preview with a timer, then to
+### Trace models
+
+A reasoning trace collapses to a stable tail preview with a timer, then to
 `Thought for Xs (ctrl+t to expand)` — no more scroll-storms:
 
-![thinking-fold demo](../../promo/demo/thinking-fold.gif)
+![thinking-fold trace demo](../../promo/demo/thinking-fold.gif)
+
+### Summary models
+
+A reasoning summary keeps its content folded while the working row shows the
+latest summary headline, then collapses to the same completed timer:
+
+![thinking-fold summary demo](../../promo/demo/thinking-fold-summary.gif)
 
 ## Behavior
 
@@ -66,8 +75,8 @@ Additional behavior:
 - An empty Pi `thinking_start` still creates the timed Item. If a provider emits
   its entire summary immediately before `thinking_end`, the cursor keeps that
   headline visible for at least one second before `Responding…`.
-- Models that expose neither a trace nor a summary use Pi's working row to say
-  that reasoning details are unavailable.
+- Models that expose neither a trace nor a summary transition directly to the
+  normal `Responding...` working row without an extra availability warning.
 - `Ctrl+T` (or the configured `app.thinking.toggle` binding) switches between
   the folded view and complete reasoning blocks. Its expansion hint appears
   only when content is actually hidden: by a `collapse` strategy, or because a

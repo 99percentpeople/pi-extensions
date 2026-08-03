@@ -82,7 +82,7 @@
     },
     "extensions/thinking-fold": {
       "name": "@99percentpeople/pi-thinking-fold",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
       },

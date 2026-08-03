@@ -21,7 +21,6 @@ import {
   type ThinkingFoldPatchHandle,
 } from "./renderer.ts";
 
-const STREAM_STATUS_KEY = "thinking-fold-stream";
 const ITEM_TIMER_INTERVAL_MS = 1000;
 const MIN_SUMMARY_CURSOR_MS = 1000;
 
@@ -278,12 +277,11 @@ export default function (pi: ExtensionAPI) {
       (event.assistantMessageEvent.type === "text_start" ||
         event.assistantMessageEvent.type === "text_delta")
     ) {
-      ctx.ui.setWorkingMessage("Responding… reasoning details unavailable");
-      ctx.ui.setStatus(STREAM_STATUS_KEY, "reasoning details unavailable");
+      showResponding(ctx);
     }
   });
 
-  const clearStreamStatus = (ctx: ExtensionContext) => {
+  const clearStreamState = (ctx: ExtensionContext) => {
     clearSummaryHold();
     stopItemTimer();
     thinkingStartedAt = undefined;
@@ -291,7 +289,6 @@ export default function (pi: ExtensionAPI) {
     lastWorkingMessage = undefined;
     if (ctx.mode !== "tui") return;
     ctx.ui.setWorkingMessage();
-    ctx.ui.setStatus(STREAM_STATUS_KEY, undefined);
   };
 
   pi.on("message_end", (event, ctx) => {
@@ -300,7 +297,7 @@ export default function (pi: ExtensionAPI) {
       patch.completeMessage(event.message);
     }
     currentAssistant = undefined;
-    clearStreamStatus(ctx);
+    clearStreamState(ctx);
   });
 
   pi.on("agent_end", (_event, ctx) => {
@@ -308,7 +305,7 @@ export default function (pi: ExtensionAPI) {
       patch.completeMessage(currentAssistant);
     }
     currentAssistant = undefined;
-    clearStreamStatus(ctx);
+    clearStreamState(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -316,7 +313,6 @@ export default function (pi: ExtensionAPI) {
     removeInputListener?.();
     removeInputListener = undefined;
     if (ctx.hasUI) {
-      ctx.ui.setStatus(STREAM_STATUS_KEY, undefined);
       ctx.ui.setWorkingMessage();
     }
     patch?.dispose();

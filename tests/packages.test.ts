@@ -131,7 +131,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(sshRemote.publishConfig?.access, "public");
 
   assert.equal(thinkingFold.name, "@99percentpeople/pi-thinking-fold");
-  assert.equal(thinkingFold.version, "0.1.6");
+  assert.equal(thinkingFold.version, "0.1.7");
   assertBuiltExtensionPackage(thinkingFold);
   assert.deepEqual(thinkingFold.files, ["dist", "README.md", "LICENSE"]);
   assert.deepEqual(thinkingFold.piBuild?.assets, ["model-behaviors.json"]);
