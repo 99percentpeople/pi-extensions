@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-codex-api",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Expose Codex subscription image, search, Fast, and usage APIs as native Pi tools and commands",
   "type": "module",
   "files": [
