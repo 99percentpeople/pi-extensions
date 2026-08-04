@@ -601,12 +601,38 @@ test("codex_search sends official commands and subscription search settings", as
     () => { searchRefreshes += 1; },
   ));
   assert.ok(tool.parameters.properties?.search_mode);
-  const searchGuidelines = tool.promptGuidelines?.join("\n") ?? "";
-  assert.match(searchGuidelines, /search_mode.*cached.*indexed.*live.*Auto.*fixed user mode/i);
+  assert.equal((tool.parameters as any).properties.search_query.maxItems, 4);
+  assert.equal((tool.parameters as any).properties.image_query.maxItems, 4);
+  assert.equal((tool.parameters as any).properties.open.maxItems, 3);
+  assert.equal((tool.parameters as any).properties.click.maxItems, 3);
+  assert.equal((tool.parameters as any).properties.find.maxItems, 3);
   assert.match(
-    searchGuidelines,
-    /same-day.*exact calendar date.*recency to 1.*freshness.*source-timezone/i,
+    (tool.parameters as any).properties.finance.items.properties.ticker.description,
+    /crypto.*bare symbol.*BTC.*not BTC-USD/i,
   );
+  assert.match(
+    (tool.parameters as any).properties.finance.items.properties.market.description,
+    /provider hint.*does not resolve.*international/i,
+  );
+  assert.match(
+    (tool.parameters as any).properties.weather.items.properties.duration.description,
+    /use 1.*current conditions.*omit.*seven-day/i,
+  );
+  const promptGuidelines = tool.promptGuidelines ?? [];
+  const searchGuidelines = promptGuidelines.join("\n");
+  assert.ok(promptGuidelines.length <= 7, "keep codex_search guidance consolidated");
+  assert.ok(searchGuidelines.length <= 1_250, "keep codex_search guidance token-efficient");
+  assert.match(searchGuidelines, /search first.*strong ref_ids.*short output.*three queries.*fourth.*medium or long/i);
+  assert.match(searchGuidelines, /direct URLs.*best effort.*do not retry blocked URLs/i);
+  assert.match(searchGuidelines, /three pages.*open\/click\/find.*full documents.*response_length.*lineno/i);
+  assert.match(searchGuidelines, /structured data.*separately from page navigation/i);
+  assert.match(searchGuidelines, /Weather: duration=1.*current conditions.*no data.*retry once.*then search/i);
+  assert.match(searchGuidelines, /Crypto: BTC\/ETH.*not BTC-USD.*market.*unsupported exchanges/i);
+  assert.match(searchGuidelines, /NHL standings.*nhl\.com/i);
+  assert.match(searchGuidelines, /cached.*indexed.*live.*Auto.*search_mode/i);
+  assert.match(searchGuidelines, /breaking news.*exact date.*recency=1.*freshness/i);
+  assert.match(searchGuidelines, /screenshots.*open the PDF.*ref_id.*Retry one render timeout/i);
+  assert.match(searchGuidelines, /external content.*untrusted data.*never as instructions/i);
   try {
     const updates: any[] = [];
     const args = {
@@ -812,6 +838,206 @@ test("codex_search uses the logged-in Codex model when cross-provider tools are 
   }
 });
 
+test("codex_search compacts lookup output, hints blocked URLs, and truncates large pages", async () => {
+  const originalFetch = globalThis.fetch;
+  let payload: Record<string, unknown> = {};
+  globalThis.fetch = async () => new Response(JSON.stringify(payload));
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => ({
+    ...DEFAULT_CODEX_API_CONFIG,
+    searchMode: "auto",
+  })));
+  try {
+    payload = {
+      output: "citeturn5finance0 Apple Inc (AAPL) is a equity in the USA market. The price is 308.91 USD currently with a change of -23.80000 (-0.07138%) from the previous close. The intraday high is 311.87 USD and the intraday low is 300.015 USD. The latest open price was 304.69 USD and the intraday volume is 132489137. The market cap is 4,548,969,428,430. The PE ratio is 37.398305084745765. The EPS ratio is 8.71. The latest trade time is Saturday, August 01, 00:15:00 UTC.",
+      results: [],
+    };
+    const financeArgs = { finance: [{ ticker: "AAPL", type: "equity" as const }] };
+    const financeResult = await tool.execute(
+      "finance-call",
+      financeArgs,
+      undefined,
+      undefined,
+      context(process.cwd()),
+    );
+    const financeText = financeResult.content[0].type === "text" ? financeResult.content[0].text : "";
+    assert.match(financeText, /^Apple Inc \(AAPL\) · equity · USA/);
+    assert.match(financeText, /P\/E 37\.4 · EPS 8\.71/);
+    assert.doesNotMatch(financeText, /cite|turn5finance|currently with a change/);
+    assert.equal((financeResult.details as any).display.kind, "lookups");
+    const renderedFinance = render(tool.renderResult!(
+      financeResult,
+      { expanded: false, isPartial: false },
+      plainTheme,
+      renderContext(false, { args: financeArgs }),
+    ));
+    assert.match(renderedFinance, /Apple Inc \(AAPL\) · equity · USA/);
+
+    payload = {
+      output: [
+        "Internal Error ()",
+        "citeturn6view0 Source: open; Total lines: 1",
+        "L0: URL https://example.com/path?q=1 is not safe to open (non-retryable error)",
+      ].join("\n"),
+      results: [],
+    };
+    const blockedResult = await tool.execute(
+      "blocked-open",
+      { open: [{ ref_id: "https://example.com/path?q=1" }] },
+      undefined,
+      undefined,
+      context(process.cwd()),
+    );
+    const blockedText = blockedResult.content[0].type === "text" ? blockedResult.content[0].text : "";
+    assert.match(blockedText, /Codex rejected this direct URL/);
+    assert.match(blockedText, /search.*returned reference ID/i);
+    assert.match(blockedText, /do not repeatedly retry/i);
+
+    payload = {
+      output: Array.from({ length: 2_500 }, (_, index) => `L${index}: page line ${index}`).join("\n"),
+      results: [],
+    };
+    const largeResult = await tool.execute(
+      "large-open",
+      { open: [{ ref_id: "turn9search0" }] },
+      undefined,
+      undefined,
+      context(process.cwd()),
+    );
+    const largeText = largeResult.content[0].type === "text" ? largeResult.content[0].text : "";
+    assert.match(largeText, /Codex search output truncated: 2000\/2500 lines/);
+    assert.match(largeText, /Open fewer references in separate calls/);
+    assert.doesNotMatch(largeText, /page line 2499/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("codex_search explains lookup outages, invalid symbols, unsupported leagues, and partial omissions", async () => {
+  const originalFetch = globalThis.fetch;
+  let payload: Record<string, unknown> = {};
+  globalThis.fetch = async () => new Response(JSON.stringify(payload));
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => ({
+    ...DEFAULT_CODEX_API_CONFIG,
+    searchMode: "auto",
+  })));
+  const execute = async (id: string, args: Record<string, unknown>, output: string) => {
+    payload = { output, results: [] };
+    const result = await tool.execute(
+      id,
+      args as any,
+      undefined,
+      undefined,
+      context(process.cwd()),
+    );
+    return {
+      result,
+      text: result.content[0].type === "text" ? result.content[0].text : "",
+    };
+  };
+
+  try {
+    const weather = await execute(
+      "weather-outage",
+      { weather: [{ location: "Shanghai, China", duration: 1 }], search_mode: "indexed" },
+      "Found no tool response. This likely means the arguments you provided were not valid.",
+    );
+    assert.match(weather.text, /weather lookup intermittently returns no data.*Retry once/i);
+    assert.match(weather.text, /search_query.*instead of repeatedly changing location, duration, or search mode/i);
+    const weatherDisplay = createCodexSearchDisplay(
+      { weather: [{ location: "Shanghai, China", duration: 1 }] },
+      weather.text,
+    );
+    assert.ok(formatCodexSearchDisplay(weatherDisplay, false).some((line) =>
+      line.role === "warning" && /weather lookup intermittently/i.test(line.text)
+    ));
+
+    const crypto = await execute(
+      "crypto-pair",
+      { finance: [{ ticker: "BTC-USD", type: "crypto" }], search_mode: "indexed" },
+      "Found no tool response. This likely means the arguments you provided were not valid.",
+    );
+    assert.match(crypto.text, /crypto quotes require a bare asset ticker.*BTC.*ETH/i);
+    assert.match(crypto.text, /BTC-USD.*ETH-USD.*return no data/i);
+
+    const partialCryptoArgs = {
+      finance: [
+        { ticker: "AAPL", type: "equity" },
+        { ticker: "BTC-USD", type: "crypto" },
+      ],
+      search_mode: "indexed",
+    };
+    const partialCrypto = await execute(
+      "partial-crypto",
+      partialCryptoArgs,
+      "citeturn31finance0 Apple Inc (AAPL) is a equity in the USA market. The price is 303.42 USD currently with a change of -5.50000 (-0.01781%) from the previous close.",
+    );
+    assert.match(partialCrypto.text, /^Apple Inc \(AAPL\)/);
+    assert.match(partialCrypto.text, /crypto quotes require a bare asset ticker/i);
+    assert.deepEqual((partialCrypto.result.details as any).hints, [
+      "Tip: crypto quotes require a bare asset ticker such as BTC or ETH; pair tickers such as BTC-USD and ETH-USD return no data.",
+    ]);
+    const renderedPartialCrypto = render(tool.renderResult!(
+      partialCrypto.result,
+      { expanded: false, isPartial: false },
+      plainTheme,
+      renderContext(false, { args: partialCryptoArgs }),
+    ));
+    assert.match(renderedPartialCrypto, /Apple Inc \(AAPL\).*crypto quotes require a bare asset ticker/is);
+
+    const nhl = await execute(
+      "nhl-standings",
+      { sports: [{ fn: "standings", league: "nhl" }], search_mode: "indexed" },
+      "Found no tool response. This likely means the arguments you provided were not valid.",
+    );
+    assert.match(nhl.text, /does not currently serve NHL standings.*nhl\.com/i);
+
+    const partialNhl = await execute(
+      "partial-nhl",
+      {
+        sports: [
+          { fn: "standings", league: "mlb" },
+          { fn: "standings", league: "nhl" },
+        ],
+        search_mode: "indexed",
+      },
+      "citeturn33sports0 # Division: East\nTampa Bay Rays 65-46",
+    );
+    assert.match(partialNhl.text, /^MLB standings/);
+    assert.match(partialNhl.text, /does not currently serve NHL standings/i);
+
+    const international = await execute(
+      "international-finance",
+      {
+        finance: [
+          { ticker: "0700", type: "equity", market: "HK" },
+          { ticker: "0700.HK", type: "equity" },
+        ],
+        search_mode: "indexed",
+      },
+      "Found no tool response. This likely means the arguments you provided were not valid.",
+    );
+    assert.match(international.text, /does not reliably resolve non-U\.S\. listings.*0700\.HK/i);
+    assert.match(international.text, /market is only a provider hint/i);
+    assert.doesNotMatch(international.text, /ticker is an ETF/i);
+
+    const indexQuote = await execute(
+      "index-quote",
+      { finance: [{ ticker: "SPX", type: "index" }], search_mode: "indexed" },
+      "Found no tool response. This likely means the arguments you provided were not valid.",
+    );
+    assert.match(indexQuote.text, /does not serve index quotes.*SPY/i);
+
+    const filteredSchedule = await execute(
+      "filtered-schedule",
+      { sports: [{ fn: "schedule", league: "nba", team: "Lakers" }], search_mode: "indexed" },
+      "Found no tool response. This likely means the arguments you provided were not valid.",
+    );
+    assert.match(filteredSchedule.text, /schedule with team\/opponent.*retry without/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Codex search display normalizes raw sources and document views", () => {
   const rawSources = [
     "First result (https://one.example/article)",
@@ -832,6 +1058,24 @@ test("Codex search display normalizes raw sources and document views", () => {
   assert.match(sourceText, /Useful first snippet/);
   assert.match(sourceText, /2\. Second result/);
   assert.doesNotMatch(sourceText, /cite|wordlim|Published|Crawled|-{20}|\n\n/);
+
+  const imageDisplay = createCodexSearchDisplay(
+    { image_query: [{ q: "mount fuji sunrise" }] },
+    [
+      "Landscape image page | Flickr (https://flickr.example/photo)",
+      "citeturn2image0 # Sunrise Reflection at Lake Kawaguchiko",
+      "A snow-capped Mount Fuji is mirrored in a calm lake under warm dawn light.",
+      "This photograph appears on a travel page with unrelated background details.",
+    ].join("\n"),
+  );
+  assert.equal(imageDisplay.kind, "sources");
+  const imageText = formatCodexSearchDisplay(imageDisplay, false)
+    .map((line) => line.text)
+    .join("\n");
+  assert.match(imageText, /^1\. Sunrise Reflection at Lake Kawaguchiko/);
+  assert.match(imageText, /flickr\.example/);
+  assert.match(imageText, /snow-capped Mount Fuji/);
+  assert.doesNotMatch(imageText, /Landscape image page|unrelated background details/);
 
   const duplicateUrlDisplay = createCodexSearchDisplay(
     { search_query: [{ q: "test" }] },
@@ -881,6 +1125,16 @@ test("Codex search display normalizes raw sources and document views", () => {
   assert.match(expandedDocument, /^Opened page\n   https:\/\/docs\.example\/page/);
   assert.match(expandedDocument, /Document line 12/);
   assert.doesNotMatch(expandedDocument, /more lines/);
+
+  const screenshotDisplay = createCodexSearchDisplay(
+    { screenshot: [{ ref_id: "turn2view0", pageno: 2 }] },
+    " (https://docs.example/report.pdf)\nciteturn3view0 ",
+  );
+  assert.equal(screenshotDisplay.kind, "document");
+  const screenshotText = formatCodexSearchDisplay(screenshotDisplay, false)
+    .map((line) => line.text)
+    .join("\n");
+  assert.equal(screenshotText, "PDF screenshot · page 3\n   docs.example");
 
   const multiDocumentOutput = [
     [
@@ -943,8 +1197,30 @@ test("Codex search display normalizes raw sources and document views", () => {
   assert.match(expandedMultiDocument, /Embedded heading/);
   assert.doesNotMatch(expandedMultiDocument, /more lines|\[Input\]|cite|wordlim|L\d+:/);
 
+  const manyDocumentOutput = Array.from({ length: 5 }, (_, index) => [
+    `Page ${index + 1} (https://page${index + 1}.example/article)`,
+    `citeturn8view${index} [wordlim: 200] Content type: text/html`,
+    `L0: # Page ${index + 1}`,
+    `L1: Body ${index + 1}`,
+  ].join("\n")).join("\n----------------------------------------\n");
+  const manyDocumentDisplay = createCodexSearchDisplay(
+    { open: Array.from({ length: 5 }, (_, index) => ({ ref_id: `turn7search${index}` })) },
+    manyDocumentOutput,
+  );
+  const collapsedManyDocuments = formatCodexSearchDisplay(manyDocumentDisplay, false, "expand")
+    .map((line) => line.text)
+    .join("\n");
+  assert.match(collapsedManyDocuments, /1\. Page 1/);
+  assert.match(collapsedManyDocuments, /3\. Page 3/);
+  assert.doesNotMatch(collapsedManyDocuments, /4\. Page 4|5\. Page 5/);
+  assert.match(collapsedManyDocuments, /2 more results and 2 more lines \(expand\)/);
+  const expandedManyDocuments = formatCodexSearchDisplay(manyDocumentDisplay, true)
+    .map((line) => line.text)
+    .join("\n");
+  assert.match(expandedManyDocuments, /5\. Page 5/);
+
   const dataDisplay = createCodexSearchDisplay(
-    { weather: [{ location: "Tokyo" }] },
+    {},
     "citeweather0 Weather: Sunny\nTemperature: 24 C",
   );
   assert.equal(dataDisplay.kind, "data");
@@ -952,6 +1228,80 @@ test("Codex search display normalizes raw sources and document views", () => {
     formatCodexSearchDisplay(dataDisplay, false).map((line) => line.text),
     ["Weather: Sunny", "Temperature: 24 C"],
   );
+});
+
+test("Codex search display formats weather, finance, sports, and time lookups", () => {
+  const weatherOutput = [
+    "citeturn8forecast0 Weather for Shanghai, Shanghai, China, China:",
+    "Current Conditions: Light rain, 92°F (33°C)",
+    "Daily Forecast:",
+    "Sunday, August 02: Partly sunny and hot, High: 100°F (38°C), Low: 82°F (28°C)",
+    "Monday, August 03: Mostly sunny, High: 97°F (36°C), Low: 79°F (26°C)",
+    "Tuesday, August 04: Rain, High: 94°F (35°C), Low: 83°F (28°C)",
+    "Wednesday, August 05: Storms, High: 93°F (34°C), Low: 82°F (28°C)",
+    "Severe weather alerts:",
+    "[SevereWeather(name='Shanghai', summary='Thunderstorm Warning in effect. Source: CMA', details='Very long\\nalert instructions')]",
+  ].join("\n");
+  const weatherDisplay = createCodexSearchDisplay(
+    { weather: [{ location: "Shanghai", duration: 4 }] },
+    weatherOutput,
+  );
+  assert.equal(weatherDisplay.kind, "lookups");
+  const collapsedWeatherLines = formatCodexSearchDisplay(weatherDisplay, false, "expand");
+  const collapsedWeather = collapsedWeatherLines.map((line) => line.text).join("\n");
+  assert.match(collapsedWeather, /^Weather · Shanghai, China/);
+  assert.match(collapsedWeather, /Light rain, 92°F \(33°C\)/);
+  assert.match(collapsedWeather, /Sunday, August 02 · Partly sunny and hot · H 100°F \(38°C\) · L 82°F \(28°C\)/);
+  assert.match(collapsedWeather, /Thunderstorm Warning in effect\. Source: CMA/);
+  assert.match(collapsedWeather, /1 more line \(expand\)$/);
+  assert.doesNotMatch(collapsedWeather, /Wednesday, August 05|Very long|alert instructions/);
+  assert.equal(
+    collapsedWeatherLines.find((line) => line.text.includes("Thunderstorm Warning"))?.role,
+    "warning",
+  );
+  const expandedWeather = formatCodexSearchDisplay(weatherDisplay, true)
+    .map((line) => line.text)
+    .join("\n");
+  assert.match(expandedWeather, /Wednesday, August 05 · Storms/);
+  assert.doesNotMatch(expandedWeather, /Very long|alert instructions/);
+
+  const financeOutput = "citeturn5finance0 Apple Inc (AAPL) is a equity in the USA market. The price is 308.91 USD currently with a change of -23.80000 (-0.07138%) from the previous close. The intraday high is 311.87 USD and the intraday low is 300.015 USD. The latest open price was 304.69 USD and the intraday volume is 132489137. The market cap is 4,548,969,428,430. The PE ratio is 37.398305084745765. The EPS ratio is 8.71. The latest trade time is Saturday, August 01, 00:15:00 UTC.";
+  const sportsOutput = [
+    "citeturn5sports0 # Conference: Eastern Conference",
+    "Detroit Pistons 60-22",
+    "Boston Celtics 56-26",
+    "# Conference: Western Conference",
+    "Oklahoma City Thunder 64-18",
+    "San Antonio Spurs 62-20",
+  ].join("\n");
+  const timeOutput = "citeturn5time0 The time in UTC+09:00 is Aug 2, 2026, 6:04:00 PM";
+  const lookupDisplay = createCodexSearchDisplay(
+    {
+      finance: [{ ticker: "AAPL", type: "equity" }],
+      sports: [{ fn: "standings", league: "nba" }],
+      time: [{ utc_offset: "+09:00" }],
+    },
+    [sportsOutput, financeOutput, timeOutput].join("\n----------------------------------------\n"),
+  );
+  assert.equal(lookupDisplay.kind, "lookups");
+  const lookupText = formatCodexSearchDisplay(lookupDisplay, true)
+    .map((line) => line.text)
+    .join("\n");
+  assert.match(lookupText, /1\. NBA standings/);
+  assert.match(lookupText, /Eastern Conference\n   1\. Detroit Pistons 60-22/);
+  assert.match(lookupText, /2\. Apple Inc \(AAPL\) · equity · USA/);
+  assert.match(lookupText, /308\.91 USD · -23\.8 \(-7\.15%\)/);
+  assert.match(lookupText, /Open 304\.69 · High 311\.87 · Low 300\.015/);
+  assert.match(lookupText, /Volume 132\.49M · Market cap 4\.55T USD/);
+  assert.match(lookupText, /P\/E 37\.4 · EPS 8\.71/);
+  assert.match(lookupText, /3\. Time · UTC\+09:00\n   Aug 2, 2026, 6:04:00 PM/);
+  assert.doesNotMatch(lookupText, /cite|turn5|currently with a change/);
+
+  const failedLookup = createCodexSearchDisplay(
+    { weather: [{ location: "Tokyo", duration: 1 }] },
+    "Found no tool response. This likely means the arguments were not valid.",
+  );
+  assert.equal(failedLookup.kind, "data");
 });
 
 test("Codex usage parsing and Fast payload preserve provider data", () => {

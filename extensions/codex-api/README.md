@@ -34,6 +34,38 @@ Image generation with `gpt-image-2` (saved PNG + description):
 
 ![codex image demo](../../promo/demo/codex-image.gif)
 
+## Search output
+
+`codex_search` keeps each result family readable:
+
+- Web and image searches render compact source cards.
+- `open`, `click`, and `find` render grouped document previews; collapsed output
+  shows at most three documents, while expanded output keeps every result.
+- Weather forecasts, finance quotes, sports standings/schedules, and time
+  lookups render structured cards. Weather alert details are reduced to their
+  actionable summaries instead of injecting the provider's full object dump.
+- Structured lookup text is compacted before it reaches the model. Other search
+  output is bounded to 2,000 lines or 50 KB and tells the model to open fewer
+  references if truncation occurs.
+
+For page workflows, search first and open returned reference IDs. Direct URLs
+are best effort because Codex's browsing backend can reject otherwise valid
+URLs. Keep page-navigation batches to three pages or fewer; `response_length`
+and `open.lineno` do not reliably shorten page bodies.
+
+Current Codex backend limitations are surfaced as actionable result hints:
+
+- Weather can become temporarily unavailable even with valid locations; retry
+  once, then fall back to web search rather than looping over modes or locations.
+- Crypto quotes require bare tickers such as `BTC` or `ETH`, not `BTC-USD`.
+- NHL standings are not served by the structured sports lookup.
+- `finance.market` is only a provider hint and does not reliably resolve
+  international exchange listings such as `0700.HK`.
+
+When a batched lookup silently omits one item, the extension compares returned
+reference indexes with the request and reports the missing item's applicable
+hint instead of presenting the batch as fully successful.
+
 ## Quick start
 
 ```bash

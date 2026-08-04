@@ -84,6 +84,9 @@ export {
   type CodexSearchDocument,
   type CodexSearchDisplayLine,
   type CodexSearchDisplayLineRole,
+  type CodexSearchLookup,
+  type CodexSearchLookupSection,
+  type CodexSearchLookupType,
   type CodexSearchSource,
 } from "./search-display.ts";
 export {
