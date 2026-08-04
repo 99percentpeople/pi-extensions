@@ -30,7 +30,7 @@ interface RegisteredTool {
   name: string;
   promptGuidelines?: string[];
   parameters: {
-    properties?: Record<string, { minimum?: number; maximum?: number; enum?: string[] }>;
+    properties?: Record<string, { description?: string; minimum?: number; maximum?: number; enum?: string[] }>;
   };
   executionMode?: string;
   execute: (...args: any[]) => Promise<any>;
@@ -699,23 +699,27 @@ test("background task tools keep waiting, status, output, and termination separa
   const allGuidelines = registeredTools.flatMap((tool) => tool.promptGuidelines ?? []);
   const orderingRules = allGuidelines.filter((guideline) => /strictly in source order/i.test(guideline));
   assert.equal(orderingRules.length, 1, "same-task ordering should be explained by one shared rule");
-  assert.match(orderingRules[0], /compose the required bg_\* calls in one assistant response/i);
-  assert.match(orderingRules[0], /same task id.*different task IDs.*parallel/i);
-  assert.match(orderingRules[0], /bg_start and bg_status without id are outside this ordering/i);
-  const lifecycleRules = allGuidelines.filter((guideline) => /survives ordinary agent-run boundaries/i.test(guideline));
+  assert.match(orderingRules[0], /compose complete bg_\* workflows in one assistant response/i);
+  assert.match(orderingRules[0], /task ID or unique name/i);
+  assert.match(orderingRules[0], /bg_start\(name=.*bg_wait\(id=.*bg_logs\(id=/i);
+  assert.match(orderingRules[0], /different tasks execute in parallel/i);
+  assert.match(orderingRules[0], /bg_status without id is independent/i);
+  const lifecycleRules = allGuidelines.filter((guideline) => /survives ordinary agent runs/i.test(guideline));
   assert.equal(lifecycleRules.length, 1, "task lifetime and snapshot retention should use one shared rule");
   assert.match(lifecycleRules[0], /session reload or shutdown terminates it/i);
-  assert.match(lifecycleRules[0], /finishes before the current agent run settles.*only for the rest of that run.*removed before the next run starts/i);
-  assert.match(lifecycleRules[0], /still running when the agent settles.*finishes while the agent is idle.*throughout the next agent run/i);
-  assert.match(lifecycleRules[0], /inspected multiple times during that run.*removed before the following run/i);
-  assert.doesNotMatch(allGuidelines.join("\n"), /reversing them|emit one bg_wait|then bg_logs chain/i);
-  assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /use bg_wait.*use bg_logs separately/i);
+  assert.match(lifecycleRules[0], /finishing during a run.*retained through that run/i);
+  assert.match(lifecycleRules[0], /still running when the agent settled.*finishes while idle.*retained through the next run/i);
+  assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /place bg_logs immediately after bg_wait in the same assistant response/i);
   assert.match(bgStatus.promptGuidelines?.join("\n") ?? "", /never returns process output/i);
   assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /only background-task tool that reads process output/i);
-  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /returns completion status only/i);
+  assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /bg_wait followed by bg_logs in the same assistant response/i);
+  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /do not wait for the bg_wait result before emitting bg_logs/i);
   assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /timeout leaves the task running/i);
   assert.match(bgSend.promptGuidelines?.join("\n") ?? "", /Use bg_send input for terminal keys/i);
-  assert.match(bgKill.promptGuidelines?.join("\n") ?? "", /termination status only.*use bg_logs/i);
+  assert.match(bgKill.promptGuidelines?.join("\n") ?? "", /termination status only.*bg_kill followed by bg_logs/i);
+  for (const tool of [bgWait, bgStatus, bgLogs, bgSend, bgKill]) {
+    assert.match(tool.parameters.properties?.id?.description ?? "", /Task ID or unique name/i);
+  }
   assert.equal(bgStart.parameters.properties?.wait, undefined);
   assert.equal(bgWait.parameters.properties?.timeout.minimum, 1);
   assert.equal(bgWait.parameters.properties?.timeout.maximum, 3600);
@@ -746,7 +750,7 @@ test("background task tools keep waiting, status, output, and termination separa
     ctx,
   );
   const firstId = first.details.id as string;
-  assert.match(first.content[0].text, /Use bg_wait for finite completion and bg_logs for output/i);
+  assert.match(first.content[0].text, /emit bg_wait then bg_logs together in one assistant response/i);
   let firstWaitSettled = false;
   const firstWait = bgWait.execute("wait-1", { id: firstId, timeout: 1 }, undefined, undefined, ctx)
     .then((result) => {
@@ -994,6 +998,67 @@ test("background task tools keep waiting, status, output, and termination separa
   assert.equal(children[5].stdin.writableEnded, true);
   children[5].finish(0, null);
 
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("start, wait, and logs compose in one response by unique task name", async () => {
+  const { tools, lifecycle, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  const preflight = async (toolName: string, toolCallId: string, input: Record<string, unknown>) => {
+    await lifecycle.get("tool_call")?.({ type: "tool_call", toolName, toolCallId, input }, ctx);
+  };
+  const execute = async (toolName: string, toolCallId: string, input: Record<string, unknown>) => {
+    const tool = tools.get(toolName);
+    assert.ok(tool);
+    try {
+      return await tool.execute(toolCallId, input, undefined, undefined, ctx);
+    } finally {
+      await lifecycle.get("tool_execution_end")?.({ type: "tool_execution_end", toolName, toolCallId }, ctx);
+    }
+  };
+
+  await lifecycle.get("turn_start")?.({ type: "turn_start", turnIndex: 1, timestamp: Date.now() }, ctx);
+  await preflight("bg_start", "composed-start", {
+    name: "Composed Flow",
+    command: "fake composed flow",
+  });
+  await preflight("bg_wait", "composed-wait", { id: "composed flow", timeout: 1 });
+  await preflight("bg_logs", "composed-logs", { id: "COMPOSED FLOW", tail: 10 });
+
+  let waitSettled = false;
+  let logsSettled = false;
+  const started = execute("bg_start", "composed-start", {
+    name: "Composed Flow",
+    command: "fake composed flow",
+  });
+  const waited = execute("bg_wait", "composed-wait", { id: "composed flow", timeout: 1 })
+    .then((result) => {
+      waitSettled = true;
+      return result;
+    });
+  const logged = execute("bg_logs", "composed-logs", { id: "COMPOSED FLOW", tail: 10 })
+    .then((result) => {
+      logsSettled = true;
+      return result;
+    });
+
+  const startResult = await started;
+  const generatedId = startResult.details.id as string;
+  assert.equal(children.length, 1, "bg_start should execute before its same-name successors");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(waitSettled, false, "bg_wait should remain pending until the newly started task exits");
+  assert.equal(logsSettled, false, "bg_logs should remain ordered after bg_wait");
+
+  children[0].stdout.write("COMPOSED FINAL\n");
+  children[0].finish(0, null);
+  const [waitResult, logsResult] = await Promise.all([waited, logged]);
+  assert.equal(waitResult.details.id, generatedId);
+  assert.equal(logsResult.details.id, generatedId);
+  assert.match(logsResult.content[0].text, /COMPOSED FINAL/);
+
+  await lifecycle.get("turn_end")?.({ type: "turn_end", turnIndex: 1 }, ctx);
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 

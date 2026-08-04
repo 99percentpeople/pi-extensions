@@ -59,7 +59,8 @@ Run the test suite in the background and inspect the failures when it exits.
 The model can start, wait for, inspect, signal, and stop tasks. Model-facing
 tools have narrow responsibilities: `bg_wait` reports completion, `bg_status`
 reports metadata, `bg_logs` reads output, and `bg_kill` reports termination.
-Users normally only need the two interactive commands:
+Every model-facing `id` accepts either the generated task ID or its unique,
+case-insensitive name. Users normally only need the two interactive commands:
 
 ```text
 /bg-attach <task-id>
@@ -71,22 +72,26 @@ attached console without stopping its task.
 
 ## Tool ordering and parallelism
 
-Background tool calls that target the same task ID in one model response execute
-strictly in source order. Calls for different task IDs remain independent and
-can execute in parallel. This supports composable workflows without making one
-tool perform another tool's job:
+Background tool calls that target the same task reference in one model response
+execute strictly in source order. A reference can be the generated ID or the
+unique task name. `bg_start` joins the same ordering chain by name, so the model
+does not need to spend a separate round learning the generated ID before it can
+compose the rest of a finite workflow:
 
 ```text
-bg_wait(A) → bg_logs(A)                 # wait, then read final/current-at-timeout output
-bg_send(A) → bg_wait(A) → bg_logs(A)   # interact, wait, then read output
-bg_kill(A) → bg_logs(A)                 # terminate, then read final output
+bg_start(name=A) → bg_wait(id=A) → bg_logs(id=A)  # start, finish, then read output
+bg_wait(A) → bg_logs(A)                            # wait, then read final/current-at-timeout output
+bg_send(A) → bg_wait(A) → bg_logs(A)              # interact, wait, then read output
+bg_kill(A) → bg_logs(A)                            # terminate, then read final output
 ```
 
-The ordering is intentional. `bg_logs(A) → bg_wait(A)` reads the output that is
-available first and only then begins waiting. Multiple chains such as
-`bg_wait(A) → bg_logs(A)` and `bg_wait(B) → bg_logs(B)` can run concurrently.
-A `bg_status` call without an ID is a global snapshot and is not part of any
-single-task chain.
+The model should emit each complete chain in one response instead of waiting for
+one tool result before emitting the next call. Calls for different tasks remain
+independent and execute in parallel. Ordering is intentional:
+`bg_logs(A) → bg_wait(A)` reads available output first and only then waits.
+Multiple chains such as `bg_wait(A) → bg_logs(A)` and
+`bg_wait(B) → bg_logs(B)` can run concurrently. A `bg_status` call without an
+ID is a global snapshot and is not part of any single-task chain.
 
 ## Pipe and PTY modes
 
@@ -215,8 +220,9 @@ after completion, inspection, or termination.
 ## Pi capabilities
 
 The extension exposes a compact set of model-facing operations: start, wait,
-status, logs, send, and kill. Each operation has one responsibility, and
-same-task source ordering composes them without sacrificing parallel execution
+status, logs, send, and kill. Each operation has one responsibility, while
+same-reference source ordering—including `bg_start` by unique name—composes a
+complete workflow in one model response without sacrificing parallel execution
 across tasks. Users can usually describe the desired outcome in natural
 language instead of calling these operations manually. While a tool call is
 streaming, fields appear only after the model writes them; missing arguments are

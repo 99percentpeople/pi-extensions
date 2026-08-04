@@ -197,9 +197,11 @@ bg_start name="git-ui" command="lazygit" pty=true
 
 Terminal keys sent through `bg_send` use angle-bracket tokens such as
 `<C-c>`, `<A-f>`, `<Space>`, `<Up>`, and `<F10>`. Escape a literal `<` as `\<`.
-Same-task calls in one model response execute in source order, so
-`bg_wait → bg_logs` waits before reading output while different task chains can
-run in parallel. The same sequence works for pipe and PTY tasks.
+Every model-facing task `id` also accepts its unique name. Same-task calls in
+one model response execute in source order, including `bg_start` by name, so a
+model can emit `bg_start(name=A) → bg_wait(id=A) → bg_logs(id=A)` together
+without first spending a round to learn the generated ID. Different task chains
+run in parallel, and the same sequence works for pipe and PTY tasks.
 
 PTY support uses `node-pty`. If no compatible native binary is available,
 installation may require a C/C++ toolchain. `/99settings` controls how many task

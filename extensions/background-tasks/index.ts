@@ -322,8 +322,9 @@ const runningTasks = new Set<BgTask>();
 const outputLogStore = new MemoryLogStore();
 // Pi preflights sibling calls in source order before executing them concurrently.
 // Build per-task chains during preflight so same-task calls preserve that order
-// without serializing calls for unrelated task IDs.
-const ORDERED_TASK_TOOL_NAMES = new Set(["bg_wait", "bg_status", "bg_logs", "bg_send", "bg_kill"]);
+// without serializing unrelated tasks. bg_start joins the chain by task name,
+// allowing a model to compose start → wait → logs before a generated ID exists.
+const ORDERED_TASK_TOOL_NAMES = new Set(["bg_start", "bg_wait", "bg_status", "bg_logs", "bg_send", "bg_kill"]);
 const orderedToolCalls = new Map<string, OrderedToolCall>();
 const orderedTaskTails = new Map<string, Promise<void>>();
 const TASK_SNAPSHOT_CUSTOM_TYPE = "pi-background-task-snapshots";
@@ -368,22 +369,39 @@ function clearOrderedToolCalls(): void {
   orderedTaskTails.clear();
 }
 
-function generateId(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let id = "";
-  for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * chars.length)];
-  return id;
-}
-
 function normalizeTaskName(name: string): string {
   return name.trim();
 }
 
+function normalizeTaskNameKey(name: string): string {
+  return normalizeTaskName(name).toLocaleLowerCase();
+}
+
 function findTaskByName(name: string): BgTask | undefined {
-  const normalized = normalizeTaskName(name).toLocaleLowerCase();
+  const normalized = normalizeTaskNameKey(name);
   return Array.from(tasks.values()).find(
-    (task) => normalizeTaskName(task.name).toLocaleLowerCase() === normalized,
+    (task) => normalizeTaskNameKey(task.name) === normalized,
   );
+}
+
+function findTaskByReference(reference: string): BgTask | undefined {
+  const normalized = normalizeTaskName(reference);
+  return tasks.get(normalized) ?? findTaskByName(normalized);
+}
+
+function taskOrderingKey(reference: string): string {
+  const task = findTaskByReference(reference);
+  return task ? `task:${task.id}` : `name:${normalizeTaskNameKey(reference)}`;
+}
+
+function generateId(): string {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let id = "";
+  do {
+    id = "";
+    for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  } while (tasks.has(id) || findTaskByName(id));
+  return id;
 }
 
 function taskLogKey(id: string, stream: "stdout" | "stderr"): string {
@@ -471,7 +489,7 @@ function truncateText(text: string, maxChars: number): string {
 function renderTaskCallLabel(id: unknown, theme: Theme): string {
   const taskId = typeof id === "string" ? id.trim() : "";
   if (!taskId) return "";
-  const task = tasks.get(taskId);
+  const task = findTaskByReference(taskId);
   return task ? theme.fg("accent", task.name) : theme.fg("muted", taskId);
 }
 
@@ -1705,9 +1723,10 @@ export default function (
 
   pi.on("tool_call", async (event) => {
     if (!ORDERED_TASK_TOOL_NAMES.has(event.toolName)) return;
-    const taskId = (event.input as Record<string, unknown>).id;
-    if (typeof taskId !== "string" || taskId.length === 0) return;
-    registerOrderedToolCall(event.toolCallId, taskId);
+    const input = event.input as Record<string, unknown>;
+    const taskReference = event.toolName === "bg_start" ? input.name : input.id;
+    if (typeof taskReference !== "string" || taskReference.trim().length === 0) return;
+    registerOrderedToolCall(event.toolCallId, taskOrderingKey(taskReference));
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
@@ -1772,15 +1791,15 @@ export default function (
   pi.registerTool({
     name: "bg_start",
     label: "BG Start",
-    description: "Start a background task asynchronously using the same configured shell syntax as Pi's bash tool.",
-    promptSnippet: "Start a long-running command in the background",
+    description: "Start a background task asynchronously. Its unique name can immediately reference ordered follow-up bg_* calls in the same assistant response.",
+    promptSnippet: "Start a background command; chain same-name wait/log calls in this response when needed",
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
       "Give each bg_start task a unique name; names are compared case-insensitively across all currently retained tasks.",
       "Set bg_start pty=true only for terminal-aware or interactive TUI programs; keep the default pipe mode for ordinary builds and servers.",
-      "When a task needs multiple actions or pieces of information, compose the required bg_* calls in one assistant response: calls with the same task id execute strictly in source order, while calls with different task IDs can execute in parallel. bg_start and bg_status without id are outside this ordering.",
-      "Within the current session, a running task survives ordinary agent-run boundaries and remains available to bg_wait, bg_status, bg_logs, bg_send, and bg_kill; session reload or shutdown terminates it. If a task finishes before the current agent run settles, bg_wait and bg_status can inspect its final status and bg_logs can inspect its retained output only for the rest of that run, and the task is normally removed before the next run starts. Only a task that is still running when the agent settles and then finishes while the agent is idle remains available throughout the next agent run; it may be inspected multiple times during that run and is normally removed before the following run.",
-      "After bg_start, use bg_wait only for finite tasks whose completion is needed, and use bg_logs separately for output; do not poll either tool.",
+      "Compose complete bg_* workflows in one assistant response. Every bg_* id accepts a task ID or unique name, and same-task calls execute strictly in source order, not in parallel. For example, emit bg_start(name=\"tests\") → bg_wait(id=\"tests\") → bg_logs(id=\"tests\") together; for an existing task, emit bg_wait → bg_logs together. Different tasks execute in parallel, and bg_status without id is independent.",
+      "A running bg_start task survives ordinary agent runs but session reload or shutdown terminates it. A task finishing during a run is normally retained through that run; a task that was still running when the agent settled and then finishes while idle is normally retained through the next run.",
+      "Use bg_wait only for finite bg_start tasks whose completion is needed. When final output is needed, place bg_logs immediately after bg_wait in the same assistant response; do not poll either tool.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "A short unique name for the task (case-insensitive among retained tasks)", minLength: 1 }),
@@ -1793,14 +1812,16 @@ export default function (
 
     executionMode: "parallel",
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
+    async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
+      const predecessor = waitForOrderedToolCall(toolCallId, signal);
+      if (predecessor) await predecessor;
       const name = normalizeTaskName(params.name);
       if (!name) throw new Error("Background task name cannot be empty.");
-      const duplicate = findTaskByName(name);
+      const duplicate = findTaskByReference(name);
       if (duplicate) {
         throw new Error(
-          `Background task name "${name}" is already in use by task ${duplicate.id} (${duplicate.status}). ` +
-          "Choose a unique name.",
+          `Background task name "${name}" is already in use by task ${duplicate.id} (${duplicate.status}) or conflicts with its ID. ` +
+          "Choose a unique name that is not another task's ID.",
         );
       }
 
@@ -1924,7 +1945,7 @@ export default function (
       updateWidget();
 
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nUse bg_wait for finite completion and bg_logs for output. Same-task bg_* calls follow source order.` }],
+        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nReference it by ID or unique name. For finite final output, emit bg_wait then bg_logs together in one assistant response.` }],
         details: { id, name, command: params.command, pid: taskProcess.pid, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
       };
     },
@@ -1955,16 +1976,16 @@ export default function (
   pi.registerTool({
     name: "bg_wait",
     label: "BG Wait",
-    description: "Wait for a finite background task to finish or time out and report its status. Does not return process output or stop the task on timeout.",
-    promptSnippet: "Wait once for a finite background task to finish",
+    description: "Wait for a finite task to finish or time out. When output is needed, compose a following bg_logs call in the same response.",
+    promptSnippet: "Wait for finite completion; put bg_logs next in this response when output is needed",
     promptGuidelines: [
       "Use bg_wait once when a finite task's final status is required before responding.",
-      "bg_wait returns completion status only; use bg_logs as the only tool for reading pipe or PTY output.",
-      "A bg_wait timeout leaves the task running; any later bg_logs call reads the output retained at that point.",
+      "bg_wait returns completion status only. When output is needed, emit bg_wait immediately followed by bg_logs in the same assistant response; do not wait for the bg_wait result before emitting bg_logs.",
+      "A bg_wait timeout leaves the task running; a following same-response bg_logs call reads the output retained at that point.",
       "Do not use bg_wait for persistent servers or watchers, and do not immediately wait again after a timeout unless the user asks you to keep waiting.",
     ],
     parameters: Type.Object({
-      id: Type.String({ description: "Task ID" }),
+      id: Type.String({ description: "Task ID or unique name (case-insensitive)" }),
       timeout: Type.Optional(Type.Number({ description: "Maximum seconds to wait (default: 300)", minimum: 1, maximum: 3600 })),
     }),
 
@@ -1973,7 +1994,7 @@ export default function (
     async execute(toolCallId, params, signal, onUpdate): Promise<AgentToolResult<Record<string, unknown>>> {
       const predecessor = waitForOrderedToolCall(toolCallId, signal);
       if (predecessor) await predecessor;
-      const task = tasks.get(params.id);
+      const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
       const timeoutSeconds = params.timeout ?? 300;
@@ -2073,12 +2094,12 @@ export default function (
     promptSnippet: "Inspect background task status only when status details are needed",
     promptGuidelines: [
       "Do not poll bg_status after bg_start; use bg_wait once when a finite task's final status is required.",
-      "Use bg_status only for requested task metadata, recovering a missing task ID, or diagnosing task state.",
-      "Use bg_status without id only when the task ID is unknown and a retained-task list is needed.",
+      "Use bg_status only for requested task metadata, recovering a missing task reference, or diagnosing task state.",
+      "Use bg_status without id only when the task ID or name is unknown and a retained-task list is needed.",
       "bg_status never returns process output; use bg_logs for both pipe and PTY output.",
     ],
     parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: "Task ID. If omitted, lists all retained tasks." })),
+      id: Type.Optional(Type.String({ description: "Task ID or unique name. If omitted, lists all retained tasks." })),
     }),
 
     executionMode: "parallel",
@@ -2113,7 +2134,7 @@ export default function (
         };
       }
 
-      const task = tasks.get(params.id);
+      const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
 
       const duration = task.endedAt
@@ -2177,16 +2198,16 @@ export default function (
     name: "bg_logs",
     label: "BG Logs",
     description:
-      "Read retained output from a background task: stdout/stderr for pipe mode or the parsed terminal buffer for PTY mode.",
-    promptSnippet: "Read pipe or PTY output from a background task",
+      "Read retained pipe or PTY output. Place bg_logs after bg_wait in the same response to read final output without another model round.",
+    promptSnippet: "Read task output; compose after bg_wait in this response for final logs",
     promptGuidelines: [
       "Use bg_logs as the only background-task tool that reads process output.",
       "Use bg_logs with tail=N for recent output; omit stream to use the correct default for either pipe or PTY mode.",
-      "Do not poll with bg_logs; use one bg_wait call when a finite task's final status is required.",
+      "Do not poll with bg_logs. For finite final output, emit bg_wait followed by bg_logs in the same assistant response; source ordering makes bg_logs run after bg_wait.",
     ],
 
     parameters: Type.Object({
-      id: Type.String({ description: "Task ID" }),
+      id: Type.String({ description: "Task ID or unique name (case-insensitive)" }),
       tail: Type.Optional(
         Type.Number({ description: "Read last N lines (default: 100)" }),
       ),
@@ -2214,7 +2235,7 @@ export default function (
     ): Promise<AgentToolResult<Record<string, unknown>>> {
       const predecessor = waitForOrderedToolCall(toolCallId, signal);
       if (predecessor) await predecessor;
-      const task = tasks.get(params.id);
+      const task = findTaskByReference(params.id);
       if (!task)
         return {
           content: [{ type: "text", text: `Task not found: ${params.id}` }],
@@ -2647,9 +2668,10 @@ export default function (
       "Provide exactly one of bg_send input or signal. bg_send input is exact text; wrap every terminal key in an angle-bracket token such as <C-d>, <A-f>, <Space>, or <Up>, and escape a literal '<' as \\<.",
       "Use bg_send input for terminal keys; use bg_send signal only when an OS process signal is explicitly intended.",
       "For a pipe task, bg_send input=<C-d> or input=<EOF> closes stdin.",
+      "When bg_send is followed by waiting or output inspection, emit bg_send → bg_wait → bg_logs together in one assistant response so same-task source ordering avoids extra model rounds.",
     ],
     parameters: Type.Object({
-      id: Type.String({ description: "Task ID" }),
+      id: Type.String({ description: "Task ID or unique name (case-insensitive)" }),
       input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter>, <A-f>, or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
       signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "Named OS signal supported by the current platform, sent to the process group" })),
     }),
@@ -2659,7 +2681,7 @@ export default function (
     async execute(toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
       const predecessor = waitForOrderedToolCall(toolCallId, signal);
       if (predecessor) await predecessor;
-      const task = tasks.get(params.id);
+      const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is not running.` }], details: {} };
       if (!task.process) return { content: [{ type: "text", text: `Task "${task.name}" process is unavailable.` }], details: {} };
@@ -2736,10 +2758,10 @@ export default function (
     promptGuidelines: [
       "Use bg_kill when a background task must be terminated.",
       "Use bg_kill with force=true to send SIGKILL immediately; otherwise bg_kill sends SIGTERM.",
-      "bg_kill returns termination status only; use bg_logs when process output is needed.",
+      "bg_kill returns termination status only. When final output is needed, emit bg_kill followed by bg_logs in the same assistant response.",
     ],
     parameters: Type.Object({
-      id: Type.String({ description: "Task ID" }),
+      id: Type.String({ description: "Task ID or unique name (case-insensitive)" }),
       force: Type.Optional(Type.Boolean({ description: "Send SIGKILL instead of SIGTERM (default: false)" })),
     }),
 
@@ -2748,7 +2770,7 @@ export default function (
     async execute(toolCallId, params, abortSignal): Promise<AgentToolResult<Record<string, unknown>>> {
       const predecessor = waitForOrderedToolCall(toolCallId, abortSignal);
       if (predecessor) await predecessor;
-      const task = tasks.get(params.id);
+      const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
       if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is already ${task.status}.` }], details: {} };
 
