@@ -1,59 +1,89 @@
 # @99percentpeople/pi-background-tasks
 
-Run long-lived commands alongside the [Pi coding agent](https://pi.dev/) without
-blocking the current conversation. The extension supports ordinary background
-processes as well as full PTY-backed terminal applications, with live status,
-retained output, interactive attach, and completion-aware cleanup.
+Run long-lived commands and full-screen terminal applications alongside the
+[Pi coding agent](https://pi.dev/) without blocking the conversation. Use it
+locally for builds, servers, tests, and TUIs—or combine it with
+[`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote)
+to run and interact with the same workloads on a remote Unix or Windows host.
 
-Just ask Pi to *"start the dev server in the background"* — then keep
-chatting while it runs. `bg_*` tools start, wait on, inspect, and stop tasks;
-`/bg-attach` opens a live terminal you can interact with (`Ctrl+]` to leave).
+Just ask Pi to *"start the dev server in the background"* and keep chatting.
+`bg_*` tools start, wait on, inspect, interact with, and stop tasks;
+`/bg-attach` opens a live terminal (`Ctrl+]` detaches without stopping it).
 
 ## Demo
 
-Ask Pi to start a server in the background — the task keeps running while
-you chat, and the status widget tracks it:
+Ask Pi to start a server in the background—the task keeps running while you
+chat, and the status widget tracks it:
 
-![background-tasks demo](../../promo/demo/background-tasks.gif)
+![background-tasks demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/background-tasks.gif)
 
-## Features
+The same start → attach → detach workflow works for a remote TUI when SSH Remote
+is active.
 
-- Run builds, servers, watchers, tests, and terminal applications in the background
-- Choose lightweight `pipe` mode or a real pseudo-terminal with `pty` mode
-- Keep consuming and retaining output even when no user is attached
-- Attach without pausing or redirecting the child process
-- Replay earlier output before switching seamlessly to live output
-- Interact with PTY applications using keyboard, mouse, focus, and resize events
-- Inspect separate stdout/stderr logs for pipe tasks or a parsed terminal screen for PTY tasks
-- Wait explicitly for task completion without repeated polling
-- Require unique task names while tasks remain retained, preventing ambiguous references
-- Keep final output available long enough for both the user and model to inspect it
-- Track task status, duration, and recent output in a compact expandable widget
-- Send text, terminal keys, stdin data, and process signals to running tasks
-- Use the same shell resolution and command syntax as Pi's built-in `bash` tool
-- Let shell adapters separate a logical task cwd from the local launcher cwd for remote backends
-- Preserve one adapter-provided execution label, such as `SSH devbox:/srv/project`, in task results
+## Highlights
+
+- Keep Pi responsive while builds, servers, watchers, tests, REPLs, and TUIs run
+- Choose lightweight pipe logging or a real PTY with a parsed terminal screen
+- Attach and detach without pausing, restarting, or reconnecting the child
+- Forward PTY keyboard, mouse, focus, and resize events
+- Retain output while detached and replay it before seamlessly following live data
+- Track status, duration, environment, and optional output in a compact widget
+- Address tasks by stable, unique names as well as generated IDs
+- Compose start, wait, logs, input, signals, and termination without polling
+- Route tasks through named shell providers such as SSH Remote and Pwsh Adapter
+- Keep remote tasks bound to their original host and cwd across workspace switches
+- Reconcile SSH transport loss before reporting a remote task as finished
+
+## Contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Run a remote TUI over SSH](#run-a-remote-tui-over-ssh)
+- [Tool ordering and parallelism](#tool-ordering-and-parallelism)
+- [Pipe and PTY modes](#pipe-and-pty-modes)
+- [Live attach and final snapshots](#live-attach-and-final-snapshots)
+- [Output retention and cleanup](#output-retention-and-cleanup)
+- [Sending input and keys](#sending-input-and-keys)
+- [Shell and platform behavior](#shell-and-platform-behavior)
+- [Shell adapter protocol v2](#shell-adapter-protocol-v2)
 
 ## Install
+
+For local background commands and TUIs:
 
 ```bash
 pi install npm:@99percentpeople/pi-background-tasks
 ```
 
-During local development:
+Add SSH Remote when tasks should run in the active remote workspace:
+
+```bash
+pi install npm:@99percentpeople/pi-ssh-remote
+```
+
+The packages are independent: Background Tasks works locally by itself, while
+SSH Remote automatically registers a higher-priority remote provider when both
+are installed. Background Tasks 2.x uses shell adapter protocol v2. Pair it with
+SSH Remote 0.5.0 or newer and, on Windows, Pwsh Adapter 1.1.0 or newer. Legacy
+unnamed providers are rejected so a remote launch cannot silently fall back to
+the local machine. Update installed adapters before updating Background Tasks.
+See the
+[SSH Remote documentation](https://github.com/99percentpeople/pi-extensions/tree/master/extensions/ssh-remote)
+for target, authentication, and transport setup.
+
+During local extension development:
 
 ```bash
 pi -e ./extensions/background-tasks/index.ts
 ```
 
-## Typical workflow
+## Quick start
 
-Ask Pi to start a command in the background, then continue working while it
-runs. For example:
+Describe the desired outcome naturally:
 
 ```text
 Run the development server in the background and tell me when it is ready.
-Start lazygit in a background PTY so I can attach to it.
+Start lazygit in a background PTY named local-git so I can attach to it.
 Run the test suite in the background and inspect the failures when it exits.
 ```
 
@@ -61,15 +91,66 @@ The model can start, wait for, inspect, signal, and stop tasks. Model-facing
 tools have narrow responsibilities: `bg_wait` reports completion, `bg_status`
 reports metadata, `bg_logs` reads output, and `bg_kill` reports termination.
 Every model-facing `id` accepts either the generated task ID or its unique,
-case-insensitive name. Users normally only need the two interactive commands:
+case-insensitive name. Users normally need only these interactive commands:
 
 ```text
 /bg-attach <task-id>
 /bg-kill <task-id>
 ```
 
-Omit the task ID to choose from an interactive list. Press `Ctrl+]` to leave an
-attached console without stopping its task.
+Omit the task ID to choose from an interactive list. Press `Ctrl+]` to leave
+an attached console without stopping its task.
+
+## Run a remote TUI over SSH
+
+With both packages installed, remote TUI execution uses the same Pi conversation
+and the same Background Tasks UI:
+
+```text
+/ssh-connect devbox:/srv/project
+```
+
+Then ask Pi:
+
+```text
+Start lazygit in a background PTY named remote-git so I can attach to it.
+```
+
+Run `/bg-attach` and select `remote-git` from the task list, or pass the task
+ID shown by `bg_start`:
+
+```text
+/bg-attach <task-id>
+```
+
+The PTY is created locally around the system OpenSSH client, while SSH allocates
+the terminal on `devbox` and starts `lazygit` in `/srv/project`. The attached
+screen forwards keyboard, mouse, focus, and resize events. Press `Ctrl+]` to
+return to Pi; `lazygit` keeps running remotely and its terminal state continues
+to be retained. You can keep chatting, change the SSH cwd, switch hosts, or
+return to the local workspace—the existing task stays bound to
+`SSH devbox:/srv/project`. The model can continue addressing it by the unique
+name `remote-git`, and `/bg-attach` keeps it in the interactive task list.
+
+Other useful remote PTY prompts include:
+
+```text
+Start htop in a remote background PTY named host-monitor.
+Run nvim README.md in a background PTY and let me attach.
+Start k9s remotely in a background PTY named cluster-ui.
+```
+
+Important details:
+
+- The task must use PTY mode; full-screen TUIs are not interactive in pipe mode.
+- The program must be installed on the remote host.
+- Remote jobs always use the local system OpenSSH client. They reuse SSH
+  Remote's managed ControlMaster when available; otherwise configure key or
+  agent authentication. Foreground passwords are never copied into background
+  processes.
+- Detaching with `Ctrl+]` leaves the task running, but Pi session shutdown still
+  terminates it. This extension is background task management, not a persistent
+  remote service or terminal multiplexer.
 
 ## Tool ordering and parallelism
 
@@ -201,10 +282,13 @@ Pipe attachments do not forward keyboard input directly, but Pi can still send
 stdin through the background task interface. PTY attachments forward input
 interactively and the same key syntax remains available for model-driven input.
 
-The signal input accepts every named signal exposed by Node.js for the current
-operating system and sends it to the task's process group on Unix. Signal
-availability and behavior remain platform-specific; Windows processes and
-Windows PTYs support a smaller set of effective signal behaviors. Use the
+The signal input accepts a portable named-signal vocabulary and validates each
+request against the task's actual execution environment. Local Unix tasks use
+their process group; a shell adapter can instead declare a process, process
+group, or process-tree target with its own supported signals. SSH Remote uses
+this path so signals reach the remote process group or Windows process tree
+instead of merely killing the local `ssh` transport. Signal behavior remains
+platform-specific, and unsupported requests return an explicit error. Use the
 dedicated kill operation when the goal is reliable process-tree termination.
 
 ## Output inspection
@@ -213,7 +297,9 @@ dedicated kill operation when the goal is reliable process-tree termination.
 retain stdout and stderr separately, while PTY tasks expose the parsed terminal
 buffer rather than raw ANSI escape sequences. Omitting `stream` works in both
 modes: pipe tasks return stdout and stderr, and PTY tasks return terminal output.
-Use `tail` or `from_line`/`max_lines` to select the retained range.
+Use `tail` or `from_line`/`max_lines` to select the retained range. An empty
+running task reports `(no output yet)`; once it finishes, the same empty log is
+reported as `(no output)` (or `(no terminal output)` for PTY mode).
 
 `bg_wait`, `bg_status`, and `bg_kill` deliberately return no logs or terminal
 screens. Emit them before `bg_logs` for the same task when output is needed
@@ -240,10 +326,13 @@ than `cmd.exe`.
 Installing `@99percentpeople/pi-pwsh-adapter` explicitly switches both Pi's
 built-in shell tool and background tasks to PowerShell syntax.
 
-Installing `@99percentpeople/pi-ssh-remote` registers an OpenSSH backend for
-pipe and PTY tasks while an SSH workspace is active. Background Tasks 1.2.7 and
-newer lets that adapter map an explicit `bg_start.cwd` to the remote workspace
-without requiring the same absolute directory to exist locally.
+Installing
+[`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote)
+registers a higher-priority OpenSSH provider for pipe and PTY tasks whenever an
+SSH workspace is active. Commands, including full-screen PTY applications, run
+in the remote cwd; an explicit `bg_start.cwd` is mapped into the remote
+workspace without requiring that absolute directory to exist locally. See
+[Run a remote TUI over SSH](#run-a-remote-tui-over-ssh) for a complete example.
 
 SSH launches are tagged with an immutable environment such as
 `SSH devbox:/srv/project`. `bg_start`, `bg_wait`, `bg_status`, `bg_logs`,
@@ -251,6 +340,57 @@ SSH launches are tagged with an immutable environment such as
 finished snapshots retain it across extension reloads. A running task stays in
 the environment where it started; later tasks follow SSH host, cwd, and
 local/remote transitions.
+
+SSH task signals use a short control connection associated with the immutable
+launch host. A task lease keeps its launch-time ControlMaster available across
+workspace switches and shutdown-handler ordering; when no managed master
+exists, the adapter retries with key or agent authentication. Foreground
+passwords are not copied into background or signal processes. On Unix the
+control request targets the recorded remote process group; Windows termination
+uses the recorded remote process tree. This keeps
+`bg_send` signals, `bg_kill`, and normal Pi shutdown from treating termination
+of the local SSH transport as proof that the remote command exited. If an
+adapter cannot confirm cleanup after its local transport disappears, the task
+enters `disconnected`: retained logs remain readable and adapter signals can be
+retried, but stdin is unavailable until the task is terminated or confirmed
+finished.
+
+### Shell adapter protocol v2
+
+Shell adapters can register independently instead of competing through
+last-writer-wins state:
+
+```ts
+pi.events.emit("bg:register", {
+  id: "my-adapter",
+  priority: 50,
+  resolveShell,
+  spawn,       // optional, scoped to this provider
+  ptySpawn,    // optional, scoped to this provider
+  onRegistered: ({ protocolVersion, taskControl }) => {},
+});
+```
+
+For each launch, an adapter may return `control` alongside `file`, `args`, and
+`env`. A control must implement async `sendSignal`, `probe`, `onTransportExit`,
+and `dispose`; it may also declare `supportedSignals`, `terminatingSignals`,
+the signal target (`process`, `process group`, or `process tree`), and stdin
+availability. Signals receive the tool's `AbortSignal`. The control remains bound
+to the task after its local launcher exits, allowing remote cleanup without
+mistaking transport termination for process termination.
+
+Named providers are queried by descending priority and fall through when their
+resolver returns `undefined`; throwing fails closed. Every registration requires
+an `id` and `resolveShell`; unnamed v1 registrations are rejected. Providers
+can unregister with
+`pi.events.emit("bg:unregister", { id })`. SSH task-control safety requires
+protocol v2, so SSH Remote blocks new remote `bg_start` calls when an older
+Background Tasks build is detected. `bg_send.signal` exposes a portable
+local/remote signal vocabulary and validates each request against the selected
+task's capabilities rather than Pi's local operating system alone. Native
+Windows `ssh.exe -n` pipe launches advertise stdin as unavailable and direct
+interactive input to PTY mode instead of reporting a misleading successful
+write.
 
 Pipe-task completion follows the tracked process's `exit` event rather than the
 stdio `close` event. Launch failures are finalized by the pre-spawn `error`

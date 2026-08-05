@@ -54,6 +54,15 @@ Extensions can be tested individually:
 pi -e ./extensions/my-extension/index.ts
 ```
 
+### Test Data Privacy
+
+- Never copy a developer's real home path, username, hostname, email, SSH target,
+  private IP, credential, or machine-specific configuration into tests, fixtures,
+  docs, snapshots, or examples.
+- Use fixed fictional values such as `/local/workspace`, `/home/deploy`,
+  `devbox`, and documentation-reserved domains or IP ranges.
+- Run `bun run check:privacy` before committing test or e2e changes.
+
 ## Development Workflow
 
 1. Create an extension package under `extensions/my-extension/`

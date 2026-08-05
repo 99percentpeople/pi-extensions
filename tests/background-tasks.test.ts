@@ -47,6 +47,7 @@ class FakeChildProcess extends EventEmitter {
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+  readonly killSignals: NodeJS.Signals[] = [];
   private closed = false;
 
   constructor(readonly pid: number) {
@@ -86,6 +87,7 @@ class FakeChildProcess extends EventEmitter {
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
+    this.killSignals.push(signal);
     this.finish(null, signal);
     return true;
   }
@@ -232,28 +234,43 @@ function createHarness(
     },
   } as unknown as ExtensionContext;
 
+  const testSpawn = () => {
+    const child = new FakeChildProcess(90_000_000 + children.length);
+    children.push(child);
+    return child as unknown as ChildProcess;
+  };
+  const testPtySpawn = (
+    _file: string,
+    _args: string[] | string,
+    options: { cols?: number; rows?: number },
+  ) => {
+    const pty = new FakePty(91_000_000 + ptys.length, options.cols ?? 80, options.rows ?? 24);
+    ptys.push(pty);
+    return pty as unknown as IPty;
+  };
   backgroundTasks(pi, {
     loadConfig: () => ({ ...config }),
     saveConfig: () => {},
+    spawnProcess: testSpawn,
+    ptySpawnProcess: testPtySpawn as typeof import("node-pty").spawn,
+    terminalInput: terminalInput as unknown as NodeJS.ReadStream,
+    terminalOutput: terminalOutput as unknown as NodeJS.WriteStream,
   });
-  eventBus.emit("bg:register", {
-    spawn: () => {
-      const child = new FakeChildProcess(90_000_000 + children.length);
-      children.push(child);
-      return child as unknown as ChildProcess;
-    },
-    ptySpawn: (_file: string, _args: string[] | string, options: { cols?: number; rows?: number }) => {
-      const pty = new FakePty(91_000_000 + ptys.length, options.cols ?? 80, options.rows ?? 24);
-      ptys.push(pty);
-      return pty as unknown as IPty;
-    },
+  const registerTestProvider = (registration: Record<string, unknown>): void => {
+    eventBus.emit("bg:register", {
+      id: "test-default",
+      priority: -100,
+      spawn: testSpawn,
+      ptySpawn: testPtySpawn,
+      ...registration,
+    });
+  };
+  registerTestProvider({
     resolveShell: (command: string) => ({
       file: "test-bash",
       args: ["-c", command],
       env: { ...process.env },
     }),
-    terminalInput: terminalInput as unknown as NodeJS.ReadStream,
-    terminalOutput: terminalOutput as unknown as NodeJS.WriteStream,
   });
   const registeredShutdown = lifecycle.get("session_shutdown");
   let cleaned = false;
@@ -284,6 +301,7 @@ function createHarness(
     widgetUpdates,
     terminalInput,
     terminalOutput,
+    registerTestProvider,
     ctx,
     cleanup: cleanupAfterTest,
     getBranch: () => [...branch],
@@ -393,8 +411,8 @@ test("background task settings normalize and persist widget display options", as
 });
 
 test("background tasks can pass commands through Pi's stdin shell transport", async () => {
-  const { tools, lifecycle, eventBus, children, ctx } = createHarness();
-  eventBus.emit("bg:register", {
+  const { tools, lifecycle, registerTestProvider, children, ctx } = createHarness();
+  registerTestProvider({
     resolveShell: (command: string) => ({
       file: "legacy-wsl-bash",
       args: ["-s"],
@@ -421,14 +439,14 @@ test("background tasks can pass commands through Pi's stdin shell transport", as
 });
 
 test("shell adapters can separate a logical task cwd from the local launch cwd", async () => {
-  const { tools, lifecycle, eventBus, ctx } = createHarness();
+  const { tools, lifecycle, registerTestProvider, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   assert.ok(bgStart);
 
   let resolverCwd: string | undefined;
   let launchCwd: string | undefined;
   const child = new FakeChildProcess(92_000_000);
-  eventBus.emit("bg:register", {
+  registerTestProvider({
     resolveShell: (
       command: string,
       _interactive: boolean,
@@ -467,11 +485,214 @@ test("shell adapters can separate a logical task cwd from the local launch cwd",
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
+test("adapter controls target remote tasks instead of local transport processes", async () => {
+  const { tools, lifecycle, registerTestProvider, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgSend = tools.get("bg_send");
+  const bgKill = tools.get("bg_kill");
+  const bgStatus = tools.get("bg_status");
+  const bgWait = tools.get("bg_wait");
+  assert.ok(bgStart && bgSend && bgKill && bgStatus && bgWait);
+
+  const remoteSignals: NodeJS.Signals[] = [];
+  registerTestProvider({
+    resolveShell: (command: string) => ({
+      file: "ssh",
+      args: ["remote", command],
+      env: { ...process.env },
+      control: {
+        sendSignal: async (signal: NodeJS.Signals) => {
+          remoteSignals.push(signal);
+          if (signal === "SIGTERM" || signal === "SIGKILL") {
+            children[0]?.finish(143, null);
+          }
+        },
+        probe: async () => "running" as const,
+        onTransportExit: async () => ({ state: "finished" as const }),
+        dispose: async () => {},
+      },
+      taskEnvironment: "SSH devbox:/srv/project",
+    }),
+  });
+
+  const started = await bgStart.execute(
+    "remote-signal-start",
+    { name: "remote-signal", command: "sleep 30" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(children.length, 1);
+
+  const sent = await bgSend.execute(
+    "remote-signal-send",
+    { id: started.details.id, signal: "SIGUSR1" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(sent.content[0].text, /Sent SIGUSR1/);
+  assert.deepEqual(remoteSignals, ["SIGUSR1"]);
+  assert.deepEqual(
+    children[0].killSignals,
+    [],
+    "the local ssh launcher must not receive the remote signal",
+  );
+  const running = await bgStatus.execute(
+    "remote-signal-status",
+    { id: started.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(running.details.status, "running");
+
+  const killed = await bgKill.execute(
+    "remote-signal-kill",
+    { id: started.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.deepEqual(remoteSignals, ["SIGUSR1", "SIGTERM"]);
+  assert.deepEqual(children[0].killSignals, []);
+  assert.equal(killed.details.status, "stopped");
+  assert.equal(killed.details.signal, "SIGTERM");
+
+  const waited = await bgWait.execute(
+    "remote-signal-wait",
+    { id: started.details.id, timeout: 1 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(waited.content[0].text, /\n  Environment: SSH devbox:\/srv\/project/);
+  assert.match(waited.content[0].text, /\n  Status:      stopped/);
+  assert.match(waited.content[0].text, /\n  Duration:    \S+/);
+  assert.match(waited.content[0].text, /\n  Exit code:   143/);
+  assert.match(waited.content[0].text, /\n  Signal:      SIGTERM/);
+
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("adapter controls survive a lost local transport and can finish a disconnected task", async () => {
+  const { tools, lifecycle, eventBus, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgStatus = tools.get("bg_status");
+  const bgSend = tools.get("bg_send");
+  const bgKill = tools.get("bg_kill");
+  assert.ok(bgStart && bgStatus && bgSend && bgKill);
+
+  const remoteSignals: string[] = [];
+  let remoteRunning = true;
+  let controlDisposals = 0;
+  eventBus.emit("bg:register", {
+    id: "remote-control-test",
+    priority: 100,
+    spawn: () => {
+      const child = new FakeChildProcess(92_500_000 + children.length);
+      children.push(child);
+      return child as unknown as ChildProcess;
+    },
+    resolveShell: (command: string) => ({
+      file: "ssh",
+      args: ["remote", command],
+      env: { ...process.env },
+      taskEnvironment: "SSH devbox:/srv/project",
+      control: {
+        supportedSignals: ["SIGTERM", "SIGKILL"],
+        terminatingSignals: ["SIGTERM", "SIGKILL"],
+        signalTarget: "process tree",
+        stdinAvailable: false,
+        sendSignal: async (signal: string, options?: { abortSignal?: AbortSignal }) => {
+          assert.notEqual(options?.abortSignal?.aborted, true);
+          remoteSignals.push(signal);
+          if (signal === "SIGKILL") remoteRunning = false;
+        },
+        probe: async () => remoteRunning ? "running" : "finished",
+        onTransportExit: async () => ({
+          state: "disconnected",
+          error: "test transport unavailable",
+        }),
+        dispose: async () => {
+          controlDisposals += 1;
+        },
+      },
+    }),
+  });
+
+  const started = await bgStart.execute(
+    "transport-loss-start",
+    { name: "transport-loss", command: "sleep 30" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  children[0].finish(255, null);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const disconnected = await bgStatus.execute(
+    "transport-loss-status",
+    { id: started.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(disconnected.details.status, "disconnected");
+  assert.match(disconnected.content[0].text, /test transport unavailable/);
+  await lifecycle.get("before_agent_start")?.({}, ctx);
+  const retainedDisconnected = await bgStatus.execute(
+    "transport-loss-retained-status",
+    { id: started.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(
+    retainedDisconnected.details.status,
+    "disconnected",
+    "unconfirmed remote tasks must not be expired or persisted as finished",
+  );
+
+  const input = await bgSend.execute(
+    "transport-loss-input",
+    { id: started.details.id, input: "still there" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(input.content[0].text, /only adapter signals remain available/);
+
+  const unsupported = await bgSend.execute(
+    "transport-loss-unsupported-signal",
+    { id: started.details.id, signal: "SIGUSR1" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(unsupported.content[0].text, /not supported by the process tree/);
+
+  const killed = await bgKill.execute(
+    "transport-loss-kill",
+    { id: started.details.id, force: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.deepEqual(remoteSignals, ["SIGKILL"]);
+  assert.equal(killed.details.status, "stopped");
+  assert.equal(killed.details.signal, "SIGKILL");
+  assert.deepEqual(children[0].killSignals, []);
+  await waitForCondition(() => controlDisposals === 1, "adapter control disposal");
+
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
 test("adapter task environments stay bound to their launch and appear in bg tool results", async () => {
   const {
     tools,
     lifecycle,
-    eventBus,
+    registerTestProvider,
     children,
     ctx,
     getBranch,
@@ -485,7 +706,7 @@ test("adapter task environments stay bound to their launch and appear in bg tool
   assert.ok(bgStart && bgWait && bgStatus && bgLogs && bgSend && bgKill);
 
   const registerSsh = (target: string, cwd: string) => {
-    eventBus.emit("bg:register", {
+    registerTestProvider({
       resolveShell: (command: string) => ({
         file: "ssh",
         args: [target, command],
@@ -618,7 +839,7 @@ test("background task widget shows compact adapter environment labels", async ()
   const {
     tools,
     lifecycle,
-    eventBus,
+    registerTestProvider,
     children,
     widgets,
     ctx,
@@ -628,7 +849,7 @@ test("background task widget shows compact adapter environment labels", async ()
   });
   const widgetCtx = { ...ctx, hasUI: true } as ExtensionContext;
   await lifecycle.get("session_start")?.({}, widgetCtx);
-  eventBus.emit("bg:register", {
+  registerTestProvider({
     resolveShell: (command: string) => ({
       file: "ssh",
       args: ["devbox", command],
@@ -656,17 +877,17 @@ test("background task widget shows compact adapter environment labels", async ()
   const lines = widgetFactory({ requestRender: () => {} }, plainTheme)
     .render(200)
     .map((line: string) => stripVTControlCharacters(line).trimEnd());
-  assert.match(lines[1], /^└─ ◐ remote-widget \([a-z0-9]+\) SSH devbox:\/srv\/project 0s stdout:0 stderr:0$/);
+  assert.match(lines[1], /^└─ ◐ remote-widget \([a-z0-9]+\) 0s stdout:0 stderr:0 @ SSH devbox:\/srv\/project$/);
 
   children[0].finish(0, null);
   await lifecycle.get("session_shutdown")?.({}, widgetCtx);
 });
 
 test("bg_start falls back to the default shell when the resolver returns undefined", async () => {
-  const { tools, lifecycle, children, ctx, eventBus } = createHarness();
+  const { tools, lifecycle, children, ctx, registerTestProvider } = createHarness();
   const bgStart = tools.get("bg_start");
   assert.ok(bgStart);
-  eventBus.emit("bg:register", {
+  registerTestProvider({
     resolveShell: () => undefined,
     spawn: () => {
       const child = new FakeChildProcess(92_000_000 + children.length);
@@ -688,6 +909,168 @@ test("bg_start falls back to the default shell when the resolver returns undefin
 
   children[0].finish(0, null);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("background backend registration rejects unnamed v1 providers", async () => {
+  const { eventBus } = createHarness();
+  assert.throws(
+    () => eventBus.emit("bg:register", {
+      resolveShell: () => ({
+        file: "legacy-shell",
+        args: [],
+        env: { ...process.env },
+      }),
+    }),
+    /requires protocol v2 with a valid id/,
+  );
+});
+
+test("background backend registration validates optional provider callbacks", async () => {
+  const { eventBus } = createHarness();
+  assert.throws(
+    () => eventBus.emit("bg:register", {
+      id: "invalid-provider",
+      resolveShell: () => undefined,
+      spawn: "not-a-function",
+    }),
+    /provider spawn must be a function/,
+  );
+});
+
+test("background task controls require the complete v2 lifecycle", async () => {
+  const { tools, registerTestProvider, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+  registerTestProvider({
+    resolveShell: (command: string) => ({
+      file: "incomplete-control-shell",
+      args: ["-c", command],
+      env: { ...process.env },
+      control: {
+        sendSignal: async () => {},
+      },
+    }),
+  });
+  await assert.rejects(
+    () => bgStart.execute(
+      "incomplete-control",
+      { name: "incomplete-control", command: "sleep 30" },
+      undefined,
+      undefined,
+      ctx,
+    ),
+    /must implement probe\(\)/,
+  );
+  assert.equal(children.length, 0);
+});
+
+test("named shell providers use priority and fall through across environment transitions", async () => {
+  const { tools, lifecycle, eventBus, children, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+
+  let remoteState: "active" | "disabled" | "failed" = "active";
+  let acknowledgedProtocol = 0;
+  const providerSpawns: string[] = [];
+  const createProviderSpawn = (label: string) => () => {
+    providerSpawns.push(label);
+    const child = new FakeChildProcess(93_000_000 + children.length);
+    children.push(child);
+    return child as unknown as ChildProcess;
+  };
+  const localProviderSpawn = createProviderSpawn("pwsh");
+  const remoteProviderSpawn = createProviderSpawn("ssh");
+  eventBus.emit("bg:register", {
+    id: "pwsh-adapter",
+    priority: 10,
+    spawn: localProviderSpawn,
+    resolveShell: (command: string) => ({
+      file: "pwsh.exe",
+      args: ["-Command", command],
+      env: { ...process.env },
+      taskEnvironment: "LOCAL PowerShell",
+    }),
+  });
+  eventBus.emit("bg:register", {
+    id: "ssh-remote",
+    priority: 100,
+    spawn: remoteProviderSpawn,
+    resolveShell: (command: string) => {
+      if (remoteState === "failed") throw new Error("SSH remote is unavailable");
+      if (remoteState === "disabled") return undefined;
+      return {
+        file: "ssh",
+        args: ["devbox", command],
+        env: { ...process.env },
+        taskEnvironment: "SSH devbox:/srv/project",
+      };
+    },
+    onRegistered: (capabilities: { protocolVersion: number }) => {
+      acknowledgedProtocol = capabilities.protocolVersion;
+    },
+  });
+  assert.equal(acknowledgedProtocol, 2);
+
+  // A later lower-priority registration must not steal an active SSH launch.
+  eventBus.emit("bg:register", {
+    id: "pwsh-adapter",
+    priority: 10,
+    spawn: localProviderSpawn,
+    resolveShell: (command: string) => ({
+      file: "pwsh.exe",
+      args: ["-Command", command],
+      env: { ...process.env },
+      taskEnvironment: "LOCAL PowerShell",
+    }),
+  });
+  const remote = await bgStart.execute(
+    "provider-remote",
+    { name: "provider-remote", command: "pwd" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(remote.details.environment, "SSH devbox:/srv/project");
+  assert.deepEqual(providerSpawns, ["ssh"]);
+  children[0].finish(0, null);
+
+  remoteState = "disabled";
+  const local = await bgStart.execute(
+    "provider-local",
+    { name: "provider-local", command: "Get-Location" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(local.details.environment, "LOCAL PowerShell");
+  assert.deepEqual(providerSpawns, ["ssh", "pwsh"]);
+  children[1].finish(0, null);
+
+  remoteState = "failed";
+  await assert.rejects(
+    bgStart.execute(
+      "provider-failed",
+      { name: "provider-failed", command: "pwd" },
+      undefined,
+      undefined,
+      ctx,
+    ),
+    /SSH remote is unavailable/,
+  );
+
+  eventBus.emit("bg:unregister", { id: "ssh-remote" });
+  const afterUnregister = await bgStart.execute(
+    "provider-unregistered",
+    { name: "provider-unregistered", command: "Get-Location" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(afterUnregister.details.environment, "LOCAL PowerShell");
+  assert.deepEqual(providerSpawns, ["ssh", "pwsh", "pwsh"]);
+  children[2].finish(0, null);
+
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
@@ -811,6 +1194,70 @@ test("pipe task status follows process exit rather than stdio close", async () =
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
+test("empty logs only say yet while a task is still running", async () => {
+  const { tools, lifecycle, children, ptys, ctx } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgLogs = tools.get("bg_logs");
+  assert.ok(bgStart && bgLogs);
+
+  const pipe = await bgStart.execute(
+    "empty-pipe-start",
+    { name: "empty-pipe", command: "exit 3" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const runningPipeLogs = await bgLogs.execute(
+    "empty-pipe-running-logs",
+    { id: pipe.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(runningPipeLogs.content[0].text, "(no output yet)");
+
+  children[0].finish(3, null);
+  const failedPipeLogs = await bgLogs.execute(
+    "empty-pipe-failed-logs",
+    { id: pipe.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(failedPipeLogs.details.status, "failed");
+  assert.equal(failedPipeLogs.content[0].text, "(no output)");
+
+  const pty = await bgStart.execute(
+    "empty-pty-start",
+    { name: "empty-pty", command: "exit 3", pty: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const runningPtyLogs = await bgLogs.execute(
+    "empty-pty-running-logs",
+    { id: pty.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(runningPtyLogs.content[0].text, "(no terminal output yet)");
+
+  ptys[0].finish(3);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const failedPtyLogs = await bgLogs.execute(
+    "empty-pty-failed-logs",
+    { id: pty.details.id },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(failedPtyLogs.details.status, "failed");
+  assert.equal(failedPtyLogs.content[0].text, "(no terminal output)");
+
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
 test("background tool calls never render undefined while arguments stream", () => {
   const { tools } = createHarness();
   const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
@@ -924,8 +1371,8 @@ test("background task tools keep waiting, status, output, and termination separa
   assert.ok(bgSend.parameters.properties?.input);
   assert.deepEqual(
     bgSend.parameters.properties?.signal.enum,
-    Object.keys(osConstants.signals).sort(),
-    "bg_send should expose every named signal available on the current platform",
+    Array.from(new Set([...Object.keys(osConstants.signals), "SIGBREAK"])).sort(),
+    "bg_send should expose the portable local/remote signal vocabulary",
   );
   assert.equal(bgSend.parameters.properties?.text, undefined);
   assert.equal(bgSend.parameters.properties?.key, undefined);

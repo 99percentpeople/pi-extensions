@@ -20,9 +20,10 @@ At startup it selects PowerShell once for the whole session:
 
 The selected executable is explicit, so both pipe and PTY background tasks work
 without relying on Windows `PATHEXT` expansion. When SSH Remote is installed,
-the adapter yields the background backend from the beginning of an SSH
-connection attempt through its successful exit, independent of extension
-startup order. It then restores the local PowerShell backend for later tasks.
+the adapter registers a named local Background Tasks provider below SSH's
+priority. Active/connecting SSH therefore owns routing, while local SSH mode
+falls through automatically to PowerShell without last-writer registration
+races or dependence on extension startup order.
 
 ## Requirements
 
@@ -41,6 +42,10 @@ To use PowerShell with background tasks, install both independent packages:
 pi install npm:@99percentpeople/pi-background-tasks
 pi install npm:@99percentpeople/pi-pwsh-adapter
 ```
+
+Background Tasks 2.0.0 or newer requires Pwsh Adapter 1.1.0 or newer. This pair
+uses named Background Control protocol-v2 providers; update the adapter before
+updating Background Tasks so the older unnamed registration is not rejected.
 
 The extension is a no-op when loaded directly on a non-Windows platform.
 

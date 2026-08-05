@@ -54,6 +54,8 @@ export interface Ssh2ClientDependencies {
   resolveConnection?: typeof resolveSsh2Connection;
   resolverOptions?: Ssh2ConfigResolverOptions;
   maxChannels?: number;
+  /** Grace period before a stuck cancelled channel invalidates the connection. */
+  terminationGraceMs?: number;
   /**
    * Called when an endpoint's authentication fails. Returns a password to
    * retry with, or undefined to abort (cancelled / no UI).
@@ -79,6 +81,7 @@ export class Ssh2Client implements SshRemoteClient {
   private readonly resolveConnection: typeof resolveSsh2Connection;
   private readonly resolverOptions: Ssh2ConfigResolverOptions;
   private readonly maxChannels: number;
+  private readonly terminationGraceMs: number;
   private readonly promptPassword: Ssh2ClientDependencies["promptPassword"];
   private readonly channels = new Set<ClientChannel>();
   private readonly tunnelChannels = new Set<ClientChannel>();
@@ -98,9 +101,17 @@ export class Ssh2Client implements SshRemoteClient {
     this.resolveConnection = dependencies.resolveConnection ?? resolveSsh2Connection;
     this.resolverOptions = dependencies.resolverOptions ?? {};
     this.maxChannels = dependencies.maxChannels ?? 8;
+    this.terminationGraceMs = dependencies.terminationGraceMs ?? 1_000;
     this.promptPassword = dependencies.promptPassword;
     if (!Number.isInteger(this.maxChannels) || this.maxChannels < 1 || this.maxChannels > 64) {
       throw new Error("ssh2 maxChannels must be an integer from 1 to 64");
+    }
+    if (
+      !Number.isInteger(this.terminationGraceMs)
+      || this.terminationGraceMs < 1
+      || this.terminationGraceMs > 30_000
+    ) {
+      throw new Error("ssh2 terminationGraceMs must be an integer from 1 to 30000");
     }
   }
 
@@ -436,27 +447,51 @@ export class Ssh2Client implements SshRemoteClient {
         cleanup();
         reject(error);
       };
+      const cancellationError = (): Error => options.signal?.aborted
+        ? new Error("aborted")
+        : timedOut
+          ? new Error(`timeout:${options.timeoutSeconds}`)
+          : new Error("SSH command cancellation did not close the channel");
+      const forceTermination = () => {
+        if (settled) return;
+        try {
+          stream?.signal("KILL");
+        } catch {}
+        try {
+          stream?.close();
+        } catch {}
+        try {
+          stream?.destroy();
+        } catch {}
+        finishReject(cancellationError());
+        // A Windows OpenSSH server can ignore channel signals and keep a
+        // PowerShell tree alive after channel.close(). Tear down the stuck
+        // persistent connection so Esc/timeout cannot wait indefinitely.
+        try {
+          connection.destroy();
+        } catch {}
+        this.invalidateConnection(connection);
+      };
       const applyTermination = () => {
         if (!stream || terminationApplied) return;
         terminationApplied = true;
         try {
           stream.signal("TERM");
         } catch {}
-        forceCloseHandle = setTimeout(() => {
-          try {
-            stream?.signal("KILL");
-            stream?.close();
-          } catch {}
-        }, 1_000);
-        forceCloseHandle.unref?.();
       };
       const requestTermination = () => {
-        terminationRequested = true;
+        if (!terminationRequested) {
+          terminationRequested = true;
+          forceCloseHandle = setTimeout(forceTermination, this.terminationGraceMs);
+          forceCloseHandle.unref?.();
+        }
         applyTermination();
       };
       const onAbort = () => requestTermination();
       const onConnectionClose = () => finishReject(
-        new Ssh2ConnectionError("ssh2 connection closed while a command was running"),
+        terminationRequested
+          ? cancellationError()
+          : new Ssh2ConnectionError("ssh2 connection closed while a command was running"),
       );
 
       connection.once("close", onConnectionClose);
@@ -476,11 +511,21 @@ export class Ssh2Client implements SshRemoteClient {
             }));
             return;
           }
+          // A forced cancellation can settle the command and invalidate the
+          // connection before ssh2 invokes this callback. Never resurrect a
+          // late channel after its semaphore slot and connection were released.
+          if (settled) {
+            channel.on("error", () => {});
+            try {
+              channel.close();
+            } catch {}
+            try {
+              channel.destroy();
+            } catch {}
+            return;
+          }
           stream = channel;
           this.channels.add(channel);
-          if (options.signal?.aborted || timedOut || terminationRequested) {
-            requestTermination();
-          }
 
           channel.on("data", (chunk: Buffer | string) => {
             const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -516,6 +561,9 @@ export class Ssh2Client implements SshRemoteClient {
           });
           channel.on("error", () => {});
           channel.end(options.input);
+          if (options.signal?.aborted || timedOut || terminationRequested) {
+            requestTermination();
+          }
         });
       } catch (error) {
         finishReject(new Ssh2ConnectionError(`Could not execute an ssh2 command: ${errorText(error)}`, {

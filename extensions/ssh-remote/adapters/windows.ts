@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import {
   isAbsolute as isLocalAbsolute,
@@ -6,7 +7,8 @@ import {
   sep as localSeparator,
   win32,
 } from "node:path";
-import type { SshExecutor, SshRunOptions } from "../client.ts";
+import { controlDirectoryName } from "../background-control.ts";
+import type { SshExecutor, SshRunOptions, SshRunResult } from "../client.ts";
 import type {
   RemoteAdapter,
   RemoteDirectoryEntry,
@@ -245,19 +247,81 @@ function isInsideLocalRoot(
   );
 }
 
+export interface WindowsPowerShellCommandHooks {
+  /** Runs after the PowerShell runtime is initialized but before the user command. */
+  before?: string;
+  /** Runs even when the user command throws or exits. */
+  finally?: string;
+}
+
+/** Record a PowerShell root PID and start time for out-of-band tree cleanup. */
+export function buildWindowsProcessControlHooks(
+  token: string,
+): WindowsPowerShellCommandHooks {
+  const directory = controlDirectoryName(token);
+  return {
+    before: `
+$controlDirectory = Join-Path ([IO.Path]::GetTempPath()) '${directory}'
+$statePath = Join-Path $controlDirectory 'state'
+if ([IO.Directory]::Exists($controlDirectory)) { throw 'SSH process control path already exists' }
+[IO.Directory]::CreateDirectory($controlDirectory) | Out-Null
+$controlUtf8 = New-Object Text.UTF8Encoding($false)
+$rootStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+[IO.File]::WriteAllText($statePath, ("$PID $rootStartedAt"), $controlUtf8)
+`,
+    finally: `
+Remove-Item -LiteralPath $controlDirectory -Recurse -Force -ErrorAction SilentlyContinue
+`,
+  };
+}
+
+/** Terminate the validated PowerShell root and every descendant with taskkill. */
+export function buildWindowsProcessTreeKillCommand(
+  shell: RemoteShell,
+  token: string,
+): string {
+  const directory = controlDirectoryName(token);
+  const controller = `
+$ErrorActionPreference = 'Stop'
+$controlDirectory = Join-Path ([IO.Path]::GetTempPath()) '${directory}'
+$statePath = Join-Path $controlDirectory 'state'
+for ($attempt = 0; $attempt -lt 30 -and -not [IO.File]::Exists($statePath); $attempt++) {
+  Start-Sleep -Milliseconds 100
+}
+if (-not [IO.File]::Exists($statePath)) { exit 75 }
+$rootParts = [IO.File]::ReadAllText($statePath).Trim() -split ' '
+$rootProcessId = 0
+$rootStartedAt = [long]0
+if ($rootParts.Count -ne 2 -or -not [int]::TryParse($rootParts[0], [ref]$rootProcessId) -or $rootProcessId -le 0 -or -not [long]::TryParse($rootParts[1], [ref]$rootStartedAt)) { exit 76 }
+$rootProcess = Get-Process -Id $rootProcessId -ErrorAction SilentlyContinue
+if ($null -eq $rootProcess -or $rootProcess.StartTime.ToUniversalTime().Ticks -ne $rootStartedAt) {
+  Remove-Item -LiteralPath $controlDirectory -Recurse -Force -ErrorAction SilentlyContinue
+  exit 77
+}
+& taskkill.exe /PID $rootProcessId /T /F 2>$null | Out-Null
+$exitCode = $LASTEXITCODE
+if ($exitCode -eq 0) {
+  Remove-Item -LiteralPath $controlDirectory -Recurse -Force -ErrorAction SilentlyContinue
+}
+exit $exitCode
+`;
+  return buildPowerShellInvocation(shell, controller);
+}
+
 export function buildWindowsPowerShellCommand(
   shell: RemoteShell,
   command: string,
   cwd: string,
   env?: NodeJS.ProcessEnv,
   interactive = false,
+  hooks?: WindowsPowerShellCommandHooks,
 ): string {
   const assignments: string[] = [];
   for (const key of REMOTE_SESSION_ENV_KEYS) {
     const value = env?.[key];
     if (typeof value === "string") assignments.push(`$env:${key} = ${utf8BytesExpression(value)}`);
   }
-  const body = `
+  const commandBody = `
 Set-Location -LiteralPath (${utf8BytesExpression(cwd)})
 ${assignments.join("\n")}
 $global:LASTEXITCODE = 0
@@ -267,6 +331,9 @@ if ($null -ne $global:LASTEXITCODE -and $global:LASTEXITCODE -ne 0) {
   exit $global:LASTEXITCODE
 }
 `;
+  const body = hooks?.finally !== undefined
+    ? `${hooks.before ?? ""}\ntry {\n${commandBody}\n} finally {\n${hooks.finally}\n}`
+    : `${hooks?.before ?? ""}\n${commandBody}`;
   return buildPowerShellInvocation(shell, wrappedPowerShellScript(body), !interactive);
 }
 
@@ -606,8 +673,88 @@ while ($files.Count -gt 0 -and $count -lt ${options.limit}) {
     cwd: string,
     options: SshRunOptions & { env?: NodeJS.ProcessEnv } = {},
   ): Promise<number | null> {
-    const { env, ...runOptions } = options;
-    const result = await this.executor.run(this.buildShellCommand(command, cwd, env), runOptions);
+    const { env, signal, timeoutSeconds, ...runOptions } = options;
+    if (signal?.aborted) throw new Error("aborted");
+    if (
+      timeoutSeconds !== undefined
+      && (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)
+    ) {
+      throw new Error("SSH timeout must be a positive number of seconds");
+    }
+
+    // Windows OpenSSH does not reliably deliver SSH TERM/KILL requests to a
+    // PowerShell process tree. Record the root PID for cancellable tool calls,
+    // then use a second channel and taskkill /T /F before closing the primary
+    // transport. This also removes nested programs such as ssh.exe children.
+    const controlled = signal !== undefined || timeoutSeconds !== undefined;
+    if (!controlled) {
+      const result = await this.executor.run(this.buildShellCommand(command, cwd, env), runOptions);
+      if (result.exitCode === 255) {
+        throw new Error("SSH transport failed (ssh exited with code 255)");
+      }
+      return result.exitCode;
+    }
+
+    const token = randomBytes(16).toString("hex");
+    const transportController = new AbortController();
+    const shellCommand = buildWindowsPowerShellCommand(
+      this.shell,
+      command,
+      cwd,
+      env,
+      false,
+      buildWindowsProcessControlHooks(token),
+    );
+    let stopReason: "aborted" | "timeout" | undefined;
+    let stopPromise: Promise<void> | undefined;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+    const requestStop = (reason: "aborted" | "timeout"): void => {
+      if (stopReason) return;
+      stopReason = reason;
+      stopPromise = this.executor.run(
+        buildWindowsProcessTreeKillCommand(this.shell, token),
+        { timeoutSeconds: 4, captureOutput: false },
+      ).then((result) => {
+        if (result.exitCode !== 0 && result.exitCode !== 77) {
+          throw new Error(`Remote Windows process-tree cleanup failed (${result.exitCode ?? "signal"})`);
+        }
+      }).catch(() => {
+        // The primary transport is still aborted below. Its hard cancellation
+        // deadline prevents an unresponsive cleanup channel from wedging Pi.
+      }).finally(() => {
+        transportController.abort();
+      });
+      void stopPromise;
+    };
+    const onAbort = (): void => requestStop("aborted");
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    if (timeoutSeconds !== undefined) {
+      timeoutHandle = setTimeout(() => requestStop("timeout"), timeoutSeconds * 1_000);
+      timeoutHandle.unref?.();
+    }
+
+    let result: SshRunResult | undefined;
+    let runError: unknown;
+    try {
+      result = await this.executor.run(shellCommand, {
+        ...runOptions,
+        signal: transportController.signal,
+      });
+    } catch (error) {
+      runError = error;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      signal?.removeEventListener("abort", onAbort);
+      if (stopPromise) await stopPromise;
+    }
+
+    if (stopReason === "aborted") throw new Error("aborted");
+    if (stopReason === "timeout") throw new Error(`timeout:${timeoutSeconds}`);
+    if (runError) throw runError;
+    if (!result) throw new Error("SSH command ended without a result");
     if (result.exitCode === 255) {
       throw new Error("SSH transport failed (ssh exited with code 255)");
     }

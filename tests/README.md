@@ -4,21 +4,33 @@ Unit and integration tests run with Node's built-in test runner (`node --test`
 via `tsx`). The repo root wires them up:
 
 ```bash
-bun run check            # lint (tsc) + all unit tests
+bun run check            # privacy scan + lint (tsc) + all unit tests
 bun run test             # unit tests only
 bun run test:integration # Windows integration tests (see below)
 ```
 
 ## Layout
 
-- `*.test.ts` — unit tests. They use fake SSH executors, in-memory harnesses,
-  and pure-function assertions; no network access. `ssh-remote.test.ts` covers
-  the ssh-remote extension's adapters, OpenSSH multiplexing, persistent ssh2
-  channels, recursive ProxyJump/config compatibility, path mapping, session
-  state, and background-shell resolver.
+- `*.test.ts` — unit tests. Most use fake SSH executors, in-memory harnesses,
+  and pure-function assertions. `ssh-remote.test.ts` also runs a localhost
+  OpenSSH background-control matrix when key-authenticated localhost SSH is
+  available; it skips automatically otherwise. The suite covers adapters,
+  OpenSSH multiplexing and task leases, persistent ssh2 channels, recursive
+  ProxyJump/config compatibility, path mapping, session state, provider
+  routing, transport-loss cleanup, Unix pipe/PTY signals, and Windows process
+  tree command generation. Windows CI additionally executes the real local
+  PowerShell/taskkill tree test.
 - `ssh-remote-windows-integration.test.ts` — integration tests against a real
   Windows host over OpenSSH. They are **skipped automatically** when no host
   is configured, so `bun run check` stays safe in CI.
+
+## Test data privacy
+
+Use fixed fictional users, paths, hosts, emails, and documentation-reserved IP
+ranges in committed tests and examples. Never paste local SSH configuration or
+machine-specific values into a fixture. `bun run check:privacy` scans tracked
+and unignored files under `tests/` and `e2e/` without printing matched values;
+it is also the first stage of `bun run check`.
 
 ## Windows integration tests
 

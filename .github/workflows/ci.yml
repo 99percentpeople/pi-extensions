@@ -34,13 +34,33 @@ jobs:
     - name: Type checking
       run: bun run lint
 
+    - name: Configure localhost OpenSSH integration target
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openssh-server
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        if [ ! -f ~/.ssh/id_ed25519 ]; then
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+        fi
+        touch ~/.ssh/authorized_keys
+        cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+        sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        sudo mkdir -p /run/sshd
+        sudo service ssh restart
+        ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+        ssh -o BatchMode=yes -T localhost true
+
     - name: Unit tests
       if: runner.os != 'Windows'
       run: bun run test
 
-    - name: SSH Remote Windows tests
+    - name: SSH Remote and Background Tasks Windows tests
       if: runner.os == 'Windows'
-      run: node --import tsx --test --test-isolation=process tests/ssh-remote.test.ts
+      run: node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/ssh-remote.test.ts
 
   packages:
     needs: validate

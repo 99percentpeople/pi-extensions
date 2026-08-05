@@ -254,6 +254,18 @@ test("PowerShell stderr stays free of CLIXML progress noise", opts, async (t) =>
   );
 });
 
+test("runShell aborts promptly when Pi cancels the tool call", opts, async (t) => {
+  if (!requireHost(t)) return;
+  const controller = new AbortController();
+  const started = Date.now();
+  const running = adapter.runShell("Start-Sleep -Seconds 30", workspace.cwd, {
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(), 500);
+  await assert.rejects(running, /aborted/);
+  assert.ok(Date.now() - started < 10_000, "AbortSignal did not stop the remote command promptly");
+});
+
 test("runShell aborts hung commands on timeout", opts, async (t) => {
   if (!requireHost(t)) return;
   const started = Date.now();

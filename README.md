@@ -18,16 +18,29 @@ fold long reasoning traces, and keep model-authored plans visible in the TUI.
 
 | Extension | npm package | Purpose |
 | --- | --- | --- |
-| background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Background commands, explicit waits, logs, signals, and optional PTY/TUI interaction |
+| background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Local or SSH-backed background commands with attachable PTY/TUI sessions, logs, signals, and explicit waits |
 | codex-api | [`@99percentpeople/pi-codex-api`](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation/editing, first-party search, Fast mode, and subscription usage status |
 | cursor-effect | [`@99percentpeople/pi-cursor-effect`](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Selectable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
-| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi file and shell tools to remote Unix or Windows workspaces through reusable OpenSSH or ssh2 transports |
+| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi tools to remote Unix or Windows workspaces and enable remote Background Tasks PTY/TUI sessions |
 | thinking-fold | [`@99percentpeople/pi-thinking-fold`](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Live tail previews for long reasoning traces with full summaries and Ctrl+T expansion |
 | todo | [`@99percentpeople/pi-todo`](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Minimal atomic whole-plan todo writes with dependencies and a read-only list above the input |
 
 The packages have separate versions and releases. Installing one extension does
 not install or enable any of the others.
+
+For Background Control protocol v2 integrations, use this compatible set:
+
+| Package | Compatible version |
+| --- | --- |
+| `@99percentpeople/pi-background-tasks` | `>=2.0.0` |
+| `@99percentpeople/pi-ssh-remote` | `>=0.5.0` |
+| `@99percentpeople/pi-pwsh-adapter` | `>=1.1.0` |
+
+Background Tasks works alone; the SSH and PowerShell versions matter only when
+those adapters are installed. Background Tasks 2.x rejects unnamed protocol-v1
+providers so an active remote workspace cannot silently fall back to a local
+process. Update installed adapters before updating Background Tasks.
 
 ## Shared settings
 
@@ -179,8 +192,9 @@ Tools:
 - `bg_wait` waits once for a finite task to finish or time out.
 - `bg_status` reads task metadata or lists known tasks.
 - `bg_logs` is the only tool that reads pipe or parsed PTY output.
-- `bg_send` sends text, terminal keys, or supported process signals.
-- `bg_kill` terminates a task.
+- `bg_send` sends text, terminal keys, or execution-environment signals.
+- `bg_kill` terminates running tasks and can retry cleanup for disconnected
+  adapter-owned tasks.
 
 Commands:
 
@@ -195,13 +209,23 @@ bg_start name="git-ui" command="lazygit" pty=true
 /bg-attach <task-id>
 ```
 
+When `ssh-remote` is installed and an SSH workspace is active, the same PTY
+workflow runs on the remote host. This makes full-screen applications such as
+`lazygit`, `htop`, `nvim`, and `k9s` remotely attachable without leaving the
+current Pi conversation; workspace switches do not move an existing task away
+from its original SSH host and cwd.
+
 Terminal keys sent through `bg_send` use angle-bracket tokens such as
 `<C-c>`, `<A-f>`, `<Space>`, `<Up>`, and `<F10>`. Escape a literal `<` as `\<`.
 Every model-facing task `id` also accepts its unique name. Same-task calls in
 one model response execute in source order, including `bg_start` by name, so a
 model can emit `bg_start(name=A) → bg_wait(id=A) → bg_logs(id=A)` together
 without first spending a round to learn the generated ID. Different task chains
-run in parallel, and the same sequence works for pipe and PTY tasks.
+run in parallel, and the same sequence works for pipe and PTY tasks. Named shell
+providers are required and use priorities instead of last-writer routing;
+adapter controls implement the complete v2 lifecycle and remain available after
+a local transport exits, so remote cleanup can be confirmed or reported as
+`disconnected` rather than falsely completed.
 
 PTY support uses `node-pty`. If no compatible native binary is available,
 installation may require a C/C++ toolchain. `/99settings` controls how many task
@@ -338,6 +362,10 @@ bun run build:all
 bun run check
 bun run pack:check
 ```
+
+`bun run check` starts with a privacy scan that rejects developer-specific
+paths, accounts, hosts, emails, private IPs, and credential-shaped material in
+committed test and e2e data.
 
 Each extension and the shared runtime helper bundle their local TypeScript
 modules into `dist/index.ts` before npm packing. Keeping the bundled entrypoint

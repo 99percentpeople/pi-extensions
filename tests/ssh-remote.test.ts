@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import type { ChildProcess, SpawnOptions } from "node:child_process";
+import {
+  spawn as spawnChild,
+  type ChildProcess,
+  type SpawnOptions,
+} from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -33,7 +37,15 @@ import {
   encodeWindowsToolPath,
   resolveWindowsRemotePath,
 } from "../extensions/ssh-remote/adapters/windows.ts";
-import { createSshBackgroundShellResolver } from "../extensions/ssh-remote/background.ts";
+import {
+  buildUnixBackgroundProbeCommand,
+  buildUnixBackgroundShellCommand,
+  buildUnixBackgroundSignalCommand,
+  buildWindowsBackgroundProbeCommand,
+  buildWindowsBackgroundShellCommand,
+  buildWindowsBackgroundSignalCommand,
+  createSshBackgroundShellResolver,
+} from "../extensions/ssh-remote/background.ts";
 import {
   buildSshArguments,
   OpenSshClient,
@@ -388,6 +400,81 @@ test("OpenSSH client owns and closes its generated ControlMaster", async () => {
   assert.ok(spawned[3].includes("-O"));
   assert.ok(spawned[3].includes("stop"));
   assert.ok(!spawned[3].includes("exit"));
+
+  const leased = new OpenSshClient(
+    { target: "devbox", multiplex: true },
+    spawn,
+  );
+  const lease = leased.acquireBackgroundLease();
+  assert.ok(lease);
+  const beforeDispose = spawned.length;
+  await leased.dispose();
+  assert.equal(
+    spawned.length,
+    beforeDispose,
+    "disposing the workspace must not close a ControlMaster with a live task lease",
+  );
+  await lease.release();
+  assert.equal(spawned.length, beforeDispose + 1);
+  assert.ok(spawned.at(-1)?.includes("-O"));
+  assert.ok(spawned.at(-1)?.includes("exit"));
+});
+
+test("SSH task leases keep signal control available when workspace shutdown runs first", async () => {
+  class FakeProcess extends EventEmitter {
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    kill(): boolean {
+      queueMicrotask(() => this.emit("close", null, "SIGKILL"));
+      return true;
+    }
+  }
+
+  const spawned: string[][] = [];
+  const spawn = (
+    _file: string,
+    args: readonly string[],
+    _options: SpawnOptions,
+  ): ChildProcess => {
+    spawned.push([...args]);
+    const child = new FakeProcess();
+    queueMicrotask(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", 0, null);
+    });
+    return child as unknown as ChildProcess;
+  };
+  const client = new OpenSshClient({ target: "devbox", multiplex: true }, spawn);
+  const resolver = createSshBackgroundShellResolver({
+    ssh: { ...client.options },
+    adapter: new UnixBashAdapter(new FakeSshClient({ target: "devbox" })),
+    workspace: {
+      platform: "unix",
+      shell: "bash",
+      home: "/home/deploy",
+      cwd: "/srv/project",
+    },
+    localCwd: "/local/project",
+    spawnControl: spawn,
+    createControlToken: () => "00112233445566778899aabbccddeeff",
+    acquireControlLease: () => client.acquireBackgroundLease(),
+  });
+  const launch = resolver("sleep 30", false, {
+    cwd: "/local/project",
+    projectTrusted: true,
+  });
+
+  await client.dispose();
+  assert.equal(spawned.length, 0, "workspace disposal must defer ControlMaster exit");
+  await launch.control?.sendSignal("SIGTERM");
+  assert.ok(spawned[0].includes(client.options.controlPath!));
+  assert.ok(!spawned[0].includes("-O"));
+
+  await launch.control?.dispose?.();
+  assert.ok(spawned.at(-1)?.includes("-O"));
+  assert.ok(spawned.at(-1)?.includes("exit"));
 });
 
 test("Windows ssh.exe adds -n for no-stdin commands and uses a temp file for input", async () => {
@@ -443,6 +530,56 @@ test("Windows ssh.exe adds -n for no-stdin commands and uses a temp file for inp
     name.startsWith("pi-ssh-stdin-"),
   );
   assert.deepEqual(leftovers, []);
+});
+
+test("OpenSSH rejects an invalid timeout before spawning or creating stdio files", async () => {
+  let spawnCalls = 0;
+  const client = new OpenSshClient(
+    { target: "winbox", executable: "ssh.exe" },
+    () => {
+      spawnCalls += 1;
+      throw new Error("must not spawn");
+    },
+  );
+
+  await assert.rejects(
+    client.run("echo never", { input: "payload", timeoutSeconds: 0 }),
+    /positive number of seconds/,
+  );
+  assert.equal(spawnCalls, 0);
+  const leftovers = readdirSync(tmpdir()).filter((name) =>
+    name.startsWith(`pi-ssh-stdin-${process.pid}-`)
+      || name.startsWith(`pi-ssh-stdio-${process.pid}-`)
+  );
+  assert.deepEqual(leftovers, []);
+  await client.dispose();
+});
+
+test("OpenSSH timeout rejects even when the local ssh process never closes", async () => {
+  class HungProcess extends EventEmitter {
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    readonly signals: string[] = [];
+    kill(signal?: string): boolean {
+      this.signals.push(signal ?? "SIGTERM");
+      return true;
+    }
+  }
+
+  const process = new HungProcess();
+  const client = new OpenSshClient(
+    { target: "winbox", executable: "ssh.exe" },
+    () => process as unknown as ChildProcess,
+  );
+  const started = Date.now();
+  await assert.rejects(
+    client.run("hung powershell command", { timeoutSeconds: 0.01 }),
+    /timeout:0\.01/,
+  );
+  assert.ok(Date.now() - started < 2_500);
+  assert.deepEqual(process.signals, ["SIGTERM", "SIGKILL"]);
+  await client.dispose();
 });
 
 test("SSH Remote transport settings normalize and persist", () => {
@@ -841,6 +978,145 @@ test("Ssh2Client reuses one authenticated connection for multiple command channe
   assert.deepEqual(streamed, ["stdout:"]);
   await client.dispose();
   assert.equal(raw.closed, true);
+});
+
+test("Ssh2Client hard-aborts a channel that ignores SSH signals and close", async () => {
+  class HungChannel extends FakeSsh2Channel {
+    override end(input?: string | Buffer): void {
+      this.input = input === undefined
+        ? Buffer.alloc(0)
+        : Buffer.isBuffer(input) ? input : Buffer.from(input);
+    }
+    override close(): void {}
+    destroy(): void {}
+  }
+  class HungClient extends FakeRawSsh2Client {
+    override exec(
+      _command: string,
+      callback: (error: Error | undefined, channel: HungChannel) => void,
+    ): void {
+      const channel = new HungChannel();
+      this.channels.push(channel);
+      callback(undefined, channel);
+    }
+  }
+
+  const raw = new HungClient();
+  const client = new Ssh2Client(
+    { target: "winbox" },
+    {
+      createClient: () => raw as any,
+      terminationGraceMs: 10,
+      resolveConnection: async () => ({
+        config: { host: "winbox", username: "deploy" },
+        hostLabel: "deploy@winbox:22",
+        warnings: [],
+        verification: {},
+      }),
+    },
+  );
+  const controller = new AbortController();
+  const running = client.run("hung powershell command", {
+    signal: controller.signal,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+
+  await assert.rejects(running, /aborted/);
+  assert.deepEqual(raw.channels[0].signals, ["TERM", "KILL"]);
+  assert.equal(raw.closed, true, "a stuck channel must invalidate its ssh2 connection");
+  await client.dispose();
+});
+
+test("Ssh2Client closes an exec channel that arrives after forced cancellation", async () => {
+  class LateChannel extends FakeSsh2Channel {
+    closeCalls = 0;
+    destroyCalls = 0;
+    override close(): void {
+      this.closeCalls += 1;
+      throw new Error("late close rejected");
+    }
+    destroy(): void {
+      this.destroyCalls += 1;
+    }
+  }
+  class DelayedClient extends FakeRawSsh2Client {
+    delayedExec?: (error: Error | undefined, channel: LateChannel) => void;
+    override exec(
+      _command: string,
+      callback: (error: Error | undefined, channel: LateChannel) => void,
+    ): void {
+      this.delayedExec = callback;
+    }
+  }
+
+  const raw = new DelayedClient();
+  const client = new Ssh2Client(
+    { target: "winbox" },
+    {
+      createClient: () => raw as any,
+      terminationGraceMs: 10,
+      resolveConnection: async () => ({
+        config: { host: "winbox", username: "deploy" },
+        hostLabel: "deploy@winbox:22",
+        warnings: [],
+        verification: {},
+      }),
+    },
+  );
+  const controller = new AbortController();
+  const running = client.run("delayed channel", { signal: controller.signal });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(raw.delayedExec);
+  controller.abort();
+  await assert.rejects(running, /aborted/);
+
+  const lateChannel = new LateChannel();
+  raw.delayedExec(undefined, lateChannel);
+  assert.equal(lateChannel.closeCalls, 1);
+  assert.equal(lateChannel.destroyCalls, 1);
+  await client.dispose();
+});
+
+test("Ssh2Client enforces timeout when a channel never closes", async () => {
+  class HungChannel extends FakeSsh2Channel {
+    override end(): void {}
+    override close(): void {}
+    destroy(): void {}
+  }
+  class HungClient extends FakeRawSsh2Client {
+    override exec(
+      _command: string,
+      callback: (error: Error | undefined, channel: HungChannel) => void,
+    ): void {
+      const channel = new HungChannel();
+      this.channels.push(channel);
+      callback(undefined, channel);
+    }
+  }
+
+  const raw = new HungClient();
+  const client = new Ssh2Client(
+    { target: "winbox" },
+    {
+      createClient: () => raw as any,
+      terminationGraceMs: 10,
+      resolveConnection: async () => ({
+        config: { host: "winbox", username: "deploy" },
+        hostLabel: "deploy@winbox:22",
+        warnings: [],
+        verification: {},
+      }),
+    },
+  );
+
+  await assert.rejects(
+    client.run("hung powershell command", { timeoutSeconds: 0.01 }),
+    /timeout:0\.01/,
+  );
+  assert.deepEqual(raw.channels[0].signals, ["TERM", "KILL"]);
+  assert.equal(raw.closed, true);
+  await client.dispose();
 });
 
 test("Ssh2Client prompts on key-less hosts via the empty-password placeholder", async () => {
@@ -2356,11 +2632,46 @@ test("remote Bash exports safe session metadata but not the local session path",
   assert.match(command, /exec bash -lc/);
 });
 
-test("background resolver maps remote cwd while launching ssh from a local directory", () => {
+test("background resolver maps remote cwd and signals the immutable SSH host", async () => {
+  class FakeControlProcess extends EventEmitter {
+    readonly stderr = new PassThrough();
+    kill(): boolean {
+      queueMicrotask(() => this.emit("close", null, "SIGKILL"));
+      return true;
+    }
+  }
+
+  const controlLaunches: Array<{
+    file: string;
+    args: readonly string[];
+    options: SpawnOptions;
+  }> = [];
+  const spawnControl = (
+    file: string,
+    args: readonly string[],
+    options: SpawnOptions,
+  ): ChildProcess => {
+    controlLaunches.push({ file, args: [...args], options });
+    const child = new FakeControlProcess();
+    const exitCode = controlLaunches.length === 1 ? 255 : 0;
+    queueMicrotask(() => {
+      child.stderr.end();
+      child.emit("close", exitCode, null);
+    });
+    return child as unknown as ChildProcess;
+  };
+
+  const token = "0123456789abcdef0123456789abcdef";
   const client = new FakeSshClient({ target: "devbox" });
   const adapter = new UnixBashAdapter(client);
   const resolver = createSshBackgroundShellResolver({
-    ssh: { target: "devbox", configFile: "/tmp/ssh.conf" },
+    ssh: {
+      target: "devbox",
+      configFile: "/tmp/ssh.conf",
+      multiplex: true,
+      controlPath: "/tmp/old-master/mux",
+      sshpassPassword: "must-not-be-forwarded",
+    },
     adapter,
     workspace: {
       platform: "unix",
@@ -2370,17 +2681,591 @@ test("background resolver maps remote cwd while launching ssh from a local direc
     },
     localCwd: "/local/project",
     env: { PATH: "/usr/bin" },
+    spawnControl,
+    createControlToken: () => token,
   });
   const launch = resolver("npm test", true, {
     cwd: "/local/project/packages/api",
     projectTrusted: true,
   });
   assert.equal(launch.file, "ssh");
+  assert.equal(launch.env.SSHPASS, undefined);
   assert.equal(launch.cwd, "/local/project");
   assert.ok(launch.args.includes("-tt"));
   assert.ok(launch.args.includes("devbox"));
-  assert.match(launch.args.at(-1) ?? "", /cd -- '\/srv\/project\/packages\/api'/);
+  assert.ok((launch.args.at(-1) ?? "").includes("/srv/project/packages/api"));
   assert.match(launch.args.at(-1) ?? "", /npm test/);
+  assert.match(launch.args.at(-1) ?? "", new RegExp(`pi-ssh-bg-${token}`));
+  assert.equal("sendSignal" in launch, false);
+  assert.equal(typeof launch.control.sendSignal, "function");
+
+  await launch.control.sendSignal("SIGTERM");
+  assert.equal(controlLaunches.length, 2);
+  assert.equal(controlLaunches[0].file, "ssh");
+  assert.equal(controlLaunches[0].options.cwd, "/local/project");
+  assert.ok(controlLaunches[0].args.includes("ControlMaster=auto"));
+  assert.ok(controlLaunches[0].args.includes("/tmp/old-master/mux"));
+  assert.ok(controlLaunches[0].args.includes("-n"));
+  assert.ok(controlLaunches[0].args.includes("devbox"));
+
+  assert.ok(controlLaunches[1].args.includes("ControlMaster=no"));
+  assert.ok(controlLaunches[1].args.includes("ControlPath=none"));
+  assert.ok(controlLaunches[1].args.includes("-n"));
+  assert.ok(!controlLaunches[1].args.includes("/tmp/old-master/mux"));
+  assert.match(controlLaunches[1].args.at(-1) ?? "", /signal_name=TERM/);
+  assert.match(controlLaunches[1].args.at(-1) ?? "", new RegExp(`pi-ssh-bg-${token}`));
+});
+
+test("SSH background probe accepts a framed status after login banner output", async () => {
+  class ProbeProcess extends EventEmitter {
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    kill(): boolean {
+      return true;
+    }
+  }
+  const resolver = createSshBackgroundShellResolver({
+    ssh: { target: "devbox", batchMode: true },
+    adapter: new UnixBashAdapter(new FakeSshClient({ target: "devbox" })),
+    workspace: {
+      platform: "unix",
+      shell: "bash",
+      home: "/home/deploy",
+      cwd: "/srv/project",
+    },
+    localCwd: "/local/project",
+    createControlToken: () => "102030405060708090a0b0c0d0e0f000",
+    spawnControl: () => {
+      const child = new ProbeProcess();
+      queueMicrotask(() => {
+        child.stdout.end("unexpected banner\nPI_SSH_BG_STATUS=running\n");
+        child.stderr.end();
+        child.emit("close", 0, null);
+      });
+      return child as unknown as ChildProcess;
+    },
+  });
+  const launch = resolver("sleep 30", false, {
+    cwd: "/local/project",
+    projectTrusted: true,
+  });
+  assert.equal(await launch.control?.probe?.(), "running");
+  await launch.control?.dispose?.();
+});
+
+test("SSH background control aborts its short-lived signal connection", async () => {
+  class HangingControlProcess extends EventEmitter {
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    killedWith: string | undefined;
+    kill(signal?: string): boolean {
+      this.killedWith = signal;
+      queueMicrotask(() => this.emit("close", null, signal ?? null));
+      return true;
+    }
+  }
+
+  let controlProcess: HangingControlProcess | undefined;
+  const resolver = createSshBackgroundShellResolver({
+    ssh: { target: "devbox", batchMode: true },
+    adapter: new UnixBashAdapter(new FakeSshClient({ target: "devbox" })),
+    workspace: {
+      platform: "unix",
+      shell: "bash",
+      home: "/home/deploy",
+      cwd: "/srv/project",
+    },
+    localCwd: "/local/project",
+    createControlToken: () => "abcdef0123456789abcdef0123456789",
+    spawnControl: () => {
+      controlProcess = new HangingControlProcess();
+      return controlProcess as unknown as ChildProcess;
+    },
+  });
+  const launch = resolver("sleep 30", false, {
+    cwd: "/local/project",
+    projectTrusted: true,
+  });
+  const abortController = new AbortController();
+  const sending = launch.control?.sendSignal("SIGTERM", {
+    abortSignal: abortController.signal,
+  });
+  abortController.abort(new Error("cancel signal control"));
+  await assert.rejects(Promise.resolve(sending), /cancel signal control/);
+  assert.equal(controlProcess?.killedWith, "SIGKILL");
+  await launch.control?.dispose?.();
+});
+
+test("Unix SSH background control preserves Bash traps and does not orphan children", {
+  skip: process.platform === "win32" ? "requires POSIX process groups" : false,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-signal-test-"));
+  const pidFile = join(directory, "child.pid");
+  const inputFile = join(directory, "stdin.txt");
+  const trapFile = join(directory, "trap.txt");
+  const token = Buffer.from(`${process.pid}-${Date.now()}`).toString("hex");
+  const controlDirectory = join(
+    process.env.TMPDIR || "/tmp",
+    `pi-ssh-bg-${token}`,
+  );
+  const trapAction = `printf trapped > ${shellQuote(trapFile)}; exit 42`;
+  const bashScript = `trap ${shellQuote(trapAction)} INT; printf '%s\\n' $$ > ${shellQuote(pidFile)}; IFS= read -r input; printf '%s\\n' "$input" > ${shellQuote(inputFile)}; while :; do sleep 1; done`;
+  const userCommand = `exec bash -c ${shellQuote(bashScript)}`;
+  const wrapped = buildUnixBackgroundShellCommand(userCommand, token);
+  const child = spawnChild("sh", ["-c", wrapped], {
+    detached: true,
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+  child.stdin.on("error", () => {});
+  child.stdin.write("forwarded over ssh stdin\n");
+  const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    },
+  );
+  let commandPid = 0;
+
+  try {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      if (existsSync(pidFile) && existsSync(inputFile)) {
+        commandPid = Number(readFileSync(pidFile, "utf8").trim());
+        if (Number.isInteger(commandPid) && commandPid > 0) break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(commandPid > 0, "wrapped command should publish its child PID");
+    assert.equal(readFileSync(inputFile, "utf8"), "forwarded over ssh stdin\n");
+
+    const controller = spawnChild(
+      "sh",
+      ["-c", buildUnixBackgroundSignalCommand(token, "SIGINT")],
+      { stdio: "ignore" },
+    );
+    const controlCode = await new Promise<number | null>((resolve, reject) => {
+      controller.once("error", reject);
+      controller.once("exit", resolve);
+    });
+    assert.equal(controlCode, 0);
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("wrapped command did not exit after remote SIGINT")),
+        5_000,
+      );
+      childExit.then(
+        () => {
+          clearTimeout(timeout);
+          resolve();
+        },
+        (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+      );
+    });
+
+    assert.equal(readFileSync(trapFile, "utf8"), "trapped");
+
+    let commandAlive = true;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try {
+        process.kill(commandPid, 0);
+      } catch {
+        commandAlive = false;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(commandAlive, false, "the command child must not survive as an orphan");
+  } finally {
+    if (commandPid > 0) {
+      try {
+        process.kill(commandPid, "SIGKILL");
+      } catch {}
+    }
+    if (child.pid) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }
+    rmSync(controlDirectory, { recursive: true, force: true });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Unix background control handles immediate kill and TERM-to-KILL escalation", {
+  skip: process.platform === "win32" ? "requires POSIX signals" : false,
+  timeout: 20_000,
+}, async () => {
+  const waitForExit = (child: ChildProcess, timeoutMs = 5_000) => new Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("process did not exit")), timeoutMs);
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal });
+    });
+  });
+
+  const immediateToken = Buffer.from(`${process.pid}-${Date.now()}-immediate`).toString("hex");
+  const immediate = spawnChild(
+    "sh",
+    ["-c", buildUnixBackgroundShellCommand("while :; do sleep 1; done", immediateToken)],
+    { detached: true, stdio: "ignore" },
+  );
+  const immediateExit = waitForExit(immediate);
+  const immediateControl = spawnChild(
+    "sh",
+    ["-c", buildUnixBackgroundSignalCommand(immediateToken, "SIGKILL")],
+    { stdio: "ignore" },
+  );
+  assert.equal((await waitForExit(immediateControl)).code, 0);
+  await immediateExit;
+  assert.equal(
+    existsSync(join(process.env.TMPDIR || "/tmp", `pi-ssh-bg-${immediateToken}`)),
+    false,
+  );
+
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-escalation-"));
+  const pidFile = join(directory, "command.pid");
+  const escalationToken = Buffer.from(`${process.pid}-${Date.now()}-escalation`).toString("hex");
+  const ignored = spawnChild(
+    "sh",
+    [
+      "-c",
+      buildUnixBackgroundShellCommand(
+        `trap '' TERM; printf '%s' $$ > ${shellQuote(pidFile)}; while :; do sleep 1; done`,
+        escalationToken,
+      ),
+    ],
+    { detached: true, stdio: "ignore" },
+  );
+  const ignoredExit = waitForExit(ignored, 10_000);
+  let commandPid = 0;
+  try {
+    const deadline = Date.now() + 3_000;
+    while (!existsSync(pidFile) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    commandPid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(commandPid > 0);
+
+    const term = spawnChild(
+      "sh",
+      ["-c", buildUnixBackgroundSignalCommand(escalationToken, "SIGTERM")],
+      { stdio: "ignore" },
+    );
+    assert.equal((await waitForExit(term)).code, 0);
+    assert.doesNotThrow(() => process.kill(commandPid, 0));
+
+    const kill = spawnChild(
+      "sh",
+      ["-c", buildUnixBackgroundSignalCommand(escalationToken, "SIGKILL")],
+      { stdio: "ignore" },
+    );
+    assert.equal((await waitForExit(kill)).code, 0);
+    await ignoredExit;
+    assert.throws(() => process.kill(commandPid, 0));
+  } finally {
+    if (commandPid > 0) {
+      try {
+        process.kill(commandPid, "SIGKILL");
+      } catch {}
+    }
+    if (ignored.pid) {
+      try {
+        process.kill(-ignored.pid, "SIGKILL");
+      } catch {}
+    }
+    rmSync(join(process.env.TMPDIR || "/tmp", `pi-ssh-bg-${escalationToken}`), {
+      recursive: true,
+      force: true,
+    });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Unix background control falls back correctly under BusyBox sh", {
+  skip: process.platform === "win32" ? "requires BusyBox on POSIX" : false,
+  timeout: 10_000,
+}, async (t) => {
+  const busybox = (process.env.PATH ?? "")
+    .split(":")
+    .map((directory) => join(directory, "busybox"))
+    .find(existsSync);
+  if (!busybox) {
+    t.skip("busybox is unavailable");
+    return;
+  }
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-busybox-"));
+  const shell = join(directory, "sh");
+  symlinkSync(busybox, shell);
+  const env = { ...process.env, PATH: `${directory}:${process.env.PATH ?? ""}` };
+  const token = Buffer.from(`${process.pid}-${Date.now()}-busybox`).toString("hex");
+  const task = spawnChild(
+    "sh",
+    ["-c", buildUnixBackgroundShellCommand("while :; do sleep 1; done", token)],
+    { env, detached: true, stdio: "ignore" },
+  );
+  const taskExit = new Promise<void>((resolve, reject) => {
+    task.once("error", reject);
+    task.once("exit", () => resolve());
+  });
+  try {
+    const control = spawnChild(
+      "sh",
+      ["-c", buildUnixBackgroundSignalCommand(token, "SIGKILL")],
+      { env, stdio: "ignore" },
+    );
+    const controlCode = await new Promise<number | null>((resolve, reject) => {
+      control.once("error", reject);
+      control.once("exit", resolve);
+    });
+    assert.equal(controlCode, 0);
+    await taskExit;
+  } finally {
+    if (task.pid) {
+      try {
+        process.kill(-task.pid, "SIGKILL");
+      } catch {}
+    }
+    rmSync(join(process.env.TMPDIR || "/tmp", `pi-ssh-bg-${token}`), {
+      recursive: true,
+      force: true,
+    });
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real localhost OpenSSH preserves all supported Bash traps in pipe and PTY modes", {
+  skip: process.platform === "win32" ? "requires a POSIX localhost SSH server" : false,
+  timeout: 120_000,
+}, async (t) => {
+  const waitForExit = (
+    child: ChildProcess,
+    timeoutMs: number,
+  ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> => new Promise(
+    (resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error(`process ${child.pid ?? "unknown"} did not exit`)),
+        timeoutMs,
+      );
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once("exit", (code, signal) => {
+        clearTimeout(timeout);
+        resolve({ code, signal });
+      });
+    },
+  );
+  const probe = spawnChild(
+    "ssh",
+    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "-T", "localhost", "true"],
+    { stdio: "ignore" },
+  );
+  let probeResult: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    probeResult = await waitForExit(probe, 5_000);
+  } catch (error) {
+    t.skip(`localhost OpenSSH unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (probeResult.code !== 0) {
+    t.skip("localhost OpenSSH key authentication is unavailable");
+    return;
+  }
+
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-trap-matrix-"));
+  const adapter = new UnixBashAdapter(
+    new FakeSshClient({ target: "localhost" }),
+    process.platform,
+    "bash",
+  );
+  const signals = [
+    "SIGINT",
+    "SIGTERM",
+    "SIGHUP",
+    "SIGQUIT",
+    "SIGUSR1",
+    "SIGUSR2",
+    "SIGALRM",
+    "SIGPIPE",
+  ] as const;
+
+  try {
+    for (const interactive of [false, true]) {
+      for (const signal of signals) {
+        const stem = `${interactive ? "pty" : "pipe"}-${signal.toLowerCase()}`;
+        const readyFile = join(directory, `${stem}.ready`);
+        const trapFile = join(directory, `${stem}.trap`);
+        const token = Buffer.from(
+          `${process.pid}-${Date.now()}-${stem}`,
+        ).toString("hex").slice(0, 96);
+        const trapAction = `printf '%s' ${shellQuote(signal)} > ${shellQuote(trapFile)}; exit 42`;
+        const script = [
+          `trap ${shellQuote(trapAction)} ${signal}`,
+          `printf ready > ${shellQuote(readyFile)}`,
+          "while :; do sleep 1; done",
+        ].join("; ");
+        const resolver = createSshBackgroundShellResolver({
+          ssh: {
+            target: "localhost",
+            batchMode: true,
+            connectTimeoutSeconds: 3,
+          },
+          adapter,
+          workspace: {
+            platform: "unix",
+            shell: "bash",
+            home: process.env.HOME ?? "/tmp",
+            cwd: directory,
+          },
+          localCwd: process.cwd(),
+          createControlToken: () => token,
+        });
+        const launch = resolver(
+          `exec bash -c ${shellQuote(script)}`,
+          interactive,
+          { cwd: directory, projectTrusted: true },
+        );
+        const child = spawnChild(launch.file, launch.args, {
+          cwd: launch.cwd,
+          env: launch.env,
+          detached: true,
+          stdio: ["pipe", "ignore", "ignore"],
+        });
+        const exited = waitForExit(child, 8_000);
+        try {
+          const deadline = Date.now() + 5_000;
+          while (!existsSync(readyFile) && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          assert.ok(existsSync(readyFile), `${stem} did not become ready`);
+          await launch.control?.sendSignal(signal);
+          const result = await exited;
+          assert.equal(result.code, 42, `${stem} should preserve the Bash trap exit code`);
+          assert.equal(readFileSync(trapFile, "utf8"), signal);
+        } finally {
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              await launch.control?.sendSignal("SIGKILL");
+            } catch {}
+            if (child.pid) {
+              try {
+                process.kill(-child.pid, "SIGKILL");
+              } catch {}
+            }
+          }
+          await launch.control?.dispose?.();
+          rmSync(join(process.env.TMPDIR || "/tmp", `pi-ssh-bg-${token}`), {
+            recursive: true,
+            force: true,
+          });
+        }
+      }
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real localhost OpenSSH cleans the remote tree after its local transport dies", {
+  skip: process.platform === "win32" ? "requires a POSIX localhost SSH server" : false,
+  timeout: 30_000,
+}, async (t) => {
+  const probe = spawnChild(
+    "ssh",
+    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "-T", "localhost", "true"],
+    { stdio: "ignore" },
+  );
+  const probeCode = await new Promise<number | null>((resolve) => {
+    probe.once("error", () => resolve(null));
+    probe.once("exit", resolve);
+  });
+  if (probeCode !== 0) {
+    t.skip("localhost OpenSSH key authentication is unavailable");
+    return;
+  }
+
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-transport-exit-"));
+  const pidFile = join(directory, "remote.pid");
+  const token = Buffer.from(`${process.pid}-${Date.now()}-transport`).toString("hex");
+  const adapter = new UnixBashAdapter(new FakeSshClient({ target: "localhost" }));
+  const launch = createSshBackgroundShellResolver({
+    ssh: { target: "localhost", batchMode: true, connectTimeoutSeconds: 3 },
+    adapter,
+    workspace: {
+      platform: "unix",
+      shell: "bash",
+      home: process.env.HOME ?? "/tmp",
+      cwd: directory,
+    },
+    localCwd: process.cwd(),
+    createControlToken: () => token,
+  })(`printf '%s' $$ > ${shellQuote(pidFile)}; while :; do sleep 1; done`, false, {
+    cwd: directory,
+    projectTrusted: true,
+  });
+  const child = spawnChild(launch.file, launch.args, {
+    cwd: launch.cwd,
+    env: launch.env,
+    detached: true,
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+  let remotePid = 0;
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(pidFile) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    remotePid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(remotePid > 0);
+    if (child.pid) process.kill(-child.pid, "SIGKILL");
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+
+    const disposition = await launch.control?.onTransportExit?.({
+      exitCode: null,
+      signal: "SIGKILL",
+    });
+    assert.deepEqual(disposition, {
+      state: "stopped",
+      signal: "SSH transport exit",
+    });
+    let alive = true;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try {
+        process.kill(remotePid, 0);
+      } catch {
+        alive = false;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(alive, false, "transport recovery must not leave a remote orphan");
+  } finally {
+    if (remotePid > 0) {
+      try {
+        process.kill(remotePid, "SIGKILL");
+      } catch {}
+    }
+    if (child.pid) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }
+    await launch.control?.dispose?.();
+    rmSync(join(process.env.TMPDIR || "/tmp", `pi-ssh-bg-${token}`), {
+      recursive: true,
+      force: true,
+    });
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 function decodePowerShellInvocation(command: string): string {
@@ -2391,6 +3276,77 @@ function decodePowerShellInvocation(command: string): string {
     ? gunzipSync(Buffer.from(compressed, "base64")).toString("utf8")
     : script;
 }
+
+function createHangingWindowsExecutor() {
+  const calls: Array<{ command: string; options: SshRunOptions }> = [];
+  const run = (command: string, options: SshRunOptions = {}): Promise<SshRunResult> => {
+    calls.push({ command, options });
+    if (calls.length > 1) {
+      return Promise.resolve({
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      });
+    }
+    return new Promise((_resolve, reject) => {
+      const abort = () => reject(new Error("aborted"));
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  return {
+    calls,
+    executor: {
+      run,
+      async runChecked(command: string, options?: SshRunOptions): Promise<SshRunResult> {
+        const result = await run(command, options);
+        if (result.exitCode !== 0) throw new Error(`exit:${result.exitCode}`);
+        return result;
+      },
+    },
+  };
+}
+
+test("Windows runShell aborts the recorded remote process tree on Esc", async () => {
+  const { calls, executor } = createHangingWindowsExecutor();
+  const adapter = new WindowsPowerShellAdapter(executor, "powershell", "win32");
+  const controller = new AbortController();
+  const running = adapter.runShell(
+    "Start-Process ssh.exe -ArgumentList 'winbox', 'exit' -Wait",
+    "C:\\Remote\\Project",
+    { signal: controller.signal },
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+
+  await assert.rejects(running, /aborted/);
+  assert.equal(calls.length, 2);
+  const primary = decodePowerShellInvocation(calls[0].command);
+  const cleanup = decodePowerShellInvocation(calls[1].command);
+  assert.match(primary, /rootStartedAt/);
+  assert.match(cleanup, /taskkill\.exe \/PID \$rootProcessId \/T \/F/);
+  const primaryToken = /pi-ssh-bg-[a-f0-9]+/.exec(primary)?.[0];
+  assert.ok(primaryToken);
+  assert.equal(cleanup.includes(primaryToken), true);
+  assert.equal(calls[1].options.signal, undefined);
+});
+
+test("Windows runShell timeout aborts the recorded remote process tree", async () => {
+  const { calls, executor } = createHangingWindowsExecutor();
+  const adapter = new WindowsPowerShellAdapter(executor, "powershell", "win32");
+
+  await assert.rejects(
+    adapter.runShell("Start-Sleep -Seconds 30", "C:\\Remote\\Project", {
+      timeoutSeconds: 0.01,
+    }),
+    /timeout:0\.01/,
+  );
+  assert.equal(calls.length, 2);
+  assert.match(
+    decodePowerShellInvocation(calls[1].command),
+    /taskkill\.exe \/PID \$rootProcessId \/T \/F/,
+  );
+});
 
 class FakeWindowsSshClient implements SshRemoteClient {
   readonly calls: RecordedRun[] = [];
@@ -2731,6 +3687,39 @@ test("remote adapter auto-detects Windows PowerShell and streams file content ov
   assert.match(pipeLaunch.args.at(-1) ?? "", / -NonInteractive /);
   assert.doesNotMatch(ptyLaunch.args.at(-1) ?? "", / -NonInteractive /);
   assert.ok(ptyLaunch.args.includes("-tt"));
+  assert.match(
+    decodePowerShellInvocation(pipeLaunch.args.at(-1) ?? ""),
+    /\$controlDirectory.*\$statePath/s,
+  );
+  assert.equal(typeof pipeLaunch.control.sendSignal, "function");
+  const windowsSignal = decodePowerShellInvocation(
+    buildWindowsBackgroundSignalCommand(
+      "0123456789abcdef0123456789abcdef",
+      "SIGTERM",
+      "pwsh",
+    ),
+  );
+  assert.match(windowsSignal, /taskkill\.exe \/PID \$rootProcessId \/T \/F/);
+  const windowsProbe = decodePowerShellInvocation(
+    buildWindowsBackgroundProbeCommand(
+      "0123456789abcdef0123456789abcdef",
+      "pwsh",
+    ),
+  );
+  assert.match(windowsProbe, /Get-Process -Id \$rootProcessId/);
+  assert.match(windowsProbe, /WriteLine\('PI_SSH_BG_STATUS=running'\)/);
+  const unixProbe = buildUnixBackgroundProbeCommand(
+    "0123456789abcdef0123456789abcdef",
+  );
+  assert.match(unixProbe, /PI_SSH_BG_STATUS=running/);
+  assert.throws(
+    () => buildWindowsBackgroundSignalCommand(
+      "0123456789abcdef0123456789abcdef",
+      "SIGUSR1",
+      "pwsh",
+    ),
+    /cannot be delivered to a Windows SSH process tree/,
+  );
 
   const path = adapter.toToolPath("notes.txt", workspace);
   assert.equal(adapter.fromToolPath(path), "C:\\Users\\Admin\\project\\notes.txt");
@@ -2742,6 +3731,85 @@ test("remote adapter auto-detects Windows PowerShell and streams file content ov
   assert.doesNotMatch(writeCall?.command ?? "", /secret file content/);
 });
 
+test("Windows background control terminates the real local PowerShell process tree", {
+  skip: process.platform !== "win32" ? "requires Windows taskkill semantics" : false,
+  timeout: 30_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-windows-bg-"));
+  const pidFile = join(directory, "child.pid");
+  const token = Buffer.from(`${process.pid}-${Date.now()}-windows-tree`).toString("hex");
+  const quotePowerShell = (value: string) => `'${value.replace(/'/g, "''")}'`;
+  const command = [
+    "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoLogo -NoProfile -Command \"Start-Sleep -Seconds 120\"' -PassThru",
+    `[IO.File]::WriteAllText(${quotePowerShell(pidFile)}, [string]$child.Id)`,
+    "while ($true) { Start-Sleep -Milliseconds 200 }",
+  ].join("\n");
+  const launchCommand = buildWindowsBackgroundShellCommand(
+    command,
+    directory,
+    "powershell",
+    token,
+    false,
+  );
+  const [launchFile, ...launchArgs] = launchCommand.split(" ");
+  const task = spawnChild(launchFile, launchArgs, {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  const taskExit = new Promise<void>((resolve, reject) => {
+    task.once("error", reject);
+    task.once("exit", () => resolve());
+  });
+  let childPid = 0;
+  try {
+    const deadline = Date.now() + 8_000;
+    while (!existsSync(pidFile) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    childPid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(childPid > 0, "PowerShell child PID should be published");
+
+    const controlCommand = buildWindowsBackgroundSignalCommand(
+      token,
+      "SIGTERM",
+      "powershell",
+    );
+    const [controlFile, ...controlArgs] = controlCommand.split(" ");
+    const control = spawnChild(controlFile, controlArgs, {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    const controlCode = await new Promise<number | null>((resolve, reject) => {
+      control.once("error", reject);
+      control.once("exit", resolve);
+    });
+    assert.equal(controlCode, 0);
+    await taskExit;
+
+    let childAlive = true;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      try {
+        process.kill(childPid, 0);
+      } catch {
+        childAlive = false;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(childAlive, false, "taskkill /T /F must remove descendants");
+  } finally {
+    if (childPid > 0) {
+      try {
+        process.kill(childPid, "SIGKILL");
+      } catch {}
+    }
+    try {
+      task.kill("SIGKILL");
+    } catch {}
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 interface HarnessOptions {
   flag?: string;
   configFlag?: string;
@@ -2751,6 +3819,7 @@ interface HarnessOptions {
   cwd?: string;
   activeTools?: string[];
   skillPaths?: string[];
+  backgroundProtocolVersion?: number | null;
   input?: (
     title: string,
     placeholder?: string,
@@ -2817,6 +3886,24 @@ function createExtensionHarness(options: HarnessOptions = {}) {
       on: (name: string, handler: (...args: any[]) => void) => eventBus.on(name, handler),
       emit: (name: string, payload: unknown) => {
         events.push({ name, payload });
+        if (
+          name === "bg:register"
+          && typeof (payload as { onRegistered?: unknown })?.onRegistered === "function"
+        ) {
+          if (options.backgroundProtocolVersion !== null) {
+            (payload as {
+              onRegistered: (capabilities: {
+                protocolVersion: number;
+                providers: boolean;
+                taskControl: boolean;
+              }) => void;
+            }).onRegistered({
+              protocolVersion: options.backgroundProtocolVersion ?? 2,
+              providers: true,
+              taskControl: (options.backgroundProtocolVersion ?? 2) >= 2,
+            });
+          }
+        }
         return eventBus.emit(name, payload);
       },
     },
@@ -3721,7 +4808,7 @@ test("ssh-cd treats absolute paths as remote and preserves cwd on failure", asyn
   const inspectedCwds: string[] = [];
   const harness = createExtensionHarness({
     flag: "devbox:/tmp",
-    cwd: "/home/zach",
+    cwd: "/local/workspace",
   });
   createSshRemoteExtension({
     platform: "linux",
@@ -3771,22 +4858,22 @@ test("ssh-cd treats absolute paths as remote and preserves cwd on failure", asyn
     harness.ctx,
   );
 
-  await change("/home/zach");
-  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/home/zach");
-  await change("/home/zach/Desktop");
+  await change("/remote/example");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/remote/example");
+  await change("/remote/example/Desktop");
   assert.equal(
     findSshSessionState(harness.entries)?.remoteCwd,
-    "/home/zach/Desktop",
+    "/remote/example/Desktop",
   );
   await change("../../..");
   assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/");
-  await change("home/zach");
-  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/home/zach");
+  await change("remote/example");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/remote/example");
   assert.deepEqual(inspectedCwds, [
-    "/home/zach",
-    "/home/zach/Desktop",
+    "/remote/example",
+    "/remote/example/Desktop",
     "/",
-    "/home/zach",
+    "/remote/example",
   ]);
   assert.equal(clients.length, 1, "cwd changes must reuse the SSH connection");
 
@@ -3800,7 +4887,7 @@ test("ssh-cd treats absolute paths as remote and preserves cwd on failure", asyn
   );
   assert.equal(
     findSshSessionState(harness.entries)?.remoteCwd,
-    "/home/zach",
+    "/remote/example",
     "a failed change must preserve the previous remote cwd",
   );
   assert.equal(harness.getSessionName(), sessionNameBeforeFailure);
@@ -3824,7 +4911,7 @@ test("ssh-cd keeps Windows remote absolute paths independent of the local cwd", 
   const inspectedCwds: string[] = [];
   const harness = createExtensionHarness({
     flag: "winbox:C:\\Temp",
-    cwd: "C:\\Users\\Zach",
+    cwd: "C:\\Local\\Workspace",
   });
   createSshRemoteExtension({
     platform: "win32",
@@ -3861,14 +4948,14 @@ test("ssh-cd keeps Windows remote absolute paths independent of the local cwd", 
   const sshCd = harness.tools.get("ssh_cd");
   await sshCd.execute(
     "ssh-cd-windows-absolute",
-    { path: "C:\\Users\\Zach\\Desktop" },
+    { path: "D:\\Remote\\Example\\Desktop" },
     undefined,
     undefined,
     harness.ctx,
   );
   assert.equal(
     findSshSessionState(harness.entries)?.remoteCwd,
-    "C:\\Users\\Zach\\Desktop",
+    "D:\\Remote\\Example\\Desktop",
   );
   await sshCd.execute(
     "ssh-cd-windows-relative",
@@ -3879,11 +4966,11 @@ test("ssh-cd keeps Windows remote absolute paths independent of the local cwd", 
   );
   assert.equal(
     findSshSessionState(harness.entries)?.remoteCwd,
-    "C:\\Users\\Zach",
+    "D:\\Remote\\Example",
   );
   assert.deepEqual(inspectedCwds, [
-    "C:\\Users\\Zach\\Desktop",
-    "C:\\Users\\Zach",
+    "D:\\Remote\\Example\\Desktop",
+    "D:\\Remote\\Example",
   ]);
 });
 
@@ -4017,19 +5104,39 @@ test("startup connection failure leaves the session alive for reconnect", async 
   );
 });
 
-test("background resolver follows SSH transitions and reclaims ownership before bg_start", async () => {
+test("background provider registry follows SSH transitions without last-writer races", async () => {
   const clients: FakeSshClient[] = [];
   const harness = createExtensionHarness({ flag: "host-a:/srv/a" });
+  type TestBackgroundResolver = (
+    command: string,
+    interactive: boolean,
+    context: { cwd: string; projectTrusted: boolean },
+  ) => {
+    file: string;
+    args: string[];
+    env: NodeJS.ProcessEnv;
+    taskEnvironment?: string;
+  } | undefined;
+  const providers = new Map<string, {
+    priority: number;
+    resolveShell: TestBackgroundResolver;
+  }>();
+  harness.pi.events.on("bg:register", (data: unknown) => {
+    const registration = data as {
+      id?: unknown;
+      priority?: unknown;
+      resolveShell?: TestBackgroundResolver;
+    };
+    if (typeof registration.id !== "string" || !registration.resolveShell) return;
+    providers.set(registration.id, {
+      priority: typeof registration.priority === "number" ? registration.priority : 0,
+      resolveShell: registration.resolveShell,
+    });
+  });
   const localResolver = (command: string) => ({
     file: "pwsh.exe",
     args: ["-Command", command],
     env: { ...process.env },
-  });
-  harness.pi.events.on(SSH_ENVIRONMENT_EVENT, (data: unknown) => {
-    const event = data as { action?: unknown; status?: unknown };
-    if (event.action === "exit" && event.status === "succeeded") {
-      harness.pi.events.emit("bg:register", { resolveShell: localResolver });
-    }
   });
   createSshRemoteExtension({
     platform: "linux",
@@ -4053,40 +5160,30 @@ test("background resolver follows SSH transitions and reclaims ownership before 
       };
     },
   })(harness.pi);
-  const latestResolver = () => {
-    const registration = harness.events.filter((event) =>
-      event.name === "bg:register"
-    ).at(-1);
-    assert.ok(registration);
-    return registration.payload.resolveShell as (
-      command: string,
-      interactive: boolean,
-      context: { cwd: string; projectTrusted: boolean },
-    ) => {
-      file: string;
-      args: string[];
-      env: NodeJS.ProcessEnv;
-      taskEnvironment?: string;
-    } | undefined;
+  const resolve = () => {
+    for (const provider of Array.from(providers.values()).sort(
+      (left, right) => right.priority - left.priority,
+    )) {
+      const launch = provider.resolveShell("pwd", false, {
+        cwd: "/local/project",
+        projectTrusted: true,
+      });
+      if (launch) return launch;
+    }
+    return undefined;
   };
-  const resolve = () => latestResolver()("pwd", false, {
-    cwd: "/local/project",
-    projectTrusted: true,
-  });
 
   await harness.emit("session_start", { reason: "startup" });
   assert.ok(resolve()?.args.includes("host-a"));
   assert.match(resolve()?.args.at(-1) ?? "", /\/srv\/a/);
   assert.equal(resolve()?.taskEnvironment, "SSH host-a:/srv/a");
 
-  // Simulate a later local adapter registration. Active SSH must reclaim the
-  // last-writer-wins backend during bg_start preflight.
-  harness.pi.events.emit("bg:register", { resolveShell: localResolver });
-  assert.equal(resolve()?.file, "pwsh.exe");
-  await harness.emit("tool_call", {
-    toolName: "bg_start",
-    toolCallId: "bg-active-host-a",
-    input: { name: "active-host-a", command: "pwd" },
+  // A lower-priority local provider can register later without stealing an
+  // active SSH launch. No tool_call-time resolver reclaim is needed.
+  harness.pi.events.emit("bg:register", {
+    id: "pwsh-adapter",
+    priority: 10,
+    resolveShell: localResolver,
   });
   assert.equal(resolve()?.file, "ssh");
   assert.ok(resolve()?.args.includes("host-a"));
@@ -4111,6 +5208,35 @@ test("background resolver follows SSH transitions and reclaims ownership before 
   assert.ok(resolve()?.args.includes("host-c"));
   assert.match(resolve()?.args.at(-1) ?? "", /\/srv\/c/);
   assert.equal(resolve()?.taskEnvironment, "SSH host-c:/srv/c");
+});
+
+test("active SSH blocks outdated Background Tasks without task-control support", async () => {
+  const harness = createExtensionHarness({
+    flag: "devbox:/srv/project",
+    backgroundProtocolVersion: null,
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => new FakeSshClient(options),
+    selectRemote: async (client, options) => ({
+      adapter: new UnixBashAdapter(client, "linux", "bash"),
+      workspace: {
+        platform: "unix",
+        shell: "bash",
+        home: "/home/deploy",
+        cwd: options.requestedCwd ?? "/srv/project",
+      },
+    }),
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+  const decision = await harness.emit("tool_call", {
+    toolName: "bg_start",
+    toolCallId: "outdated-background-tasks",
+    input: { name: "unsafe-remote", command: "sleep 30" },
+  }) as { block?: boolean; reason?: string };
+  assert.equal(decision.block, true);
+  assert.match(decision.reason ?? "", /task-control protocol v2.*Update Background Tasks/i);
+  await harness.emit("session_shutdown", { reason: "quit" });
 });
 
 test("background resolver fails closed while SSH is unavailable", async () => {

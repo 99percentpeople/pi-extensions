@@ -205,6 +205,10 @@ class AutoWindowsSshClient implements SshRemoteClient {
     return checkedResult(await this.run(command, options));
   }
 
+  acquireBackgroundLease() {
+    return this.delegate.acquireBackgroundLease?.();
+  }
+
   async dispose(options?: SshDisposeOptions): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
@@ -396,6 +400,10 @@ class SshpassRetryClient implements SshRemoteClient {
     return checkedResult(await this.run(command, options));
   }
 
+  acquireBackgroundLease() {
+    return this.delegate.acquireBackgroundLease?.();
+  }
+
   async dispose(options?: SshDisposeOptions): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
@@ -540,6 +548,10 @@ class AutoUnixSshClient implements SshRemoteClient {
 
   async runChecked(command: string, options?: SshRunOptions): Promise<SshRunResult> {
     return checkedResult(await this.run(command, options));
+  }
+
+  acquireBackgroundLease() {
+    return this.delegate.acquireBackgroundLease?.();
   }
 
   async dispose(options?: SshDisposeOptions): Promise<void> {

@@ -63,6 +63,10 @@ export interface SshDisposeOptions {
   preserveBackgroundSessions?: boolean;
 }
 
+export interface SshBackgroundLease {
+  release(): void | Promise<void>;
+}
+
 export interface SshRemoteClient extends SshExecutor {
   readonly options: Readonly<SshClientOptions>;
   /** Effective foreground transport. Optional for third-party/test implementations. */
@@ -73,6 +77,8 @@ export interface SshRemoteClient extends SshExecutor {
   readonly fallbackReason?: string;
   /** Non-fatal OpenSSH options or identities that ssh2 could not reproduce. */
   readonly compatibilityWarnings?: readonly string[];
+  /** Keep a managed ControlMaster available until one background task finishes. */
+  acquireBackgroundLease?(): SshBackgroundLease | undefined;
   dispose(options?: SshDisposeOptions): void | Promise<void>;
 }
 
@@ -185,6 +191,10 @@ export class OpenSshClient implements SshRemoteClient {
   private readonly spawnFn: SpawnFunction;
   private readonly children = new Set<ChildProcess>();
   private readonly controlDirectory?: string;
+  private backgroundLeaseCount = 0;
+  private pendingControlClose: "stop" | "exit" | undefined;
+  private controlClosePromise: Promise<void> | undefined;
+  private controlClosed = false;
   private disposed = false;
 
   constructor(options: SshClientOptions, spawnFn: SpawnFunction = spawn) {
@@ -200,12 +210,41 @@ export class OpenSshClient implements SshRemoteClient {
     this.spawnFn = spawnFn;
   }
 
+  acquireBackgroundLease(): SshBackgroundLease | undefined {
+    if (
+      this.disposed
+      || this.options.multiplex !== true
+      || !this.options.controlPath
+      || this.controlClosed
+    ) {
+      return undefined;
+    }
+    this.backgroundLeaseCount += 1;
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        this.backgroundLeaseCount = Math.max(0, this.backgroundLeaseCount - 1);
+        if (this.backgroundLeaseCount === 0 && this.pendingControlClose) {
+          await this.closeControl(this.pendingControlClose);
+        }
+      },
+    };
+  }
+
   async run(
     command: string,
     options: SshRunOptions = {},
   ): Promise<SshRunResult> {
     if (this.disposed) throw new Error("SSH client is closed");
     if (options.signal?.aborted) throw new Error("aborted");
+    if (
+      options.timeoutSeconds !== undefined
+      && (!Number.isFinite(options.timeoutSeconds) || options.timeoutSeconds <= 0)
+    ) {
+      throw new Error("SSH timeout must be a positive number of seconds");
+    }
 
     const sshProgram = this.options.executable ?? "ssh";
     const hasInput = options.input !== undefined;
@@ -243,26 +282,59 @@ export class OpenSshClient implements SshRemoteClient {
     let stdoutTempFile: string | undefined;
     let stderrFd: number | undefined;
     let stderrTempFile: string | undefined;
-    if (windowsClient) {
-      if (options.input !== undefined) {
-        const temp = createStdinTempFile(options.input);
-        stdinFd = temp.fd;
-        stdinTempFile = temp.path;
+    const cleanupStdioFiles = () => {
+      for (const fd of [stdinFd, stdoutFd, stderrFd]) {
+        if (fd !== undefined) {
+          try {
+            closeSync(fd);
+          } catch {}
+        }
       }
-      const out = createTempFile();
-      stdoutFd = out.fd;
-      stdoutTempFile = out.path;
-      const err = createTempFile();
-      stderrFd = err.fd;
-      stderrTempFile = err.path;
+      stdinFd = undefined;
+      stdoutFd = undefined;
+      stderrFd = undefined;
+      for (const file of [stdinTempFile, stdoutTempFile, stderrTempFile]) {
+        if (file !== undefined) {
+          try {
+            rmSync(file, { force: true });
+          } catch {}
+        }
+      }
+      stdinTempFile = undefined;
+      stdoutTempFile = undefined;
+      stderrTempFile = undefined;
+    };
+    try {
+      if (windowsClient) {
+        if (options.input !== undefined) {
+          const temp = createStdinTempFile(options.input);
+          stdinFd = temp.fd;
+          stdinTempFile = temp.path;
+        }
+        const out = createTempFile();
+        stdoutFd = out.fd;
+        stdoutTempFile = out.path;
+        const err = createTempFile();
+        stderrFd = err.fd;
+        stderrTempFile = err.path;
+      }
+    } catch (error) {
+      cleanupStdioFiles();
+      throw error;
     }
-    const child = this.spawnFn(executable, args, {
-      env,
-      stdio: windowsClient
-        ? [stdinFd ?? "ignore", stdoutFd!, stderrFd!]
-        : ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    let child: ChildProcess;
+    try {
+      child = this.spawnFn(executable, args, {
+        env,
+        stdio: windowsClient
+          ? [stdinFd ?? "ignore", stdoutFd!, stderrFd!]
+          : ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (error) {
+      cleanupStdioFiles();
+      throw error;
+    }
     this.children.add(child);
 
     return new Promise<SshRunResult>((resolve, reject) => {
@@ -314,20 +386,7 @@ export class OpenSshClient implements SshRemoteClient {
         if (forceKillHandle) clearTimeout(forceKillHandle);
         if (pollHandle) clearInterval(pollHandle);
         options.signal?.removeEventListener("abort", onAbort);
-        for (const fd of [stdinFd, stdoutFd, stderrFd]) {
-          if (fd !== undefined) {
-            try {
-              closeSync(fd);
-            } catch {}
-          }
-        }
-        for (const file of [stdinTempFile, stdoutTempFile, stderrTempFile]) {
-          if (file !== undefined) {
-            try {
-              rmSync(file, { force: true });
-            } catch {}
-          }
-        }
+        cleanupStdioFiles();
         this.children.delete(child);
       };
       const finishReject = (error: Error) => {
@@ -346,6 +405,23 @@ export class OpenSshClient implements SshRemoteClient {
           try {
             child.kill("SIGKILL");
           } catch {}
+          if (process.platform === "win32" && child.pid) {
+            try {
+              const killer = spawn(
+                "taskkill",
+                ["/PID", String(child.pid), "/T", "/F"],
+                { stdio: "ignore", windowsHide: true },
+              );
+              killer.unref();
+            } catch {}
+          }
+          finishReject(
+            options.signal?.aborted
+              ? new Error("aborted")
+              : timedOut
+                ? new Error(`timeout:${options.timeoutSeconds}`)
+                : new Error("SSH command cancellation did not close the process"),
+          );
         }, 1_000);
         forceKillHandle.unref?.();
       };
@@ -388,16 +464,6 @@ export class OpenSshClient implements SshRemoteClient {
       });
 
       if (options.timeoutSeconds !== undefined) {
-        if (
-          !Number.isFinite(options.timeoutSeconds) ||
-          options.timeoutSeconds <= 0
-        ) {
-          onAbort();
-          finishReject(
-            new Error("SSH timeout must be a positive number of seconds"),
-          );
-          return;
-        }
         timeoutHandle = setTimeout(() => {
           timedOut = true;
           onAbort();
@@ -426,6 +492,74 @@ export class OpenSshClient implements SshRemoteClient {
     );
   }
 
+  private closeControl(mode: "stop" | "exit"): Promise<void> {
+    if (this.controlClosed) return Promise.resolve();
+    if (this.controlClosePromise) return this.controlClosePromise;
+
+    const pending = (async () => {
+      const controlPath = this.options.controlPath;
+      if (this.options.multiplex === true && controlPath) {
+        const executable = this.options.executable ?? "ssh";
+        const args: string[] = [];
+        if (this.options.configFile) args.push("-F", this.options.configFile);
+        args.push(
+          "-o",
+          `BatchMode=${this.options.batchMode === false ? "no" : "yes"}`,
+          "-S",
+          controlPath,
+          "-O",
+          mode,
+          this.options.target,
+        );
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+          try {
+            const child = this.spawnFn(executable, args, {
+              env: process.env,
+              stdio: "ignore",
+              windowsHide: true,
+            });
+            const timeout = setTimeout(() => {
+              try {
+                child.kill("SIGKILL");
+              } catch {}
+              finish();
+            }, 1_500);
+            timeout.unref?.();
+            child.once("error", () => {
+              clearTimeout(timeout);
+              finish();
+            });
+            child.once("close", () => {
+              clearTimeout(timeout);
+              finish();
+            });
+          } catch {
+            finish();
+          }
+        });
+      }
+
+      if (this.controlDirectory) {
+        try {
+          rmSync(this.controlDirectory, { recursive: true, force: true });
+        } catch {}
+      }
+      this.controlClosed = true;
+      this.pendingControlClose = undefined;
+    })();
+    const tracked = pending.finally(() => {
+      if (this.controlClosePromise === tracked) this.controlClosePromise = undefined;
+    });
+    this.controlClosePromise = tracked;
+    return tracked;
+  }
+
   async dispose(options: SshDisposeOptions = {}): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
@@ -436,58 +570,12 @@ export class OpenSshClient implements SshRemoteClient {
     }
     this.children.clear();
 
-    const controlPath = this.options.controlPath;
-    if (this.options.multiplex === true && controlPath) {
-      const executable = this.options.executable ?? "ssh";
-      const args: string[] = [];
-      if (this.options.configFile) args.push("-F", this.options.configFile);
-      args.push(
-        "-o",
-        `BatchMode=${this.options.batchMode === false ? "no" : "yes"}`,
-        "-S",
-        controlPath,
-        "-O",
-        options.preserveBackgroundSessions ? "stop" : "exit",
-        this.options.target,
-      );
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          resolve();
-        };
-        try {
-          const child = this.spawnFn(executable, args, {
-            env: process.env,
-            stdio: "ignore",
-            windowsHide: true,
-          });
-          const timeout = setTimeout(() => {
-            try {
-              child.kill("SIGKILL");
-            } catch {}
-            finish();
-          }, 1_500);
-          timeout.unref?.();
-          child.once("error", () => {
-            clearTimeout(timeout);
-            finish();
-          });
-          child.once("close", () => {
-            clearTimeout(timeout);
-            finish();
-          });
-        } catch {
-          finish();
-        }
-      });
-    }
-
-    if (this.controlDirectory) {
-      try {
-        rmSync(this.controlDirectory, { recursive: true, force: true });
-      } catch {}
-    }
+    const requestedMode = options.preserveBackgroundSessions ? "stop" : "exit";
+    this.pendingControlClose = this.pendingControlClose === "exit"
+      || requestedMode === "exit"
+      ? "exit"
+      : "stop";
+    if (this.backgroundLeaseCount > 0) return;
+    await this.closeControl(this.pendingControlClose);
   }
 }

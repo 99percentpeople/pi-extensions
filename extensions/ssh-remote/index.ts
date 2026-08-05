@@ -73,6 +73,7 @@ import { SshPasswordResolver } from "./password-resolver.ts";
 
 const STATUS_KEY = "ssh-remote";
 const CONNECT_TIMEOUT_SECONDS = 10;
+const BACKGROUND_TASK_CONTROL_PROTOCOL_VERSION = 2;
 export const AI_SSH_PASSWORD_PROMPT_TIMEOUT_MS = 60_000;
 export const SSH_ENVIRONMENT_EVENT = "ssh-remote:environment";
 const SSH_ENVIRONMENT_CONTEXT_TYPE = "ssh-remote-environment";
@@ -521,6 +522,8 @@ export function createSshRemoteExtension(
     let autoSessionName: string | undefined;
     let autoSessionTitle: string | undefined;
     let remoteBackendsRegistered = false;
+    let backgroundBackendProtocolVersion = 0;
+    let backgroundTaskControlSupported = false;
 
     const emitEnvironmentEvent = (event: SshEnvironmentEvent): void => {
       pi.events.emit(SSH_ENVIRONMENT_EVENT, event);
@@ -569,19 +572,40 @@ export function createSshRemoteExtension(
       // resolver reads the live runtime state on each launch: active sessions
       // run tasks on the remote (reconnecting picks up the new connection),
       // failed/connecting sessions fail closed like the routed tools, and a
-      // session without SSH falls back to the default local shell backend.
+      // session without SSH falls through to lower-priority local providers.
       pi.events.emit("bg:register", {
+        id: "ssh-remote",
+        priority: 100,
+        onRegistered: (capabilities: {
+          protocolVersion?: unknown;
+          taskControl?: unknown;
+        }) => {
+          if (
+            typeof capabilities.protocolVersion === "number"
+            && Number.isInteger(capabilities.protocolVersion)
+          ) {
+            backgroundBackendProtocolVersion = Math.max(
+              backgroundBackendProtocolVersion,
+              capabilities.protocolVersion,
+            );
+          }
+          if (capabilities.taskControl === true) {
+            backgroundTaskControlSupported = true;
+          }
+        },
         resolveShell: (
           command: string,
           interactive: boolean,
           context?: BackgroundShellResolverContext,
         ) => {
           if (runtime.kind === "active") {
+            const active = runtime;
             return createSshBackgroundShellResolver({
-              ssh: { ...runtime.client.options },
-              adapter: runtime.adapter,
-              workspace: runtime.workspace,
+              ssh: { ...active.client.options },
+              adapter: active.adapter,
+              workspace: active.workspace,
               localCwd: ctx.cwd,
+              acquireControlLease: () => active.client.acquireBackgroundLease?.(),
             })(command, interactive, context);
           }
           if (runtime.kind === "failed") {
@@ -926,9 +950,9 @@ export function createSshRemoteExtension(
         }
       }
       runtime = { kind: "disabled" };
-      // A local shell adapter may reclaim the shared background backend after
-      // the exit event. Allow the SSH resolver to register again on a later
-      // /ssh-connect in the same Pi session.
+      // The named provider remains registered and now falls through locally.
+      // Re-emitting on a later connect refreshes protocol acknowledgement after
+      // an extension reload.
       remoteBackendsRegistered = false;
       passwordResolver.setUI(undefined);
       updateStatus(ctx);
@@ -1951,14 +1975,27 @@ export function createSshRemoteExtension(
     });
 
     pi.on("tool_call", (event, ctx) => {
-      // Background task backends are registered through a shared "bg:register"
-      // bus where the last registrant wins. Reclaim the resolver immediately
-      // before every active SSH launch so extension/session-start ordering
-      // cannot route bg_start to a later local adapter. Failed and connecting
-      // workspaces still fail closed independent of the selected resolver.
+      // Background Tasks protocol v2 keeps named providers instead of relying
+      // on last-writer registration. Re-emit only when a dynamically loaded or
+      // outdated Background Tasks extension has not acknowledged that protocol.
       if (event.toolName !== "bg_start") return;
       if (runtime.kind === "active") {
-        emitBackgroundBackend(ctx, true);
+        if (
+          backgroundBackendProtocolVersion < BACKGROUND_TASK_CONTROL_PROTOCOL_VERSION
+          || !backgroundTaskControlSupported
+        ) {
+          emitBackgroundBackend(ctx, true);
+        }
+        if (
+          backgroundBackendProtocolVersion < BACKGROUND_TASK_CONTROL_PROTOCOL_VERSION
+          || !backgroundTaskControlSupported
+        ) {
+          return {
+            block: true,
+            reason:
+              "SSH background tasks require @99percentpeople/pi-background-tasks with task-control protocol v2 support. Update Background Tasks and reload Pi.",
+          };
+        }
         return undefined;
       }
       if (runtime.kind === "failed") {
@@ -2084,6 +2121,7 @@ export type {
   SshShellPreference,
 } from "./adapters/index.ts";
 export type {
+  SshBackgroundLease,
   SshClientOptions,
   SshDisposeOptions,
   SshRemoteClient,

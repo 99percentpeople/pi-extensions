@@ -3,12 +3,7 @@ import {
   type ExtensionAPI,
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
-import {
-  spawn,
-  spawnSync,
-  type SpawnOptions,
-  type ChildProcess,
-} from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const UTF8_PRELUDE = `
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -237,33 +232,6 @@ export function createPowerShellBashToolDefinition(
   };
 }
 
-/**
- * Wrapper around spawn that intercepts shell invocations from background-tasks.
- * When bg_start calls `spawn('/bin/sh', ['-c', cmd], opts)`,
- * this rewrites it to the selected PowerShell executable.
- */
-function createBgSpawnWrapper(runtime: PowerShellRuntime) {
-  const SHELLS = new Set(["/bin/sh", "/bin/bash", "/usr/bin/sh", "/usr/bin/bash", "sh", "bash"]);
-
-  return function pwshSpawn(
-    command: string,
-    args?: readonly string[],
-    options?: SpawnOptions,
-  ): ChildProcess {
-    if (SHELLS.has(command) && args?.[0] === "-c" && args.length >= 2) {
-      // Rewrite: /bin/sh -c <cmd>  →  PowerShell -Command <cmd>
-      const userCommand = args.slice(1).join(" ");
-      return spawn(
-        runtime.file,
-        ["-NoProfile", "-NonInteractive", "-NoLogo", "-Command", `${UTF8_PRELUDE}\n${userCommand}`],
-        { ...options, windowsHide: true },
-      );
-    }
-    // Fallback: pass through unchanged
-    return spawn(command, args as string[], options ?? {});
-  };
-}
-
 export function createBgShellResolver(runtime: PowerShellRuntime) {
   return (command: string, interactive: boolean) => ({
     file: runtime.file,
@@ -288,8 +256,14 @@ export default function (pi: ExtensionAPI) {
 
   const runtime = selectPowerShellRuntime();
   const pwshOps = createPwshBashOperations(runtime);
-  const bgSpawn = createBgSpawnWrapper(runtime);
   const bgShell = createBgShellResolver(runtime);
+  const registerBackgroundBackend = (): void => {
+    pi.events.emit("bg:register", {
+      id: "pwsh-adapter",
+      priority: 10,
+      resolveShell: bgShell,
+    });
+  };
 
   // Bash delegation protocol: another extension (for example ssh-remote) can
   // claim the bash tool for the current session by emitting "bash:delegate"
@@ -304,31 +278,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Adapt background-tasks to use the selected PowerShell instead of /bin/sh.
-  pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
+  registerBackgroundBackend();
 
-  // SSH Remote owns the background resolver from the start of a connection
-  // attempt until a successful exit. Track that claim so extension load order
-  // cannot make this adapter overwrite an active or fail-closed SSH resolver
-  // from a later-running session_start handler.
-  let sshEnvironmentClaimed = false;
-  pi.events.on("ssh-remote:environment", (data: unknown) => {
-    const event = data as { action?: unknown; status?: unknown };
-    if (event.action === "connect") {
-      sshEnvironmentClaimed = true;
-      return;
-    }
-    if (event.action === "exit" && event.status === "succeeded") {
-      sshEnvironmentClaimed = false;
-      pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
-    }
-  });
-
-  // Re-register on session start in case bg extension loads after us, unless
-  // SSH Remote has already claimed the backend in an earlier startup handler.
+  // Re-register on session start in case Background Tasks loaded after us.
+  // Named provider replacement is idempotent and SSH routing uses priority.
   pi.on("session_start", async (_event, ctx) => {
-    if (!sshEnvironmentClaimed) {
-      pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
-    }
+    registerBackgroundBackend();
     ctx.ui.notify(
       `bash tool loaded through ${runtime.label} (${runtime.file}). background-tasks adapted.`,
       "info",

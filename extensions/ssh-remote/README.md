@@ -28,9 +28,12 @@ on the local machine.
   `/tree`
 - Fails closed when an SSH workspace is unavailable instead of silently using
   local files
-- Integrates with `@99percentpeople/pi-background-tasks`,
-  `@99percentpeople/pi-workspace-files`, `@99percentpeople/pi-codex-api`, and
-  `@99percentpeople/pi-pwsh-adapter`
+- Combines with
+  [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks)
+  to run and attach to remote PTY/TUI applications such as `lazygit`, `htop`,
+  `nvim`, and `k9s`
+- Integrates with `@99percentpeople/pi-workspace-files`,
+  `@99percentpeople/pi-codex-api`, and `@99percentpeople/pi-pwsh-adapter`
 
 ## Contents
 
@@ -87,6 +90,33 @@ Useful commands inside Pi:
 /ssh-reconnect                      Reconnect or apply a transport change
 /ssh-exit                           Return this conversation to its local workspace
 ```
+
+### Remote background TUIs
+
+Install Background Tasks 2.0.0 or newer alongside SSH Remote 0.5.0 or newer:
+
+```bash
+pi install npm:@99percentpeople/pi-background-tasks
+```
+
+These versions share Background Control protocol v2. Older Background Tasks
+builds are blocked for active SSH workspaces rather than risking local fallback;
+Background Tasks 2.x likewise rejects older unnamed SSH providers. Update both
+packages together.
+
+While the SSH workspace is active, ask Pi to *"start lazygit in a background
+PTY named remote-git"*, then run `/bg-attach` and select it from the task list
+(or pass the generated task ID):
+
+```text
+/bg-attach <task-id>
+```
+
+Keyboard, mouse, resize, signals, retained terminal state, and cleanup are
+routed to the original remote host. `Ctrl+]` detaches while the TUI keeps
+running. See the
+[Background Tasks remote TUI guide](https://github.com/99percentpeople/pi-extensions/tree/master/extensions/background-tasks#run-a-remote-tui-over-ssh)
+for requirements and more examples.
 
 A typical OpenSSH alias works with either transport:
 
@@ -373,7 +403,11 @@ POSIX `sh` scripts on Unix and encoded PowerShell scripts on Windows. This lets
 OpenWrt, Alpine, BusyBox, and other Bash-free systems use the complete file-tool
 set. On Windows, PowerShell commands are encoded as UTF-16LE payloads so script
 content does not appear directly in `ssh.exe` arguments; file data still moves
-as binary stdin/stdout.
+as binary stdin/stdout. Cancellable Windows shell calls also record the root
+PowerShell PID and start time. A Pi Esc cancellation or bash timeout uses a
+second SSH channel with `taskkill /T /F` to remove that validated remote process
+tree before closing the primary channel; a hard transport deadline prevents a
+PowerShell 5.1 or Windows OpenSSH close hang from wedging the tool call.
 
 Known POSIX-control-script limits:
 
@@ -530,7 +564,10 @@ referenced_image_paths: [C:\Users\dev\Desktop\reference.jpg]
 
 When `@99percentpeople/pi-background-tasks` is installed, SSH Remote registers a
 remote backend for pipe and PTY jobs. Version 1.2.7 or newer also allows
-`bg_start.cwd` to name a remote-only Unix or Windows directory.
+`bg_start.cwd` to name a remote-only Unix or Windows directory. Remote signal,
+transport-recovery, and ControlMaster-lease safety require Background Tasks
+protocol v2; SSH Remote blocks remote `bg_start` with an actionable update
+message when an older build is detected.
 
 Background jobs require a real local process or PTY, so they always launch the
 system OpenSSH client:
@@ -541,10 +578,11 @@ system OpenSSH client:
 - A foreground password is not forwarded to those separate processes; use an
   SSH key or agent.
 
-An active SSH workspace reclaims the shared background resolver immediately
-before every `bg_start`, preventing a later local adapter registration from
-redirecting the job. A disconnected SSH workspace blocks `bg_start` instead of
-falling back locally.
+SSH Remote registers a named, high-priority Background Tasks provider. Active
+SSH resolves remotely, connecting or failed SSH fails closed, and local mode
+falls through to lower-priority providers such as Pwsh. This avoids
+last-writer registration races and restores arbitrary local adapters without a
+per-`bg_start` reclaim.
 
 Every SSH launch records an immutable label such as
 `SSH devbox:/srv/project`. Background task results—including start,
@@ -553,10 +591,31 @@ it inline in the widget. This lets the model and user distinguish old tasks
 after a host or cwd switch. Finished task snapshots retain the label across
 extension reloads.
 
-Running jobs stay on their original host and cwd across `/ssh-connect`,
-`/ssh-exit`, and `/ssh-cd`. In-session changes stop new ControlMaster reuse
-without terminating existing multiplexed channels. Pi shutdown terminates the
-local SSH job processes; resume does not reattach them.
+Each launch also creates a private remote control record for its Unix process
+group or Windows process tree. `bg_send` signals and `bg_kill` use a short SSH
+control channel to target that remote process directly; they do not mistake
+termination of the local `ssh` launcher for termination of the command. Unix
+supports its normal named signals and preserves the user shell's signal
+handling, so Bash `trap` handlers continue to run for signals such as `INT`,
+`TERM`, `HUP`, `QUIT`, `USR1`, and `USR2`. Remote Windows termination uses
+`taskkill /T /F`, and unsupported Unix-only signals return an error.
+
+Each multiplexed job holds a task lease on its launch-time ControlMaster. Host
+switches and even an earlier-running SSH shutdown handler defer socket removal
+until all leased jobs settle, so password-authenticated jobs remain
+controllable without copying a password into background or signal processes.
+A key- or agent-authenticated direct connection remains the fallback when no
+managed master exists.
+
+If the local `ssh` transport exits unexpectedly, the task control probes its
+immutable remote record, requests `SIGTERM`, escalates to `SIGKILL` when needed,
+and only then finalizes the task. If connectivity prevents confirmation,
+Background Tasks reports `disconnected` and preserves signal control for a
+later retry instead of claiming that the remote process exited. Running jobs
+stay on their original host and cwd across `/ssh-connect`, `/ssh-exit`, and
+`/ssh-cd`; resume does not reattach running jobs. Native Windows `ssh.exe` pipe
+launches use `-n` to avoid the OpenSSH stdio deadlock and therefore require PTY
+mode when later interactive stdin is needed.
 
 ### Windows PowerShell adapter
 
@@ -567,8 +626,8 @@ for that tool name:
 - active SSH sessions run the delegated shell remotely;
 - connecting or failed SSH sessions fail closed;
 - local sessions use the normal local PowerShell backend;
-- after `/ssh-exit`, the PowerShell adapter reclaims the local background
-  backend through `ssh-remote:environment`.
+- after `/ssh-exit`, the named SSH provider falls through to the registered
+  local PowerShell background provider.
 
 Use compatible versions of both packages.
 
@@ -577,6 +636,10 @@ Use compatible versions of both packages.
 - `ssh2` implements the documented compatibility subset only. Use explicit
   OpenSSH for certificates, hardware keys, arbitrary routing, GSSAPI, or
   keyboard-interactive authentication.
+- Windows PowerShell 5.1 can keep a manually nested native `ssh.exe` invocation
+  open long after its remote command exits when console stdin remains attached.
+  Prefer `ssh -n ...` for such nested commands or use PowerShell 7. Pi Esc and
+  bash timeout still terminate the outer recorded process tree.
 - Local `AGENTS.md`, `.pi`, project settings, registered skills, and references
   inside skill directories are not virtualized. They continue to come from
   Pi's local anchor directory.

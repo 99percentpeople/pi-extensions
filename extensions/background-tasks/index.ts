@@ -58,6 +58,42 @@ const { SerializeAddon } = cjsRequire("@xterm/addon-serialize") as typeof import
 
 // ── Types ──────────────────────────────────────────────────────────────
 
+export type BackgroundSignal = NodeJS.Signals | "SIGBREAK";
+export type BackgroundControlProbeResult = "running" | "finished" | "unknown";
+
+export interface BackgroundControlOptions {
+  abortSignal?: AbortSignal;
+}
+
+export type BackgroundTransportExitDisposition =
+  | { state: "finished" }
+  | { state: "stopped"; signal?: string }
+  | { state: "disconnected"; error: string };
+
+export interface BackgroundTaskControl {
+  /** Signals accepted by this execution environment, independent of Pi's local OS. */
+  supportedSignals?: readonly BackgroundSignal[];
+  /** Signals that should classify a later task exit as an intentional stop. */
+  terminatingSignals?: readonly BackgroundSignal[];
+  /** Human-readable destination used in bg_send results. */
+  signalTarget?: "process" | "process group" | "process tree";
+  /** False when an adapter launch deliberately detached stdin (for example ssh -n). */
+  stdinAvailable?: boolean;
+  sendSignal(
+    signal: BackgroundSignal,
+    options?: BackgroundControlOptions,
+  ): void | Promise<void>;
+  /** Probe adapter-owned state after the local transport has disappeared. */
+  probe(options?: BackgroundControlOptions): Promise<BackgroundControlProbeResult>;
+  /** Reconcile an unexpected local transport exit with the real task. */
+  onTransportExit(
+    event: { exitCode: number | null; signal: string | null },
+    options?: BackgroundControlOptions,
+  ): Promise<BackgroundTransportExitDisposition>;
+  /** Release adapter resources such as a ControlMaster task lease. */
+  dispose(): void | Promise<void>;
+}
+
 interface PipeTaskProcess {
   kind: "pipe";
   pid: number;
@@ -98,8 +134,13 @@ interface ShellLaunch {
   /** Local cwd for the launched shell process; adapters may map context.cwd elsewhere. */
   cwd?: string;
   initialStdin?: string;
+  /** Adapter-owned lifecycle and signaling, independent of the local launcher. */
+  control?: BackgroundTaskControl;
   /** Immutable execution location captured on the task at launch time. */
   taskEnvironment?: string;
+  /** Provider-scoped launch functions; omitted by normal shell adapters. */
+  spawnProcess?: typeof spawn;
+  ptySpawnProcess?: typeof nodePty.spawn;
 }
 
 interface ShellResolverContext {
@@ -120,9 +161,13 @@ interface BgTask {
   mode: "pipe" | "pty";
   environment: string | null;
   process: BackgroundProcess | null;
+  control: BackgroundTaskControl | null;
+  controlDisposed: boolean;
+  transportExitPending: Promise<void> | null;
   console: ConsoleSession;
   attachment: AttachmentState;
-  status: "running" | "completed" | "failed" | "stopped";
+  status: "running" | "disconnected" | "completed" | "failed" | "stopped";
+  statusDetail: string | null;
   exitCode: number | null;
   signal: string | null;
   order: number;
@@ -137,7 +182,7 @@ interface BgTask {
   retainForNextAgentTurn: boolean;
   stdoutPending: string;
   stderrPending: string;
-  requestedStopSignal: NodeJS.Signals | null;
+  requestedStopSignal: BackgroundSignal | null;
 }
 
 interface LatestLog {
@@ -146,7 +191,7 @@ interface LatestLog {
   at: number;
 }
 
-type FinishedTaskStatus = Exclude<BgTask["status"], "running">;
+type FinishedTaskStatus = "completed" | "failed" | "stopped";
 
 interface PersistedFinishedTask {
   id: string;
@@ -195,6 +240,11 @@ interface BgWaitRenderState {
 export interface BackgroundTasksExtensionDependencies {
   loadConfig?: () => BackgroundTasksConfig;
   saveConfig?: (config: BackgroundTasksConfig) => void;
+  /** Explicit process factories and terminal streams for tests or embedded runtimes. */
+  spawnProcess?: typeof spawn;
+  ptySpawnProcess?: typeof nodePty.spawn;
+  terminalInput?: NodeJS.ReadStream;
+  terminalOutput?: NodeJS.WriteStream;
 }
 
 interface StoredLog {
@@ -271,8 +321,6 @@ export class MemoryLogStore {
 
 // ── Execution Backend ─────────────────────────────────────────────────
 
-let spawnFn: typeof spawn = spawn;
-let ptySpawnFn: typeof nodePty.spawn = nodePty.spawn;
 let terminalInput: NodeJS.ReadStream = process.stdin;
 let terminalOutput: NodeJS.WriteStream = process.stdout;
 
@@ -310,14 +358,46 @@ function defaultShellResolver(
   };
 }
 
-let resolveShell: ShellResolver = defaultShellResolver;
+export const BACKGROUND_BACKEND_PROTOCOL_VERSION = 2;
+
+interface RegisteredShellProvider {
+  id: string;
+  priority: number;
+  order: number;
+  resolveShell: ShellResolver;
+  spawn?: typeof spawn;
+  ptySpawn?: typeof nodePty.spawn;
+}
+
+let shellProviderOrder = 0;
+const shellProviders = new Map<string, RegisteredShellProvider>();
+
+function resolveShell(
+  command: string,
+  interactive: boolean,
+  context?: ShellResolverContext,
+): ShellLaunch {
+  const providers = Array.from(shellProviders.values()).sort(
+    (left, right) => right.priority - left.priority || right.order - left.order,
+  );
+  for (const provider of providers) {
+    const launch = provider.resolveShell(command, interactive, context);
+    if (launch) {
+      return {
+        ...launch,
+        spawnProcess: provider.spawn ?? spawn,
+        ptySpawnProcess: provider.ptySpawn ?? nodePty.spawn,
+      };
+    }
+  }
+  return defaultShellResolver(command, interactive, context);
+}
 
 function resetExecutionBackend(): void {
-  spawnFn = spawn;
-  ptySpawnFn = nodePty.spawn;
   terminalInput = process.stdin;
   terminalOutput = process.stdout;
-  resolveShell = defaultShellResolver;
+  shellProviders.clear();
+  shellProviderOrder = 0;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -620,7 +700,7 @@ function normalizeTaskEnvironment(value: unknown): string | null {
   if (
     !label
     || label.length > 1_000
-    || /[\x00-\x1f\x7f]/.test(label)
+    || /[\p{Cc}\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(label)
   ) return null;
   return label;
 }
@@ -629,13 +709,55 @@ function taskEnvironmentDetails(task: BgTask): { environment?: string } {
   return task.environment ? { environment: task.environment } : {};
 }
 
+function isFinalTaskStatus(status: BgTask["status"]): status is FinishedTaskStatus {
+  return status === "completed" || status === "failed" || status === "stopped";
+}
+
+function isTaskControllable(task: BgTask): boolean {
+  return task.status === "running" || task.status === "disconnected";
+}
+
+function taskControlFromLaunch(shell: ShellLaunch): BackgroundTaskControl | null {
+  const control = shell.control;
+  if (!control) return null;
+  for (const method of ["sendSignal", "probe", "onTransportExit", "dispose"] as const) {
+    if (typeof control[method] !== "function") {
+      throw new Error(`Background task control must implement ${method}().`);
+    }
+  }
+  return control;
+}
+
+async function disposeTaskControl(task: BgTask): Promise<void> {
+  if (task.controlDisposed) return;
+  task.controlDisposed = true;
+  const control = task.control;
+  task.control = null;
+  if (control) await control.dispose();
+}
+
+const TASK_DETAIL_LABEL_WIDTH = "Environment:".length + 1;
+
+function taskDetailLine(label: string, value: unknown, indent = ""): string {
+  return `${indent}${`${label}:`.padEnd(TASK_DETAIL_LABEL_WIDTH)}${String(value)}`;
+}
+
 function taskEnvironmentLine(task: BgTask, indent = ""): string | undefined {
-  return task.environment ? `${indent}Environment: ${task.environment}` : undefined;
+  return task.environment
+    ? taskDetailLine("Environment", task.environment, indent)
+    : undefined;
 }
 
 function withTaskEnvironment(task: BgTask, text: string): string {
   const line = taskEnvironmentLine(task);
   return line ? `${line}\n${text}` : text;
+}
+
+function emptyOutputMessage(
+  task: BgTask,
+  label: "output" | "terminal output",
+): string {
+  return `(no ${label}${task.status === "running" ? " yet" : ""})`;
 }
 
 function taskEnvironmentSuffix(task: BgTask): string {
@@ -658,7 +780,7 @@ function serializeConsoleSnapshot(task: BgTask): string {
 }
 
 function serializeFinishedTask(task: BgTask): PersistedFinishedTask {
-  if (task.status === "running" || task.endedAt === null) {
+  if (!isFinalTaskStatus(task.status) || task.endedAt === null) {
     throw new Error(`Task "${task.name}" is not ready for snapshot persistence.`);
   }
   return {
@@ -791,7 +913,7 @@ function enqueueSnapshotPersistence(operation: () => Promise<void> | void): Prom
 
 function persistFinishedTaskSnapshot(task: BgTask): Promise<void> {
   return enqueueSnapshotPersistence(async () => {
-    if (!appendTaskSnapshotEntry || task.status === "running") return;
+    if (!appendTaskSnapshotEntry || !isFinalTaskStatus(task.status)) return;
     await flushConsole(task);
     if (!appendTaskSnapshotEntry || !tasks.has(task.id)) return;
     appendTaskSnapshotEntry({
@@ -817,7 +939,7 @@ function persistTaskReconciliation(removed: string[], clearedRetention: string[]
 async function restoreFinishedTaskSnapshots(ctx: ExtensionContext): Promise<void> {
   await snapshotPersistenceQueue;
   const snapshots = replayFinishedTaskSnapshots(ctx);
-  const finished = Array.from(tasks.values()).filter((task) => task.status !== "running");
+  const finished = Array.from(tasks.values()).filter((task) => isFinalTaskStatus(task.status));
   for (const task of finished) {
     await flushConsole(task);
     tasks.delete(task.id);
@@ -835,9 +957,13 @@ async function restoreFinishedTaskSnapshots(ctx: ExtensionContext): Promise<void
       mode: snapshot.mode,
       environment: snapshot.environment ?? null,
       process: null,
+      control: null,
+      controlDisposed: true,
+      transportExitPending: null,
       console,
       attachment: {},
       status: snapshot.status,
+      statusDetail: null,
       exitCode: snapshot.exitCode,
       signal: snapshot.signal,
       order: snapshot.order,
@@ -927,7 +1053,32 @@ async function waitForTaskEnd(task: BgTask, timeoutMs: number): Promise<void> {
   await waitUntilAllowed(timeoutMs, [task.done.signal], undefined);
 }
 
-async function sendProcessSignal(task: BgTask, signal: NodeJS.Signals, killTree = false): Promise<void> {
+async function sendProcessSignal(
+  task: BgTask,
+  signal: BackgroundSignal,
+  killTree = false,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(abortSignal);
+  const control = task.control;
+  if (control) {
+    if (
+      control.supportedSignals
+      && !control.supportedSignals.includes(signal)
+    ) {
+      throw new Error(
+        `${signal} is not supported by the ${control.signalTarget ?? "adapter process"}.`,
+      );
+    }
+    await control.sendSignal(signal, { abortSignal });
+    throwIfAborted(abortSignal);
+    return;
+  }
+
+  if (!(signal in osConstants.signals)) {
+    throw new Error(`${signal} is not supported on ${process.platform}.`);
+  }
+  const localSignal = signal as NodeJS.Signals;
   const taskProcess = task.process;
   const pid = taskProcess?.pid;
   if (!taskProcess || !pid) throw new Error(`Task "${task.name}" process is unavailable.`);
@@ -936,7 +1087,7 @@ async function sendProcessSignal(task: BgTask, signal: NodeJS.Signals, killTree 
     if (killTree && (signal === "SIGTERM" || signal === "SIGKILL")) {
       await new Promise<void>((resolve, reject) => {
         const args = ["/T", "/PID", String(pid)];
-        if (signal === "SIGKILL") args.unshift("/F");
+        if (localSignal === "SIGKILL") args.unshift("/F");
         const killer = spawn("taskkill", args, { stdio: "ignore", windowsHide: true });
         killer.once("error", reject);
         killer.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with code ${code}`)));
@@ -944,33 +1095,54 @@ async function sendProcessSignal(task: BgTask, signal: NodeJS.Signals, killTree 
       return;
     }
     if (taskProcess.kind === "pty") {
-      if (signal !== "SIGTERM" && signal !== "SIGHUP") {
-        throw new Error(`${signal} is not supported by node-pty on Windows; send a terminal control key or use bg_kill.`);
+      if (localSignal !== "SIGTERM" && localSignal !== "SIGHUP") {
+        throw new Error(`${localSignal} is not supported by node-pty on Windows; send a terminal control key or use bg_kill.`);
       }
       taskProcess.pty.kill();
       return;
     }
-    if (!taskProcess.child.kill(signal)) throw new Error(`Failed to send ${signal} to task "${task.name}".`);
+    if (!taskProcess.child.kill(localSignal)) throw new Error(`Failed to send ${localSignal} to task "${task.name}".`);
     return;
   }
 
   try {
-    process.kill(-pid, signal);
+    process.kill(-pid, localSignal);
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
     if (code !== "ESRCH") throw error;
-    if (taskProcess.kind === "pty") taskProcess.pty.kill(signal);
-    else if (!taskProcess.child.kill(signal)) throw error;
+    if (taskProcess.kind === "pty") taskProcess.pty.kill(localSignal);
+    else if (!taskProcess.child.kill(localSignal)) throw error;
   }
 }
 
-async function sendTaskSignal(task: BgTask, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
+async function sendTaskSignal(
+  task: BgTask,
+  signal: "SIGTERM" | "SIGKILL",
+  abortSignal?: AbortSignal,
+): Promise<void> {
   task.requestedStopSignal = signal;
   try {
-    await sendProcessSignal(task, signal, true);
+    await sendProcessSignal(task, signal, true, abortSignal);
   } catch (error) {
     task.requestedStopSignal = null;
     throw error;
+  }
+}
+
+async function settleDisconnectedTaskAfterSignal(
+  task: BgTask,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  if (task.status !== "disconnected" || !task.control) return;
+  const state = await task.control.probe({ abortSignal });
+  if (state === "finished") {
+    finishTask(
+      task,
+      task.exitCode,
+      task.requestedStopSignal ?? task.signal,
+      false,
+      task.requestedStopSignal ? "stopped" : undefined,
+    );
   }
 }
 
@@ -1007,19 +1179,26 @@ function forceKillProcess(task: BgTask): void {
   taskProcess.child.kill("SIGKILL");
 }
 
-function finishTask(task: BgTask, code: number | null, signal: string | null, failedToSpawn = false): void {
-  if (task.status !== "running") return;
+function finishTask(
+  task: BgTask,
+  code: number | null,
+  signal: string | null,
+  failedToSpawn = false,
+  statusOverride?: FinishedTaskStatus,
+): void {
+  if (isFinalTaskStatus(task.status)) return;
   task.endedAt = Date.now();
   task.exitCode = code;
   task.signal = task.requestedStopSignal ?? signal;
   task.process = null;
-  task.status = task.requestedStopSignal
+  task.status = statusOverride ?? (task.requestedStopSignal
     ? "stopped"
     : failedToSpawn
       ? "failed"
       : signal
         ? "stopped"
-        : code === 0 ? "completed" : "failed";
+        : code === 0 ? "completed" : "failed");
+  task.statusDetail = null;
   runningTasks.delete(task);
   task.done.abort();
   task.attachment.taskExited?.();
@@ -1027,6 +1206,96 @@ function finishTask(task: BgTask, code: number | null, signal: string | null, fa
   // Snapshot persistence does not change visible task state; avoid a second,
   // delayed widget render after the task has already transitioned to finished.
   void persistFinishedTaskSnapshot(task).catch(() => {});
+  void disposeTaskControl(task).catch(() => {});
+}
+
+function disconnectTask(
+  task: BgTask,
+  code: number | null,
+  signal: string | null,
+  error: string,
+): void {
+  if (task.status !== "running") return;
+  task.endedAt = Date.now();
+  task.exitCode = code;
+  task.signal = signal;
+  task.process = null;
+  task.status = "disconnected";
+  task.statusDetail = error;
+  runningTasks.delete(task);
+  task.done.abort();
+  task.attachment.taskExited?.();
+  updateWidget();
+}
+
+function settleTaskTransportExit(
+  task: BgTask,
+  code: number | null,
+  signal: string | null,
+  failedToSpawn = false,
+): void {
+  if (task.transportExitPending || task.status !== "running") return;
+  task.process = null;
+  const operation = (async () => {
+    if (
+      failedToSpawn
+      || task.requestedStopSignal
+      || !task.control
+    ) {
+      finishTask(task, code, signal, failedToSpawn);
+      return;
+    }
+
+    let disposition: BackgroundTransportExitDisposition;
+    try {
+      disposition = await task.control.onTransportExit({
+        exitCode: code,
+        signal,
+      });
+    } catch (error) {
+      disposition = {
+        state: "disconnected",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    if (isFinalTaskStatus(task.status)) return;
+    if (task.requestedStopSignal) {
+      finishTask(task, code, signal);
+      return;
+    }
+    if (disposition.state === "finished") {
+      finishTask(task, code, signal);
+      return;
+    }
+    if (disposition.state === "stopped") {
+      finishTask(
+        task,
+        code,
+        disposition.signal ?? signal ?? "transport-exit",
+        false,
+        "stopped",
+      );
+      return;
+    }
+    disconnectTask(task, code, signal, disposition.error);
+  })();
+  const pending = operation
+    .catch((error) => {
+      if (task.status === "running") {
+        disconnectTask(
+          task,
+          code,
+          signal,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    })
+    .finally(() => {
+      if (task.transportExitPending === pending) task.transportExitPending = null;
+    });
+  task.transportExitPending = pending;
+  void pending;
 }
 
 const ATTACH_DETACH_KEY = "\x1d";
@@ -1489,13 +1758,13 @@ interface TaskReconciliation {
 
 async function discardExpiredFinishedTasks(): Promise<TaskReconciliation> {
   const expired = Array.from(tasks.values()).filter(
-    (task) => task.status !== "running" && !task.retainForNextAgentTurn,
+    (task) => isFinalTaskStatus(task.status) && !task.retainForNextAgentTurn,
   );
   const clearedRetention: string[] = [];
   for (const task of tasks.values()) {
     if (!task.retainForNextAgentTurn) continue;
     task.retainForNextAgentTurn = false;
-    if (task.status !== "running") clearedRetention.push(task.id);
+    if (isFinalTaskStatus(task.status)) clearedRetention.push(task.id);
   }
   for (const task of expired) tasks.delete(task.id);
   await Promise.all(expired.map(async (task) => {
@@ -1545,13 +1814,13 @@ function getCollapsedBackgroundTasks(
 
   const selected = new Set(
     visible
-      .filter((task) => task.status === "running")
+      .filter((task) => task.status === "running" || task.status === "disconnected")
       .slice(-collapsedTaskLimit),
   );
   const remaining = collapsedTaskLimit - selected.size;
   if (remaining > 0) {
     for (const task of visible
-      .filter((candidate) => candidate.status !== "running")
+      .filter((candidate) => isFinalTaskStatus(candidate.status))
       .slice(-remaining)) {
       selected.add(task);
     }
@@ -1575,7 +1844,8 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
     ? visible
     : getCollapsedBackgroundTasks(visible, backgroundTasksConfig.collapsedTaskLimit);
   const runningCount = getRunningTasks().length;
-  const finishedCount = visible.length - runningCount;
+  const disconnectedCount = visible.filter((task) => task.status === "disconnected").length;
+  const finishedCount = visible.filter((task) => isFinalTaskStatus(task.status)).length;
   const now = Date.now();
   const lines: string[] = [];
 
@@ -1583,22 +1853,32 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
     const isLast = index === displayed.length - 1;
     const branch = isLast ? "└─" : "├─";
     const duration = formatWidgetDuration((task.endedAt ?? now) - task.startedAt);
-    const environment = task.environment ? ` ${task.environment}` : "";
+    const environment = task.environment ? ` @ ${task.environment}` : "";
     if (task.status === "running") {
       const output = task.mode === "pty"
         ? `pty:${task.console.terminal.cols}x${task.console.terminal.rows}`
         : `stdout:${task.stdoutLines} stderr:${task.stderrLines}`;
       lines.push(theme
-        ? `${theme.fg("dim", branch)} ${theme.fg("warning", "◐")} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)}${environment ? theme.fg("muted", environment) : ""} ${theme.fg("muted", duration)} ${theme.fg("dim", output)}`
-        : `${branch} ◐ ${task.name} (${task.id})${environment} ${duration} ${output}`);
+        ? `${theme.fg("dim", branch)} ${theme.fg("warning", "◐")} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg("muted", duration)} ${theme.fg("dim", output)}${environment ? theme.fg("muted", environment) : ""}`
+        : `${branch} ◐ ${task.name} (${task.id}) ${duration} ${output}${environment}`);
     } else {
-      const glyph = task.status === "completed" ? "✓" : task.status === "failed" ? "×" : "■";
-      const color = task.status === "completed" ? "success" : task.status === "failed" ? "error" : "warning";
+      const glyph = task.status === "completed"
+        ? "✓"
+        : task.status === "failed"
+          ? "×"
+          : task.status === "disconnected"
+            ? "!"
+            : "■";
+      const color = task.status === "completed"
+        ? "success"
+        : task.status === "failed"
+          ? "error"
+          : "warning";
       const exit = task.exitCode !== null ? ` exit=${task.exitCode}` : "";
       const signal = task.signal ? ` signal=${task.signal}` : "";
       lines.push(theme
-        ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)}${environment ? theme.fg("muted", environment) : ""} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}`
-        : `${branch} ${glyph} ${task.name} (${task.id})${environment} ${task.status} ${duration}${exit}${signal}`);
+        ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}${environment ? theme.fg("muted", environment) : ""}`
+        : `${branch} ${glyph} ${task.name} (${task.id}) ${task.status} ${duration}${exit}${signal}${environment}`);
     }
 
     if (shouldShowOutputPreview(task, backgroundTasksConfig.outputPreview)) {
@@ -1622,6 +1902,9 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
   const title = `${visible.length} background task${visible.length === 1 ? "" : "s"}`;
   const statusParts = [
     ...(runningCount > 0 ? [{ color: "warning" as const, text: `${runningCount} running` }] : []),
+    ...(disconnectedCount > 0
+      ? [{ color: "warning" as const, text: `${disconnectedCount} disconnected` }]
+      : []),
     ...(finishedCount > 0 ? [{ color: "muted" as const, text: `${finishedCount} finished` }] : []),
   ];
   const header = theme
@@ -1697,6 +1980,8 @@ export default function (
   // so a remote or alternate shell from the previous session cannot leak into
   // a newly loaded local session before adapters register again.
   resetExecutionBackend();
+  terminalInput = dependencies.terminalInput ?? process.stdin;
+  terminalOutput = dependencies.terminalOutput ?? process.stdout;
   backgroundTasksConfig = normalizeBackgroundTasksConfig(
     (dependencies.loadConfig ?? loadBackgroundTasksConfig)(),
   );
@@ -1727,19 +2012,57 @@ export default function (
   };
   enableSnapshotPersistence();
 
+  pi.events.on("bg:unregister", (data: unknown) => {
+    const id = (data as { id?: unknown })?.id;
+    if (typeof id === "string") shellProviders.delete(id);
+  });
+
   pi.events.on("bg:register", (data: unknown) => {
     const ops = data as {
+      id?: unknown;
+      priority?: unknown;
       spawn?: typeof spawn;
       ptySpawn?: typeof nodePty.spawn;
       resolveShell?: ShellResolver;
-      terminalInput?: NodeJS.ReadStream;
-      terminalOutput?: NodeJS.WriteStream;
+      onRegistered?: (capabilities: {
+        protocolVersion: number;
+        providers: boolean;
+        taskControl: boolean;
+      }) => void;
     };
-    if (ops.spawn) spawnFn = ops.spawn;
-    if (ops.ptySpawn) ptySpawnFn = ops.ptySpawn;
-    if (ops.resolveShell) resolveShell = ops.resolveShell;
-    if (ops.terminalInput) terminalInput = ops.terminalInput;
-    if (ops.terminalOutput) terminalOutput = ops.terminalOutput;
+    const id = typeof ops.id === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(ops.id)
+      ? ops.id
+      : undefined;
+    if (!id) {
+      throw new Error(
+        "Background shell provider registration requires protocol v2 with a valid id. "
+          + "Update legacy SSH or PowerShell adapters before using this Background Tasks release.",
+      );
+    }
+    if (typeof ops.resolveShell !== "function") {
+      throw new Error(`Background shell provider "${id}" must register a resolveShell function.`);
+    }
+    for (const method of ["spawn", "ptySpawn", "onRegistered"] as const) {
+      if (ops[method] !== undefined && typeof ops[method] !== "function") {
+        throw new Error(`Background shell provider ${method} must be a function when provided.`);
+      }
+    }
+    const priority = typeof ops.priority === "number" && Number.isFinite(ops.priority)
+      ? Math.max(-1_000, Math.min(1_000, ops.priority))
+      : 0;
+    shellProviders.set(id, {
+      id,
+      priority,
+      order: shellProviderOrder++,
+      resolveShell: ops.resolveShell,
+      spawn: ops.spawn,
+      ptySpawn: ops.ptySpawn,
+    });
+    ops.onRegistered?.({
+      protocolVersion: BACKGROUND_BACKEND_PROTOCOL_VERSION,
+      providers: true,
+      taskControl: true,
+    });
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1802,24 +2125,33 @@ export default function (
     uiCtx = null;
     for (const task of tasks.values()) task.attachment.detach?.("shutdown");
     await Promise.all(Array.from(tasks.values()).map(async (task) => {
-      if (!task.process || task.status !== "running") return;
+      await task.transportExitPending?.catch(() => {});
+      if (!isTaskControllable(task) || (!task.process && !task.control)) return;
       try {
         await sendTaskSignal(task, "SIGTERM");
+        await settleDisconnectedTaskAfterSignal(task);
         await waitForTaskEnd(task, 3000);
-        if (task.status === "running") {
+        if (isTaskControllable(task)) {
           await sendTaskSignal(task, "SIGKILL");
+          await settleDisconnectedTaskAfterSignal(task);
           await waitForTaskEnd(task, 1000);
         }
       } catch {
+        // Closing the local launcher is only a last-resort local cleanup. Do
+        // not treat it as proof that an adapter-owned remote process exited.
         forceKillProcess(task);
       }
     }));
     for (const task of tasks.values()) {
-      if (task.status !== "running") continue;
-      forceKillProcess(task);
-      finishTask(task, null, "shutdown");
+      if (task.status === "running") {
+        forceKillProcess(task);
+        if (!task.control) finishTask(task, null, "shutdown");
+      }
     }
-    await Promise.all(Array.from(tasks.values()).map((task) => flushConsole(task)));
+    await Promise.all(Array.from(tasks.values()).map(async (task) => {
+      await flushConsole(task);
+      await disposeTaskControl(task).catch(() => {});
+    }));
     await snapshotPersistenceQueue;
     for (const task of tasks.values()) task.console.terminal.dispose();
     tasks.clear();
@@ -1873,16 +2205,12 @@ export default function (
       const stderrLogKey = taskLogKey(id, "stderr");
       const mode = params.pty ? "pty" : "pipe";
       const cwd = params.cwd || ctx.cwd;
-      const shell =
-        resolveShell(params.command, mode === "pty", {
-          cwd,
-          projectTrusted: ctx.isProjectTrusted(),
-        }) ??
-        defaultShellResolver(params.command, mode === "pty", {
-          cwd,
-          projectTrusted: ctx.isProjectTrusted(),
-        });
+      const shell = resolveShell(params.command, mode === "pty", {
+        cwd,
+        projectTrusted: ctx.isProjectTrusted(),
+      });
       const launchCwd = shell.cwd ?? cwd;
+      const taskControl = taskControlFromLaunch(shell);
       const cols = Math.min(MAX_TERMINAL_COLS, Math.max(
         MIN_TERMINAL_COLS,
         Math.floor(params.cols ?? terminalOutput.columns ?? 120),
@@ -1897,32 +2225,48 @@ export default function (
       try {
         if (mode === "pty") {
           let ptyProcess: nodePty.IPty;
-          ptyProcess = ptySpawnFn(shell.file, shell.args, {
+          ptyProcess = (shell.ptySpawnProcess ?? dependencies.ptySpawnProcess ?? nodePty.spawn)(shell.file, shell.args, {
             name: shell.env.TERM || "xterm-256color",
             cols,
             rows,
             cwd: launchCwd,
             env: { ...shell.env, TERM: shell.env.TERM || "xterm-256color" },
           });
-          taskProcess = { kind: "pty", pid: ptyProcess.pid, pty: ptyProcess };
+          taskProcess = {
+            kind: "pty",
+            pid: ptyProcess.pid,
+            pty: ptyProcess,
+          };
         } else {
-          const child = spawnFn(shell.file, shell.args, {
+          const child = (shell.spawnProcess ?? dependencies.spawnProcess ?? spawn)(shell.file, shell.args, {
             cwd: launchCwd,
             stdio: ["pipe", "pipe", "pipe"],
             env: shell.env,
             detached: process.platform !== "win32",
           });
-          taskProcess = { kind: "pipe", pid: child.pid ?? 0, child };
+          taskProcess = {
+            kind: "pipe",
+            pid: child.pid ?? 0,
+            child,
+          };
         }
       } catch (error) {
         console.terminal.dispose();
+        if (taskControl) await taskControl.dispose();
         throw error;
       }
 
       const task: BgTask = {
         id, name, command: params.command, mode,
         environment: normalizeTaskEnvironment(shell.taskEnvironment),
-        process: taskProcess, console, attachment: {}, status: "running",
+        process: taskProcess,
+        control: taskControl,
+        controlDisposed: false,
+        transportExitPending: null,
+        console,
+        attachment: {},
+        status: "running",
+        statusDetail: null,
         exitCode: null, signal: null,
         order: nextTaskOrder++,
         startedAt: Date.now(), endedAt: null,
@@ -1939,7 +2283,11 @@ export default function (
       if (taskProcess.kind === "pty") {
         taskProcess.pty.onData((data) => recordPtyData(task, data));
         taskProcess.pty.onExit(({ exitCode, signal }) => {
-          finishTask(task, exitCode, signal ? `signal ${signal}` : null);
+          settleTaskTransportExit(
+            task,
+            exitCode,
+            signal ? `signal ${signal}` : null,
+          );
         });
       } else {
         const child = taskProcess.child;
@@ -1960,14 +2308,14 @@ export default function (
           const errorLine = `[error: ${err.message}]`;
           recordPipeData(task, "stderr", Buffer.from(`\n${errorLine}\n`));
           // A launch failure emits `error` and `close`, but never `exit`.
-          if (!spawned) finishTask(task, null, null, true);
+          if (!spawned) settleTaskTransportExit(task, null, null, true);
         });
         let outputRevisionAtExit: number | null = null;
         // Process state follows `exit` only. On Windows, inherited stdio handles can
         // keep `close` pending long after this PID no longer exists.
         child.once("exit", (code, signal) => {
           outputRevisionAtExit = outputRevision;
-          finishTask(task, code, signal);
+          settleTaskTransportExit(task, code, signal);
         });
         // `close` is an I/O lifecycle event. If more output arrived after `exit`,
         // update the snapshot without adding a redundant entry for the normal case.
@@ -1989,10 +2337,22 @@ export default function (
       updateWidget();
 
       const environmentLine = taskEnvironmentLine(task, "  ");
+      const launchLines = [
+        taskDetailLine("ID", id, "  "),
+        taskDetailLine("Name", name, "  "),
+        ...(environmentLine ? [environmentLine] : []),
+        taskDetailLine("Command", params.command, "  "),
+        taskDetailLine("PID", taskProcess.pid, "  "),
+        taskDetailLine(
+          "Mode",
+          `${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}`,
+          "  ",
+        ),
+      ];
       return {
         content: [{
           type: "text",
-          text: `Background task started:\n  ID:      ${id}\n  Name:    ${name}\n${environmentLine ? `${environmentLine}\n` : ""}  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nReference it by ID or unique name. For finite final output, emit bg_wait then bg_logs together in one assistant response.`,
+          text: `Background task started:\n${launchLines.join("\n")}\nReference it by ID or unique name. For finite final output, emit bg_wait then bg_logs together in one assistant response.`,
         }],
         details: {
           id,
@@ -2089,12 +2449,15 @@ export default function (
         : [`Task "${task.name}" (${task.id}) ${task.status} after ${duration}.`];
       const environmentLine = taskEnvironmentLine(task, "  ");
       if (environmentLine) parts.push(environmentLine);
-      parts.push(
-        `  Status:     ${task.status}`,
-        `  Duration:   ${duration}`,
-      );
-      if (task.exitCode !== null) parts.push(`  Exit code:  ${task.exitCode}`);
-      if (task.signal) parts.push(`  Signal:     ${task.signal}`);
+      parts.push(taskDetailLine("Status", task.status, "  "));
+      if (task.statusDetail) {
+        parts.push(taskDetailLine("Detail", task.statusDetail, "  "));
+      }
+      parts.push(taskDetailLine("Duration", duration, "  "));
+      if (task.exitCode !== null) {
+        parts.push(taskDetailLine("Exit code", task.exitCode, "  "));
+      }
+      if (task.signal) parts.push(taskDetailLine("Signal", task.signal, "  "));
 
       return {
         content: [{ type: "text", text: parts.join("\n") }],
@@ -2107,6 +2470,7 @@ export default function (
           exitCode: task.exitCode,
           signal: task.signal,
           mode: task.mode,
+          statusDetail: task.statusDetail ?? undefined,
           ...taskEnvironmentDetails(task),
         },
       };
@@ -2150,7 +2514,7 @@ export default function (
         ? "warning"
         : details?.status === "failed"
           ? "error"
-          : details?.status === "stopped"
+          : details?.status === "stopped" || details?.status === "disconnected"
             ? "warning"
             : "toolOutput";
       return new Text(theme.fg(color, content) || content, 0, 0);
@@ -2210,6 +2574,7 @@ export default function (
 
       const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
+      await settleDisconnectedTaskAfterSignal(task, signal).catch(() => {});
 
       const duration = task.endedAt
         ? formatDuration(task.endedAt - task.startedAt)
@@ -2218,14 +2583,19 @@ export default function (
       const parts: string[] = [
         `Task: ${task.name} (${task.id})`,
         ...(environmentLine ? [environmentLine] : []),
-        `  Status:    ${task.status}`,
-        `  Command:   ${task.command}`,
-        `  Mode:      ${task.mode}`,
-        `  Duration:  ${duration}`,
+        taskDetailLine("Status", task.status, "  "),
+        ...(task.statusDetail
+          ? [taskDetailLine("Detail", task.statusDetail, "  ")]
+          : []),
+        taskDetailLine("Command", task.command, "  "),
+        taskDetailLine("Mode", task.mode, "  "),
+        taskDetailLine("Duration", duration, "  "),
       ];
-      if (task.exitCode !== null) parts.push(`  Exit code: ${task.exitCode}`);
-      if (task.signal) parts.push(`  Signal:    ${task.signal}`);
-      if (task.process?.pid) parts.push(`  PID:       ${task.process.pid}`);
+      if (task.exitCode !== null) {
+        parts.push(taskDetailLine("Exit code", task.exitCode, "  "));
+      }
+      if (task.signal) parts.push(taskDetailLine("Signal", task.signal, "  "));
+      if (task.process?.pid) parts.push(taskDetailLine("PID", task.process.pid, "  "));
       if (task.status === "running") parts.push("  Use bg_wait to await completion; do not poll bg_status.");
 
       return {
@@ -2238,6 +2608,7 @@ export default function (
           exitCode: task.exitCode,
           signal: task.signal,
           pid: task.process?.pid,
+          statusDetail: task.statusDetail ?? undefined,
           ...taskEnvironmentDetails(task),
         },
       };
@@ -2262,6 +2633,7 @@ export default function (
           if (l.includes("completed")) return l.replace("completed", theme.fg("accent", "completed"));
           if (l.includes("failed")) return l.replace("failed", theme.fg("error", "failed"));
           if (l.includes("stopped")) return l.replace("stopped", theme.fg("warning", "stopped"));
+          if (l.includes("disconnected")) return l.replace("disconnected", theme.fg("warning", "disconnected"));
         }
         return theme.fg("toolOutput", l) || l;
       });
@@ -2355,7 +2727,9 @@ export default function (
             type: "text",
             text: withTaskEnvironment(
               task,
-              output ? `── terminal ──\n${output}` : "(no terminal output yet)",
+              output
+                ? `── terminal ──\n${output}`
+                : emptyOutputMessage(task, "terminal output"),
             ),
           }],
           details: {
@@ -2405,7 +2779,7 @@ export default function (
       if (stream === "both") {
         if (stdout) parts.push(`── stdout ──\n${stdout}`);
         if (stderr) parts.push(`── stderr ──\n${stderr}`);
-        if (!stdout && !stderr) parts.push("(no output yet)");
+        if (!stdout && !stderr) parts.push(emptyOutputMessage(task, "output"));
       } else {
         parts.push(
           stream === "stdout"
@@ -2465,9 +2839,11 @@ export default function (
           return theme.fg("accent", l) || l;
         if (
           l === "(no output yet)" ||
+          l === "(no output)" ||
           l === "(no stdout)" ||
           l === "(no stderr)" ||
-          l === "(no terminal output yet)"
+          l === "(no terminal output yet)" ||
+          l === "(no terminal output)"
         )
           return theme.fg("muted", l) || l;
         return theme.fg("toolOutput", l) || l;
@@ -2768,61 +3144,56 @@ export default function (
     return { data, eof, keyTokens, textBytes };
   }
 
-  const STOP_SIGNALS = new Set<NodeJS.Signals>(["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]);
-  const SEND_SIGNALS = (Object.keys(osConstants.signals) as NodeJS.Signals[]).sort();
+  const DEFAULT_TERMINATING_SIGNALS = new Set<BackgroundSignal>([
+    "SIGABRT",
+    "SIGHUP",
+    "SIGINT",
+    "SIGKILL",
+    "SIGQUIT",
+    "SIGTERM",
+  ]);
+  const SEND_SIGNALS: BackgroundSignal[] = [
+    "SIGABRT", "SIGALRM", "SIGBREAK", "SIGBUS", "SIGCHLD", "SIGCONT",
+    "SIGFPE", "SIGHUP", "SIGILL", "SIGINT", "SIGIO", "SIGIOT",
+    "SIGKILL", "SIGPIPE", "SIGPOLL", "SIGPROF", "SIGPWR", "SIGQUIT",
+    "SIGSEGV", "SIGSTKFLT", "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP",
+    "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1", "SIGUSR2",
+    "SIGVTALRM", "SIGWINCH", "SIGXCPU", "SIGXFSZ",
+  ].sort() as BackgroundSignal[];
+
+  const signalClassifiesStop = (
+    task: BgTask,
+    signal: BackgroundSignal,
+  ): boolean => task.control?.terminatingSignals
+    ? task.control.terminatingSignals.includes(signal)
+    : DEFAULT_TERMINATING_SIGNALS.has(signal);
 
   pi.registerTool({
     name: "bg_send",
     label: "BG Send",
-    description: "Send text and terminal keys using one compact input string, or send an OS signal to a running background task.",
+    description: "Send text and terminal keys to a running task, or signal a running/disconnected adapter-owned task.",
     promptSnippet: "Send a compact text/key input string or an OS signal to a background task",
     promptGuidelines: [
       "Provide exactly one of bg_send input or signal. bg_send input is exact text; wrap every terminal key in an angle-bracket token such as <C-d>, <A-f>, <Space>, or <Up>, and escape a literal '<' as \\<.",
       "Use bg_send input for terminal keys; use bg_send signal only when an OS process signal is explicitly intended.",
       "For a pipe task, bg_send input=<C-d> or input=<EOF> closes stdin.",
       "When bg_send is followed by waiting or output inspection, emit bg_send → bg_wait → bg_logs together in one assistant response so same-task source ordering avoids extra model rounds.",
+      "For a disconnected adapter task, bg_send input is unavailable because the local transport is gone, but bg_send signal may remain usable for cleanup.",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Task ID or unique name (case-insensitive)" }),
       input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter>, <A-f>, or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
-      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "Named OS signal supported by the current platform, sent to the process group" })),
+      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "Named signal validated against the task's local or adapter execution environment" })),
     }),
 
     executionMode: "parallel",
 
-    async execute(toolCallId, params, signal): Promise<AgentToolResult<Record<string, unknown>>> {
-      const predecessor = waitForOrderedToolCall(toolCallId, signal);
+    async execute(toolCallId, params, abortSignal): Promise<AgentToolResult<Record<string, unknown>>> {
+      const predecessor = waitForOrderedToolCall(toolCallId, abortSignal);
       if (predecessor) await predecessor;
       const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
-      if (task.status !== "running") {
-        return {
-          content: [{
-            type: "text",
-            text: `Task "${task.name}"${taskEnvironmentSuffix(task)} is not running.`,
-          }],
-          details: {
-            id: task.id,
-            name: task.name,
-            status: task.status,
-            ...taskEnvironmentDetails(task),
-          },
-        };
-      }
-      if (!task.process) {
-        return {
-          content: [{
-            type: "text",
-            text: `Task "${task.name}" process${taskEnvironmentSuffix(task)} is unavailable.`,
-          }],
-          details: {
-            id: task.id,
-            name: task.name,
-            status: task.status,
-            ...taskEnvironmentDetails(task),
-          },
-        };
-      }
+      await task.transportExitPending?.catch(() => {});
 
       const sourceCount = [params.input !== undefined, params.signal !== undefined].filter(Boolean).length;
       if (sourceCount !== 1) {
@@ -2830,14 +3201,32 @@ export default function (
       }
 
       if (params.signal) {
-        const previousStopSignal = task.requestedStopSignal;
-        if (STOP_SIGNALS.has(params.signal)) task.requestedStopSignal = params.signal;
-        try {
-          await sendProcessSignal(task, params.signal);
+        if (!isTaskControllable(task)) {
           return {
             content: [{
               type: "text",
-              text: `Sent ${params.signal} to "${task.name}" process group${taskEnvironmentSuffix(task)}.`,
+              text: `Task "${task.name}"${taskEnvironmentSuffix(task)} is not controllable (${task.status}).`,
+            }],
+            details: {
+              id: task.id,
+              name: task.name,
+              status: task.status,
+              ...taskEnvironmentDetails(task),
+            },
+          };
+        }
+        const previousStopSignal = task.requestedStopSignal;
+        const target = task.control?.signalTarget ?? "process group";
+        if (signalClassifiesStop(task, params.signal)) {
+          task.requestedStopSignal = params.signal;
+        }
+        try {
+          await sendProcessSignal(task, params.signal, false, abortSignal);
+          await settleDisconnectedTaskAfterSignal(task, abortSignal);
+          return {
+            content: [{
+              type: "text",
+              text: `Sent ${params.signal} to "${task.name}" ${target}${taskEnvironmentSuffix(task)}.`,
             }],
             details: {
               id: task.id,
@@ -2848,6 +3237,7 @@ export default function (
           };
         } catch (err) {
           task.requestedStopSignal = previousStopSignal;
+          throwIfAborted(abortSignal);
           return {
             content: [{
               type: "text",
@@ -2860,6 +3250,29 @@ export default function (
             },
           };
         }
+      }
+
+      if (
+        task.status !== "running"
+        || !task.process
+        || task.control?.stdinAvailable === false
+      ) {
+        return {
+          content: [{
+            type: "text",
+            text: task.status === "disconnected"
+              ? `Task "${task.name}" transport${taskEnvironmentSuffix(task)} is disconnected; only adapter signals remain available.`
+              : task.control?.stdinAvailable === false
+                ? `Task "${task.name}" stdin${taskEnvironmentSuffix(task)} is unavailable for this adapter launch; use PTY mode for interactive input.`
+                : `Task "${task.name}"${taskEnvironmentSuffix(task)} is not running.`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            status: task.status,
+            ...taskEnvironmentDetails(task),
+          },
+        };
       }
 
       let parsed: ParsedInput;
@@ -2949,7 +3362,7 @@ export default function (
   pi.registerTool({
     name: "bg_kill",
     label: "BG Kill",
-    description: "Terminate a background task and report the termination result. Sends SIGTERM by default or SIGKILL with force=true; does not return process output.",
+    description: "Terminate a running or disconnected background task and report the result. Sends SIGTERM by default or SIGKILL with force=true; does not return process output.",
     promptSnippet: "Terminate an unresponsive background task",
     promptGuidelines: [
       "Use bg_kill when a background task must be terminated.",
@@ -2968,7 +3381,8 @@ export default function (
       if (predecessor) await predecessor;
       const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
-      if (task.status !== "running") {
+      await task.transportExitPending?.catch(() => {});
+      if (!isTaskControllable(task)) {
         return {
           content: [{
             type: "text",
@@ -2985,9 +3399,11 @@ export default function (
 
       const signal = params.force ? "SIGKILL" : "SIGTERM";
       try {
-        await sendTaskSignal(task, signal);
+        await sendTaskSignal(task, signal, abortSignal);
+        await settleDisconnectedTaskAfterSignal(task, abortSignal);
       }
       catch (err) {
+        throwIfAborted(abortSignal);
         return {
           content: [{
             type: "text",
@@ -3003,7 +3419,7 @@ export default function (
 
       await waitForTaskEnd(task, params.force ? 500 : 2500);
 
-      const action = task.status === "running" ? `Sent ${signal} to` : "Terminated";
+      const action = isTaskControllable(task) ? `Sent ${signal} to` : "Terminated";
       return {
         content: [{
           type: "text",
@@ -3080,13 +3496,13 @@ export default function (
     description: "Kill a background task by ID",
     getArgumentCompletions: (prefix: string) => {
       const items = Array.from(tasks.values())
-        .filter(t => t.status === "running")
+        .filter(isTaskControllable)
         .map(t => ({ value: t.id, label: `${t.id} ${t.name}` }));
       return items.filter(i => i.value.startsWith(prefix));
     },
     handler: async (args, ctx) => {
       if (!args) {
-        const running = Array.from(tasks.values()).filter(t => t.status === "running");
+        const running = Array.from(tasks.values()).filter(isTaskControllable);
         if (running.length === 0) {
           ctx.ui.notify("No running tasks.", "info");
           return;
@@ -3104,13 +3520,15 @@ export default function (
         ctx.ui.notify(`Task not found: ${args}`, "error");
         return;
       }
-      if (task.status !== "running") {
+      await task.transportExitPending?.catch(() => {});
+      if (!isTaskControllable(task)) {
         ctx.ui.notify(`Task "${task.name}" is already ${task.status}.`, "warning");
         return;
       }
 
       try {
         await sendTaskSignal(task, "SIGKILL");
+        await settleDisconnectedTaskAfterSignal(task);
       } catch (error) {
         ctx.ui.notify(`Failed to kill "${task.name}": ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
