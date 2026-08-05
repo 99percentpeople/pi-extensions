@@ -243,6 +243,8 @@ export interface BackgroundTasksExtensionDependencies {
   /** Explicit process factories and terminal streams for tests or embedded runtimes. */
   spawnProcess?: typeof spawn;
   ptySpawnProcess?: typeof nodePty.spawn;
+  /** Test/embedding seam for native Windows taskkill process-tree control. */
+  killWindowsProcessTree?: WindowsProcessTreeKiller;
   terminalInput?: NodeJS.ReadStream;
   terminalOutput?: NodeJS.WriteStream;
 }
@@ -324,6 +326,35 @@ export class MemoryLogStore {
 let terminalInput: NodeJS.ReadStream = process.stdin;
 let terminalOutput: NodeJS.WriteStream = process.stdout;
 
+export const BACKGROUND_SEND_SIGNALS: readonly BackgroundSignal[] = Object.freeze([
+  "SIGABRT", "SIGALRM", "SIGBREAK", "SIGBUS", "SIGCHLD", "SIGCONT",
+  "SIGFPE", "SIGHUP", "SIGILL", "SIGINT", "SIGIO", "SIGIOT",
+  "SIGKILL", "SIGPIPE", "SIGPOLL", "SIGPROF", "SIGPWR", "SIGQUIT",
+  "SIGSEGV", "SIGSTKFLT", "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP",
+  "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1", "SIGUSR2",
+  "SIGVTALRM", "SIGWINCH", "SIGXCPU", "SIGXFSZ",
+].sort() as BackgroundSignal[]);
+
+export type WindowsProcessTreeKiller = (
+  pid: number,
+  signal: "SIGTERM" | "SIGKILL",
+) => Promise<void>;
+
+const defaultWindowsProcessTreeKiller: WindowsProcessTreeKiller = (
+  pid,
+  signal,
+) => new Promise<void>((resolve, reject) => {
+  const args = ["/T", "/PID", String(pid)];
+  if (signal === "SIGKILL") args.unshift("/F");
+  const killer = spawn("taskkill", args, { stdio: "ignore", windowsHide: true });
+  killer.once("error", reject);
+  killer.once("exit", (code) => code === 0
+    ? resolve()
+    : reject(new Error(`taskkill exited with code ${code}`)));
+});
+
+let killWindowsProcessTree: WindowsProcessTreeKiller = defaultWindowsProcessTreeKiller;
+
 function defaultShellResolver(
   command: string,
   interactive: boolean,
@@ -396,6 +427,7 @@ function resolveShell(
 function resetExecutionBackend(): void {
   terminalInput = process.stdin;
   terminalOutput = process.stdout;
+  killWindowsProcessTree = defaultWindowsProcessTreeKiller;
   shellProviders.clear();
   shellProviderOrder = 0;
 }
@@ -1085,13 +1117,7 @@ async function sendProcessSignal(
 
   if (process.platform === "win32") {
     if (killTree && (signal === "SIGTERM" || signal === "SIGKILL")) {
-      await new Promise<void>((resolve, reject) => {
-        const args = ["/T", "/PID", String(pid)];
-        if (localSignal === "SIGKILL") args.unshift("/F");
-        const killer = spawn("taskkill", args, { stdio: "ignore", windowsHide: true });
-        killer.once("error", reject);
-        killer.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with code ${code}`)));
-      });
+      await killWindowsProcessTree(pid, signal);
       return;
     }
     if (taskProcess.kind === "pty") {
@@ -1982,6 +2008,8 @@ export default function (
   resetExecutionBackend();
   terminalInput = dependencies.terminalInput ?? process.stdin;
   terminalOutput = dependencies.terminalOutput ?? process.stdout;
+  killWindowsProcessTree = dependencies.killWindowsProcessTree
+    ?? defaultWindowsProcessTreeKiller;
   backgroundTasksConfig = normalizeBackgroundTasksConfig(
     (dependencies.loadConfig ?? loadBackgroundTasksConfig)(),
   );
@@ -3152,15 +3180,6 @@ export default function (
     "SIGQUIT",
     "SIGTERM",
   ]);
-  const SEND_SIGNALS: BackgroundSignal[] = [
-    "SIGABRT", "SIGALRM", "SIGBREAK", "SIGBUS", "SIGCHLD", "SIGCONT",
-    "SIGFPE", "SIGHUP", "SIGILL", "SIGINT", "SIGIO", "SIGIOT",
-    "SIGKILL", "SIGPIPE", "SIGPOLL", "SIGPROF", "SIGPWR", "SIGQUIT",
-    "SIGSEGV", "SIGSTKFLT", "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP",
-    "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1", "SIGUSR2",
-    "SIGVTALRM", "SIGWINCH", "SIGXCPU", "SIGXFSZ",
-  ].sort() as BackgroundSignal[];
-
   const signalClassifiesStop = (
     task: BgTask,
     signal: BackgroundSignal,
@@ -3183,7 +3202,7 @@ export default function (
     parameters: Type.Object({
       id: Type.String({ description: "Task ID or unique name (case-insensitive)" }),
       input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter>, <A-f>, or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
-      signal: Type.Optional(StringEnum(SEND_SIGNALS, { description: "Named signal validated against the task's local or adapter execution environment" })),
+      signal: Type.Optional(StringEnum([...BACKGROUND_SEND_SIGNALS], { description: "Named signal validated against the task's local or adapter execution environment" })),
     }),
 
     executionMode: "parallel",

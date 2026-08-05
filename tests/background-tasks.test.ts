@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
-import { constants as osConstants, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
@@ -15,6 +15,7 @@ import {
 import type { IPty } from "node-pty";
 import backgroundTasks, {
   BACKGROUND_COLLAPSED_TASK_LIMIT_PRESETS,
+  BACKGROUND_SEND_SIGNALS,
   DEFAULT_BACKGROUND_TASKS_CONFIG,
   MemoryLogStore,
   OUTPUT_PREVIEW_LABELS,
@@ -253,6 +254,19 @@ function createHarness(
     saveConfig: () => {},
     spawnProcess: testSpawn,
     ptySpawnProcess: testPtySpawn as typeof import("node-pty").spawn,
+    killWindowsProcessTree: async (pid, signal) => {
+      const child = children.find((candidate) => candidate.pid === pid);
+      if (child) {
+        child.kill(signal);
+        return;
+      }
+      const pty = ptys.find((candidate) => candidate.pid === pid);
+      if (pty) {
+        pty.kill(signal);
+        return;
+      }
+      throw new Error(`Fake process tree not found: ${pid}`);
+    },
     terminalInput: terminalInput as unknown as NodeJS.ReadStream,
     terminalOutput: terminalOutput as unknown as NodeJS.WriteStream,
   });
@@ -1371,7 +1385,7 @@ test("background task tools keep waiting, status, output, and termination separa
   assert.ok(bgSend.parameters.properties?.input);
   assert.deepEqual(
     bgSend.parameters.properties?.signal.enum,
-    Array.from(new Set([...Object.keys(osConstants.signals), "SIGBREAK"])).sort(),
+    BACKGROUND_SEND_SIGNALS,
     "bg_send should expose the portable local/remote signal vocabulary",
   );
   assert.equal(bgSend.parameters.properties?.text, undefined);
