@@ -17,7 +17,7 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.2.9",
+      "version": "1.2.10",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@xterm/addon-serialize": "0.14.0",
@@ -33,7 +33,7 @@
     },
     "extensions/codex-api": {
       "name": "@99percentpeople/pi-codex-api",
-      "version": "0.2.5",
+      "version": "0.2.6",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@99percentpeople/pi-workspace-files": "0.1.0",
