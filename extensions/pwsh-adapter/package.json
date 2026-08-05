@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-pwsh-adapter",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "PowerShell 7 and Windows PowerShell 5.1 shell adapter for Pi",
   "type": "module",
   "os": [

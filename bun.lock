@@ -17,7 +17,7 @@
     },
     "extensions/background-tasks": {
       "name": "@99percentpeople/pi-background-tasks",
-      "version": "1.2.11",
+      "version": "1.2.12",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@xterm/addon-serialize": "0.14.0",
@@ -58,7 +58,7 @@
     },
     "extensions/pwsh-adapter": {
       "name": "@99percentpeople/pi-pwsh-adapter",
-      "version": "1.0.9",
+      "version": "1.0.10",
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "typebox": "*",
@@ -66,7 +66,7 @@
     },
     "extensions/ssh-remote": {
       "name": "@99percentpeople/pi-ssh-remote",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "dependencies": {
         "@99percentpeople/pi-shared-settings": "0.1.2",
         "@99percentpeople/pi-workspace-files": "0.1.0",
