@@ -22,6 +22,7 @@ import {
   applyFastModePayload,
   CodexApiClient,
   CodexApiError,
+  CodexOAuthError,
   createCodexApiClient,
   createCodexSearchDisplay,
   DEFAULT_CODEX_API_CONFIG,
@@ -254,7 +255,8 @@ test("Codex client resolves OAuth account, roots, headers, and API errors", asyn
   expiredCodex.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: false, error: "token refresh failed" });
   await assert.rejects(
     () => createCodexApiClient(expiredCodex),
-    /Codex subscription OAuth is unavailable: token refresh failed.*Run \/login/,
+    (error) => error instanceof CodexOAuthError
+      && /Codex subscription OAuth is unavailable: token refresh failed.*Run \/login/.test(error.message),
   );
 });
 
@@ -2053,6 +2055,320 @@ test("Codex usage redeem reports when no credits are available", async () => {
     assert.equal(notifications.at(-1)?.level, "info");
     assert.match(notifications.at(-1)?.message ?? "", /No Codex rate limit reset credits are available to redeem/);
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Codex usage status replaces syncing with an auth-expired error on 401", async () => {
+  const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-auth-expired-"));
+  const authPath = join(temporary, "auth.json");
+  await writeFile(authPath, JSON.stringify({ account: "a" }));
+  const handle = registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  }, { authPath });
+
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  let credentialReads = 0;
+  ctx.modelRegistry.getApiKeyAndHeaders = async () => {
+    credentialReads += 1;
+    return { ok: true, apiKey: jwt() };
+  };
+  ctx.ui = {
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    notify() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { message: "invalid token" } }), { status: 401 });
+  try {
+    await handlers.get("session_start")?.({}, ctx);
+    // The transient syncing state must always be replaced by the terminal
+    // auth error, even though the refresh itself failed.
+    assert.equal(statuses.at(-1), "[error]Codex auth expired — /login");
+    assert.equal(handle.getSnapshots().length, 0);
+    // Account checking must reuse its resolved OAuth client; a second
+    // credential read after showing syncing could hang outside the fetch timeout.
+    assert.equal(credentialReads, 1);
+
+    // A later successful refresh clears the error and shows real usage.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      rate_limit: {
+        primary_window: {
+          used_percent: 30,
+          limit_window_seconds: 5 * 60 * 60,
+          reset_at: Math.floor(Date.now() / 1000) + 60 * 60,
+        },
+      },
+    }));
+    await handle.refreshUsage(ctx, true);
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 70% 1h");
+    assert.equal(handle.getSnapshots()[0]?.primary?.usedPercent, 30);
+
+    // Failure while resolving/refreshing OAuth itself is also actionable; it
+    // may happen before the WHAM endpoint can return an HTTP 401.
+    ctx.modelRegistry.getApiKeyAndHeaders = async () => ({
+      ok: false,
+      error: "token refresh failed",
+    });
+    await handlers.get("model_select")?.({}, ctx);
+    assert.equal(statuses.at(-1), "[error]Codex auth expired — /login");
+  } finally {
+    globalThis.fetch = originalFetch;
+    handlers.get("session_shutdown")?.({}, ctx);
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Codex usage status keeps the last snapshot on transient failures", async () => {
+  const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-transient-"));
+  const authPath = join(temporary, "auth.json");
+  await writeFile(authPath, JSON.stringify({ account: "a" }));
+  const handle = registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  }, { authPath });
+
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.ui = {
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    notify() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests += 1;
+    if (requests === 1) {
+      return new Response(JSON.stringify({
+        rate_limit: {
+          primary_window: {
+            used_percent: 10,
+            limit_window_seconds: 5 * 60 * 60,
+            reset_at: Math.floor(Date.now() / 1000) + 60 * 60,
+          },
+        },
+      }));
+    }
+    return new Response(JSON.stringify({ error: "backend hiccup" }), { status: 500 });
+  };
+  try {
+    await handlers.get("session_start")?.({}, ctx);
+    assert.equal(handle.getSnapshots()[0]?.primary?.usedPercent, 10);
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 90% 1h");
+
+    // Non-auth failures keep the last known usage instead of dropping it.
+    await assert.rejects(handle.refreshUsage(ctx, true), /backend hiccup/);
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 90% 1h");
+    assert.equal(handle.getSnapshots()[0]?.primary?.usedPercent, 10);
+  } finally {
+    globalThis.fetch = originalFetch;
+    handlers.get("session_shutdown")?.({}, ctx);
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Codex usage status shows unavailable when a first refresh fails without a snapshot", async () => {
+  const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-unavailable-"));
+  const authPath = join(temporary, "auth.json");
+  await writeFile(authPath, JSON.stringify({ account: "a" }));
+  registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  }, { authPath });
+
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.ui = {
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    notify() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: "network partition" }), { status: 502 });
+  try {
+    await handlers.get("session_start")?.({}, ctx);
+    // A failed first refresh must not leave the transient syncing state up.
+    assert.ok(statuses.includes("[muted]Codex syncing…"));
+    assert.equal(statuses.at(-1), "[warning]Codex usage unavailable");
+  } finally {
+    globalThis.fetch = originalFetch;
+    handlers.get("session_shutdown")?.({}, ctx);
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Codex usage refresh times out stalled requests instead of syncing forever", async () => {
+  const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-timeout-"));
+  const authPath = join(temporary, "auth.json");
+  await writeFile(authPath, JSON.stringify({ account: "a" }));
+  const handle = registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  }, { authPath, usageFetchTimeoutMs: 50 });
+
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.ui = {
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    notify() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+
+  const originalFetch = globalThis.fetch;
+  let aborted = 0;
+  globalThis.fetch = (_input, init) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => {
+      aborted += 1;
+      reject(new DOMException("Timed out", "TimeoutError"));
+    });
+  });
+  try {
+    await handlers.get("session_start")?.({}, ctx);
+    assert.equal(aborted, 1);
+    // The stalled request must settle so the status moves past syncing.
+    assert.equal(statuses.at(-1), "[warning]Codex usage unavailable");
+    assert.equal(handle.getSnapshots().length, 0);
+
+    // A later refresh creates a fresh request instead of awaiting the stale one.
+    const started = Date.now();
+    await assert.rejects(handle.refreshUsage(ctx, true), /network request failed/);
+    assert.equal(aborted, 2);
+    assert.ok(Date.now() - started < 5000);
+    assert.equal(statuses.at(-1), "[warning]Codex usage unavailable");
+  } finally {
+    globalThis.fetch = originalFetch;
+    handlers.get("session_shutdown")?.({}, ctx);
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("Codex usage ignores a late auth error from a stale account refresh", async () => {
+  const pi = {
+    registerCommand() {},
+    on() {},
+  } as unknown as ExtensionAPI;
+  const handle = registerCodexUsageAndFast(pi, {
+    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    updateConfig: () => {},
+  });
+
+  const tokenA = jwt("acct-a");
+  const tokenB = jwt("acct-b");
+  let activeToken = tokenA;
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: activeToken });
+  ctx.ui = {
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    notify() {},
+    theme: {
+      fg: (color: string, text: string) => `[${color}]${text}`,
+      bold: (text: string) => `[bold]${text}`,
+    },
+  };
+
+  const payload = (usedPercent: number) => JSON.stringify({
+    rate_limit: {
+      primary_window: {
+        used_percent: usedPercent,
+        limit_window_seconds: 5 * 60 * 60,
+        reset_at: Math.floor(Date.now() / 1000) + 60 * 60,
+      },
+    },
+  });
+  let accountAFetches = 0;
+  let releaseStale: (() => void) | undefined;
+  let markStaleStarted: (() => void) | undefined;
+  const staleStarted = new Promise<void>((resolve) => {
+    markStaleStarted = resolve;
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    const accountId = new Headers(init?.headers).get("chatgpt-account-id");
+    if (accountId === "acct-a") {
+      accountAFetches += 1;
+      if (accountAFetches === 1) return new Response(payload(10));
+      markStaleStarted?.();
+      await new Promise<void>((resolve) => {
+        releaseStale = resolve;
+      });
+      return new Response(
+        JSON.stringify({ error: { message: "old token expired" } }),
+        { status: 401 },
+      );
+    }
+    assert.equal(accountId, "acct-b");
+    return new Response(payload(70));
+  };
+
+  let staleRefresh: Promise<void> | undefined;
+  try {
+    await handle.refreshUsage(ctx, true);
+    staleRefresh = handle.refreshUsage(ctx, true);
+    await staleStarted;
+
+    activeToken = tokenB;
+    await handle.refreshUsage(ctx, true);
+    assert.equal(handle.getSnapshots()[0]?.primary?.usedPercent, 70);
+    const currentStatus = statuses.at(-1);
+    assert.match(currentStatus ?? "", /Codex 5h 30%/);
+
+    releaseStale?.();
+    await assert.rejects(staleRefresh, /old token expired/);
+    // Account A's late 401 must not overwrite account B's successful status.
+    assert.equal(handle.getSnapshots()[0]?.primary?.usedPercent, 70);
+    assert.equal(statuses.at(-1), currentStatus);
+  } finally {
+    releaseStale?.();
+    await staleRefresh?.catch(() => {});
     globalThis.fetch = originalFetch;
   }
 });

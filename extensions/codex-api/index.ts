@@ -52,6 +52,7 @@ export default function (pi: ExtensionAPI) {
 export {
   CodexApiClient,
   CodexApiError,
+  CodexOAuthError,
   createCodexApiClient,
   extractCodexAccountId,
   resolveCodexApiRoot,

@@ -118,9 +118,14 @@ rate limit redeem
 - Earned reset cards, sorted by expiry, with local-time expiry timestamps
 - The status bar mirrors this compactly: `Codex weekly 65% 5d 3h` →
   `Codex weekly limit reached 5d 14h`
+- When a refresh fails the status never stays on the transient
+  `Codex syncing…`: expired/invalid OAuth tokens show `Codex auth expired — /login`
+  (red), other failures keep the last known usage or show `Codex usage unavailable`
+  until the next successful refresh
 
 Usage refreshes automatically on session start and model select;
-`/codex-usage` always forces a fresh read.
+`/codex-usage` always forces a fresh read. Every usage request is capped at a
+15-second timeout so a stalled backend cannot leave the status bar spinning.
 
 ### `/codex-redeem`
 

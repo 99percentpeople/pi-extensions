@@ -4,8 +4,14 @@ import {
   getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
+  type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
-import { createCodexApiClient } from "./client.ts";
+import {
+  CodexApiError,
+  CodexOAuthError,
+  createCodexApiClient,
+  type CodexApiClient,
+} from "./client.ts";
 import type { CodexApiConfig } from "./config.ts";
 
 const USAGE_PATH = "../wham/usage";
@@ -16,6 +22,10 @@ const REDEEM_DIALOG_TIMEOUT_MS = 30_000;
 const REDEEM_RETRY_WINDOW_MS = 5 * 60_000;
 const USAGE_REFRESH_INTERVAL_MS = 60_000;
 const AUTH_WATCH_DEBOUNCE_MS = 100;
+/** Cap usage/redeem requests so a stalled backend cannot wedge the status pipeline. */
+const USAGE_FETCH_TIMEOUT_MS = 15_000;
+const AUTH_EXPIRED_STATUS = "Codex auth expired — /login";
+const USAGE_UNAVAILABLE_STATUS = "Codex usage unavailable";
 
 const STATUS_KEY = "codex-api-usage";
 
@@ -472,6 +482,13 @@ interface AccountUsageFetch {
   promise: Promise<void>;
 }
 
+interface ResolvedActiveClient {
+  accountChanged: boolean;
+  accountId: string;
+  client: CodexApiClient;
+  revision: number;
+}
+
 interface PendingRedeem {
   redeemRequestId: string;
   creditId?: string;
@@ -497,6 +514,8 @@ export interface CodexUsageOptions {
   authPath?: string;
   /** Internal/test override for command-handler tests without a session lifecycle. */
   registerCommandsImmediately?: boolean;
+  /** Internal/test override to keep timeout tests fast. */
+  usageFetchTimeoutMs?: number;
 }
 
 /**
@@ -531,9 +550,16 @@ export function registerCodexUsageAndFast(
       && (ctx.model?.provider === "openai-codex" || config.allowOtherProviders);
   };
 
-  const setStatus = (ctx: ExtensionContext, value: string | undefined): void => {
+  const usageFetchSignal = (): AbortSignal =>
+    AbortSignal.timeout(options.usageFetchTimeoutMs ?? USAGE_FETCH_TIMEOUT_MS);
+
+  const setStatus = (
+    ctx: ExtensionContext,
+    value: string | undefined,
+    color: ThemeColor = "muted",
+  ): void => {
     ctx.ui.setStatus(STATUS_KEY, value && ctx.ui.theme
-      ? ctx.ui.theme.fg("muted", value)
+      ? ctx.ui.theme.fg(color, value)
       : value);
   };
 
@@ -552,6 +578,31 @@ export function registerCodexUsageAndFast(
   const showSyncingStatus = (ctx: ExtensionContext): void => {
     latestContext = ctx;
     setStatus(ctx, usageEnabled(ctx) ? "Codex syncing…" : undefined);
+  };
+
+  /**
+   * Terminal status for a failed refresh: keep the last known usage during
+   * transient failures, but surface an actionable error when the stored OAuth
+   * token is rejected outright (the snapshot would be stale anyway).
+   */
+  const showErrorStatus = (ctx: ExtensionContext, error: unknown): void => {
+    latestContext = ctx;
+    if (!usageEnabled(ctx)) {
+      setStatus(ctx, undefined);
+      return;
+    }
+    const isAuthError = error instanceof CodexOAuthError
+      || (error instanceof CodexApiError && (error.status === 401 || error.status === 403));
+    const snapshots = currentState()?.snapshots;
+    if (!isAuthError && snapshots && snapshots.length > 0) {
+      setStatus(ctx, formatCodexStatus(snapshots, controller.getConfig().fastMode));
+      return;
+    }
+    setStatus(
+      ctx,
+      isAuthError ? AUTH_EXPIRED_STATUS : USAGE_UNAVAILABLE_STATUS,
+      isAuthError ? "error" : "warning",
+    );
   };
 
   const invalidateAuthState = (ctx: ExtensionContext, action: "set" | "remove"): void => {
@@ -582,7 +633,10 @@ export function registerCodexUsageAndFast(
     return state;
   };
 
-  const resolveActiveClient = async (ctx: ExtensionContext, config: CodexApiConfig) => {
+  const resolveActiveClient = async (
+    ctx: ExtensionContext,
+    config: CodexApiConfig,
+  ): Promise<ResolvedActiveClient> => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const revision = credentialRevision;
       const client = await createCodexApiClient(ctx, {
@@ -600,17 +654,18 @@ export function registerCodexUsageAndFast(
     throw new Error("Codex account changed while resolving subscription usage; retry the refresh");
   };
 
-  const refreshUsage = async (ctx: ExtensionContext, force = false): Promise<void> => {
-    latestContext = ctx;
-    const config = controller.getConfig();
-    if (ctx.model?.provider !== "openai-codex" && !config.allowOtherProviders) {
-      throw new Error(
-        "An active openai-codex model is required to refresh subscription usage. "
-          + "Enable Other providers in /99settings to use the logged-in Codex subscription from another model.",
-      );
-    }
+  const isCurrentResolution = (
+    ctx: ExtensionContext,
+    resolved: ResolvedActiveClient,
+  ): boolean => latestContext === ctx
+    && activeAccountId === resolved.accountId
+    && credentialRevision === resolved.revision;
 
-    const resolved = await resolveActiveClient(ctx, config);
+  const refreshResolvedUsage = async (
+    ctx: ExtensionContext,
+    resolved: ResolvedActiveClient,
+    force = false,
+  ): Promise<void> => {
     const state = accountState(resolved.accountId);
     const now = Date.now();
     if (
@@ -619,14 +674,19 @@ export function registerCodexUsageAndFast(
       && state.snapshots.length > 0
       && now - state.lastFetchAt < USAGE_REFRESH_INTERVAL_MS
     ) {
-      refreshStatus(ctx);
+      if (isCurrentResolution(ctx, resolved)) refreshStatus(ctx);
       return;
     }
 
     let usageFetch = state.usageFetch;
     if (!usageFetch || usageFetch.revision !== resolved.revision) {
       const operation = (async () => {
-        const payload = await resolved.client.get<unknown>(USAGE_PATH);
+        // Timeout: a stalled request must settle so the transient syncing
+        // state is always replaced by a terminal status.
+        const payload = await resolved.client.get<unknown>(
+          USAGE_PATH,
+          usageFetchSignal(),
+        );
         const parsed = parseCodexUsagePayload(payload);
         if (parsed.length === 0) throw new Error("Codex usage API returned no usage data");
         state.snapshots = parsed;
@@ -643,14 +703,41 @@ export function registerCodexUsageAndFast(
     }
 
     await usageFetch.promise;
-    if (activeAccountId === resolved.accountId && credentialRevision === resolved.revision) {
-      refreshStatus(ctx);
+    if (isCurrentResolution(ctx, resolved)) refreshStatus(ctx);
+  };
+
+  const refreshUsage = async (ctx: ExtensionContext, force = false): Promise<void> => {
+    latestContext = ctx;
+    const invocationRevision = credentialRevision;
+    const config = controller.getConfig();
+    if (ctx.model?.provider !== "openai-codex" && !config.allowOtherProviders) {
+      const error = new Error(
+        "An active openai-codex model is required to refresh subscription usage. "
+          + "Enable Other providers in /99settings to use the logged-in Codex subscription from another model.",
+      );
+      showErrorStatus(ctx, error);
+      throw error;
+    }
+
+    let resolved: ResolvedActiveClient | undefined;
+    try {
+      resolved = await resolveActiveClient(ctx, config);
+      await refreshResolvedUsage(ctx, resolved, force);
+    } catch (error) {
+      // Ignore stale completions from an old account/context/session. A current
+      // failure always replaces syncing with a terminal status.
+      const isCurrent = resolved
+        ? isCurrentResolution(ctx, resolved)
+        : latestContext === ctx && credentialRevision === invocationRevision;
+      if (isCurrent) showErrorStatus(ctx, error);
+      throw error;
     }
   };
 
   const refreshInBackground = (ctx: ExtensionContext, force = false) => {
     latestContext = ctx;
-    void refreshUsage(ctx, force).catch(() => refreshStatus(ctx));
+    // refreshUsage reports the terminal status itself on failure.
+    void refreshUsage(ctx, force).catch(() => {});
   };
 
   const stopPolling = (): void => {
@@ -676,7 +763,7 @@ export function registerCodexUsageAndFast(
       if (active && usageEnabled(active)) {
         const intervalMs = intervalMinutes * 60_000;
         if (!state || state.snapshots.length === 0 || Date.now() - state.lastFetchAt >= intervalMs) {
-          void refreshUsage(active).catch(() => refreshStatus(active));
+          void refreshUsage(active).catch(() => {});
         }
       }
       scheduleNextPoll();
@@ -717,29 +804,45 @@ export function registerCodexUsageAndFast(
       const usageAvailable = codexOAuthAvailable(ctx, config);
       if (!codexOAuthLoginAvailable(ctx)) {
         if (activeAccountId !== undefined) invalidateAuthState(ctx, "remove");
+        else setStatus(ctx, undefined);
         return;
       }
-      let accountId: string;
+      let client: CodexApiClient;
       try {
         // Command visibility follows login state, not the active model or the
         // cross-provider tool setting. The latter still controls execution.
-        const client = await createCodexApiClient(ctx, {
+        client = await createCodexApiClient(ctx, {
           allowOtherProviders: true,
         });
-        accountId = client.accountId;
-      } catch {
-        // Keep the latest valid snapshot on transient credential-refresh failures.
+      } catch (error) {
+        // Credential-resolution failures are terminal too. Suppress a stale
+        // completion after a context switch or session shutdown.
+        if (latestContext === ctx) showErrorStatus(ctx, error);
         return;
       }
       if (!accountObserverActive || latestContext !== ctx) return;
       registerCodexCommands(ctx);
-      const accountChanged = activateAccount(accountId, ctx);
+      const accountChanged = activateAccount(client.accountId, ctx);
+      const resolved: ResolvedActiveClient = {
+        accountChanged,
+        accountId: client.accountId,
+        client,
+        revision: credentialRevision,
+      };
       if (
         usageAvailable
         && config.usageStatus
         && (forceUsage || accountChanged || (currentState()?.snapshots.length ?? 0) === 0)
       ) {
-        await refreshUsage(ctx, true);
+        try {
+          // Reuse the client resolved above. Resolving OAuth a second time after
+          // showing syncing would create an unbounded pre-fetch stall window.
+          await refreshResolvedUsage(ctx, resolved, true);
+        } catch (error) {
+          if (isCurrentResolution(ctx, resolved)) showErrorStatus(ctx, error);
+        }
+      } else {
+        refreshStatus(ctx);
       }
     })();
     const pending = operation.finally(() => {
@@ -811,7 +914,10 @@ export function registerCodexUsageAndFast(
       try {
         const resolved = await resolveActiveClient(ctx, controller.getConfig());
         const state = accountState(resolved.accountId);
-        const payload = await resolved.client.get<unknown>(REDEEM_CREDITS_PATH);
+        const payload = await resolved.client.get<unknown>(
+          REDEEM_CREDITS_PATH,
+          usageFetchSignal(),
+        );
         state.redeemCredits = parseCodexRedeemCredits(payload);
       } catch {
         // Redeem details are best-effort; the base usage message still shows.
@@ -849,7 +955,10 @@ export function registerCodexUsageAndFast(
       }
       const state = accountState(resolved.accountId);
       try {
-        const payload = await resolved.client.get<unknown>(REDEEM_CREDITS_PATH);
+        const payload = await resolved.client.get<unknown>(
+          REDEEM_CREDITS_PATH,
+          usageFetchSignal(),
+        );
         const redeemCredits = parseCodexRedeemCredits(payload);
         state.redeemCredits = redeemCredits;
         const now = Date.now();
@@ -926,7 +1035,7 @@ export function registerCodexUsageAndFast(
           await resolved.client.post<unknown>(REDEEM_PATH, {
             redeem_request_id: pending.redeemRequestId,
             credit_id: pending.creditId,
-          });
+          }, usageFetchSignal());
           pendingRedeemByAccount.delete(resolved.accountId);
           try {
             await refreshUsage(ctx, true);

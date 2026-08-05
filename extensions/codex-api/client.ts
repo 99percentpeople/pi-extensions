@@ -26,6 +26,14 @@ export class CodexApiError extends Error {
   }
 }
 
+/** OAuth credentials are absent, malformed, or could not be refreshed. */
+export class CodexOAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexOAuthError";
+  }
+}
+
 function headerValue(headers: Record<string, string> | undefined, name: string): string | undefined {
   const normalized = name.toLowerCase();
   return Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === normalized)?.[1];
@@ -42,7 +50,7 @@ export function extractCodexAccountId(accessToken: string): string {
     if (typeof accountId !== "string" || accountId.length === 0) throw new Error("missing claim");
     return accountId;
   } catch {
-    throw new Error("Failed to extract ChatGPT account ID from Codex OAuth token");
+    throw new CodexOAuthError("Failed to extract ChatGPT account ID from Codex OAuth token");
   }
 }
 
@@ -179,8 +187,8 @@ export interface CodexApiClientContextOptions {
   allowOtherProviders?: boolean;
 }
 
-function codexOAuthUnavailable(message?: string): Error {
-  return new Error(
+function codexOAuthUnavailable(message?: string): CodexOAuthError {
+  return new CodexOAuthError(
     `Codex subscription OAuth is unavailable${message ? `: ${message}` : ""}. `
       + "Run /login and sign in to openai-codex, then retry.",
   );
