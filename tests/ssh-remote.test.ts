@@ -38,6 +38,7 @@ import {
   buildSshArguments,
   OpenSshClient,
   type SshClientOptions,
+  type SshDisposeOptions,
   type SshRemoteClient,
   type SshRunOptions,
   type SshRunResult,
@@ -48,9 +49,16 @@ import {
   saveSshRemoteConfig,
   loadSshRemoteConfig,
 } from "../extensions/ssh-remote/config.ts";
-import { createSshRemoteExtension } from "../extensions/ssh-remote/index.ts";
+import {
+  AI_SSH_PASSWORD_PROMPT_TIMEOUT_MS,
+  SSH_ENVIRONMENT_EVENT,
+  createSshRemoteExtension as createSshRemoteExtensionBase,
+} from "../extensions/ssh-remote/index.ts";
 import { Ssh2Client, Ssh2ConnectionError } from "../extensions/ssh-remote/ssh2-client.ts";
-import { SshPasswordResolver } from "../extensions/ssh-remote/password-resolver.ts";
+import {
+  SshPasswordResolver,
+  SshPasswordTimeoutError,
+} from "../extensions/ssh-remote/password-resolver.ts";
 import {
   expandProxyJumpTokens,
   parseKnownHostSearchOutput,
@@ -59,7 +67,10 @@ import {
   resolveSsh2Connection,
   Ssh2CompatibilityError,
 } from "../extensions/ssh-remote/ssh2-config.ts";
-import { createSshTransportClient } from "../extensions/ssh-remote/transport.ts";
+import {
+  createSshTransportClient,
+  type SshPasswordProvider,
+} from "../extensions/ssh-remote/transport.ts";
 import {
   buildRemoteBashCommand,
   createRemoteEditOperations,
@@ -67,8 +78,11 @@ import {
   createRemoteWriteOperations,
 } from "../extensions/ssh-remote/operations.ts";
 import {
+  findSshEnvironmentState,
   findSshSessionState,
   normalizeSshSessionState,
+  SSH_LOCAL_SESSION_STATE,
+  SSH_LOCAL_SESSION_STATE_TYPE,
   SSH_SESSION_STATE_TYPE,
   type SshSessionState,
 } from "../extensions/ssh-remote/session-state.ts";
@@ -79,6 +93,16 @@ import {
   shellQuote,
 } from "../extensions/ssh-remote/target.ts";
 
+function createSshRemoteExtension(
+  dependencies: Parameters<typeof createSshRemoteExtensionBase>[0] = {},
+): ReturnType<typeof createSshRemoteExtensionBase> {
+  return createSshRemoteExtensionBase({
+    loadConfig: () => ({ ...DEFAULT_SSH_REMOTE_CONFIG }),
+    saveConfig: () => {},
+    ...dependencies,
+  });
+}
+
 interface RecordedRun {
   command: string;
   options?: SshRunOptions;
@@ -88,6 +112,7 @@ interface RecordedRun {
 class FakeSshClient implements SshRemoteClient {
   readonly calls: RecordedRun[] = [];
   disposed = false;
+  readonly disposeOptions: Array<SshDisposeOptions | undefined> = [];
   remoteFileExists = false;
   userShell = "";
   /** When set, `command -v <value>` probes answer yes for this command name. */
@@ -227,7 +252,8 @@ class FakeSshClient implements SshRemoteClient {
     return result;
   }
 
-  dispose(): void {
+  dispose(options?: SshDisposeOptions): void {
+    this.disposeOptions.push(options);
     this.disposed = true;
   }
 }
@@ -352,6 +378,16 @@ test("OpenSSH client owns and closes its generated ControlMaster", async () => {
   assert.ok(spawned[0].includes(client.options.controlPath!));
   assert.ok(spawned[1].includes("-O"));
   assert.ok(spawned[1].includes("exit"));
+
+  const graceful = new OpenSshClient(
+    { target: "devbox", multiplex: true },
+    spawn,
+  );
+  await graceful.run("watch build");
+  await graceful.dispose({ preserveBackgroundSessions: true });
+  assert.ok(spawned[3].includes("-O"));
+  assert.ok(spawned[3].includes("stop"));
+  assert.ok(!spawned[3].includes("exit"));
 });
 
 test("Windows ssh.exe adds -n for no-stdin commands and uses a temp file for input", async () => {
@@ -415,27 +451,47 @@ test("SSH Remote transport settings normalize and persist", () => {
     transport: "ssh2",
     passwordPrompt: true,
     persistPasswords: true,
+    aiControlTools: false,
+    aiPasswordAuth: true,
   });
   assert.deepEqual(normalizeSshRemoteConfig({ transport: "invalid" }), {
     transport: "auto",
     passwordPrompt: true,
     persistPasswords: true,
+    aiControlTools: false,
+    aiPasswordAuth: true,
   });
   assert.deepEqual(normalizeSshRemoteConfig({
     transport: "ssh2",
     passwordPrompt: false,
     persistPasswords: false,
-  }), { transport: "ssh2", passwordPrompt: false, persistPasswords: false });
+    aiControlTools: true,
+    aiPasswordAuth: false,
+  }), {
+    transport: "ssh2",
+    passwordPrompt: false,
+    persistPasswords: false,
+    aiControlTools: true,
+    aiPasswordAuth: false,
+  });
 
   const directory = mkdtempSync(join(tmpdir(), "pi-ssh-settings-test-"));
   const path = join(directory, "settings.json");
   try {
     writeFileSync(path, JSON.stringify({ unrelated: { enabled: true } }));
-    saveSshRemoteConfig({ transport: "openssh" }, path);
+    saveSshRemoteConfig({
+      transport: "openssh",
+      passwordPrompt: true,
+      persistPasswords: true,
+      aiControlTools: false,
+      aiPasswordAuth: false,
+    }, path);
     assert.deepEqual(loadSshRemoteConfig(path), {
       transport: "openssh",
       passwordPrompt: true,
       persistPasswords: true,
+      aiControlTools: false,
+      aiPasswordAuth: false,
     });
     const document = JSON.parse(readFileSync(path, "utf8"));
     assert.deepEqual(document.unrelated, { enabled: true });
@@ -2695,6 +2751,11 @@ interface HarnessOptions {
   cwd?: string;
   activeTools?: string[];
   skillPaths?: string[];
+  input?: (
+    title: string,
+    placeholder?: string,
+    options?: { timeout?: number; signal?: AbortSignal },
+  ) => Promise<string | undefined>;
 }
 
 function createExtensionHarness(options: HarnessOptions = {}) {
@@ -2706,9 +2767,15 @@ function createExtensionHarness(options: HarnessOptions = {}) {
   const events: Array<{ name: string; payload: any }> = [];
   const entries = [...(options.branch ?? [])];
   const notifications: Array<{ message: string; level?: string }> = [];
+  const inputCalls: Array<{
+    title: string;
+    placeholder?: string;
+    options?: { timeout?: number; signal?: AbortSignal };
+  }> = [];
   const statuses = new Map<string, unknown>();
   const themeCalls: Array<{ color: string; text: string }> = [];
   let shutdowns = 0;
+  let idleWaits = 0;
   let sessionName: string | undefined = options.sessionName;
   let activeTools = [...(options.activeTools ?? ["read", "bash", "edit", "write"])];
   if (options.flag) flags.set("ssh", options.flag);
@@ -2773,6 +2840,9 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     shutdown: () => {
       shutdowns++;
     },
+    waitForIdle: async () => {
+      idleWaits++;
+    },
     sessionManager: {
       getBranch: () => [...entries],
       getSessionId: () => "session-id",
@@ -2785,6 +2855,14 @@ function createExtensionHarness(options: HarnessOptions = {}) {
         else statuses.set(key, value);
       },
       notify: (message: string, level?: string) => notifications.push({ message, level }),
+      input: async (
+        title: string,
+        placeholder?: string,
+        inputOptions?: { timeout?: number; signal?: AbortSignal },
+      ) => {
+        inputCalls.push({ title, placeholder, options: inputOptions });
+        return options.input?.(title, placeholder, inputOptions);
+      },
     },
   } as unknown as ExtensionContext;
 
@@ -2805,12 +2883,17 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     events,
     entries,
     notifications,
+    inputCalls,
     statuses,
     themeCalls,
     emit,
     getSessionName: () => sessionName,
     getActiveTools: () => [...activeTools],
     getShutdowns: () => shutdowns,
+    getIdleWaits: () => idleWaits,
+    setBranch: (branch: unknown[]) => {
+      entries.splice(0, entries.length, ...branch);
+    },
   };
 }
 
@@ -2818,7 +2901,15 @@ function sessionEntry(state: unknown) {
   return { type: "custom", customType: SSH_SESSION_STATE_TYPE, data: state };
 }
 
-test("SSH commands stay hidden in local sessions", async () => {
+function localSessionEntry() {
+  return {
+    type: "custom",
+    customType: SSH_LOCAL_SESSION_STATE_TYPE,
+    data: SSH_LOCAL_SESSION_STATE,
+  };
+}
+
+test("SSH commands stay available while local sessions keep AI controls disabled", async () => {
   const harness = createExtensionHarness();
   createSshRemoteExtension({ platform: "linux" })(harness.pi);
 
@@ -2826,15 +2917,82 @@ test("SSH commands stay hidden in local sessions", async () => {
   assert.equal(harness.tools.has("grep"), false);
   assert.equal(harness.tools.has("find"), false);
   assert.equal(harness.tools.has("ls"), false);
-  assert.equal(harness.commands.has("ssh-status"), false);
-  assert.equal(harness.commands.has("ssh-reconnect"), false);
+  for (const name of [
+    "ssh-connect",
+    "ssh-exit",
+    "ssh-cd",
+    "ssh-status",
+    "ssh-reconnect",
+    "ssh-forget-password",
+  ]) {
+    assert.equal(harness.commands.has(name), true, `${name} should be registered`);
+  }
   await harness.emit("session_start", { reason: "startup" });
   assert.deepEqual(harness.getActiveTools(), ["read", "bash", "edit", "write"]);
-  assert.equal(harness.tools.has("grep"), false);
-  assert.equal(harness.tools.has("find"), false);
-  assert.equal(harness.tools.has("ls"), false);
-  assert.equal(harness.commands.has("ssh-status"), false);
-  assert.equal(harness.commands.has("ssh-reconnect"), false);
+  for (const name of ["ssh_connect", "ssh_exit", "ssh_cd", "ssh_status"]) {
+    assert.equal(harness.tools.has(name), false);
+  }
+  await harness.commands.get("ssh-status").handler("", harness.ctx);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /Workspace: local/);
+});
+
+test("ssh-forget-password scopes deletion to this session unless all is requested", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-forget-command-test-"));
+  const secretsPath = join(directory, "secrets.json");
+  const currentEndpoint = {
+    hostLabel: "deploy@devbox:22",
+    username: "deploy",
+    host: "devbox",
+    port: 22,
+  };
+  const initialSecrets = {
+    [currentEndpoint.hostLabel]: "current-pw",
+    "admin@other-host:22": "other-pw",
+  };
+  writeFileSync(secretsPath, `${JSON.stringify(initialSecrets)}\n`);
+
+  try {
+    const harness = createExtensionHarness({ flag: "deploy@devbox" });
+    createSshRemoteExtension({
+      platform: "linux",
+      secretsPath,
+      createTransportClient: (options, factoryOptions) => {
+        factoryOptions.passwordProvider?.cached(currentEndpoint);
+        return new FakeSshClient(options);
+      },
+    })(harness.pi);
+    assert.equal(harness.commands.has("ssh-forget-password"), true);
+    assert.equal(harness.commands.has("ssh-forget-passwords"), false);
+    await harness.emit("session_start", { reason: "startup" });
+
+    await harness.commands.get("ssh-forget-password").handler(
+      "unexpected",
+      harness.ctx,
+    );
+    assert.deepEqual(JSON.parse(readFileSync(secretsPath, "utf8")), initialSecrets);
+    assert.match(
+      harness.notifications.at(-1)?.message ?? "",
+      /Usage: \/ssh-forget-password \[all\]/,
+    );
+
+    await harness.commands.get("ssh-forget-password").handler("", harness.ctx);
+    assert.deepEqual(JSON.parse(readFileSync(secretsPath, "utf8")), {
+      "admin@other-host:22": "other-pw",
+    });
+    assert.match(
+      harness.notifications.at(-1)?.message ?? "",
+      /Forgot 1 cached SSH password used by this session/,
+    );
+
+    await harness.commands.get("ssh-forget-password").handler("all", harness.ctx);
+    assert.deepEqual(JSON.parse(readFileSync(secretsPath, "utf8")), {});
+    assert.match(
+      harness.notifications.at(-1)?.message ?? "",
+      /Forgot 1 cached SSH password across all sessions/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("invalid SSH transport flags fail closed before creating a client", async () => {
@@ -2873,12 +3031,860 @@ test("SSH commands appear for remote sessions and reconnect the active target", 
 
   await harness.emit("session_start", { reason: "startup" });
   await harness.commands.get("ssh-status").handler("", harness.ctx);
-  assert.match(harness.notifications.at(-1)?.message ?? "", /SSH target: devbox/);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /target: devbox/);
 
   await harness.commands.get("ssh-reconnect").handler("", harness.ctx);
   assert.equal(clients.length, 2);
   assert.equal(clients[0].disposed, true);
   assert.equal(clients[1].options.target, "devbox");
+});
+
+test("local sessions can connect and explicitly exit without resuming the old SSH target", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness();
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  await harness.commands.get("ssh-connect").handler(
+    "devbox:/srv/project",
+    harness.ctx,
+  );
+  assert.equal(harness.getIdleWaits(), 1);
+  assert.equal(clients.length, 1);
+  assert.equal(findSshSessionState(harness.entries)?.target, "devbox");
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
+
+  await harness.commands.get("ssh-exit").handler("", harness.ctx);
+  assert.equal(harness.getIdleWaits(), 2);
+  assert.equal(clients[0].disposed, true);
+  assert.deepEqual(clients[0].disposeOptions, [{
+    preserveBackgroundSessions: true,
+  }]);
+  assert.equal(harness.statuses.has("ssh-remote"), false);
+  assert.equal(findSshSessionState(harness.entries), undefined);
+  assert.equal(findSshEnvironmentState(harness.entries)?.mode, "local");
+  assert.equal(await harness.emit("user_bash", {
+    command: "pwd",
+    cwd: "/local/project",
+    excludeFromContext: false,
+  }), undefined);
+
+  const resumedClients: FakeSshClient[] = [];
+  const resumed = createExtensionHarness({ branch: [...harness.entries] });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      resumedClients.push(client);
+      return client;
+    },
+  })(resumed.pi);
+  await resumed.emit("session_start", { reason: "resume" });
+  assert.equal(resumedClients.length, 0);
+  assert.equal(resumed.statuses.has("ssh-remote"), false);
+});
+
+test("session tree navigation restores the branch-specific local or SSH environment", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ flag: "devbox:/srv/project" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+  const remoteBranch = [...harness.entries];
+
+  harness.setBranch([localSessionEntry()]);
+  await harness.emit("session_tree", { newLeafId: "local", oldLeafId: "remote" });
+  assert.equal(clients[0].disposed, true);
+  assert.equal(harness.statuses.has("ssh-remote"), false);
+
+  harness.setBranch(remoteBranch);
+  await harness.emit("session_tree", { newLeafId: "remote", oldLeafId: "local" });
+  assert.equal(clients.length, 2);
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/srv/project");
+});
+
+test("failed session-tree host switches fail closed instead of restoring the old branch host", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ flag: "host-a:/srv/a" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async (client, options) => {
+      if (client.options.target === "host-b") {
+        throw new Error("host-b is offline");
+      }
+      return {
+        adapter: new UnixBashAdapter(client, "linux", "bash"),
+        workspace: {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd: options.requestedCwd ?? "/srv/a",
+        },
+      };
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  harness.setBranch([sessionEntry({
+    version: 2,
+    target: "host-b",
+    remotePlatform: "unix",
+    remoteShell: "bash",
+    remoteCwd: "/srv/b",
+    remoteHome: "/home/deploy",
+    requestedCwd: "/srv/b",
+  })]);
+  await harness.emit("session_tree", {
+    newLeafId: "host-b-branch",
+    oldLeafId: "host-a-branch",
+  });
+
+  assert.equal(clients.length, 2);
+  assert.equal(clients[0].disposed, true, "the old branch connection must be closed");
+  assert.equal(clients[1].disposed, true, "the failed candidate must be closed");
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Disconnected");
+  await assert.rejects(
+    () => harness.tools.get("bash").execute(
+      "bash-after-tree-switch-failure",
+      { command: "pwd" },
+      undefined,
+      undefined,
+      harness.ctx,
+    ),
+    /SSH remote is unavailable: host-b is offline/,
+  );
+});
+
+test("AI control setting exposes sequential SSH environment tools without built-in permission prompts", async () => {
+  assert.equal(AI_SSH_PASSWORD_PROMPT_TIMEOUT_MS, 60_000);
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness();
+  createSshRemoteExtension({
+    platform: "linux",
+    loadConfig: () => ({
+      ...DEFAULT_SSH_REMOTE_CONFIG,
+      aiControlTools: true,
+    }),
+    saveConfig: () => {},
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  for (const name of ["ssh_connect", "ssh_exit", "ssh_cd", "ssh_status"]) {
+    assert.equal(harness.tools.has(name), true);
+    assert.ok(harness.getActiveTools().includes(name));
+  }
+  assert.equal(
+    harness.tools.has("read"),
+    true,
+    "state-aware workspace wrappers must exist before ssh_connect can share a tool batch",
+  );
+  assert.equal(harness.tools.get("ssh_connect").executionMode, "sequential");
+  assert.equal(harness.tools.get("ssh_exit").executionMode, "sequential");
+  assert.equal(harness.tools.get("ssh_cd").executionMode, "sequential");
+  assert.ok(harness.tools.get("ssh_connect").promptGuidelines.some(
+    (guideline: string) =>
+      /tell the user.*password.*within 60 seconds/i.test(guideline),
+  ));
+  assert.ok(harness.tools.get("ssh_connect").promptGuidelines.some(
+    (guideline: string) =>
+      /switch directly.*do not call ssh_exit before switching/i.test(guideline),
+  ));
+  assert.ok(harness.tools.get("ssh_connect").promptGuidelines.some(
+    (guideline: string) =>
+      /returns to local automatically.*previous SSH workspace remains active.*Do not call ssh_exit/is.test(guideline),
+  ));
+  assert.ok(harness.tools.get("ssh_connect").promptGuidelines.some(
+    (guideline: string) =>
+      /AI password auth is disabled.*fails immediately.*key-based login/i.test(guideline),
+  ));
+
+  const renderTheme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  const renderComponent = (component: { render(width: number): string[] }): string =>
+    component.render(200).map((line) => line.trimEnd()).join("\n");
+  const renderToolCall = (name: string, args: Record<string, unknown>): string => {
+    const component = harness.tools.get(name).renderCall(
+      args,
+      renderTheme,
+      {
+        lastComponent: undefined,
+        argsComplete: true,
+        executionStarted: false,
+        isPartial: false,
+      },
+    );
+    return renderComponent(component);
+  };
+  assert.equal(
+    renderToolCall("ssh_connect", { target: "devbox:/srv/project" }),
+    "ssh_connect devbox:/srv/project",
+  );
+  assert.equal(
+    renderToolCall("ssh_cd", { path: "../service api" }),
+    'ssh_cd "../service api"',
+  );
+  assert.equal(renderToolCall("ssh_cd", { path: "/tmp" }), "ssh_cd /tmp");
+  assert.equal(renderToolCall("ssh_exit", {}), "ssh_exit");
+  assert.equal(renderToolCall("ssh_status", {}), "ssh_status");
+
+  const partialConnectCall = harness.tools.get("ssh_connect").renderCall(
+    { target: "dev" },
+    renderTheme,
+    {
+      lastComponent: undefined,
+      argsComplete: false,
+      executionStarted: false,
+      isPartial: true,
+    },
+  );
+  assert.equal(
+    renderComponent(partialConnectCall),
+    "ssh_connect dev …",
+  );
+  const completedConnectCall = harness.tools.get("ssh_connect").renderCall(
+    { target: "devbox:/srv/project" },
+    renderTheme,
+    {
+      lastComponent: partialConnectCall,
+      argsComplete: true,
+      executionStarted: false,
+      isPartial: false,
+    },
+  );
+  assert.equal(completedConnectCall, partialConnectCall);
+  assert.equal(
+    renderComponent(completedConnectCall),
+    "ssh_connect devbox:/srv/project",
+  );
+
+  const connected = await harness.tools.get("ssh_connect").execute(
+    "ssh-connect-ai",
+    { target: "devbox:/srv/project" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(connected.content[0].text, /SSH workspace active/);
+  assert.equal(clients.length, 1);
+
+  const status = await harness.tools.get("ssh_status").execute(
+    "ssh-status-ai",
+    {},
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(status.content[0].text, /Workspace: SSH/);
+  assert.match(status.content[0].text, /target: devbox/);
+
+  const exited = await harness.tools.get("ssh_exit").execute(
+    "ssh-exit-ai",
+    {},
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(exited.content[0].text, /Local workspace active/);
+  assert.equal(findSshEnvironmentState(harness.entries)?.mode, "local");
+  assert.ok(harness.events.some((event) =>
+    event.name === "ssh-remote:environment"
+      && event.payload.action === "connect"
+      && event.payload.source === "tool"
+      && event.payload.status === "succeeded"
+  ));
+});
+
+test("ssh-connect switches active hosts directly and preserves the old host on failure", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ flag: "host-a:/srv/a" });
+  createSshRemoteExtension({
+    platform: "linux",
+    loadConfig: () => ({
+      ...DEFAULT_SSH_REMOTE_CONFIG,
+      aiControlTools: true,
+    }),
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async (client, options) => {
+      if (client.options.target === "broken-host") {
+        throw new Error("target rejected the connection");
+      }
+      const cwd = options.requestedCwd
+        ?? (client.options.target === "host-a" ? "/srv/a" : "/srv/default");
+      return {
+        adapter: new UnixBashAdapter(client, "linux", "bash"),
+        workspace: {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd,
+        },
+      };
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(findSshSessionState(harness.entries)?.target, "host-a");
+
+  const aiSwitch = await harness.tools.get("ssh_connect").execute(
+    "ssh-switch-host-b",
+    { target: "host-b:/srv/b" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(aiSwitch.content[0].text, /host-b:\/srv\/b/);
+  assert.equal(clients.length, 2);
+  assert.equal(clients[0].disposed, true);
+  assert.deepEqual(clients[0].disposeOptions, [{
+    preserveBackgroundSessions: true,
+  }]);
+  assert.equal(clients[1].disposed, false);
+  assert.equal(findSshSessionState(harness.entries)?.target, "host-b");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/srv/b");
+
+  await harness.commands.get("ssh-connect").handler(
+    "host-c:/srv/c",
+    harness.ctx,
+  );
+  assert.equal(clients.length, 3);
+  assert.equal(clients[1].disposed, true);
+  assert.deepEqual(clients[1].disposeOptions, [{
+    preserveBackgroundSessions: true,
+  }]);
+  assert.equal(clients[2].disposed, false);
+  assert.equal(findSshSessionState(harness.entries)?.target, "host-c");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/srv/c");
+
+  const stateEntriesBeforeFailure = harness.entries.filter((entry: any) =>
+    entry.customType === SSH_SESSION_STATE_TYPE
+  ).length;
+  await assert.rejects(
+    () => harness.tools.get("ssh_connect").execute(
+      "ssh-switch-broken",
+      { target: "broken-host:/srv/broken" },
+      undefined,
+      undefined,
+      harness.ctx,
+    ),
+    /switch to broken-host failed;.*host-c:\/srv\/c remains active: target rejected/is,
+  );
+  assert.equal(clients.length, 4);
+  assert.equal(clients[2].disposed, false, "the previous connection must remain usable");
+  assert.equal(clients[3].disposed, true, "the failed candidate must be disposed");
+  assert.deepEqual(clients[3].disposeOptions, [undefined]);
+  assert.equal(findSshSessionState(harness.entries)?.target, "host-c");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/srv/c");
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
+  assert.equal(
+    harness.entries.filter((entry: any) =>
+      entry.customType === SSH_SESSION_STATE_TYPE
+    ).length,
+    stateEntriesBeforeFailure,
+  );
+  assert.equal(
+    harness.events.some((event) =>
+      event.name === "ssh-remote:environment"
+        && event.payload.action === "exit"
+    ),
+    false,
+    "host switches must not require or emit an intermediate exit",
+  );
+  const status = await harness.tools.get("ssh_status").execute(
+    "ssh-status-after-failed-switch",
+    {},
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(status.content[0].text, /target: host-c/);
+  assert.match(status.content[0].text, /cwd: \/srv\/c/);
+});
+
+test("AI password auth setting fails immediately while manual password prompts remain available", async () => {
+  const providers = new Map<SshRemoteClient, SshPasswordProvider | undefined>();
+  const updates: unknown[] = [];
+  const endpoint = {
+    hostLabel: "deploy@devbox:22",
+    username: "deploy",
+    host: "devbox",
+    port: 22,
+  };
+  const harness = createExtensionHarness({
+    input: async () => "manual-pw",
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    loadConfig: () => ({
+      ...DEFAULT_SSH_REMOTE_CONFIG,
+      persistPasswords: false,
+      aiControlTools: true,
+      aiPasswordAuth: false,
+    }),
+    createTransportClient: (options, factoryOptions) => {
+      const client = new FakeSshClient(options);
+      providers.set(client, factoryOptions.passwordProvider);
+      return client;
+    },
+    selectRemote: async (client, options) => {
+      const provider = providers.get(client);
+      if (!provider) {
+        throw new Error("Permission denied (publickey,password)");
+      }
+      assert.equal(
+        await provider.retry(
+          endpoint,
+          new Error("Permission denied (publickey,password)"),
+        ),
+        "manual-pw",
+      );
+      return {
+        adapter: new UnixBashAdapter(client, "linux", "bash"),
+        workspace: {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd: options.requestedCwd ?? "/srv/project",
+        },
+      };
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  await assert.rejects(
+    () => harness.tools.get("ssh_connect").execute(
+      "ssh-connect-ai-password-disabled",
+      { target: "deploy@devbox:/srv/project" },
+      undefined,
+      (update: unknown) => updates.push(update),
+      harness.ctx,
+    ),
+    /password authentication is required.*AI password authentication is disabled.*key-based login \(recommended\).*AI password auth in \/99settings/is,
+  );
+  assert.equal(harness.inputCalls.length, 0);
+  assert.equal(updates.length, 0);
+  assert.equal(findSshEnvironmentState(harness.entries)?.mode, "local");
+  assert.equal(harness.statuses.has("ssh-remote"), false);
+
+  await harness.commands.get("ssh-connect").handler(
+    "deploy@devbox:/srv/project",
+    harness.ctx,
+  );
+  assert.equal(harness.inputCalls.length, 1);
+  assert.equal(harness.inputCalls[0].options, undefined);
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
+  assert.equal(findSshSessionState(harness.entries)?.target, "deploy@devbox");
+});
+
+test("AI ssh_connect times password input out and automatically restores local", async () => {
+  const endpoint = {
+    hostLabel: "deploy@password-host:22",
+    username: "deploy",
+    host: "password-host",
+    port: 22,
+  };
+  let passwordProvider: SshPasswordProvider | undefined;
+  const updates: any[] = [];
+  const harness = createExtensionHarness({
+    input: async (_title, _placeholder, options) =>
+      new Promise<string | undefined>((resolve) => {
+        if (options?.signal?.aborted) {
+          resolve(undefined);
+          return;
+        }
+        options?.signal?.addEventListener(
+          "abort",
+          () => resolve(undefined),
+          { once: true },
+        );
+      }),
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    aiPasswordPromptTimeoutMs: 10,
+    loadConfig: () => ({
+      ...DEFAULT_SSH_REMOTE_CONFIG,
+      persistPasswords: false,
+      aiControlTools: true,
+    }),
+    createTransportClient: (options, factoryOptions) => {
+      passwordProvider = factoryOptions.passwordProvider;
+      return new FakeSshClient(options);
+    },
+    selectRemote: async () => {
+      await passwordProvider!.retry(
+        endpoint,
+        new Error("Permission denied (publickey,password)"),
+      );
+      throw new Error("password prompt unexpectedly returned");
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  await assert.rejects(
+    () => harness.tools.get("ssh_connect").execute(
+      "ssh-connect-password-timeout",
+      { target: "deploy@password-host:/srv/project" },
+      undefined,
+      (update: unknown) => updates.push(update),
+      harness.ctx,
+    ),
+    /automatically returned to its local workspace:.*timed out after 1 second/,
+  );
+
+  assert.equal(harness.inputCalls.length, 1);
+  assert.equal(
+    harness.inputCalls[0].title,
+    "SSH password for deploy@password-host:22",
+  );
+  assert.equal(harness.inputCalls[0].placeholder, "Enter the SSH password");
+  assert.equal(harness.inputCalls[0].options?.timeout, 10);
+  assert.equal(harness.inputCalls[0].options?.signal?.aborted, true);
+  assert.ok(updates.some((update) =>
+    /requires user input.*within 1 second.*model cannot enter it/.test(
+      update.content[0].text,
+    )
+  ));
+  assert.equal(harness.statuses.has("ssh-remote"), false);
+  assert.equal(findSshEnvironmentState(harness.entries)?.mode, "local");
+  assert.ok(harness.events.some((event) =>
+    event.name === "ssh-remote:environment"
+      && event.payload.action === "connect"
+      && event.payload.status === "failed"
+  ));
+  assert.ok(harness.events.some((event) =>
+    event.name === "ssh-remote:environment"
+      && event.payload.action === "exit"
+      && event.payload.source === "tool"
+      && event.payload.status === "succeeded"
+  ));
+  const status = await harness.tools.get("ssh_status").execute(
+    "ssh-status-after-timeout",
+    {},
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.match(status.content[0].text, /Workspace: local/i);
+});
+
+test("manual ssh-connect password prompts have no timeout and stay disconnected on failure", async () => {
+  const endpoint = {
+    hostLabel: "deploy@password-host:22",
+    username: "deploy",
+    host: "password-host",
+    port: 22,
+  };
+  let passwordProvider: SshPasswordProvider | undefined;
+  const harness = createExtensionHarness({
+    input: async () => "typed-password",
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    loadConfig: () => ({
+      ...DEFAULT_SSH_REMOTE_CONFIG,
+      persistPasswords: false,
+      aiControlTools: true,
+    }),
+    createTransportClient: (options, factoryOptions) => {
+      passwordProvider = factoryOptions.passwordProvider;
+      return new FakeSshClient(options);
+    },
+    selectRemote: async () => {
+      assert.equal(
+        await passwordProvider!.retry(
+          endpoint,
+          new Error("Permission denied (publickey,password)"),
+        ),
+        "typed-password",
+      );
+      throw new Error("remote workspace probe failed");
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  await harness.commands.get("ssh-connect").handler(
+    "deploy@password-host:/srv/project",
+    harness.ctx,
+  );
+
+  assert.equal(harness.inputCalls.length, 1);
+  assert.equal(harness.inputCalls[0].options, undefined);
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Disconnected");
+  assert.notEqual(findSshEnvironmentState(harness.entries)?.mode, "local");
+  assert.equal(
+    harness.events.some((event) =>
+      event.name === "ssh-remote:environment"
+        && event.payload.action === "exit"
+        && event.payload.source === "tool"
+    ),
+    false,
+  );
+});
+
+test("ssh-cd updates the virtual remote cwd and persists it without reconnecting", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ flag: "devbox:/srv/project" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async (client) => {
+      const adapter = new UnixBashAdapter(client, "linux", "bash");
+      adapter.inspectWorkspace = async (requestedCwd) => ({
+        platform: "unix",
+        shell: "bash",
+        home: "/home/deploy",
+        cwd: requestedCwd ?? "/srv/project",
+      });
+      return {
+        adapter,
+        workspace: {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd: "/srv/project",
+        },
+      };
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  await harness.commands.get("ssh-cd").handler("src", harness.ctx);
+  assert.equal(clients.length, 1, "changing cwd must reuse the SSH connection");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/srv/project/src");
+  assert.match(harness.getSessionName() ?? "", /devbox:\/srv\/project\/src/);
+
+  await harness.tools.get("read").execute(
+    "read-new-cwd",
+    { path: "README.md" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.ok(clients[0].calls.some((call) =>
+    call.command.includes("'/srv/project/src/README.md'")
+  ));
+  const backgroundResolver = harness.events.find((event) =>
+    event.name === "bg:register"
+  )?.payload.resolveShell;
+  assert.equal(typeof backgroundResolver, "function");
+  const backgroundLaunch = backgroundResolver("pwd", false, {
+    cwd: "/local/project",
+    projectTrusted: true,
+  });
+  assert.match(backgroundLaunch.args.at(-1) ?? "", /\/srv\/project\/src/);
+  assert.equal(
+    backgroundLaunch.taskEnvironment,
+    "SSH devbox:/srv/project/src",
+  );
+
+  const context = await harness.emit("context", { messages: [] }) as {
+    messages: Array<{ content: string }>;
+  };
+  assert.match(context.messages.at(-1)?.content ?? "", /devbox:\/srv\/project\/src/);
+});
+
+test("ssh-cd treats absolute paths as remote and preserves cwd on failure", async () => {
+  const clients: FakeSshClient[] = [];
+  const inspectedCwds: string[] = [];
+  const harness = createExtensionHarness({
+    flag: "devbox:/tmp",
+    cwd: "/home/zach",
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    loadConfig: () => ({
+      ...DEFAULT_SSH_REMOTE_CONFIG,
+      aiControlTools: true,
+    }),
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async (client) => {
+      const adapter = new UnixBashAdapter(client, "linux", "bash");
+      adapter.inspectWorkspace = async (requestedCwd) => {
+        const cwd = requestedCwd ?? "/tmp";
+        inspectedCwds.push(cwd);
+        if (cwd === "/does-not-exist") {
+          throw new Error(`Remote directory does not exist: ${cwd}`);
+        }
+        return {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd,
+        };
+      };
+      return {
+        adapter,
+        workspace: {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd: "/tmp",
+        },
+      };
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  const sshCd = harness.tools.get("ssh_cd");
+  const change = (path: string) => sshCd.execute(
+    `ssh-cd-${path}`,
+    { path },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+
+  await change("/home/zach");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/home/zach");
+  await change("/home/zach/Desktop");
+  assert.equal(
+    findSshSessionState(harness.entries)?.remoteCwd,
+    "/home/zach/Desktop",
+  );
+  await change("../../..");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/");
+  await change("home/zach");
+  assert.equal(findSshSessionState(harness.entries)?.remoteCwd, "/home/zach");
+  assert.deepEqual(inspectedCwds, [
+    "/home/zach",
+    "/home/zach/Desktop",
+    "/",
+    "/home/zach",
+  ]);
+  assert.equal(clients.length, 1, "cwd changes must reuse the SSH connection");
+
+  const stateEntriesBeforeFailure = harness.entries.filter((entry: any) =>
+    entry.customType === SSH_SESSION_STATE_TYPE
+  ).length;
+  const sessionNameBeforeFailure = harness.getSessionName();
+  await assert.rejects(
+    () => change("/does-not-exist"),
+    /Remote directory does not exist: \/does-not-exist/,
+  );
+  assert.equal(
+    findSshSessionState(harness.entries)?.remoteCwd,
+    "/home/zach",
+    "a failed change must preserve the previous remote cwd",
+  );
+  assert.equal(harness.getSessionName(), sessionNameBeforeFailure);
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
+  assert.equal(
+    harness.entries.filter((entry: any) =>
+      entry.customType === SSH_SESSION_STATE_TYPE
+    ).length,
+    stateEntriesBeforeFailure,
+    "a failed change must not persist a new session state",
+  );
+  assert.ok(harness.events.some((event) =>
+    event.name === "ssh-remote:environment"
+      && event.payload.action === "change-cwd"
+      && event.payload.status === "failed"
+      && event.payload.remoteCwd === "/does-not-exist"
+  ));
+});
+
+test("ssh-cd keeps Windows remote absolute paths independent of the local cwd", async () => {
+  const inspectedCwds: string[] = [];
+  const harness = createExtensionHarness({
+    flag: "winbox:C:\\Temp",
+    cwd: "C:\\Users\\Zach",
+  });
+  createSshRemoteExtension({
+    platform: "win32",
+    loadConfig: () => ({
+      ...DEFAULT_SSH_REMOTE_CONFIG,
+      aiControlTools: true,
+    }),
+    createClient: (options) => new FakeWindowsSshClient(options),
+    selectRemote: async (client) => {
+      const adapter = new WindowsPowerShellAdapter(client, "pwsh", "win32");
+      adapter.inspectWorkspace = async (requestedCwd) => {
+        const cwd = requestedCwd ?? "C:\\Temp";
+        inspectedCwds.push(cwd);
+        return {
+          platform: "windows",
+          shell: "pwsh",
+          home: "C:\\Users\\Admin",
+          cwd,
+        };
+      };
+      return {
+        adapter,
+        workspace: {
+          platform: "windows",
+          shell: "pwsh",
+          home: "C:\\Users\\Admin",
+          cwd: "C:\\Temp",
+        },
+      };
+    },
+  })(harness.pi);
+  await harness.emit("session_start", { reason: "startup" });
+
+  const sshCd = harness.tools.get("ssh_cd");
+  await sshCd.execute(
+    "ssh-cd-windows-absolute",
+    { path: "C:\\Users\\Zach\\Desktop" },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(
+    findSshSessionState(harness.entries)?.remoteCwd,
+    "C:\\Users\\Zach\\Desktop",
+  );
+  await sshCd.execute(
+    "ssh-cd-windows-relative",
+    { path: ".." },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(
+    findSshSessionState(harness.entries)?.remoteCwd,
+    "C:\\Users\\Zach",
+  );
+  assert.deepEqual(inspectedCwds, [
+    "C:\\Users\\Zach\\Desktop",
+    "C:\\Users\\Zach",
+  ]);
 });
 
 test("optional grep, find, and ls tools stay opt-in and route through SSH", async () => {
@@ -2987,10 +3993,14 @@ test("startup connection failure leaves the session alive for reconnect", async 
   assert.equal(harness.getShutdowns(), 0);
   assert.equal(harness.statuses.has("ssh-remote"), true);
 
-  // A failed reconnect keeps the session alive for another attempt.
+  // A failed reconnect keeps the established connection active.
   failNextProbe = true;
   await harness.commands.get("ssh-reconnect").handler("", harness.ctx);
   assert.equal(harness.getShutdowns(), 0);
+  assert.equal(clients.length, 2);
+  assert.equal(clients[0].disposed, false);
+  assert.equal(clients[1].disposed, true);
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
   assert.ok(
     harness.notifications.some((n) => n.message.includes("temporary failure")),
   );
@@ -2999,9 +4009,108 @@ test("startup connection failure leaves the session alive for reconnect", async 
   failNextProbe = false;
   await harness.commands.get("ssh-reconnect").handler("", harness.ctx);
   assert.equal(harness.getShutdowns(), 0);
+  assert.equal(clients.length, 3);
+  assert.equal(clients[0].disposed, true);
+  assert.equal(clients[2].disposed, false);
   assert.ok(
     harness.notifications.some((n) => n.message.includes("SSH remote active")),
   );
+});
+
+test("background resolver follows SSH transitions and reclaims ownership before bg_start", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({ flag: "host-a:/srv/a" });
+  const localResolver = (command: string) => ({
+    file: "pwsh.exe",
+    args: ["-Command", command],
+    env: { ...process.env },
+  });
+  harness.pi.events.on(SSH_ENVIRONMENT_EVENT, (data: unknown) => {
+    const event = data as { action?: unknown; status?: unknown };
+    if (event.action === "exit" && event.status === "succeeded") {
+      harness.pi.events.emit("bg:register", { resolveShell: localResolver });
+    }
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+    selectRemote: async (client, options) => {
+      if (client.options.target === "broken-host") {
+        throw new Error("broken host");
+      }
+      return {
+        adapter: new UnixBashAdapter(client, "linux", "bash"),
+        workspace: {
+          platform: "unix",
+          shell: "bash",
+          home: "/home/deploy",
+          cwd: options.requestedCwd ?? "/srv/default",
+        },
+      };
+    },
+  })(harness.pi);
+  const latestResolver = () => {
+    const registration = harness.events.filter((event) =>
+      event.name === "bg:register"
+    ).at(-1);
+    assert.ok(registration);
+    return registration.payload.resolveShell as (
+      command: string,
+      interactive: boolean,
+      context: { cwd: string; projectTrusted: boolean },
+    ) => {
+      file: string;
+      args: string[];
+      env: NodeJS.ProcessEnv;
+      taskEnvironment?: string;
+    } | undefined;
+  };
+  const resolve = () => latestResolver()("pwd", false, {
+    cwd: "/local/project",
+    projectTrusted: true,
+  });
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.ok(resolve()?.args.includes("host-a"));
+  assert.match(resolve()?.args.at(-1) ?? "", /\/srv\/a/);
+  assert.equal(resolve()?.taskEnvironment, "SSH host-a:/srv/a");
+
+  // Simulate a later local adapter registration. Active SSH must reclaim the
+  // last-writer-wins backend during bg_start preflight.
+  harness.pi.events.emit("bg:register", { resolveShell: localResolver });
+  assert.equal(resolve()?.file, "pwsh.exe");
+  await harness.emit("tool_call", {
+    toolName: "bg_start",
+    toolCallId: "bg-active-host-a",
+    input: { name: "active-host-a", command: "pwd" },
+  });
+  assert.equal(resolve()?.file, "ssh");
+  assert.ok(resolve()?.args.includes("host-a"));
+
+  await harness.commands.get("ssh-connect").handler("host-b:/srv/b", harness.ctx);
+  assert.ok(resolve()?.args.includes("host-b"));
+  assert.match(resolve()?.args.at(-1) ?? "", /\/srv\/b/);
+  assert.equal(resolve()?.taskEnvironment, "SSH host-b:/srv/b");
+
+  await harness.commands.get("ssh-connect").handler(
+    "broken-host:/srv/broken",
+    harness.ctx,
+  );
+  assert.ok(resolve()?.args.includes("host-b"), "a failed switch must keep the old backend");
+  assert.ok(!resolve()?.args.includes("broken-host"));
+
+  await harness.commands.get("ssh-exit").handler("", harness.ctx);
+  assert.equal(resolve()?.file, "pwsh.exe");
+
+  await harness.commands.get("ssh-connect").handler("host-c:/srv/c", harness.ctx);
+  assert.equal(resolve()?.file, "ssh");
+  assert.ok(resolve()?.args.includes("host-c"));
+  assert.match(resolve()?.args.at(-1) ?? "", /\/srv\/c/);
+  assert.equal(resolve()?.taskEnvironment, "SSH host-c:/srv/c");
 });
 
 test("background resolver fails closed while SSH is unavailable", async () => {
@@ -3142,11 +4251,11 @@ test("extension persists, routes, prompts, and restores an SSH workspace", async
   const harness = createExtensionHarness({ flag: "devbox:/srv/project" });
   extension(harness.pi);
 
-  assert.equal(harness.commands.has("ssh-status"), false);
-  assert.equal(harness.commands.has("ssh-reconnect"), false);
-  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(harness.commands.has("ssh-connect"), true);
+  assert.equal(harness.commands.has("ssh-exit"), true);
   assert.equal(harness.commands.has("ssh-status"), true);
   assert.equal(harness.commands.has("ssh-reconnect"), true);
+  await harness.emit("session_start", { reason: "startup" });
   assert.equal(clients.length, 1);
   const saved = findSshSessionState(harness.entries);
   assert.equal(saved?.target, "devbox");
@@ -3191,14 +4300,16 @@ test("extension persists, routes, prompts, and restores an SSH workspace", async
   assert.equal(result.content[0].text, "remote contents\n");
   assert.ok(clients[0].calls.some((call) => call.command.includes("/home/deploy/notes.txt")));
 
-  const prompt = await harness.emit("before_agent_start", {
-    systemPrompt: "Current working directory: /local/project",
-  }) as { systemPrompt: string };
-  assert.match(prompt.systemPrompt, /Current working directory: \/srv\/project \(SSH devbox\)/);
-  assert.match(prompt.systemPrompt, /SSH remote workspace is active/);
+  const context = await harness.emit("context", { messages: [] }) as {
+    messages: Array<{ role: string; content: string }>;
+  };
+  assert.match(context.messages.at(-1)?.content ?? "", /devbox:\/srv\/project/);
+  assert.match(context.messages.at(-1)?.content ?? "", /authoritative/);
+  assert.match(context.messages.at(-1)?.content ?? "", /local cwd \(\/local\/project\).*only the local session anchor/);
 
   await harness.emit("session_shutdown", { reason: "quit" });
   assert.equal(clients[0].disposed, true);
+  assert.deepEqual(clients[0].disposeOptions, [undefined]);
 });
 
 test("extension routes Windows workspaces through PowerShell without exposing logical paths", async () => {
@@ -3256,12 +4367,13 @@ test("extension routes Windows workspaces through PowerShell without exposing lo
   assert.ok(writeCall);
   assert.doesNotMatch(writeCall.command, /windows value/);
 
-  const prompt = await harness.emit("before_agent_start", {
-    systemPrompt: "Current working directory: /local/project",
-  }) as { systemPrompt: string };
-  assert.match(prompt.systemPrompt, /Current working directory: C:\\Users\\Admin/);
-  assert.match(prompt.systemPrompt, /PowerShell syntax, not Bash syntax/);
-  assert.doesNotMatch(prompt.systemPrompt, /compatible|bg_\*|codex_image/);
+  const context = await harness.emit("context", { messages: [] }) as {
+    messages: Array<{ role: string; content: string }>;
+  };
+  const environmentMessage = context.messages.at(-1)?.content ?? "";
+  assert.match(environmentMessage, /winbox:C:\\Users\\Admin/);
+  assert.match(environmentMessage, /PowerShell syntax, not Bash syntax/);
+  assert.doesNotMatch(environmentMessage, /compatible|bg_\*|codex_image/);
   assert.equal(
     clients[0].options.executable,
     process.platform === "win32" ? "ssh.exe" : undefined,
@@ -3409,7 +4521,11 @@ test("Windows clients route Unix workspaces through ssh.exe", async () => {
         command: string,
         interactive: boolean,
         context: { cwd: string; projectTrusted: boolean },
-      ) => { file: string; cwd?: string };
+      ) => {
+        file: string;
+        cwd?: string;
+        taskEnvironment?: string;
+      };
     };
   const launch = background.resolveShell("pwd", false, {
     cwd: "C:\\local\\project\\src",
@@ -3417,6 +4533,10 @@ test("Windows clients route Unix workspaces through ssh.exe", async () => {
   });
   assert.equal(launch.file, "ssh.exe");
   assert.equal(launch.cwd, "C:\\local\\project");
+  assert.equal(
+    launch.taskEnvironment,
+    "SSH devbox:/srv/project/src",
+  );
 });
 
 test("Windows clients route Windows shells through ssh.exe", async () => {
@@ -3499,6 +4619,31 @@ test("session state migrates Unix v1 entries and validates Windows v2 paths", ()
   })?.remoteShell, "sh");
 });
 
+test("local session tombstones override earlier remote state per branch", () => {
+  const remote: SshSessionState = {
+    version: 2,
+    target: "devbox",
+    remotePlatform: "unix",
+    remoteShell: "bash",
+    remoteCwd: "/srv/project",
+    remoteHome: "/home/deploy",
+  };
+  const remoteBranch = [sessionEntry(remote)];
+  assert.equal(findSshEnvironmentState(remoteBranch)?.mode, "remote");
+  assert.equal(findSshSessionState(remoteBranch)?.target, "devbox");
+
+  const localBranch = [...remoteBranch, localSessionEntry()];
+  assert.equal(findSshEnvironmentState(localBranch)?.mode, "local");
+  assert.equal(findSshSessionState(localBranch), undefined);
+
+  const reconnectedBranch = [...localBranch, sessionEntry({
+    ...remote,
+    remoteCwd: "/srv/other",
+  })];
+  assert.equal(findSshEnvironmentState(reconnectedBranch)?.mode, "remote");
+  assert.equal(findSshSessionState(reconnectedBranch)?.remoteCwd, "/srv/other");
+});
+
 test("ash-only sh sessions survive resume", async () => {
   const stored: SshSessionState = {
     version: 2,
@@ -3530,11 +4675,12 @@ test("ash-only sh sessions survive resume", async () => {
   );
   assert.equal(findSshSessionState(harness.entries)?.remoteShell, "sh");
   assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
-  const prompt = await harness.emit("before_agent_start", {
-    systemPrompt: "Current working directory: /local/project",
-  }) as { systemPrompt: string };
-  assert.match(prompt.systemPrompt, /POSIX sh syntax/);
-  assert.doesNotMatch(prompt.systemPrompt, /execute Bash syntax/);
+  const context = await harness.emit("context", { messages: [] }) as {
+    messages: Array<{ content: string }>;
+  };
+  const environmentMessage = context.messages.at(-1)?.content ?? "";
+  assert.match(environmentMessage, /POSIX sh syntax/);
+  assert.doesNotMatch(environmentMessage, /execute Bash syntax/);
   await harness.emit("session_shutdown", { reason: "quit" });
 });
 
@@ -3606,6 +4752,12 @@ test("password resolver caches, persists, rejects, and forgets", async () => {
     host: "devbox",
     port: 22,
   };
+  const otherEndpoint = {
+    hostLabel: "admin@other-host:22",
+    username: "admin",
+    host: "other-host",
+    port: 22,
+  };
   const prompts: string[] = [];
   const resolver = new SshPasswordResolver({ persistPasswords: true, secretsPath });
   resolver.setUI({
@@ -3646,9 +4798,31 @@ test("password resolver caches, persists, rejects, and forgets", async () => {
   assert.equal(await resolver.retryPassword(endpoint), "pw2");
   assert.equal(resolver.cachedPassword(endpoint), "pw2");
 
-  // forgetAll clears everything, including the persisted file.
-  resolver.forgetAll();
-  assert.equal(resolver.cachedPassword(endpoint), undefined);
+  // Session-scoped forgetting removes only endpoints touched by this resolver.
+  const otherResolver = new SshPasswordResolver({
+    persistPasswords: true,
+    secretsPath,
+  });
+  otherResolver.setUI({
+    prompt: async () => "other-pw",
+    notify: () => {},
+  });
+  assert.equal(await otherResolver.resolvePassword(otherEndpoint), "other-pw");
+  assert.equal(resolver.forgetCurrentSession(), 1);
+  const afterSessionForget = new SshPasswordResolver({
+    persistPasswords: true,
+    secretsPath,
+  });
+  assert.equal(afterSessionForget.cachedPassword(endpoint), undefined);
+  assert.equal(afterSessionForget.cachedPassword(otherEndpoint), "other-pw");
+
+  // forgetAll clears every persisted entry, including other sessions' hosts.
+  assert.equal(resolver.forgetAll(), 1);
+  const afterForgetAll = new SshPasswordResolver({
+    persistPasswords: true,
+    secretsPath,
+  });
+  assert.equal(afterForgetAll.cachedPassword(otherEndpoint), undefined);
   assert.deepEqual(
     JSON.parse(readFileSync(secretsPath, "utf8")),
     {},
@@ -3721,6 +4895,39 @@ test("password rejection messages reach the provider retry callback", async () =
   await client.run("whoami");
   assert.equal(errors.length, 1);
   assert.ok(errors[0] instanceof Ssh2ConnectionError);
+});
+
+test("password resolver hard-times out prompts even when the UI does not resolve", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh-secrets-test-"));
+  const secretsPath = join(directory, "secrets.json");
+  const endpoint = {
+    hostLabel: "deploy@slow-host:22",
+    username: "deploy",
+    host: "slow-host",
+    port: 22,
+  };
+  let promptControls: { timeoutMs?: number; signal?: AbortSignal } | undefined;
+  const resolver = new SshPasswordResolver({
+    persistPasswords: false,
+    secretsPath,
+  });
+  resolver.setUI({
+    prompt: async (_title, controls) => {
+      promptControls = controls;
+      return new Promise<string | undefined>(() => {});
+    },
+    notify: () => {},
+  });
+
+  await assert.rejects(
+    () => resolver.resolvePassword(endpoint, undefined, { timeoutMs: 5 }),
+    (error: unknown) =>
+      error instanceof SshPasswordTimeoutError
+      && /timed out after 1 second/.test(error.message),
+  );
+  assert.equal(promptControls?.timeoutMs, 5);
+  assert.equal(promptControls?.signal?.aborted, true);
+  rmSync(directory, { recursive: true, force: true });
 });
 
 test("password resolver stays silent without a UI or when persistence is off", async () => {

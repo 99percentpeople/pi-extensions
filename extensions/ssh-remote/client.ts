@@ -58,6 +58,11 @@ export interface SshExecutor {
   runChecked(command: string, options?: SshRunOptions): Promise<SshRunResult>;
 }
 
+export interface SshDisposeOptions {
+  /** Keep already-running multiplexed background channels alive while stopping new reuse. */
+  preserveBackgroundSessions?: boolean;
+}
+
 export interface SshRemoteClient extends SshExecutor {
   readonly options: Readonly<SshClientOptions>;
   /** Effective foreground transport. Optional for third-party/test implementations. */
@@ -68,7 +73,7 @@ export interface SshRemoteClient extends SshExecutor {
   readonly fallbackReason?: string;
   /** Non-fatal OpenSSH options or identities that ssh2 could not reproduce. */
   readonly compatibilityWarnings?: readonly string[];
-  dispose(): void | Promise<void>;
+  dispose(options?: SshDisposeOptions): void | Promise<void>;
 }
 
 export type SpawnFunction = (
@@ -421,7 +426,7 @@ export class OpenSshClient implements SshRemoteClient {
     );
   }
 
-  async dispose(): Promise<void> {
+  async dispose(options: SshDisposeOptions = {}): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     for (const child of this.children) {
@@ -442,7 +447,7 @@ export class OpenSshClient implements SshRemoteClient {
         "-S",
         controlPath,
         "-O",
-        "exit",
+        options.preserveBackgroundSessions ? "stop" : "exit",
         this.options.target,
       );
       await new Promise<void>((resolve) => {

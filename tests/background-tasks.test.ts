@@ -467,6 +467,201 @@ test("shell adapters can separate a logical task cwd from the local launch cwd",
   await lifecycle.get("session_shutdown")?.({}, ctx);
 });
 
+test("adapter task environments stay bound to their launch and appear in bg tool results", async () => {
+  const {
+    tools,
+    lifecycle,
+    eventBus,
+    children,
+    ctx,
+    getBranch,
+  } = createHarness();
+  const bgStart = tools.get("bg_start");
+  const bgWait = tools.get("bg_wait");
+  const bgStatus = tools.get("bg_status");
+  const bgLogs = tools.get("bg_logs");
+  const bgSend = tools.get("bg_send");
+  const bgKill = tools.get("bg_kill");
+  assert.ok(bgStart && bgWait && bgStatus && bgLogs && bgSend && bgKill);
+
+  const registerSsh = (target: string, cwd: string) => {
+    eventBus.emit("bg:register", {
+      resolveShell: (command: string) => ({
+        file: "ssh",
+        args: [target, command],
+        env: { ...process.env },
+        taskEnvironment: `SSH ${target}:${cwd}`,
+      }),
+    });
+  };
+  const hostAEnvironment = "SSH host-a:/srv/a";
+  registerSsh("host-a", "/srv/a");
+
+  const first = await bgStart.execute(
+    "environment-host-a-start",
+    { name: "remote-a", command: "fake remote a" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const firstId = first.details.id as string;
+  assert.deepEqual(first.details.environment, hostAEnvironment);
+  assert.match(first.content[0].text, /Environment: SSH host-a:\/srv\/a/);
+
+  const list = await bgStatus.execute(
+    "environment-host-a-list",
+    {},
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(list.content[0].text, /\[SSH host-a:\/srv\/a\]/);
+  assert.deepEqual(list.details.tasks[0].environment, hostAEnvironment);
+
+  const detail = await bgStatus.execute(
+    "environment-host-a-detail",
+    { id: firstId },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(detail.content[0].text, /Environment: SSH host-a:\/srv\/a/);
+  assert.deepEqual(detail.details.environment, hostAEnvironment);
+
+  children[0].stdout.write("REMOTE A OUTPUT\n");
+  const logs = await bgLogs.execute(
+    "environment-host-a-logs",
+    { id: firstId, stream: "both" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(
+    logs.content[0].text,
+    /^Environment: SSH host-a:\/srv\/a\n── stdout ──\nREMOTE A OUTPUT$/,
+  );
+  assert.deepEqual(logs.details.environment, hostAEnvironment);
+
+  const sent = await bgSend.execute(
+    "environment-host-a-send",
+    { id: firstId, input: "continue" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(sent.content[0].text, /on SSH host-a:\/srv\/a/);
+  assert.deepEqual(sent.details.environment, hostAEnvironment);
+
+  // Re-register another backend before host A finishes. Existing tasks must
+  // retain their immutable launch environment while new tasks follow host B.
+  registerSsh("host-b", "/srv/b");
+  const afterSwitch = await bgStatus.execute(
+    "environment-host-a-after-switch",
+    { id: firstId },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.deepEqual(afterSwitch.details.environment, hostAEnvironment);
+
+  children[0].finish(0, null);
+  const waited = await bgWait.execute(
+    "environment-host-a-wait",
+    { id: firstId, timeout: 1 },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(waited.content[0].text, /Environment: SSH host-a:\/srv\/a/);
+  assert.deepEqual(waited.details.environment, hostAEnvironment);
+
+  const second = await bgStart.execute(
+    "environment-host-b-start",
+    { name: "remote-b", command: "fake remote b" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(second.details.environment, "SSH host-b:/srv/b");
+  const killed = await bgKill.execute(
+    "environment-host-b-kill",
+    { id: second.details.id, force: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(killed.content[0].text, /on SSH host-b:\/srv\/b/);
+  assert.equal(killed.details.environment, "SSH host-b:/srv/b");
+
+  await waitForCondition(
+    () => getBranch().some((entry: any) =>
+      entry.data?.action === "upsert"
+      && entry.data.task?.id === firstId
+      && entry.data.task?.environment === hostAEnvironment),
+    "persisted task environment",
+  );
+  await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  await lifecycle.get("session_start")?.({ reason: "reload" }, ctx);
+  const restored = await bgStatus.execute(
+    "environment-host-a-restored",
+    { id: firstId },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.deepEqual(restored.details.environment, hostAEnvironment);
+
+  await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+test("background task widget shows compact adapter environment labels", async () => {
+  const {
+    tools,
+    lifecycle,
+    eventBus,
+    children,
+    widgets,
+    ctx,
+  } = createHarness({
+    collapsedTaskLimit: 1,
+    outputPreview: "off",
+  });
+  const widgetCtx = { ...ctx, hasUI: true } as ExtensionContext;
+  await lifecycle.get("session_start")?.({}, widgetCtx);
+  eventBus.emit("bg:register", {
+    resolveShell: (command: string) => ({
+      file: "ssh",
+      args: ["devbox", command],
+      env: { ...process.env },
+      taskEnvironment: "SSH devbox:/srv/project",
+    }),
+  });
+
+  const bgStart = tools.get("bg_start");
+  assert.ok(bgStart);
+  await bgStart.execute(
+    "widget-environment-start",
+    { name: "remote-widget", command: "fake remote widget" },
+    undefined,
+    undefined,
+    widgetCtx,
+  );
+
+  const widgetFactory = widgets.get("bg-tasks-widget");
+  assert.ok(widgetFactory);
+  const plainTheme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  const lines = widgetFactory({ requestRender: () => {} }, plainTheme)
+    .render(200)
+    .map((line: string) => stripVTControlCharacters(line).trimEnd());
+  assert.match(lines[1], /^└─ ◐ remote-widget \([a-z0-9]+\) SSH devbox:\/srv\/project 0s stdout:0 stderr:0$/);
+
+  children[0].finish(0, null);
+  await lifecycle.get("session_shutdown")?.({}, widgetCtx);
+});
+
 test("bg_start falls back to the default shell when the resolver returns undefined", async () => {
   const { tools, lifecycle, children, ctx, eventBus } = createHarness();
   const bgStart = tools.get("bg_start");

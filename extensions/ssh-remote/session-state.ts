@@ -3,6 +3,8 @@ import type { RemotePlatform, RemoteShell } from "./adapters/types.ts";
 
 export const SSH_SESSION_STATE_TYPE = "pi-ssh-remote-state";
 export const SSH_SESSION_STATE_VERSION = 2 as const;
+export const SSH_LOCAL_SESSION_STATE_TYPE = "pi-ssh-local-state";
+export const SSH_LOCAL_SESSION_STATE_VERSION = 1 as const;
 
 export interface SshSessionState {
   version: typeof SSH_SESSION_STATE_VERSION;
@@ -14,6 +16,18 @@ export interface SshSessionState {
   requestedCwd?: string;
   configFile?: string;
 }
+
+export interface SshLocalSessionState {
+  version: typeof SSH_LOCAL_SESSION_STATE_VERSION;
+}
+
+export type SshEnvironmentState =
+  | { mode: "remote"; session: SshSessionState }
+  | { mode: "local"; state: SshLocalSessionState };
+
+export const SSH_LOCAL_SESSION_STATE: SshLocalSessionState = {
+  version: SSH_LOCAL_SESSION_STATE_VERSION,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -98,16 +112,36 @@ export function normalizeSshSessionState(value: unknown): SshSessionState | unde
   };
 }
 
-export function findSshSessionState(entries: readonly unknown[]): SshSessionState | undefined {
+export function findSshEnvironmentState(
+  entries: readonly unknown[],
+): SshEnvironmentState | undefined {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
-    if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== SSH_SESSION_STATE_TYPE) {
+    if (!isRecord(entry) || entry.type !== "custom") continue;
+
+    if (entry.customType === SSH_LOCAL_SESSION_STATE_TYPE) {
+      if (
+        isRecord(entry.data)
+        && entry.data.version === SSH_LOCAL_SESSION_STATE_VERSION
+      ) {
+        return {
+          mode: "local",
+          state: { version: SSH_LOCAL_SESSION_STATE_VERSION },
+        };
+      }
       continue;
     }
-    const state = normalizeSshSessionState(entry.data);
-    if (state) return state;
+
+    if (entry.customType !== SSH_SESSION_STATE_TYPE) continue;
+    const session = normalizeSshSessionState(entry.data);
+    if (session) return { mode: "remote", session };
   }
   return undefined;
+}
+
+export function findSshSessionState(entries: readonly unknown[]): SshSessionState | undefined {
+  const environment = findSshEnvironmentState(entries);
+  return environment?.mode === "remote" ? environment.session : undefined;
 }
 
 export function formatRemoteLocation(state: Pick<SshSessionState, "target" | "remoteCwd">): string {

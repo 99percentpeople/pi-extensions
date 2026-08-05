@@ -11,6 +11,10 @@ export interface SshRemoteConfig {
   passwordPrompt: boolean;
   /** Persist entered passwords to a restricted secrets file for -r resumes. */
   persistPasswords: boolean;
+  /** Expose tools that let the model connect, exit, inspect, or change SSH cwd. */
+  aiControlTools: boolean;
+  /** Allow model-triggered SSH connections to authenticate with a password. */
+  aiPasswordAuth: boolean;
 }
 
 export const SSH_REMOTE_SETTINGS_NAMESPACE = "ssh-remote";
@@ -19,6 +23,8 @@ export const DEFAULT_SSH_REMOTE_CONFIG: SshRemoteConfig = {
   transport: "auto",
   passwordPrompt: true,
   persistPasswords: true,
+  aiControlTools: false,
+  aiPasswordAuth: true,
 };
 
 export function normalizeSshRemoteConfig(value: unknown): SshRemoteConfig {
@@ -26,6 +32,8 @@ export function normalizeSshRemoteConfig(value: unknown): SshRemoteConfig {
   const transport = (value as { transport?: unknown }).transport;
   const passwordPrompt = (value as { passwordPrompt?: unknown }).passwordPrompt;
   const persistPasswords = (value as { persistPasswords?: unknown }).persistPasswords;
+  const aiControlTools = (value as { aiControlTools?: unknown }).aiControlTools;
+  const aiPasswordAuth = (value as { aiPasswordAuth?: unknown }).aiPasswordAuth;
   return {
     transport: transport === "openssh" || transport === "ssh2" || transport === "auto"
       ? transport
@@ -36,6 +44,12 @@ export function normalizeSshRemoteConfig(value: unknown): SshRemoteConfig {
     persistPasswords: typeof persistPasswords === "boolean"
       ? persistPasswords
       : DEFAULT_SSH_REMOTE_CONFIG.persistPasswords,
+    aiControlTools: typeof aiControlTools === "boolean"
+      ? aiControlTools
+      : DEFAULT_SSH_REMOTE_CONFIG.aiControlTools,
+    aiPasswordAuth: typeof aiPasswordAuth === "boolean"
+      ? aiPasswordAuth
+      : DEFAULT_SSH_REMOTE_CONFIG.aiPasswordAuth,
   };
 }
 

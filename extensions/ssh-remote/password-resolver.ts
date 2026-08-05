@@ -13,9 +13,19 @@ export interface SshPasswordEndpoint {
   port?: number;
 }
 
+export interface SshPasswordPromptControls {
+  /** Hard timeout and UI countdown in milliseconds. Omit for no timeout. */
+  timeoutMs?: number;
+  /** Abort the prompt when its owning tool call is cancelled. */
+  signal?: AbortSignal;
+}
+
 export interface SshPasswordPromptUI {
   /** Prompt the user for a password. Resolves undefined when cancelled. */
-  prompt(title: string): Promise<string | undefined>;
+  prompt(
+    title: string,
+    controls?: SshPasswordPromptControls,
+  ): Promise<string | undefined>;
   /** Show a warning/info notification. */
   notify(message: string, type?: "info" | "warning" | "error"): void;
 }
@@ -27,6 +37,14 @@ export class SshPasswordCancelledError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "SshPasswordCancelledError";
+  }
+}
+
+/** Thrown when an AI-initiated password prompt reaches its hard timeout. */
+export class SshPasswordTimeoutError extends SshPasswordCancelledError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SshPasswordTimeoutError";
   }
 }
 
@@ -81,6 +99,7 @@ function writeSecrets(path: string, secrets: Record<string, string>): void {
  */
 export class SshPasswordResolver {
   private readonly memory = new Map<string, string>();
+  private readonly sessionHostLabels = new Set<string>();
   private readonly secretsPath: string;
   private ui?: SshPasswordPromptUI;
   private persist: boolean;
@@ -107,8 +126,66 @@ export class SshPasswordResolver {
    * Used while resolving connection configs so key auth still wins.
    */
   cachedPassword(endpoint: SshPasswordEndpoint): string | undefined {
+    this.sessionHostLabels.add(endpoint.hostLabel);
     return this.memory.get(endpoint.hostLabel)
       ?? (this.persist ? readSecrets(this.secretsPath)[endpoint.hostLabel] : undefined);
+  }
+
+  private async promptPassword(
+    title: string,
+    controls: SshPasswordPromptControls,
+  ): Promise<string | undefined> {
+    const ui = this.ui;
+    if (!ui) return undefined;
+    const { timeoutMs, signal } = controls;
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+      throw new Error("SSH password prompt timeout must be a positive number");
+    }
+    if (timeoutMs === undefined && !signal) {
+      return ui.prompt(title);
+    }
+
+    const promptController = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let removeAbortListener = (): void => {};
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      const abort = (): void => {
+        const error = new SshPasswordCancelledError(
+          `${title} was cancelled`,
+          { cause: signal?.reason },
+        );
+        reject(error);
+        promptController.abort(error);
+      };
+      if (signal?.aborted) {
+        abort();
+      } else if (signal) {
+        signal.addEventListener("abort", abort, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", abort);
+      }
+      if (timeoutMs !== undefined) {
+        timeout = setTimeout(() => {
+          const seconds = Math.ceil(timeoutMs / 1000);
+          const error = new SshPasswordTimeoutError(
+            `${title} timed out after ${seconds} second${seconds === 1 ? "" : "s"}`,
+          );
+          reject(error);
+          promptController.abort(error);
+        }, timeoutMs);
+      }
+    });
+
+    try {
+      const prompt = Promise.resolve().then(() => ui.prompt(title, {
+        timeoutMs,
+        signal: promptController.signal,
+      }));
+      return await Promise.race([prompt, interrupted]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      removeAbortListener();
+      if (!promptController.signal.aborted) promptController.abort();
+    }
   }
 
   /**
@@ -120,6 +197,7 @@ export class SshPasswordResolver {
   async resolvePassword(
     endpoint: SshPasswordEndpoint,
     failureInfo?: string,
+    controls: SshPasswordPromptControls = {},
   ): Promise<string | undefined> {
     const cached = this.cachedPassword(endpoint);
     if (cached !== undefined) return cached;
@@ -130,8 +208,9 @@ export class SshPasswordResolver {
         "warning",
       );
     }
-    const password = await this.ui.prompt(
+    const password = await this.promptPassword(
       `SSH password for ${endpoint.hostLabel}`,
+      controls,
     );
     if (password === undefined || password === "") return undefined;
     this.memory.set(endpoint.hostLabel, password);
@@ -165,20 +244,52 @@ export class SshPasswordResolver {
   async retryPassword(
     endpoint: SshPasswordEndpoint,
     failureInfo?: string,
+    controls: SshPasswordPromptControls = {},
   ): Promise<string | undefined> {
     // Surface the rejection only when a secret was actually tried (typed
     // by the user or a cached one): the first prompt on a key-less host
     // has nothing to reject yet.
     const hadSecret = this.cachedPassword(endpoint) !== undefined;
     this.rejectPassword(endpoint);
-    return this.resolvePassword(endpoint, hadSecret ? failureInfo : undefined);
+    return this.resolvePassword(
+      endpoint,
+      hadSecret ? failureInfo : undefined,
+      controls,
+    );
   }
 
-  /** Clears every password (memory and secrets file). */
-  forgetAll(): void {
-    this.memory.clear();
-    if (this.persist && existsSync(this.secretsPath)) {
+  /** Clears passwords used by this Pi session from memory and persisted storage. */
+  forgetCurrentSession(): number {
+    const labels = [...this.sessionHostLabels];
+    let removed = 0;
+    const secrets = existsSync(this.secretsPath)
+      ? readSecrets(this.secretsPath)
+      : undefined;
+    let changedSecrets = false;
+    for (const label of labels) {
+      let found = this.memory.delete(label);
+      if (secrets && label in secrets) {
+        delete secrets[label];
+        changedSecrets = true;
+        found = true;
+      }
+      if (found) removed += 1;
+    }
+    if (changedSecrets && secrets) writeSecrets(this.secretsPath, secrets);
+    this.sessionHostLabels.clear();
+    return removed;
+  }
+
+  /** Clears every password from this process and persisted storage. */
+  forgetAll(): number {
+    const labels = new Set(this.memory.keys());
+    if (existsSync(this.secretsPath)) {
+      const secrets = readSecrets(this.secretsPath);
+      for (const label of Object.keys(secrets)) labels.add(label);
       writeSecrets(this.secretsPath, {});
     }
+    this.memory.clear();
+    this.sessionHostLabels.clear();
+    return labels.size;
   }
 }

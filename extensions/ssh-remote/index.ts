@@ -13,8 +13,10 @@ import {
   type EditToolDetails,
   type ExtensionAPI,
   type ExtensionContext,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
   selectRemoteAdapter,
@@ -31,6 +33,7 @@ import {
 } from "./client.ts";
 import {
   loadSshRemoteConfig,
+  normalizeSshRemoteConfig,
   saveSshRemoteConfig,
   type SshRemoteConfig,
 } from "./config.ts";
@@ -50,8 +53,11 @@ import {
 } from "./search-tools.ts";
 import { registerRemoteWorkspaceFiles } from "./workspace-files.ts";
 import {
+  findSshEnvironmentState,
   findSshSessionState,
   formatRemoteLocation,
+  SSH_LOCAL_SESSION_STATE,
+  SSH_LOCAL_SESSION_STATE_TYPE,
   SSH_SESSION_STATE_TYPE,
   SSH_SESSION_STATE_VERSION,
   type SshSessionState,
@@ -67,6 +73,69 @@ import { SshPasswordResolver } from "./password-resolver.ts";
 
 const STATUS_KEY = "ssh-remote";
 const CONNECT_TIMEOUT_SECONDS = 10;
+export const AI_SSH_PASSWORD_PROMPT_TIMEOUT_MS = 60_000;
+export const SSH_ENVIRONMENT_EVENT = "ssh-remote:environment";
+const SSH_ENVIRONMENT_CONTEXT_TYPE = "ssh-remote-environment";
+const AI_CONTROL_TOOL_NAMES = [
+  "ssh_connect",
+  "ssh_exit",
+  "ssh_cd",
+  "ssh_status",
+] as const;
+const AI_CONTROL_TOOL_NAME_SET = new Set<string>(AI_CONTROL_TOOL_NAMES);
+
+interface SshControlToolRenderContext {
+  lastComponent?: unknown;
+  argsComplete?: boolean;
+  executionStarted?: boolean;
+  isPartial?: boolean;
+}
+
+function renderSshControlToolCall(
+  toolName: string,
+  argumentValue: unknown,
+  theme: Theme,
+  context: SshControlToolRenderContext,
+): Text {
+  const text = context.lastComponent instanceof Text
+    ? context.lastComponent
+    : new Text("", 0, 0);
+  const parameter = typeof argumentValue === "string" && argumentValue.length > 0
+    ? theme.fg(
+        "accent",
+        /^[^\s\x00-\x1f\x7f]+$/.test(argumentValue)
+          ? argumentValue
+          : JSON.stringify(argumentValue),
+      )
+    : "";
+  const argumentsComplete = context.argsComplete
+    || context.executionStarted
+    || !context.isPartial;
+  text.setText(
+    theme.fg("toolTitle", theme.bold(toolName))
+      + (parameter ? ` ${parameter}` : "")
+      + (argumentsComplete ? "" : theme.fg("dim", " …")),
+  );
+  return text;
+}
+
+export type SshEnvironmentAction = "connect" | "exit" | "change-cwd";
+export type SshEnvironmentActionSource =
+  | "startup"
+  | "restore"
+  | "tree"
+  | "command"
+  | "tool";
+export type SshEnvironmentActionStatus = "started" | "succeeded" | "failed";
+
+export interface SshEnvironmentEvent {
+  action: SshEnvironmentAction;
+  source: SshEnvironmentActionSource;
+  status: SshEnvironmentActionStatus;
+  target?: string;
+  remoteCwd?: string;
+  error?: string;
+}
 
 interface ConnectionIntent {
   target: string;
@@ -87,6 +156,14 @@ interface ActiveConnection {
   remoteGitBranch?: string;
 }
 
+type ConnectionAttemptResult =
+  | { ok: true; active: ActiveConnection }
+  | {
+      ok: false;
+      error: string;
+      restoredPrevious?: ActiveConnection;
+    };
+
 type RuntimeState =
   | { kind: "disabled" }
   | { kind: "connecting"; intent: ConnectionIntent }
@@ -96,12 +173,16 @@ type RuntimeState =
 export interface SshRemoteExtensionDependencies {
   platform?: NodeJS.Platform;
   createClient?: (options: SshClientOptions) => SshRemoteClient;
+  /** Override the transport factory (tests). */
+  createTransportClient?: typeof createSshTransportClient;
   selectRemote?: typeof selectRemoteAdapter;
   loadPreviousSessionState?: (path: string) => SshSessionState | undefined;
   loadConfig?: () => SshRemoteConfig;
   saveConfig?: (config: SshRemoteConfig) => void;
   /** Override the password secrets file path (tests). */
   secretsPath?: string;
+  /** Override the AI password-prompt timeout (tests). */
+  aiPasswordPromptTimeoutMs?: number;
 }
 
 function defaultLoadPreviousSessionState(
@@ -118,6 +199,27 @@ function parseTransportPreference(
   if (value === undefined || value === "") return fallback;
   if (value === "auto" || value === "openssh" || value === "ssh2") return value;
   throw new Error("--ssh-transport must be one of: auto, openssh, ssh2");
+}
+
+function isSshAuthenticationFailure(error: unknown): boolean {
+  const visited = new Set<unknown>();
+  let current = error;
+  while (current !== undefined && current !== null && !visited.has(current)) {
+    visited.add(current);
+    const message = current instanceof Error ? current.message : String(current);
+    if (
+      /permission denied/i.test(message)
+      || /authentication (?:failed|failure)/i.test(message)
+      || /all configured authentication methods failed/i.test(message)
+      || /no supported authentication methods/i.test(message)
+      || /unable to authenticate/i.test(message)
+      || /password authentication (?:is )?required/i.test(message)
+    ) {
+      return true;
+    }
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return false;
 }
 
 function parseShellPreference(value: unknown): SshShellPreference {
@@ -344,23 +446,50 @@ export function createSshRemoteExtension(
     dependencies.loadPreviousSessionState ?? defaultLoadPreviousSessionState;
 
   return function sshRemoteExtension(pi: ExtensionAPI): void {
-    let config = (dependencies.loadConfig ?? loadSshRemoteConfig)();
+    let config = normalizeSshRemoteConfig(
+      (dependencies.loadConfig ?? loadSshRemoteConfig)(),
+    );
     const saveConfig = dependencies.saveConfig ?? saveSshRemoteConfig;
     const passwordResolver = new SshPasswordResolver({
       persistPasswords: config.persistPasswords,
       secretsPath: dependencies.secretsPath,
     });
+    const aiPasswordPromptTimeoutMs =
+      dependencies.aiPasswordPromptTimeoutMs ?? AI_SSH_PASSWORD_PROMPT_TIMEOUT_MS;
+    if (
+      !Number.isFinite(aiPasswordPromptTimeoutMs)
+      || aiPasswordPromptTimeoutMs <= 0
+    ) {
+      throw new Error("AI SSH password prompt timeout must be a positive number");
+    }
+    let syncAiControlTools = (): void => {};
     registerSshRemoteSettings(pi, {
       getConfig: () => config,
       updateConfig: (next, ctx) => {
-        config = next;
-        passwordResolver.setPersistPasswords(next.persistPasswords);
+        const previous = config;
+        config = normalizeSshRemoteConfig(next);
+        passwordResolver.setPersistPasswords(config.persistPasswords);
         try {
           saveConfig(config);
-          ctx.ui.notify(
-            "SSH transport saved; use /ssh-reconnect to apply it to an active workspace",
-            "info",
-          );
+          syncAiControlTools();
+          if (previous.transport !== config.transport) {
+            ctx.ui.notify(
+              "SSH transport saved; use /ssh-reconnect to apply it to an active workspace",
+              "info",
+            );
+          } else if (previous.aiControlTools !== config.aiControlTools) {
+            ctx.ui.notify(
+              `SSH AI control tools ${config.aiControlTools ? "enabled" : "disabled"}`,
+              "info",
+            );
+          } else if (previous.aiPasswordAuth !== config.aiPasswordAuth) {
+            ctx.ui.notify(
+              `SSH AI password authentication ${config.aiPasswordAuth ? "enabled" : "disabled"}`,
+              "info",
+            );
+          } else {
+            ctx.ui.notify("SSH Remote settings saved", "info");
+          }
         } catch (error) {
           ctx.ui.notify(
             `Failed to save SSH Remote settings: ${error instanceof Error ? error.message : String(error)}`,
@@ -391,6 +520,11 @@ export function createSshRemoteExtension(
     let runtime: RuntimeState = { kind: "disabled" };
     let autoSessionName: string | undefined;
     let autoSessionTitle: string | undefined;
+    let remoteBackendsRegistered = false;
+
+    const emitEnvironmentEvent = (event: SshEnvironmentEvent): void => {
+      pi.events.emit(SSH_ENVIRONMENT_EVENT, event);
+    };
 
     registerRemoteWorkspaceFiles(pi, () =>
       runtime.kind === "active" ? runtime : undefined,
@@ -425,7 +559,12 @@ export function createSshRemoteExtension(
       ctx.ui.notify(`SSH remote unavailable: ${message}`, "error");
     };
 
-    const emitBackgroundBackend = (ctx: ExtensionContext): void => {
+    const emitBackgroundBackend = (
+      ctx: ExtensionContext,
+      force = false,
+    ): void => {
+      if (remoteBackendsRegistered && !force) return;
+      remoteBackendsRegistered = true;
       // Registered for every session that requests an SSH workspace. The
       // resolver reads the live runtime state on each launch: active sessions
       // run tasks on the remote (reconnecting picks up the new connection),
@@ -491,13 +630,27 @@ export function createSshRemoteExtension(
     const connect = async (
       intent: ConnectionIntent,
       ctx: ExtensionContext,
-    ): Promise<void> => {
-      if (runtime.kind === "active") await runtime.client.dispose();
+      source: SshEnvironmentActionSource,
+      signal?: AbortSignal,
+      onPasswordPrompt?: (title: string, timeoutMs: number) => void,
+    ): Promise<ConnectionAttemptResult> => {
+      const previousActive = runtime.kind === "active" ? runtime : undefined;
+      const preservePreviousOnFailure = previousActive !== undefined
+        && (source === "command" || source === "tool");
+      const aiPasswordAuthDisabled = source === "tool" && !config.aiPasswordAuth;
       runtime = { kind: "connecting", intent };
       updateStatus(ctx);
+      emitEnvironmentEvent({
+        action: "connect",
+        source,
+        status: "started",
+        target: intent.target,
+        remoteCwd: intent.requestedCwd,
+      });
 
       let client: SshRemoteClient | undefined;
       try {
+        if (signal?.aborted) throw new Error("SSH connection cancelled");
         const transport = parseTransportPreference(
           pi.getFlag("ssh-transport"),
           config.transport,
@@ -514,27 +667,51 @@ export function createSshRemoteExtension(
         // secrets file so /resume and -r reuse the password without re-asking.
         passwordResolver.setUI(ctx.hasUI
           ? {
-              prompt: (title) => ctx.ui.input(title),
+              prompt: (title, controls) => {
+                if (controls?.timeoutMs !== undefined) {
+                  onPasswordPrompt?.(title, controls.timeoutMs);
+                }
+                return ctx.ui.input(
+                  title,
+                  "Enter the SSH password",
+                  controls
+                    ? {
+                        timeout: controls.timeoutMs,
+                        signal: controls.signal,
+                      }
+                    : undefined,
+                );
+              },
               notify: (message, type) => ctx.ui.notify(message, type),
             }
           : undefined);
-        const passwordProvider: SshPasswordProvider | undefined = config.passwordPrompt
+        const passwordProvider: SshPasswordProvider | undefined =
+          config.passwordPrompt && !aiPasswordAuthDisabled
           ? {
               cached: (endpoint) => passwordResolver.cachedPassword(endpoint),
               retry: (endpoint, error) => passwordResolver.retryPassword(
                 endpoint,
                 error instanceof Error ? error.message : undefined,
+                source === "tool"
+                  ? {
+                      timeoutMs: aiPasswordPromptTimeoutMs,
+                      signal,
+                    }
+                  : {},
               ),
             }
           : undefined;
-        let shellPreference = intent.shellPreference;
+        const shellPreference = intent.shellPreference;
         client = dependencies.createClient
           ? dependencies.createClient(clientOptions)
-          : createSshTransportClient(clientOptions, {
-              platform,
-              preference: transport,
-              passwordProvider,
-            });
+          : (dependencies.createTransportClient ?? createSshTransportClient)(
+              clientOptions,
+              {
+                platform,
+                preference: transport,
+                passwordProvider,
+              },
+            );
         const requestedCwd = intent.storedState?.remoteCwd ?? intent.requestedCwd;
         const selected = await selectRemote(client, {
           localPlatform: platform,
@@ -543,6 +720,7 @@ export function createSshRemoteExtension(
           expectedShell: intent.storedState?.remoteShell,
           requestedCwd,
         });
+        if (signal?.aborted) throw new Error("SSH connection cancelled");
         for (const warning of selected.warnings ?? []) {
           ctx.ui.notify(warning, "warning");
         }
@@ -637,10 +815,277 @@ export function createSshRemoteExtension(
             + `(${session.remotePlatform}/${session.remoteShell}; ${transportLabel})`,
           "info",
         );
+        emitEnvironmentEvent({
+          action: "connect",
+          source,
+          status: "succeeded",
+          target: session.target,
+          remoteCwd: session.remoteCwd,
+        });
+        if (previousActive && previousActive.client !== client) {
+          try {
+            await previousActive.client.dispose({ preserveBackgroundSessions: true });
+          } catch (error) {
+            ctx.ui.notify(
+              `Previous SSH connection cleanup warning: ${error instanceof Error ? error.message : String(error)}`,
+              "warning",
+            );
+          }
+        }
+        return { ok: true, active };
       } catch (error) {
-        await client?.dispose();
-        fail(ctx, error, intent);
+        const connectionError = aiPasswordAuthDisabled
+          && isSshAuthenticationFailure(error)
+          ? new Error(
+              `SSH password authentication is required for ${intent.target}, but AI password authentication is disabled. `
+                + "Configure SSH key-based login (recommended), or enable AI password auth in /99settings.",
+              { cause: error },
+            )
+          : error;
+        const message = connectionError instanceof Error
+          ? connectionError.message
+          : String(connectionError);
+        if (client && client !== previousActive?.client) {
+          try {
+            await client.dispose();
+          } catch {
+            // Keep the original connection error.
+          }
+        }
+        if (preservePreviousOnFailure) {
+          runtime = previousActive;
+          updateStatus(ctx);
+          ctx.ui.notify(
+            `SSH switch to ${intent.target} failed; still connected to ${formatRemoteLocation(previousActive.session)}: ${message}`,
+            "error",
+          );
+        } else {
+          if (previousActive) {
+            try {
+              await previousActive.client.dispose({ preserveBackgroundSessions: true });
+            } catch {
+              // The requested branch must fail closed even if cleanup fails.
+            }
+          }
+          fail(ctx, connectionError, intent);
+        }
+        emitEnvironmentEvent({
+          action: "connect",
+          source,
+          status: "failed",
+          target: intent.target,
+          remoteCwd: intent.requestedCwd,
+          error: message,
+        });
+        return {
+          ok: false,
+          error: message,
+          restoredPrevious: preservePreviousOnFailure
+            ? previousActive
+            : undefined,
+        };
       }
+    };
+
+    const disconnect = async (
+      ctx: ExtensionContext,
+      source: SshEnvironmentActionSource,
+      options: { persist: boolean; notify?: boolean },
+    ): Promise<boolean> => {
+      if (runtime.kind === "disabled") {
+        if (options.notify !== false) {
+          ctx.ui.notify("The current workspace is already local", "info");
+        }
+        return false;
+      }
+      if (runtime.kind === "connecting") {
+        throw new Error(`SSH is still connecting to ${runtime.intent.target}`);
+      }
+
+      const previous = runtime;
+      const target = previous.kind === "active"
+        ? previous.session.target
+        : previous.intent?.target;
+      const remoteCwd = previous.kind === "active"
+        ? previous.session.remoteCwd
+        : previous.intent?.requestedCwd;
+      emitEnvironmentEvent({
+        action: "exit",
+        source,
+        status: "started",
+        target,
+        remoteCwd,
+      });
+
+      let disposeError: string | undefined;
+      if (previous.kind === "active") {
+        try {
+          await previous.client.dispose({ preserveBackgroundSessions: true });
+        } catch (error) {
+          disposeError = error instanceof Error ? error.message : String(error);
+        }
+      }
+      runtime = { kind: "disabled" };
+      // A local shell adapter may reclaim the shared background backend after
+      // the exit event. Allow the SSH resolver to register again on a later
+      // /ssh-connect in the same Pi session.
+      remoteBackendsRegistered = false;
+      passwordResolver.setUI(undefined);
+      updateStatus(ctx);
+      if (pi.getSessionName() === autoSessionName) pi.setSessionName("");
+      autoSessionName = undefined;
+      autoSessionTitle = undefined;
+      if (options.persist) {
+        pi.appendEntry(SSH_LOCAL_SESSION_STATE_TYPE, SSH_LOCAL_SESSION_STATE);
+      }
+      if (disposeError) {
+        ctx.ui.notify(`SSH connection cleanup warning: ${disposeError}`, "warning");
+      }
+      if (options.notify !== false) {
+        ctx.ui.notify(`Local workspace active: ${ctx.cwd}`, "info");
+      }
+      emitEnvironmentEvent({
+        action: "exit",
+        source,
+        status: "succeeded",
+        target,
+        remoteCwd,
+      });
+      return true;
+    };
+
+    const changeRemoteCwd = async (
+      value: string,
+      ctx: ExtensionContext,
+      source: SshEnvironmentActionSource,
+      signal?: AbortSignal,
+    ): Promise<ActiveConnection> => {
+      if (runtime.kind !== "active") {
+        if (runtime.kind === "failed") {
+          throw new Error(`SSH remote is unavailable: ${runtime.error}`);
+        }
+        if (runtime.kind === "connecting") {
+          throw new Error(`SSH is still connecting to ${runtime.intent.target}`);
+        }
+        throw new Error("The current workspace is local; use /ssh-connect first");
+      }
+      const active = runtime;
+      // ssh_cd receives an explicitly remote path. Do not use mapCwd here:
+      // mapCwd intentionally translates absolute paths under Pi's local cwd
+      // into the remote workspace for delegated bash/background operations.
+      const requested = active.adapter.fromToolPath(
+        active.adapter.toToolPath(value, active.workspace),
+      );
+      emitEnvironmentEvent({
+        action: "change-cwd",
+        source,
+        status: "started",
+        target: active.session.target,
+        remoteCwd: requested,
+      });
+      try {
+        if (signal?.aborted) throw new Error("SSH cwd change cancelled");
+        const workspace = await active.adapter.inspectWorkspace(requested);
+        if (signal?.aborted) throw new Error("SSH cwd change cancelled");
+        const session: SshSessionState = {
+          ...active.session,
+          remotePlatform: workspace.platform,
+          remoteShell: workspace.shell,
+          remoteCwd: workspace.cwd,
+          remoteHome: workspace.home,
+          requestedCwd: workspace.cwd,
+        };
+        const ownsSessionName = pi.getSessionName() === autoSessionName;
+        active.workspace = workspace;
+        active.session = session;
+        active.intent = {
+          ...active.intent,
+          requestedCwd: workspace.cwd,
+          storedState: session,
+          persistOnSuccess: false,
+        };
+        pi.appendEntry(SSH_SESSION_STATE_TYPE, session);
+        active.remoteGitBranch = await detectRemoteGitBranch(
+          active.adapter,
+          active.workspace,
+        );
+        if (ownsSessionName) {
+          autoSessionName = remoteSessionLabel(
+            session,
+            active.remoteGitBranch,
+            autoSessionTitle,
+          );
+          pi.setSessionName(autoSessionName);
+        }
+        updateStatus(ctx);
+        ctx.ui.notify(
+          `SSH remote cwd changed: ${formatRemoteLocation(session)}`,
+          "info",
+        );
+        emitEnvironmentEvent({
+          action: "change-cwd",
+          source,
+          status: "succeeded",
+          target: session.target,
+          remoteCwd: session.remoteCwd,
+        });
+        return active;
+      } catch (error) {
+        emitEnvironmentEvent({
+          action: "change-cwd",
+          source,
+          status: "failed",
+          target: active.session.target,
+          remoteCwd: requested,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+    };
+
+    const createExplicitIntent = (
+      value: string,
+      ctx: ExtensionContext,
+    ): ConnectionIntent => {
+      const parsed = parseSshTarget(value);
+      const configFlag = pi.getFlag("ssh-config") as string | undefined;
+      return {
+        ...parsed,
+        configFile: configFlag ? expandLocalPath(configFlag, ctx.cwd) : undefined,
+        shellPreference: parseShellPreference(pi.getFlag("ssh-shell")),
+        persistOnSuccess: true,
+      };
+    };
+
+    const formatStatus = (ctx: ExtensionContext): string => {
+      if (runtime.kind === "disabled") {
+        return `Workspace: local\ncwd: ${ctx.cwd}`;
+      }
+      if (runtime.kind === "connecting") {
+        return `Workspace: SSH connecting\ntarget: ${runtime.intent.target}`;
+      }
+      if (runtime.kind === "failed") {
+        return [
+          "Workspace: SSH unavailable",
+          runtime.intent?.target ? `target: ${runtime.intent.target}` : undefined,
+          `error: ${runtime.error}`,
+        ].filter((line): line is string => Boolean(line)).join("\n");
+      }
+      return [
+        "Workspace: SSH",
+        `SSH target: ${runtime.session.target}`,
+        `platform: ${runtime.session.remotePlatform}`,
+        `shell: ${runtime.session.remoteShell}`,
+        `transport: ${runtime.client.transport ?? "custom"}${runtime.client.reusesConnection === undefined ? "" : runtime.client.reusesConnection ? " (reused)" : " (single-use)"}`,
+        runtime.client.fallbackReason
+          ? `transport fallback: ${runtime.client.fallbackReason}`
+          : undefined,
+        `cwd: ${runtime.session.remoteCwd}`,
+        `home: ${runtime.session.remoteHome}`,
+        runtime.session.configFile
+          ? `Config file: ${runtime.session.configFile}`
+          : undefined,
+      ].filter((line): line is string => Boolean(line)).join("\n");
     };
 
     const resolveIntent = (
@@ -719,74 +1164,6 @@ export function createSshRemoteExtension(
     };
 
 
-    let sshCommandsRegistered = false;
-    const registerSshCommands = (): void => {
-      if (sshCommandsRegistered) return;
-      sshCommandsRegistered = true;
-
-      pi.registerCommand("ssh-status", {
-        description: "Show the SSH remote workspace status",
-        handler: async (_args, ctx) => {
-          if (runtime.kind === "disabled") {
-            ctx.ui.notify("SSH remote mode is disabled for this session", "info");
-          } else if (runtime.kind === "connecting") {
-            ctx.ui.notify(
-              `SSH is connecting to ${runtime.intent.target}`,
-              "info",
-            );
-          } else if (runtime.kind === "failed") {
-            ctx.ui.notify(`SSH remote unavailable: ${runtime.error}`, "error");
-          } else {
-            ctx.ui.notify(
-              [
-                `SSH target: ${runtime.session.target}`,
-                `platform: ${runtime.session.remotePlatform}`,
-                `shell: ${runtime.session.remoteShell}`,
-                `transport: ${runtime.client.transport ?? "custom"}${runtime.client.reusesConnection === undefined ? "" : runtime.client.reusesConnection ? " (reused)" : " (single-use)"}`,
-                runtime.client.fallbackReason
-                  ? `transport fallback: ${runtime.client.fallbackReason}`
-                  : undefined,
-                `cwd: ${runtime.session.remoteCwd}`,
-                `home: ${runtime.session.remoteHome}`,
-                runtime.session.configFile
-                  ? `Config file: ${runtime.session.configFile}`
-                  : undefined,
-              ].join("\n"),
-              "info",
-            );
-          }
-        },
-      });
-
-      pi.registerCommand("ssh-reconnect", {
-        description: "Reconnect the current SSH remote workspace",
-        handler: async (_args, ctx) => {
-          const intent =
-            runtime.kind === "active" || runtime.kind === "connecting"
-              ? runtime.intent
-              : runtime.kind === "failed"
-                ? runtime.intent
-                : undefined;
-          if (!intent) {
-            ctx.ui.notify("This session has no SSH remote target", "warning");
-            return;
-          }
-          await connect(
-            { ...intent, persistOnSuccess: intent.persistOnSuccess },
-            ctx,
-          );
-        },
-      });
-
-      pi.registerCommand("ssh-forget-passwords", {
-        description: "Forget cached SSH passwords (memory and secrets file)",
-        handler: async (_args, ctx) => {
-          passwordResolver.forgetAll();
-          ctx.ui.notify("SSH passwords cleared", "info");
-        },
-      });
-    };
-
     const requireActive = (): ActiveConnection | undefined => {
       if (runtime.kind === "disabled") return undefined;
       if (runtime.kind === "active") return runtime;
@@ -824,6 +1201,10 @@ export function createSshRemoteExtension(
 
     const remoteReadTool: typeof readTemplate = {
       ...readTemplate,
+      promptGuidelines: [
+        ...(readTemplate.promptGuidelines ?? []),
+        "When the SSH Remote environment context is present, read resolves paths in that remote workspace rather than Pi's local cwd.",
+      ],
       async execute(id, params, signal, onUpdate, ctx) {
         const localSkillPath = resolveLocalSkillReadPath(
           params.path,
@@ -862,6 +1243,10 @@ export function createSshRemoteExtension(
 
     const remoteWriteTool: typeof writeTemplate = {
       ...writeTemplate,
+      promptGuidelines: [
+        ...(writeTemplate.promptGuidelines ?? []),
+        "When the SSH Remote environment context is present, write modifies files in that remote workspace rather than Pi's local cwd.",
+      ],
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
         if (!active) {
@@ -886,6 +1271,10 @@ export function createSshRemoteExtension(
 
     const remoteGrepTool: typeof grepTemplate = {
       ...grepTemplate,
+      promptGuidelines: [
+        ...(grepTemplate.promptGuidelines ?? []),
+        "When the SSH Remote environment context is present, grep searches that remote workspace.",
+      ],
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
         if (!active) {
@@ -925,6 +1314,10 @@ export function createSshRemoteExtension(
 
     const remoteFindTool: typeof findTemplate = {
       ...findTemplate,
+      promptGuidelines: [
+        ...(findTemplate.promptGuidelines ?? []),
+        "When the SSH Remote environment context is present, find searches that remote workspace.",
+      ],
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
         if (!active) {
@@ -953,6 +1346,10 @@ export function createSshRemoteExtension(
 
     const remoteLsTool: typeof lsTemplate = {
       ...lsTemplate,
+      promptGuidelines: [
+        ...(lsTemplate.promptGuidelines ?? []),
+        "When the SSH Remote environment context is present, ls lists that remote workspace.",
+      ],
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
         if (!active) {
@@ -972,6 +1369,10 @@ export function createSshRemoteExtension(
 
     const remoteEditTool: typeof editTemplate = {
       ...editTemplate,
+      promptGuidelines: [
+        ...(editTemplate.promptGuidelines ?? []),
+        "When the SSH Remote environment context is present, edit modifies files in that remote workspace rather than Pi's local cwd.",
+      ],
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
         if (!active) {
@@ -1073,6 +1474,10 @@ export function createSshRemoteExtension(
       ),
       promptSnippet:
         "Execute commands in the active local or remote workspace shell",
+      promptGuidelines: [
+        ...(bashTemplate.promptGuidelines ?? []),
+        "When the SSH Remote environment context is present, bash runs in that remote cwd and must use its stated shell syntax.",
+      ],
       async execute(id, params, signal, onUpdate, ctx) {
         const active = requireActive();
         if (!active) {
@@ -1107,16 +1512,373 @@ export function createSshRemoteExtension(
       pi.setActiveTools(activeTools);
     };
 
+    const ensureRemoteRouting = (ctx: ExtensionContext): void => {
+      registerRemoteTools();
+      emitBackgroundBackend(ctx);
+    };
+
+    pi.registerCommand("ssh-connect", {
+      description: "Connect or switch the current session to an SSH workspace: /ssh-connect host[:path]",
+      handler: async (args, ctx) => {
+        await ctx.waitForIdle();
+        const target = args.trim();
+        if (!target) {
+          ctx.ui.notify("Usage: /ssh-connect <host[:path]>", "warning");
+          return;
+        }
+        if (runtime.kind === "connecting") {
+          ctx.ui.notify(`SSH is still connecting to ${runtime.intent.target}`, "warning");
+          return;
+        }
+        try {
+          const intent = createExplicitIntent(target, ctx);
+          ensureRemoteRouting(ctx);
+          await connect(intent, ctx, "command");
+        } catch (error) {
+          ctx.ui.notify(
+            error instanceof Error ? error.message : String(error),
+            "error",
+          );
+        }
+      },
+    });
+
+    pi.registerCommand("ssh-exit", {
+      description: "Exit the SSH workspace and return this session to its local workspace",
+      handler: async (_args, ctx) => {
+        await ctx.waitForIdle();
+        try {
+          await disconnect(ctx, "command", { persist: true });
+        } catch (error) {
+          ctx.ui.notify(
+            error instanceof Error ? error.message : String(error),
+            "error",
+          );
+        }
+      },
+    });
+
+    pi.registerCommand("ssh-cd", {
+      description: "Change the persistent cwd of the current SSH workspace",
+      handler: async (args, ctx) => {
+        await ctx.waitForIdle();
+        const path = args.trim();
+        if (!path) {
+          ctx.ui.notify("Usage: /ssh-cd <remote-path>", "warning");
+          return;
+        }
+        try {
+          await changeRemoteCwd(path, ctx, "command");
+        } catch (error) {
+          ctx.ui.notify(
+            error instanceof Error ? error.message : String(error),
+            "error",
+          );
+        }
+      },
+    });
+
+    pi.registerCommand("ssh-status", {
+      description: "Show the active local or SSH workspace status",
+      handler: async (_args, ctx) => {
+        ctx.ui.notify(
+          formatStatus(ctx),
+          runtime.kind === "failed" ? "error" : "info",
+        );
+      },
+    });
+
+    pi.registerCommand("ssh-reconnect", {
+      description: "Reconnect the current SSH remote workspace",
+      handler: async (_args, ctx) => {
+        await ctx.waitForIdle();
+        const intent =
+          runtime.kind === "active" || runtime.kind === "connecting"
+            ? runtime.intent
+            : runtime.kind === "failed"
+              ? runtime.intent
+              : undefined;
+        if (!intent) {
+          ctx.ui.notify("This session has no SSH remote target", "warning");
+          return;
+        }
+        ensureRemoteRouting(ctx);
+        await connect(
+          { ...intent, persistOnSuccess: intent.persistOnSuccess },
+          ctx,
+          "command",
+        );
+      },
+    });
+
+    pi.registerCommand("ssh-forget-password", {
+      description: "Forget SSH passwords used by this session, or all cached passwords with: /ssh-forget-password all",
+      handler: async (args, ctx) => {
+        const scope = args.trim().toLowerCase();
+        if (scope !== "" && scope !== "all") {
+          ctx.ui.notify(
+            "Usage: /ssh-forget-password [all]",
+            "warning",
+          );
+          return;
+        }
+        await ctx.waitForIdle();
+        if (scope === "all") {
+          const count = passwordResolver.forgetAll();
+          ctx.ui.notify(
+            count === 0
+              ? "No cached SSH passwords to forget"
+              : `Forgot ${count} cached SSH password${count === 1 ? "" : "s"} across all sessions`,
+            "info",
+          );
+          return;
+        }
+        const count = passwordResolver.forgetCurrentSession();
+        ctx.ui.notify(
+          count === 0
+            ? "No cached SSH passwords were used by this session"
+            : `Forgot ${count} cached SSH password${count === 1 ? "" : "s"} used by this session`,
+          "info",
+        );
+      },
+    });
+
+    const assertAiControlToolsEnabled = (): void => {
+      if (!config.aiControlTools) {
+        throw new Error("SSH AI control tools are disabled in /99settings");
+      }
+    };
+
+    let aiControlToolsRegistered = false;
+    const ensureAiControlToolsRegistered = (): void => {
+      if (aiControlToolsRegistered) return;
+      aiControlToolsRegistered = true;
+
+      pi.registerTool({
+        name: "ssh_connect",
+        label: "SSH Connect",
+        description: "Connect the current Pi session to an SSH workspace, replacing an active SSH target without requiring ssh_exit first. The target accepts host or host:path syntax. When AI password authentication is enabled, a required password must be entered by the user in Pi's UI within 60 seconds; otherwise key-based login is required.",
+        promptSnippet: "Connect or switch the current session to an SSH workspace",
+        promptGuidelines: [
+          "Use ssh_connect when the user asks to enter an SSH workspace or switch directly from the active SSH target to another one; do not call ssh_exit before switching targets.",
+          "Before calling ssh_connect, tell the user that Pi may show an SSH password prompt when AI password auth is enabled and that they must enter the password themselves within 60 seconds; never ask the user to send the password in chat.",
+          "If AI password auth is disabled and key authentication fails, ssh_connect fails immediately and recommends configuring SSH key-based login; do not retry until the key or setting changes.",
+          "If ssh_connect fails from a local workspace, it returns to local automatically; if a target switch fails, the previous SSH workspace remains active. Do not call ssh_exit just to clean up either failure.",
+          "Do not combine ssh_connect with workspace file or shell operations in the same tool batch; connect first, then inspect the resulting SSH environment.",
+        ],
+        parameters: Type.Object({
+          target: Type.String({
+            description: "SSH target as host, user@host, or host:path",
+            minLength: 1,
+          }),
+        }),
+        executionMode: "sequential",
+        renderCall(args, theme, context) {
+          return renderSshControlToolCall(
+            "ssh_connect",
+            args.target,
+            theme,
+            context,
+          );
+        },
+        async execute(_toolCallId, params, signal, onUpdate, ctx) {
+          assertAiControlToolsEnabled();
+          if (runtime.kind === "connecting") {
+            throw new Error(`SSH is still connecting to ${runtime.intent.target}`);
+          }
+          const intent = createExplicitIntent(params.target, ctx);
+          ensureRemoteRouting(ctx);
+          const attempt = await connect(
+            intent,
+            ctx,
+            "tool",
+            signal,
+            (title, timeoutMs) => {
+              const seconds = Math.ceil(timeoutMs / 1000);
+              onUpdate?.({
+                content: [{
+                  type: "text",
+                  text:
+                    `${title} requires user input. Enter the password in Pi's UI `
+                    + `within ${seconds} second${seconds === 1 ? "" : "s"}; `
+                    + "the model cannot enter it.",
+                }],
+                details: {
+                  action: "connect",
+                  phase: "waiting-password",
+                  passwordPromptTimeoutMs: timeoutMs,
+                },
+              });
+            },
+          );
+          if (!attempt.ok) {
+            if (attempt.restoredPrevious) {
+              throw new Error(
+                `SSH switch to ${intent.target} failed; the previous workspace `
+                  + `${formatRemoteLocation(attempt.restoredPrevious.session)} `
+                  + `remains active: ${attempt.error}`,
+              );
+            }
+            await disconnect(ctx, "tool", { persist: true, notify: false });
+            throw new Error(
+              "SSH connection failed and the session automatically returned "
+                + `to its local workspace: ${attempt.error}`,
+            );
+          }
+          const { active } = attempt;
+          return {
+            content: [{
+              type: "text",
+              text: `SSH workspace active: ${formatRemoteLocation(active.session)} (${active.session.remotePlatform}/${active.session.remoteShell})`,
+            }],
+            details: {
+              action: "connect",
+              target: active.session.target,
+              cwd: active.session.remoteCwd,
+            },
+          };
+        },
+      });
+
+      pi.registerTool({
+        name: "ssh_exit",
+        label: "SSH Exit",
+        description: "Exit the active SSH workspace and route the current Pi session back to its local workspace.",
+        promptSnippet: "Exit SSH and return the current session to its local workspace",
+        promptGuidelines: [
+          "Use ssh_exit only when the user asks to return the current session to its local workspace.",
+          "Do not combine ssh_exit with workspace file or shell operations in the same tool batch; exit first, then inspect the local environment.",
+        ],
+        parameters: Type.Object({}),
+        executionMode: "sequential",
+        renderCall(_args, theme, context) {
+          return renderSshControlToolCall(
+            "ssh_exit",
+            undefined,
+            theme,
+            context,
+          );
+        },
+        async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+          assertAiControlToolsEnabled();
+          if (signal?.aborted) throw new Error("SSH exit cancelled");
+          const changed = await disconnect(ctx, "tool", { persist: true });
+          return {
+            content: [{
+              type: "text",
+              text: changed
+                ? `Local workspace active: ${ctx.cwd}`
+                : `Workspace already local: ${ctx.cwd}`,
+            }],
+            details: { action: "exit", cwd: ctx.cwd, changed },
+          };
+        },
+      });
+
+      pi.registerTool({
+        name: "ssh_cd",
+        label: "SSH Cwd",
+        description: "Change the persistent working directory of the active SSH workspace. Relative paths resolve from the current remote cwd.",
+        promptSnippet: "Change the cwd of the active SSH workspace",
+        promptGuidelines: [
+          "Use ssh_cd when the user asks to change the active SSH workspace directory; subsequent workspace tools use the resolved remote cwd.",
+          "Do not combine ssh_cd with workspace file or shell operations in the same tool batch; change cwd first, then inspect it.",
+        ],
+        parameters: Type.Object({
+          path: Type.String({ description: "Remote directory path", minLength: 1 }),
+        }),
+        executionMode: "sequential",
+        renderCall(args, theme, context) {
+          return renderSshControlToolCall(
+            "ssh_cd",
+            args.path,
+            theme,
+            context,
+          );
+        },
+        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+          assertAiControlToolsEnabled();
+          const active = await changeRemoteCwd(params.path, ctx, "tool", signal);
+          return {
+            content: [{
+              type: "text",
+              text: `SSH remote cwd active: ${formatRemoteLocation(active.session)}`,
+            }],
+            details: {
+              action: "change-cwd",
+              target: active.session.target,
+              cwd: active.session.remoteCwd,
+            },
+          };
+        },
+      });
+
+      pi.registerTool({
+        name: "ssh_status",
+        label: "SSH Status",
+        description: "Report whether the current Pi session uses its local workspace or an SSH workspace, including target, cwd, shell, and transport.",
+        promptSnippet: "Inspect the current local or SSH workspace environment",
+        promptGuidelines: [
+          "Use ssh_status when the current local or SSH workspace environment is unclear.",
+        ],
+        parameters: Type.Object({}),
+        executionMode: "parallel",
+        renderCall(_args, theme, context) {
+          return renderSshControlToolCall(
+            "ssh_status",
+            undefined,
+            theme,
+            context,
+          );
+        },
+        async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+          assertAiControlToolsEnabled();
+          return {
+            content: [{ type: "text", text: formatStatus(ctx) }],
+            details: {
+              kind: runtime.kind,
+              session: runtime.kind === "active" ? runtime.session : undefined,
+            },
+          };
+        },
+      });
+    };
+
+    syncAiControlTools = (): void => {
+      if (config.aiControlTools) {
+        // Register the live local/remote wrappers before the model can emit an
+        // ssh_connect call alongside workspace tools in the same response.
+        // The sequential connect runs first; later wrappers in that batch then
+        // consult the updated runtime instead of using captured local tools.
+        registerRemoteTools();
+        ensureAiControlToolsRegistered();
+      }
+      if (!aiControlToolsRegistered) return;
+      const withoutAiTools = pi.getActiveTools().filter(
+        (name) => !AI_CONTROL_TOOL_NAME_SET.has(name),
+      );
+      const next = config.aiControlTools
+        ? [...withoutAiTools, ...AI_CONTROL_TOOL_NAMES]
+        : withoutAiTools;
+      const current = pi.getActiveTools();
+      if (
+        current.length !== next.length
+        || current.some((name, index) => name !== next[index])
+      ) {
+        pi.setActiveTools(next);
+      }
+    };
+
     pi.on("session_start", async (event, ctx) => {
       runtime = { kind: "disabled" };
       autoSessionName = undefined;
       autoSessionTitle = undefined;
+      syncAiControlTools();
       let intent: ConnectionIntent | undefined;
       try {
         intent = resolveIntent(event, ctx);
       } catch (error) {
-        registerRemoteTools();
-        emitBackgroundBackend(ctx);
+        ensureRemoteRouting(ctx);
         fail(ctx, error);
         return;
       }
@@ -1124,10 +1886,49 @@ export function createSshRemoteExtension(
         updateStatus(ctx);
         return;
       }
-      registerRemoteTools();
-      registerSshCommands();
-      emitBackgroundBackend(ctx);
-      await connect(intent, ctx);
+      ensureRemoteRouting(ctx);
+      await connect(
+        intent,
+        ctx,
+        event.reason === "startup" ? "startup" : "restore",
+      );
+    });
+
+    pi.on("session_tree", async (_event, ctx) => {
+      const environment = findSshEnvironmentState(ctx.sessionManager.getBranch());
+      try {
+        if (environment?.mode === "remote") {
+          const stored = environment.session;
+          if (
+            runtime.kind === "active"
+            && runtime.session.target === stored.target
+            && runtime.session.remotePlatform === stored.remotePlatform
+            && runtime.session.remoteShell === stored.remoteShell
+            && runtime.session.remoteCwd === stored.remoteCwd
+            && runtime.session.configFile === stored.configFile
+          ) {
+            return;
+          }
+          ensureRemoteRouting(ctx);
+          await connect({
+            target: stored.target,
+            requestedCwd: stored.remoteCwd,
+            configFile: stored.configFile,
+            shellPreference: stored.remoteShell,
+            storedState: stored,
+            persistOnSuccess: false,
+          }, ctx, "tree");
+          return;
+        }
+        if (runtime.kind !== "disabled") {
+          await disconnect(ctx, "tree", { persist: false });
+        }
+      } catch (error) {
+        ctx.ui.notify(
+          `Could not restore SSH environment for this branch: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
     });
 
     pi.on("message_end", (event) => {
@@ -1149,14 +1950,17 @@ export function createSshRemoteExtension(
       pi.setSessionName(autoSessionName);
     });
 
-    pi.on("tool_call", (event) => {
+    pi.on("tool_call", (event, ctx) => {
       // Background task backends are registered through a shared "bg:register"
-      // bus where the last registrant wins (for example pi-pwsh-adapter
-      // re-registers a local PowerShell backend on session start). That makes
-      // bg_start silently run on the local machine while the SSH workspace is
-      // unavailable. Fail closed here instead, independent of registration
-      // order, so background tasks match the routed tools.
+      // bus where the last registrant wins. Reclaim the resolver immediately
+      // before every active SSH launch so extension/session-start ordering
+      // cannot route bg_start to a later local adapter. Failed and connecting
+      // workspaces still fail closed independent of the selected resolver.
       if (event.toolName !== "bg_start") return;
+      if (runtime.kind === "active") {
+        emitBackgroundBackend(ctx, true);
+        return undefined;
+      }
       if (runtime.kind === "failed") {
         return { block: true, reason: `SSH remote is unavailable: ${runtime.error}` };
       }
@@ -1192,28 +1996,50 @@ export function createSshRemoteExtension(
       };
     });
 
-    pi.on("before_agent_start", (event, ctx) => {
-      if (runtime.kind !== "active") return;
-      const location = formatRemoteLocation(runtime.session);
-      const localLine = `Current working directory: ${ctx.cwd}`;
-      const remoteLine = `Current working directory: ${runtime.session.remoteCwd} (SSH ${runtime.session.target})`;
-      const base = event.systemPrompt.includes(localLine)
-        ? event.systemPrompt.replace(localLine, remoteLine)
-        : `${event.systemPrompt}\n\n${remoteLine}`;
-      const shellGuidance =
-        runtime.session.remotePlatform === "windows"
-          ? "The bash tool and user ! commands execute PowerShell syntax, not Bash syntax."
-          : runtime.session.remoteShell === "zsh"
-            ? "The bash tool and user ! commands execute Zsh syntax."
-            : runtime.session.remoteShell === "sh"
-              ? "The bash tool and user ! commands execute POSIX sh syntax."
-              : "The bash tool and user ! commands execute Bash syntax.";
+    pi.on("context", (event, ctx) => {
+      const messages = event.messages.filter((message) =>
+        !(message.role === "custom" && message.customType === SSH_ENVIRONMENT_CONTEXT_TYPE)
+      );
+      let content: string | undefined;
+      let details: Record<string, unknown> | undefined;
+      if (runtime.kind === "active") {
+        const shellGuidance =
+          runtime.session.remotePlatform === "windows"
+            ? "The bash tool and user ! commands execute PowerShell syntax, not Bash syntax."
+            : runtime.session.remoteShell === "zsh"
+              ? "The bash tool and user ! commands execute Zsh syntax."
+              : runtime.session.remoteShell === "sh"
+                ? "The bash tool and user ! commands execute POSIX sh syntax."
+                : "The bash tool and user ! commands execute Bash syntax.";
+        content =
+          `SSH Remote workspace context (authoritative): ${formatRemoteLocation(runtime.session)} `
+          + `(${runtime.session.remotePlatform}/${runtime.session.remoteShell}). `
+          + "The read, write, edit, bash, optional grep/find/ls, workspace-file providers, and user ! commands operate on this remote workspace. "
+          + `${shellGuidance} Pi's local cwd (${ctx.cwd}) is only the local session anchor; do not treat it as the project filesystem.`;
+        details = { kind: "active", session: runtime.session };
+      } else if (runtime.kind === "failed") {
+        content =
+          `SSH Remote workspace is unavailable: ${runtime.error}. `
+          + "Workspace tools fail closed and must not fall back to Pi's local cwd. Reconnect or explicitly exit SSH before continuing with local files.";
+        details = { kind: "failed", error: runtime.error, intent: runtime.intent };
+      } else if (runtime.kind === "connecting") {
+        content =
+          `SSH Remote is still connecting to ${runtime.intent.target}. `
+          + "Do not use workspace tools until the connection finishes.";
+        details = { kind: "connecting", intent: runtime.intent };
+      }
+      if (!content) {
+        return messages.length === event.messages.length ? undefined : { messages };
+      }
       return {
-        systemPrompt:
-          `${base}\n\nSSH remote workspace is active at ${location} ` +
-          `(${runtime.session.remotePlatform}/${runtime.session.remoteShell}). ` +
-          "The read, write, edit, bash, optional grep/find/ls, and user ! commands operate on that remote workspace. " +
-          `${shellGuidance} Do not treat the local Pi working directory as the project filesystem.`,
+        messages: [...messages, {
+          role: "custom",
+          customType: SSH_ENVIRONMENT_CONTEXT_TYPE,
+          content,
+          display: false,
+          details,
+          timestamp: Date.now(),
+        }],
       };
     });
 
@@ -1259,8 +2085,18 @@ export type {
 } from "./adapters/index.ts";
 export type {
   SshClientOptions,
+  SshDisposeOptions,
   SshRemoteClient,
   SshTransportKind,
   SshTransportPreference,
 } from "./client.ts";
-export type { SshSessionState } from "./session-state.ts";
+export {
+  findSshEnvironmentState,
+  findSshSessionState,
+  SSH_LOCAL_SESSION_STATE,
+  SSH_LOCAL_SESSION_STATE_TYPE,
+  SSH_SESSION_STATE_TYPE,
+  type SshEnvironmentState,
+  type SshLocalSessionState,
+  type SshSessionState,
+} from "./session-state.ts";

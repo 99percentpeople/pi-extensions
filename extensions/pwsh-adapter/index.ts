@@ -306,9 +306,29 @@ export default function (pi: ExtensionAPI) {
   // Adapt background-tasks to use the selected PowerShell instead of /bin/sh.
   pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
 
-  // Re-register on session start in case bg extension loads after us
+  // SSH Remote owns the background resolver from the start of a connection
+  // attempt until a successful exit. Track that claim so extension load order
+  // cannot make this adapter overwrite an active or fail-closed SSH resolver
+  // from a later-running session_start handler.
+  let sshEnvironmentClaimed = false;
+  pi.events.on("ssh-remote:environment", (data: unknown) => {
+    const event = data as { action?: unknown; status?: unknown };
+    if (event.action === "connect") {
+      sshEnvironmentClaimed = true;
+      return;
+    }
+    if (event.action === "exit" && event.status === "succeeded") {
+      sshEnvironmentClaimed = false;
+      pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
+    }
+  });
+
+  // Re-register on session start in case bg extension loads after us, unless
+  // SSH Remote has already claimed the backend in an earlier startup handler.
   pi.on("session_start", async (_event, ctx) => {
-    pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
+    if (!sshEnvironmentClaimed) {
+      pi.events.emit("bg:register", { spawn: bgSpawn, resolveShell: bgShell });
+    }
     ctx.ui.notify(
       `bash tool loaded through ${runtime.label} (${runtime.file}). background-tasks adapted.`,
       "info",

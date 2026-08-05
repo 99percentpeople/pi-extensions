@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import {
   OpenSshClient,
   type SshClientOptions,
+  type SshDisposeOptions,
   type SshRemoteClient,
   type SshRunOptions,
   type SshRunResult,
@@ -15,7 +16,11 @@ import {
   type SshPasswordEndpoint,
 } from "./password-resolver.ts";
 
-export { SshPasswordCancelledError, SshPasswordFailedError } from "./password-resolver.ts";
+export {
+  SshPasswordCancelledError,
+  SshPasswordFailedError,
+  SshPasswordTimeoutError,
+} from "./password-resolver.ts";
 
 export interface SshPasswordProvider {
   /** Cached password for config resolution; keys still win at auth time. */
@@ -200,11 +205,11 @@ class AutoWindowsSshClient implements SshRemoteClient {
     return checkedResult(await this.run(command, options));
   }
 
-  async dispose(): Promise<void> {
+  async dispose(options?: SshDisposeOptions): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     await this.fallbackPromise?.catch(() => {});
-    await this.delegate.dispose();
+    await this.delegate.dispose(options);
   }
 }
 
@@ -391,10 +396,10 @@ class SshpassRetryClient implements SshRemoteClient {
     return checkedResult(await this.run(command, options));
   }
 
-  async dispose(): Promise<void> {
+  async dispose(options?: SshDisposeOptions): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
-    await this.delegate.dispose();
+    await this.delegate.dispose(options);
   }
 }
 
@@ -537,11 +542,11 @@ class AutoUnixSshClient implements SshRemoteClient {
     return checkedResult(await this.run(command, options));
   }
 
-  async dispose(): Promise<void> {
+  async dispose(options?: SshDisposeOptions): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     await this.fallbackPromise?.catch(() => {});
-    await this.delegate.dispose();
+    await this.delegate.dispose(options);
   }
 }
 

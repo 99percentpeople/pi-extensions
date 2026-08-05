@@ -57,6 +57,18 @@ export function registerSshRemoteSettings(
       description: "Save entered passwords to a restricted secrets file so -r resumes reuse them without re-asking",
       currentValue: booleanLabel(controller.getConfig().persistPasswords),
       values: ["On", "Off"],
+    }, {
+      id: "aiControlTools",
+      label: "AI control tools",
+      description: "Let the model connect, exit, inspect, and change the cwd of SSH environments",
+      currentValue: booleanLabel(controller.getConfig().aiControlTools),
+      values: ["On", "Off"],
+    }, {
+      id: "aiPasswordAuth",
+      label: "AI password auth",
+      description: "Allow model-triggered SSH connections to request a password when key authentication fails",
+      currentValue: booleanLabel(controller.getConfig().aiPasswordAuth),
+      values: ["On", "Off"],
     }],
     onChange: (id, value, ctx) => {
       const config = controller.getConfig();
@@ -65,7 +77,12 @@ export function registerSshRemoteSettings(
         if (transport) controller.updateConfig({ ...config, transport }, ctx);
         return;
       }
-      if (id === "passwordPrompt" || id === "persistPasswords") {
+      if (
+        id === "passwordPrompt"
+        || id === "persistPasswords"
+        || id === "aiControlTools"
+        || id === "aiPasswordAuth"
+      ) {
         const enabled = booleanForLabel(value);
         if (enabled !== undefined) {
           controller.updateConfig({ ...config, [id]: enabled }, ctx);

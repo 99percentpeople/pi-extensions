@@ -98,6 +98,8 @@ interface ShellLaunch {
   /** Local cwd for the launched shell process; adapters may map context.cwd elsewhere. */
   cwd?: string;
   initialStdin?: string;
+  /** Immutable execution location captured on the task at launch time. */
+  taskEnvironment?: string;
 }
 
 interface ShellResolverContext {
@@ -116,6 +118,7 @@ interface BgTask {
   name: string;
   command: string;
   mode: "pipe" | "pty";
+  environment: string | null;
   process: BackgroundProcess | null;
   console: ConsoleSession;
   attachment: AttachmentState;
@@ -150,6 +153,8 @@ interface PersistedFinishedTask {
   name: string;
   command: string;
   mode: BgTask["mode"];
+  /** Optional for backward compatibility with schema-v1 snapshots. */
+  environment?: string | null;
   status: FinishedTaskStatus;
   exitCode: number | null;
   signal: string | null;
@@ -604,6 +609,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object";
 }
 
+function normalizeTaskEnvironment(value: unknown): string | null {
+  // Accept the short-lived object form written by development builds before
+  // task environments were simplified to one label.
+  const label = typeof value === "string"
+    ? value
+    : isRecord(value) && typeof value.label === "string"
+      ? value.label
+      : undefined;
+  if (
+    !label
+    || label.length > 1_000
+    || /[\x00-\x1f\x7f]/.test(label)
+  ) return null;
+  return label;
+}
+
+function taskEnvironmentDetails(task: BgTask): { environment?: string } {
+  return task.environment ? { environment: task.environment } : {};
+}
+
+function taskEnvironmentLine(task: BgTask, indent = ""): string | undefined {
+  return task.environment ? `${indent}Environment: ${task.environment}` : undefined;
+}
+
+function withTaskEnvironment(task: BgTask, text: string): string {
+  const line = taskEnvironmentLine(task);
+  return line ? `${line}\n${text}` : text;
+}
+
+function taskEnvironmentSuffix(task: BgTask): string {
+  return task.environment ? ` on ${task.environment}` : "";
+}
+
 function tailUtf8(value: string, maxBytes: number): string {
   const data = Buffer.from(value, "utf8");
   if (data.length <= maxBytes) return value;
@@ -628,6 +666,7 @@ function serializeFinishedTask(task: BgTask): PersistedFinishedTask {
     name: task.name,
     command: task.command,
     mode: task.mode,
+    environment: task.environment,
     status: task.status,
     exitCode: task.exitCode,
     signal: task.signal,
@@ -692,6 +731,7 @@ function readPersistedFinishedTask(value: unknown): PersistedFinishedTask | unde
     name: value.name,
     command: value.command,
     mode: value.mode,
+    environment: normalizeTaskEnvironment(value.environment),
     status: value.status,
     exitCode: value.exitCode,
     signal: value.signal,
@@ -793,6 +833,7 @@ async function restoreFinishedTaskSnapshots(ctx: ExtensionContext): Promise<void
       name: snapshot.name,
       command: snapshot.command,
       mode: snapshot.mode,
+      environment: snapshot.environment ?? null,
       process: null,
       console,
       attachment: {},
@@ -1542,21 +1583,22 @@ function renderWidgetLines(theme?: Theme, width = MAX_DISPLAY_LOG_CHARS, expande
     const isLast = index === displayed.length - 1;
     const branch = isLast ? "└─" : "├─";
     const duration = formatWidgetDuration((task.endedAt ?? now) - task.startedAt);
+    const environment = task.environment ? ` ${task.environment}` : "";
     if (task.status === "running") {
       const output = task.mode === "pty"
         ? `pty:${task.console.terminal.cols}x${task.console.terminal.rows}`
         : `stdout:${task.stdoutLines} stderr:${task.stderrLines}`;
       lines.push(theme
-        ? `${theme.fg("dim", branch)} ${theme.fg("warning", "◐")} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg("muted", duration)} ${theme.fg("dim", output)}`
-        : `${branch} ◐ ${task.name} (${task.id}) ${duration} ${output}`);
+        ? `${theme.fg("dim", branch)} ${theme.fg("warning", "◐")} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)}${environment ? theme.fg("muted", environment) : ""} ${theme.fg("muted", duration)} ${theme.fg("dim", output)}`
+        : `${branch} ◐ ${task.name} (${task.id})${environment} ${duration} ${output}`);
     } else {
       const glyph = task.status === "completed" ? "✓" : task.status === "failed" ? "×" : "■";
       const color = task.status === "completed" ? "success" : task.status === "failed" ? "error" : "warning";
       const exit = task.exitCode !== null ? ` exit=${task.exitCode}` : "";
       const signal = task.signal ? ` signal=${task.signal}` : "";
       lines.push(theme
-        ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}`
-        : `${branch} ${glyph} ${task.name} (${task.id}) ${task.status} ${duration}${exit}${signal}`);
+        ? `${theme.fg("dim", branch)} ${theme.fg(color, glyph)} ${theme.bold(theme.fg("accent", task.name))} ${theme.fg("dim", `(${task.id})`)}${environment ? theme.fg("muted", environment) : ""} ${theme.fg(color, task.status)} ${theme.fg("muted", duration)}${theme.fg("dim", `${exit}${signal}`)}`
+        : `${branch} ${glyph} ${task.name} (${task.id})${environment} ${task.status} ${duration}${exit}${signal}`);
     }
 
     if (shouldShowOutputPreview(task, backgroundTasksConfig.outputPreview)) {
@@ -1796,6 +1838,7 @@ export default function (
     promptGuidelines: [
       "Use bg_start to run long commands (builds, servers, tests) in the background so you can do other work while waiting.",
       "Give each bg_start task a unique name; names are compared case-insensitively across all currently retained tasks.",
+      "Use the Environment returned by bg_start and later bg_* results as the task's immutable launch location; an SSH task stays on that target and cwd even if the active workspace changes.",
       "Set bg_start pty=true only for terminal-aware or interactive TUI programs; keep the default pipe mode for ordinary builds and servers.",
       "Compose complete bg_* workflows in one assistant response. Every bg_* id accepts a task ID or unique name, and same-task calls execute strictly in source order, not in parallel. For example, emit bg_start(name=\"tests\") → bg_wait(id=\"tests\") → bg_logs(id=\"tests\") together; for an existing task, emit bg_wait → bg_logs together. Different tasks execute in parallel, and bg_status without id is independent.",
       "A running bg_start task survives ordinary agent runs but session reload or shutdown terminates it. A task finishing during a run is normally retained through that run; a task that was still running when the agent settled and then finishes while idle is normally retained through the next run.",
@@ -1878,6 +1921,7 @@ export default function (
 
       const task: BgTask = {
         id, name, command: params.command, mode,
+        environment: normalizeTaskEnvironment(shell.taskEnvironment),
         process: taskProcess, console, attachment: {}, status: "running",
         exitCode: null, signal: null,
         order: nextTaskOrder++,
@@ -1944,9 +1988,22 @@ export default function (
       uiCtx = ctx;
       updateWidget();
 
+      const environmentLine = taskEnvironmentLine(task, "  ");
       return {
-        content: [{ type: "text", text: `Background task started:\n  ID:      ${id}\n  Name:    ${name}\n  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nReference it by ID or unique name. For finite final output, emit bg_wait then bg_logs together in one assistant response.` }],
-        details: { id, name, command: params.command, pid: taskProcess.pid, mode, cols: mode === "pty" ? cols : undefined, rows: mode === "pty" ? rows : undefined },
+        content: [{
+          type: "text",
+          text: `Background task started:\n  ID:      ${id}\n  Name:    ${name}\n${environmentLine ? `${environmentLine}\n` : ""}  Command: ${params.command}\n  PID:     ${taskProcess.pid}\n  Mode:    ${mode}${mode === "pty" ? ` (${cols}x${rows}; use /bg-attach ${id} for interactive control)` : ` (use /bg-attach ${id} to replay and follow output)`}\nReference it by ID or unique name. For finite final output, emit bg_wait then bg_logs together in one assistant response.`,
+        }],
+        details: {
+          id,
+          name,
+          command: params.command,
+          pid: taskProcess.pid,
+          mode,
+          cols: mode === "pty" ? cols : undefined,
+          rows: mode === "pty" ? rows : undefined,
+          ...taskEnvironmentDetails(task),
+        },
       };
     },
 
@@ -1962,10 +2019,17 @@ export default function (
 
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Starting..."), 0, 0);
-      const d = result.details as { id?: string; name?: string; pid?: number } | undefined;
+      const d = result.details as {
+        id?: string;
+        name?: string;
+        pid?: number;
+        environment?: string;
+      } | undefined;
       if (!d) return new Text(theme.fg("success", "Done"), 0, 0);
+      const location = d.environment ? ` @ ${d.environment}` : "";
       const lines = [
-        theme.fg("accent", d.name ?? "") + theme.fg("dim", ` ${d.id ?? ""} pid=${d.pid ?? ""}`),
+        theme.fg("accent", d.name ?? "")
+          + theme.fg("dim", ` ${d.id ?? ""} pid=${d.pid ?? ""}${location}`),
       ];
       return new Text(lines.join("\n"), 0, 0);
     },
@@ -2002,7 +2066,12 @@ export default function (
       if (task.status === "running") {
         onUpdate?.({
           content: [],
-          details: { id: task.id, name: task.name, status: task.status },
+          details: {
+            id: task.id,
+            name: task.name,
+            status: task.status,
+            ...taskEnvironmentDetails(task),
+          },
         });
         await waitUntilAllowed(timeoutMs, [task.done.signal], signal);
       }
@@ -2018,6 +2087,8 @@ export default function (
             "The task is still running; the timeout did not stop it.",
           ]
         : [`Task "${task.name}" (${task.id}) ${task.status} after ${duration}.`];
+      const environmentLine = taskEnvironmentLine(task, "  ");
+      if (environmentLine) parts.push(environmentLine);
       parts.push(
         `  Status:     ${task.status}`,
         `  Duration:   ${duration}`,
@@ -2036,6 +2107,7 @@ export default function (
           exitCode: task.exitCode,
           signal: task.signal,
           mode: task.mode,
+          ...taskEnvironmentDetails(task),
         },
       };
     },
@@ -2117,7 +2189,8 @@ export default function (
             ? formatDuration(task.endedAt - task.startedAt)
             : formatDuration(Date.now() - task.startedAt);
           const exit = task.exitCode !== null ? ` exit=${task.exitCode}` : "";
-          return `[${task.id}] "${task.name}" ${task.status} ${task.mode} (${duration})${exit}`;
+          const environment = task.environment ? ` [${task.environment}]` : "";
+          return `[${task.id}] "${task.name}" ${task.status} ${task.mode} (${duration})${exit}${environment}`;
         });
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -2129,6 +2202,7 @@ export default function (
               mode: task.mode,
               exitCode: task.exitCode,
               signal: task.signal,
+              ...taskEnvironmentDetails(task),
             })),
           },
         };
@@ -2140,8 +2214,10 @@ export default function (
       const duration = task.endedAt
         ? formatDuration(task.endedAt - task.startedAt)
         : formatDuration(Date.now() - task.startedAt);
+      const environmentLine = taskEnvironmentLine(task, "  ");
       const parts: string[] = [
         `Task: ${task.name} (${task.id})`,
+        ...(environmentLine ? [environmentLine] : []),
         `  Status:    ${task.status}`,
         `  Command:   ${task.command}`,
         `  Mode:      ${task.mode}`,
@@ -2162,6 +2238,7 @@ export default function (
           exitCode: task.exitCode,
           signal: task.signal,
           pid: task.process?.pid,
+          ...taskEnvironmentDetails(task),
         },
       };
     },
@@ -2252,8 +2329,20 @@ export default function (
         await flushConsole(task);
         if (stream === "stderr") {
           return {
-            content: [{ type: "text", text: "(PTY output combines stdout and stderr; use stream=terminal)" }],
-            details: { id: task.id, name: task.name, status: task.status, mode: task.mode },
+            content: [{
+              type: "text",
+              text: withTaskEnvironment(
+                task,
+                "(PTY output combines stdout and stderr; use stream=terminal)",
+              ),
+            }],
+            details: {
+              id: task.id,
+              name: task.name,
+              status: task.status,
+              mode: task.mode,
+              ...taskEnvironmentDetails(task),
+            },
           };
         }
         const snapshotLines = getTerminalSnapshotLines(task);
@@ -2262,7 +2351,13 @@ export default function (
           : snapshotLines.slice(-lines);
         const output = selected.join("\n");
         return {
-          content: [{ type: "text", text: output ? `── terminal ──\n${output}` : "(no terminal output yet)" }],
+          content: [{
+            type: "text",
+            text: withTaskEnvironment(
+              task,
+              output ? `── terminal ──\n${output}` : "(no terminal output yet)",
+            ),
+          }],
           details: {
             id: task.id,
             name: task.name,
@@ -2271,14 +2366,27 @@ export default function (
             terminalRows: snapshotLines.length,
             cols: task.console.terminal.cols,
             rows: task.console.terminal.rows,
+            ...taskEnvironmentDetails(task),
           },
         };
       }
 
       if (stream === "terminal") {
         return {
-          content: [{ type: "text", text: "(terminal output is only available for PTY tasks)" }],
-          details: { id: task.id, name: task.name, status: task.status, mode: task.mode },
+          content: [{
+            type: "text",
+            text: withTaskEnvironment(
+              task,
+              "(terminal output is only available for PTY tasks)",
+            ),
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            status: task.status,
+            mode: task.mode,
+            ...taskEnvironmentDetails(task),
+          },
         };
       }
 
@@ -2307,13 +2415,17 @@ export default function (
       }
 
       return {
-        content: [{ type: "text", text: parts.join("\n") }],
+        content: [{
+          type: "text",
+          text: withTaskEnvironment(task, parts.join("\n")),
+        }],
         details: {
           id: task.id,
           name: task.name,
           status: task.status,
           stdoutLines: task.stdoutLines,
           stderrLines: task.stderrLines,
+          ...taskEnvironmentDetails(task),
         },
       };
     },
@@ -2683,8 +2795,34 @@ export default function (
       if (predecessor) await predecessor;
       const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
-      if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is not running.` }], details: {} };
-      if (!task.process) return { content: [{ type: "text", text: `Task "${task.name}" process is unavailable.` }], details: {} };
+      if (task.status !== "running") {
+        return {
+          content: [{
+            type: "text",
+            text: `Task "${task.name}"${taskEnvironmentSuffix(task)} is not running.`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            status: task.status,
+            ...taskEnvironmentDetails(task),
+          },
+        };
+      }
+      if (!task.process) {
+        return {
+          content: [{
+            type: "text",
+            text: `Task "${task.name}" process${taskEnvironmentSuffix(task)} is unavailable.`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            status: task.status,
+            ...taskEnvironmentDetails(task),
+          },
+        };
+      }
 
       const sourceCount = [params.input !== undefined, params.signal !== undefined].filter(Boolean).length;
       if (sourceCount !== 1) {
@@ -2697,12 +2835,30 @@ export default function (
         try {
           await sendProcessSignal(task, params.signal);
           return {
-            content: [{ type: "text", text: `Sent ${params.signal} to "${task.name}" process group.` }],
-            details: { id: task.id, name: task.name, signal: params.signal },
+            content: [{
+              type: "text",
+              text: `Sent ${params.signal} to "${task.name}" process group${taskEnvironmentSuffix(task)}.`,
+            }],
+            details: {
+              id: task.id,
+              name: task.name,
+              signal: params.signal,
+              ...taskEnvironmentDetails(task),
+            },
           };
         } catch (err) {
           task.requestedStopSignal = previousStopSignal;
-          return { content: [{ type: "text", text: `Failed to send ${params.signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+          return {
+            content: [{
+              type: "text",
+              text: `Failed to send ${params.signal} to "${task.name}"${taskEnvironmentSuffix(task)}: ${err instanceof Error ? err.message : String(err)}`,
+            }],
+            details: {
+              id: task.id,
+              name: task.name,
+              ...taskEnvironmentDetails(task),
+            },
+          };
         }
       }
 
@@ -2710,25 +2866,65 @@ export default function (
       try {
         parsed = parseInput(task, params.input ?? "");
       } catch (err) {
-        return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+        return {
+          content: [{
+            type: "text",
+            text: `Failed for "${task.name}"${taskEnvironmentSuffix(task)}: ${err instanceof Error ? err.message : String(err)}`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            ...taskEnvironmentDetails(task),
+          },
+        };
       }
 
       if (parsed.eof) {
         closeTaskInput(task);
         return {
-          content: [{ type: "text", text: `Closed stdin for "${task.name}".` }],
-          details: { id: task.id, name: task.name, eof: true, mode: task.mode },
+          content: [{
+            type: "text",
+            text: `Closed stdin for "${task.name}"${taskEnvironmentSuffix(task)}.`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            eof: true,
+            mode: task.mode,
+            ...taskEnvironmentDetails(task),
+          },
         };
       }
 
       try {
         writeTaskInput(task, parsed.data);
         return {
-          content: [{ type: "text", text: `Sent to "${task.name}": ${parsed.data.length} bytes (${parsed.keyTokens} key tokens)` }],
-          details: { id: task.id, name: task.name, bytes: parsed.data.length, keyTokens: parsed.keyTokens, textBytes: parsed.textBytes, mode: task.mode },
+          content: [{
+            type: "text",
+            text: `Sent to "${task.name}"${taskEnvironmentSuffix(task)}: ${parsed.data.length} bytes (${parsed.keyTokens} key tokens)`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            bytes: parsed.data.length,
+            keyTokens: parsed.keyTokens,
+            textBytes: parsed.textBytes,
+            mode: task.mode,
+            ...taskEnvironmentDetails(task),
+          },
         };
       } catch (err) {
-        return { content: [{ type: "text", text: `Failed: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+        return {
+          content: [{
+            type: "text",
+            text: `Failed for "${task.name}"${taskEnvironmentSuffix(task)}: ${err instanceof Error ? err.message : String(err)}`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            ...taskEnvironmentDetails(task),
+          },
+        };
       }
     },
 
@@ -2772,22 +2968,55 @@ export default function (
       if (predecessor) await predecessor;
       const task = findTaskByReference(params.id);
       if (!task) return { content: [{ type: "text", text: `Task not found: ${params.id}` }], details: {} };
-      if (task.status !== "running") return { content: [{ type: "text", text: `Task "${task.name}" is already ${task.status}.` }], details: {} };
+      if (task.status !== "running") {
+        return {
+          content: [{
+            type: "text",
+            text: `Task "${task.name}"${taskEnvironmentSuffix(task)} is already ${task.status}.`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            status: task.status,
+            ...taskEnvironmentDetails(task),
+          },
+        };
+      }
 
       const signal = params.force ? "SIGKILL" : "SIGTERM";
       try {
         await sendTaskSignal(task, signal);
       }
       catch (err) {
-        return { content: [{ type: "text", text: `Failed to send ${signal}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to send ${signal} to "${task.name}"${taskEnvironmentSuffix(task)}: ${err instanceof Error ? err.message : String(err)}`,
+          }],
+          details: {
+            id: task.id,
+            name: task.name,
+            ...taskEnvironmentDetails(task),
+          },
+        };
       }
 
       await waitForTaskEnd(task, params.force ? 500 : 2500);
 
       const action = task.status === "running" ? `Sent ${signal} to` : "Terminated";
       return {
-        content: [{ type: "text", text: `${action} "${task.name}". Status: ${task.status}` }],
-        details: { id: task.id, name: task.name, status: task.status, signal, mode: task.mode },
+        content: [{
+          type: "text",
+          text: `${action} "${task.name}"${taskEnvironmentSuffix(task)}. Status: ${task.status}`,
+        }],
+        details: {
+          id: task.id,
+          name: task.name,
+          status: task.status,
+          signal,
+          mode: task.mode,
+          ...taskEnvironmentDetails(task),
+        },
       };
     },
 

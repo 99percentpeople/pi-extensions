@@ -8,6 +8,7 @@ export interface BackgroundShellLaunch {
   env: NodeJS.ProcessEnv;
   cwd?: string;
   initialStdin?: string;
+  taskEnvironment?: string;
 }
 
 export interface BackgroundShellResolverContext {
@@ -60,6 +61,9 @@ export function createSshBackgroundShellResolver(
       // OpenSSH process out of a remote-only path while the command itself
       // changes to the mapped remote directory.
       cwd: options.localCwd,
+      // Captured immutably by background-tasks so later host/cwd switches do
+      // not make an existing task look as if it moved with the Pi workspace.
+      taskEnvironment: `SSH ${options.ssh.target}:${remoteCwd}`,
     };
   };
 }
