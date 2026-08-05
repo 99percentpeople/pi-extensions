@@ -32,6 +32,7 @@ you chat, and the status widget tracks it:
 - Send text, terminal keys, stdin data, and process signals to running tasks
 - Use the same shell resolution and command syntax as Pi's built-in `bash` tool
 - Let shell adapters separate a logical task cwd from the local launcher cwd for remote backends
+- Preserve one adapter-provided execution label, such as `SSH devbox:/srv/project`, in task results
 
 ## Install
 
@@ -145,8 +146,9 @@ final screen remains available through attach or explicit logs.
 
 The header uses separate colors for the total, running, and finished counts so
 active work stands out without making the whole widget look like a warning.
-Running durations and recent output refresh without repeatedly registering a
-new widget.
+When a shell adapter supplies an execution label, task rows show it inline—for
+example `SSH devbox:/srv/project`. Running durations and recent output refresh
+without repeatedly registering a new widget.
 
 ## Output retention and cleanup
 
@@ -242,6 +244,13 @@ Installing `@99percentpeople/pi-ssh-remote` registers an OpenSSH backend for
 pipe and PTY tasks while an SSH workspace is active. Background Tasks 1.2.7 and
 newer lets that adapter map an explicit `bg_start.cwd` to the remote workspace
 without requiring the same absolute directory to exist locally.
+
+SSH launches are tagged with an immutable environment such as
+`SSH devbox:/srv/project`. `bg_start`, `bg_wait`, `bg_status`, `bg_logs`,
+`bg_send`, and `bg_kill` return that location in their task information, and
+finished snapshots retain it across extension reloads. A running task stays in
+the environment where it started; later tasks follow SSH host, cwd, and
+local/remote transitions.
 
 Pipe-task completion follows the tracked process's `exit` event rather than the
 stdio `close` event. Launch failures are finalized by the pre-spawn `error`

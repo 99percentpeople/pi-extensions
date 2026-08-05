@@ -239,8 +239,18 @@ configuration subset through `ssh -G`. Shell selection is one flag:
 explicitly, or auto mode detects the remote account's login shell (Zsh
 accounts get Zsh) with a sh/PowerShell fallback and warning when the chosen
 shell is missing. The resolved target, platform, shell, and cwd are stored as
-hidden Pi session state and reconnect on resume; failed connections block
-remote tools instead of falling back to local files. The
+hidden Pi session state and reconnect on resume; failed user/startup connections
+block remote tools instead of falling back to local files. Existing conversations can
+switch between local and SSH workspaces or directly between SSH targets with
+`/ssh-connect`; `/ssh-exit` returns local, and `/ssh-cd` changes the persistent
+remote cwd without reconnecting. A
+default-off `/99settings` option can expose matching environment-control tools
+to the model. Model-driven password prompts have a 60-second countdown; a
+separate default-on setting can disable AI password authentication and require
+SSH keys without affecting manual connections. Failed initial model connections
+return local, while failed host switches retain the previous remote; explicit
+initial user connections can wait indefinitely and remain disconnected on
+failure. The
 status line shows only the themed connection state, while an automatic
 `SSH target:path (branch) • first message` session name places the remote
 location and opening request in Pi's normal footer and native `/resume` list

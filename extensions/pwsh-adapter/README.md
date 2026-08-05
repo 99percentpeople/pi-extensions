@@ -19,7 +19,10 @@ At startup it selects PowerShell once for the whole session:
 2. Otherwise Windows PowerShell 5.1 through `powershell.exe`.
 
 The selected executable is explicit, so both pipe and PTY background tasks work
-without relying on Windows `PATHEXT` expansion.
+without relying on Windows `PATHEXT` expansion. When SSH Remote is installed,
+the adapter yields the background backend from the beginning of an SSH
+connection attempt through its successful exit, independent of extension
+startup order. It then restores the local PowerShell backend for later tasks.
 
 ## Requirements
 

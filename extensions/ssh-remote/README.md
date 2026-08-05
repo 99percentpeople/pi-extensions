@@ -1,88 +1,51 @@
 # @99percentpeople/pi-ssh-remote
 
 Use the local [Pi coding agent](https://pi.dev/) against a remote Unix or
-Windows workspace. The extension routes Pi's built-in `read`, `write`, `edit`,
-and `bash` tools plus the optional `grep`, `find`, and `ls` tools and user
-`!`/`!!` commands through a selectable OpenSSH or `ssh2` transport while
-leaving the Pi UI, model credentials, packages, and session files on the local
-machine.
+Windows workspace without leaving the current Pi conversation.
 
-The extension supports Linux, macOS, and Windows clients connected to:
+SSH Remote routes Pi's project-facing tools through SSH while keeping the TUI,
+model credentials, installed packages, session files, and conversation history
+on the local machine.
 
-- Unix hosts with POSIX `sh`, including Bash, Zsh, ash, and BusyBox;
-- Windows OpenSSH hosts with PowerShell 7 or Windows PowerShell 5.1.
+- **Local clients:** Linux, macOS, and Windows
+- **Remote Unix hosts:** POSIX `sh`, including Bash, Zsh, ash, and BusyBox
+- **Remote Windows hosts:** PowerShell 7 or Windows PowerShell 5.1 over OpenSSH
 
-## Features
+## Highlights
 
-- Provides `auto`, `openssh`, and `ssh2` transports through `/99settings` or
-  `--ssh-transport`
-- Reuses one authenticated connection by default: managed OpenSSH multiplexing
-  on Linux/macOS and persistent `ssh2` channels on Windows
-- Resolves aliases and effective settings through the normal OpenSSH config;
-  both transports support single- and multi-hop `ProxyJump`, while OpenSSH
-  mode retains arbitrary `ProxyCommand` and other advanced client behavior
-- Accepts rsync-style targets such as `host:/srv/project` and `user@host:path`
-- Auto-detects the remote account's login shell (Zsh accounts get Zsh), or
-  selects a shell explicitly via `--ssh-shell`; no per-target settings files
-  are needed
-- Shell selection is one flag: automatic login-shell detection by default, or
-  explicit `--ssh-shell` with a sh/PowerShell fallback and warning when
-  missing; probing failure keeps the deterministic Bash/PowerShell order
-- Keeps Pi's native tool schemas, truncation, diffs, rendering, and mutation
-  queue behavior; `grep`, `find`, and `ls` retain Pi's default disabled state
-- Streams file contents over SSH stdin/stdout instead of putting them in
-  command-line arguments
-- Stores the target, platform, shell, remote home, and resolved cwd in the Pi
-  session
-- Restores and reconnects after `/resume`, `pi -r`, `pi -c`, reload, fork, or
-  clone; `/new` inherits the previous remote target
-- Fails closed after a configured connection fails instead of silently writing
-  to the local filesystem
-- Adapts `@99percentpeople/pi-background-tasks` through its `bg:register`
-  backend when that extension is installed
+- Routes `read`, `write`, `edit`, `bash`, optional `grep`/`find`/`ls`, and user
+  `!`/`!!` commands to the remote workspace
+- Switches the same Pi session between local and SSH workspaces, or directly
+  between SSH hosts
+- Supports `auto`, `openssh`, and `ssh2` transports
+- Reuses authenticated connections by default: OpenSSH multiplexing on
+  Linux/macOS and a persistent `ssh2` connection on Windows
+- Uses normal OpenSSH aliases and configuration, including multi-hop
+  `ProxyJump`
+- Detects Unix and Windows shells automatically, with an explicit shell option
+  when needed
+- Restores branch-aware SSH state across resume, reload, fork, clone, and
+  `/tree`
+- Fails closed when an SSH workspace is unavailable instead of silently using
+  local files
+- Integrates with `@99percentpeople/pi-background-tasks`,
+  `@99percentpeople/pi-workspace-files`, `@99percentpeople/pi-codex-api`, and
+  `@99percentpeople/pi-pwsh-adapter`
 
-## Quick start
+## Contents
 
-```bash
-# 1. Install
-pi install npm:@99percentpeople/pi-ssh-remote
-
-# 2. Start a session against a remote Unix or Windows workspace.
-# The default transport is auto: multiplexed OpenSSH on Linux/macOS,
-# persistent ssh2 on Windows.
-pi --ssh devbox:/srv/project
-pi --ssh 'winuser@winbox:C:\Users\winuser\project'
-
-# 3. Check the active connection and the effective transport
-/ssh-status            # target, platform, shell, transport, cwd/home
-/ssh-reconnect         # reconnect / apply a transport change
-```
-
-Common options:
-
-```bash
---ssh-shell auto|bash|zsh|pwsh|powershell   # remote shell (default auto-detect)
---ssh-transport auto|openssh|ssh2           # transport preference
---ssh-config <path>                                      # alternate local OpenSSH config
-```
-
-Jump hosts work through the normal OpenSSH config with either transport:
-
-```sshconfig
-Host devbox
-    HostName 192.0.2.20
-    User deploy
-    IdentityFile ~/.ssh/company
-    ProxyJump bastion
-```
-
-```bash
-pi --ssh devbox:/srv/project
-```
-
-See [SSH transport](#ssh-transport) for transport details, [Remote shell
-selection](#remote-shell-selection) for shell detection, and [Commands](#commands)
-for the session commands.
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Targets and paths](#targets-and-paths)
+- [Configuration](#configuration)
+- [SSH transports](#ssh-transports)
+- [Authentication](#authentication)
+- [Remote platform and shell](#remote-platform-and-shell)
+- [Workspace and session lifecycle](#workspace-and-session-lifecycle)
+- [AI control tools](#ai-control-tools)
+- [Tool routing and integrations](#tool-routing-and-integrations)
+- [Compatibility and limitations](#compatibility-and-limitations)
+- [Security](#security)
 
 ## Install
 
@@ -90,158 +53,58 @@ for the session commands.
 pi install npm:@99percentpeople/pi-ssh-remote
 ```
 
-During local development:
+The system OpenSSH client (`ssh` or `ssh.exe`) must be available on `PATH`.
+SSH Remote uses it directly in OpenSSH mode, for `ssh -G` configuration
+resolution in `ssh2` mode, and for remote background jobs.
+
+> **Bun on Windows:** `bun add` or `bun install` may report
+> `Blocked N postinstalls` and skip the native crypto build used by `ssh2`.
+> This can make persistent `ssh2` connections hang during setup. Run
+> `bun pm untrusted` to allow the scripts, or install with `npm i`, before using
+> `ssh2` mode.
+
+## Quick start
 
 ```bash
-bun run build:packages
-bun run --cwd extensions/ssh-remote build
-pi -e ./extensions/ssh-remote/index.ts --ssh devbox:/srv/project
+# Unix workspace
+pi --ssh devbox:/srv/project
+
+# Windows workspace (quote the target in your shell)
+pi --ssh 'winuser@winbox:C:\Users\winuser\project'
 ```
 
-> **Bun on Windows**: installing the package with `bun add`/`bun install` may
-> block `ssh2`'s postinstall scripts (Bun prints `Blocked N postinstalls`).
-> That skips the native build of ssh2's bundled AES-GCM/ChaCha20-Poly1305
-> binding (`lib/protocol/crypto`) and the persistent `ssh2` transport can hang
-> at connection setup. Run `bun pm untrusted` to allow the scripts (or install
-> with `npm i`) before using `ssh2` mode.
+The default transport is `auto`:
 
-## SSH transport
+- Linux/macOS clients start with multiplexed OpenSSH.
+- Windows clients start with a persistent `ssh2` connection.
 
-The default is `auto`:
+Useful commands inside Pi:
 
-| Local platform | Foreground transport | Connection behavior |
-| --- | --- | --- |
-| Linux / macOS | OpenSSH | Extension-managed `ControlMaster` and `ControlPersist` |
-| Windows | `ssh2` | One persistent TCP/authentication connection with an exec channel per operation |
-
-Choose explicitly from **SSH Remote → Transport** in `/99settings`, or on the
-command line:
-
-```bash
-pi --ssh devbox:/srv/project --ssh-transport auto
-pi --ssh devbox:/srv/project --ssh-transport openssh
-pi --ssh devbox:/srv/project --ssh-transport ssh2
+```text
+/ssh-status                         Show the current local or SSH environment
+/ssh-cd /srv/another-project        Change the remote cwd without reconnecting
+/ssh-connect staging:/srv/project   Enter SSH or switch directly to another host
+/ssh-reconnect                      Reconnect or apply a transport change
+/ssh-exit                           Return this conversation to its local workspace
 ```
 
-A saved setting applies to the next remote connection; use `/ssh-reconnect` to
-apply it to an active workspace. A command-line value overrides the saved
-setting. `/ssh-status` reports the effective transport and whether it is reused.
-
-In `auto` mode on Windows, an unsupported `ssh2` configuration or connection
-setup automatically falls back to single-use OpenSSH and displays the reason.
-Explicit `ssh2` mode fails instead, allowing configuration incompatibilities to
-be diagnosed rather than hidden.
-
-### OpenSSH mode
-
-The extension invokes the system `ssh` executable (`ssh.exe` on Windows) with
-its destination alias unchanged. Without `--ssh-config`, OpenSSH automatically
-reads its normal user and system configuration, including `~/.ssh/config`.
-
-On Linux and macOS, the extension supplies a private, short-lived ControlPath
-and closes its ControlMaster during session shutdown. Each operation still
-spawns a lightweight `ssh` process, but it opens a channel on the existing TCP
-and authenticated SSH connection. This works with either Unix or Windows
-remote hosts.
-
-The native Windows OpenSSH client does not reliably support ControlMaster, so
-OpenSSH mode forces `ControlMaster=no` and executes each foreground operation
-through a separate connection. Install or enable the Windows OpenSSH Client
-capability and ensure `ssh.exe` is available on `PATH`.
+A typical OpenSSH alias works with either transport:
 
 ```sshconfig
 Host devbox
     HostName 192.0.2.20
     User deploy
-    Port 2222
     IdentityFile ~/.ssh/company
     ProxyJump bastion
 ```
 
 ```bash
-ssh devbox
 pi --ssh devbox:/srv/project
 ```
 
-### ssh2 mode and OpenSSH compatibility
+## Targets and paths
 
-`ssh2` mode runs `ssh -G` to resolve aliases, `Include`, `Match`, host, user,
-port, identity files, agent location, keepalives, effective algorithm lists,
-and each `ProxyJump` endpoint. It verifies every jump and final server key
-against direct entries in the configured OpenSSH `known_hosts` files and
-supports unencrypted private keys plus Unix, Windows OpenSSH named-pipe,
-Cygwin, or Pageant agents where `ssh2` supports them.
-
-`ProxyJump jump1,jump2` is implemented entirely through ssh2 `direct-tcpip`
-channels: every hop has its own authenticated SSH connection, and the next
-connection uses the previous hop's channel as its socket. No `ssh`, `nc`, or
-`socat` executable is required on a jump server. Each jump server must permit
-TCP forwarding to the next host (for OpenSSH servers, check
-`AllowTcpForwarding` and `PermitOpen`), and destination names are resolved from
-the preceding jump server's network.
-
-The following effective OpenSSH features require `openssh` mode and produce a
-clear compatibility error: arbitrary `ProxyCommand`, `KnownHostsCommand`,
-`RemoteCommand`, `CertificateFile`, `@cert-authority`, `PKCS11Provider`, and
-multi-step `AuthenticationMethods`. Keyboard-interactive and GSSAPI login,
-security-key/FIDO identities, and encrypted keys combined with
-`IdentitiesOnly=yes` are also unsupported; direct password authentication is
-available through the TUI. `ControlMaster`, `ControlPersist`,
-and `ControlPath` are unnecessary and ignored because `ssh2` owns the persistent
-connection itself. Paths containing spaces in a multi-file
-`UserKnownHostsFile`/`GlobalKnownHostsFile` value may not be reproduced; select
-OpenSSH for those configurations.
-
-The negotiated cipher list is filtered at runtime: Bun does not currently
-implement the `chacha20-poly1305` cipher in `node:crypto`
-(oven-sh/bun#8072), so that cipher is dropped automatically and the
-connection uses AES-GCM/CTR instead of failing.
-
-Both transports are non-interactive. The extension enables `BatchMode=yes` for
-OpenSSH and a ten-second connection timeout, so passphrase and new-host
-prompts do not corrupt the Pi TUI. Load keys into an SSH agent and accept a
-new host key with the system OpenSSH client before starting Pi.
-
-### Password authentication
-
-When public-key or agent authentication fails, the TUI asks for a password
-(plain-text input until Pi gains a masked input API) and retries. On Unix,
-`auto` tries multiplexed OpenSSH first, retrying a rejected password in place
-through `sshpass` when it is installed (cached secrets first, no re-ask), and
-falls back to `ssh2` only when sshpass is missing (ssh2 is the remaining
-password-capable transport). If the user cancels the prompt or every password
-attempt is rejected, the connection fails outright — ssh2 would reject the
-same secret, so there is nothing to fall back to. `ssh2` mode (and Windows
-`auto`) prompts directly. After a password was actually tried, a rejection is
-surfaced verbatim in a warning before the next prompt (for example `Permission
-denied (publickey,password)`). OpenSSH's advertised authentication-method list
-is checked first, so publickey-only servers fail directly without a pointless
-password prompt. Explicit `openssh` mode uses the system `sshpass` when installed (`apt install sshpass` on Debian/Ubuntu,
-`pacman -S sshpass` in Git Bash on Windows, or a standalone `sshpass.exe`):
-the password travels only in the `SSHPASS` environment variable, the remote
-side stays PTY-free (`-T`) so binary file data is untouched, and a single
-prompt attempt keeps the retry loop in the extension. Without sshpass,
-explicit `openssh` reports the missing tool or falls back to `ssh2` on
-`auto`. The password is held in memory for the process, so `/resume`,
-reconnects, and extra channels reuse it without re-asking; with
-`persistPasswords` enabled (default) it is also saved to
-`ssh-remote-secrets.json` next to Pi's settings so `-r` restarts reuse it.
-The file uses mode 0600 on POSIX; Windows relies on the inherited user-profile
-ACL because Node does not expose POSIX permission bits there. Public keys and
-the agent always win; passwords never enter SSH command
-arguments and are passed only through ssh2 or the `SSHPASS` environment. A
-wrong password re-prompts until cancelled or the retry safety limit is reached.
-Clear all cached passwords with `/ssh-forget-passwords`, disable prompting in
-`/99settings` (Password prompt), or disable persistence (Persist passwords).
-Headless sessions never prompt.
-
-Use a different local config file only when needed:
-
-```bash
-pi --ssh devbox:/srv/project --ssh-config ~/.ssh/work.conf
-```
-
-Accepted target forms include:
+SSH Remote accepts rsync-style locations:
 
 ```text
 devbox
@@ -251,10 +114,228 @@ winbox
 winuser@winbox:C:\Users\winuser\project
 ```
 
-With no path, the remote login working directory is used. This is normally the
-remote home directory. Relative paths are resolved from that directory.
+IPv6 literals must use brackets. With no path, the remote login working
+directory is used, normally the remote home directory. A relative startup path
+is resolved from that directory.
 
-## Remote shell selection
+### Unix paths
+
+```bash
+pi --ssh devbox:~/project
+pi --ssh devbox:/srv/project
+```
+
+Unix paths use POSIX syntax. `~` and `~/path` resolve from the remote home.
+`~other` paths are not supported.
+
+### Windows paths
+
+```bash
+pi --ssh 'winbox:C:\Users\developer\project'
+pi --ssh 'winbox:D:\source'
+pi --ssh 'winbox:\\server\share\project'
+```
+
+Windows paths may be drive-qualified or UNC paths. Relative paths, `~`,
+`~/path`, and `~\path` resolve against the remote user profile and cwd.
+Drive-relative paths such as `C:folder` and `~other` paths are rejected because
+their meaning is ambiguous.
+
+`/ssh-cd` and `ssh_cd` always interpret their argument in the **remote**
+filesystem:
+
+- absolute paths remain remote absolute paths;
+- relative paths resolve from the current remote cwd.
+
+## Configuration
+
+### Command-line flags
+
+| Flag | Values | Purpose |
+| --- | --- | --- |
+| `--ssh` | `host` or `host:path` | Start or resume in an SSH workspace |
+| `--ssh-config` | local path | Use an alternate local OpenSSH config |
+| `--ssh-shell` | `auto`, `bash`, `zsh`, `pwsh`, `powershell` | Select the remote shell |
+| `--ssh-transport` | `auto`, `openssh`, `ssh2` | Override the saved transport preference |
+
+Examples:
+
+```bash
+pi --ssh devbox:/srv/project --ssh-transport openssh
+pi --ssh devbox:/srv/project --ssh-shell zsh
+pi --ssh devbox:/srv/project --ssh-config ~/.ssh/work.conf
+```
+
+### `/99settings`
+
+Open **SSH Remote** in `/99settings`:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| **Transport** | `Auto` | Chooses `auto`, `openssh`, or `ssh2`; reconnect to apply it to an active workspace |
+| **Password prompt** | On | Allows TUI password prompts when key/agent authentication fails |
+| **Persist passwords** | On | Saves entered passwords for later reconnects and `-r` resumes |
+| **AI control tools** | Off | Exposes SSH environment controls to the model |
+| **AI password auth** | On | Allows model-triggered connections to use or request a password |
+
+A command-line transport overrides the saved setting. Changing **AI control
+tools**, **AI password auth**, or password persistence takes effect immediately;
+a transport change applies on the next connection or `/ssh-reconnect`.
+
+## SSH transports
+
+| Local platform | `auto` foreground transport | Connection reuse |
+| --- | --- | --- |
+| Linux / macOS | OpenSSH | Managed `ControlMaster` and `ControlPersist` |
+| Windows | `ssh2` | One persistent TCP/authentication connection; one exec channel per operation |
+
+Use `/ssh-status` to see the effective transport and whether its connection is
+reused.
+
+### Automatic fallback
+
+- **Linux/macOS `auto`:** starts with multiplexed OpenSSH. If the server needs a
+  password and `sshpass` is unavailable, it can fall back to `ssh2`, which can
+  prompt directly.
+- **Windows `auto`:** starts with `ssh2`. A compatibility or connection-setup
+  failure before the first channel opens falls back to single-use OpenSSH and
+  reports the reason.
+- **Explicit `openssh` or `ssh2`:** does not hide incompatibilities by switching
+  transports.
+
+Cancelling a password prompt or exhausting password retries is a terminal
+failure; another transport would reject the same credentials.
+
+### OpenSSH mode
+
+OpenSSH mode invokes the system `ssh` executable and leaves the destination
+alias unchanged. Without `--ssh-config`, the client reads its normal user and
+system configuration, including `~/.ssh/config`. This is the best choice for
+advanced OpenSSH behavior that `ssh2` cannot reproduce.
+
+On Linux and macOS, SSH Remote creates a private short-lived ControlPath. Each
+operation still starts a lightweight local `ssh` process, but that process opens
+a channel on the existing authenticated connection. The remote host may be
+Unix or Windows.
+
+Native Win32 OpenSSH still builds its mux entry points as
+[no-ops](https://github.com/PowerShell/openssh-portable/blob/v10.0.0.0/contrib/win32/win32compat/no-ops.c#L59-L86),
+so SSH Remote explicitly supplies `ControlMaster=no` and `ControlPath=none` on
+Windows. Each foreground OpenSSH operation therefore creates a separate
+connection.
+
+OpenSSH starts non-interactively with `BatchMode=yes`, no remote PTY (`-T`),
+and a ten-second connection timeout. Password retries are performed only
+through `sshpass`; new-host and key-passphrase prompts never take over the Pi
+TUI.
+
+### `ssh2` mode
+
+`ssh2` keeps one authenticated connection open and creates an exec channel for
+each foreground operation. It runs `ssh -G` locally to resolve:
+
+- aliases, `Include`, and `Match` rules;
+- host, user, port, identities, and agent location;
+- keepalives and effective algorithm lists;
+- `ProxyJump` endpoints;
+- configured `known_hosts` files.
+
+Single- and multi-hop `ProxyJump` are implemented with `direct-tcpip` channels.
+Each hop receives its own authenticated SSH connection, and the next hop uses
+the preceding channel as its socket. Jump servers do not need `ssh`, `nc`, or
+`socat`, but they must allow TCP forwarding to the next endpoint. Destination
+names are resolved from the preceding jump host's network.
+
+Supported authentication material includes unencrypted private keys and Unix,
+Windows OpenSSH named-pipe, Cygwin, or Pageant agents where supported by
+`ssh2`.
+
+The following effective OpenSSH features require `openssh` mode:
+
+- arbitrary `ProxyCommand`;
+- `KnownHostsCommand` or `RemoteCommand`;
+- `CertificateFile` and `@cert-authority`;
+- `PKCS11Provider` and security-key/FIDO identities;
+- keyboard-interactive or GSSAPI login;
+- multi-step `AuthenticationMethods`;
+- encrypted keys combined with `IdentitiesOnly=yes`.
+
+`ControlMaster`, `ControlPersist`, and `ControlPath` are ignored because `ssh2`
+owns the persistent connection. Paths containing spaces in a multi-file
+`UserKnownHostsFile` or `GlobalKnownHostsFile` value may not be reproduced;
+choose OpenSSH for those configurations.
+
+Bun does not currently implement `chacha20-poly1305` in `node:crypto`
+([oven-sh/bun#8072](https://github.com/oven-sh/bun/issues/8072)). SSH Remote
+filters that cipher at runtime and negotiates AES-GCM/CTR instead.
+
+## Authentication
+
+SSH keys or an agent are recommended. They work across foreground operations,
+reconnects, host switches, and background tasks without forwarding secrets
+through the TUI.
+
+### Host verification
+
+- OpenSSH uses the system client's normal host-key policy.
+- `ssh2` verifies every destination and jump host against direct entries in the
+  configured OpenSSH `known_hosts` files.
+- `ssh2` refuses unknown or changed keys and does not enroll trust
+  automatically. Connect once with the system OpenSSH client to review and
+  accept a new key before starting Pi.
+
+### Password authentication
+
+When key or agent authentication fails and **Password prompt** is enabled:
+
+| Mode | Password behavior |
+| --- | --- |
+| Linux/macOS `auto` | Retries OpenSSH through `sshpass` when installed; otherwise falls back to `ssh2` |
+| Windows `auto` or explicit `ssh2` | Prompts through the persistent `ssh2` client |
+| Explicit `openssh` | Requires `sshpass` or `sshpass.exe` |
+
+Install `sshpass` with, for example, `apt install sshpass` on Debian/Ubuntu or
+`pacman -S sshpass` in Git Bash on Windows. OpenSSH passwords are placed only in
+the `SSHPASS` environment variable, never in command arguments. `ssh2` sends
+them through its authentication protocol.
+
+The password prompt currently uses plain-text input because Pi does not yet
+provide a masked input API. A wrong password re-prompts until cancelled or the
+retry safety limit is reached. Servers that advertise only public-key methods
+fail directly without opening a pointless prompt. Headless sessions never
+prompt.
+
+Passwords are held in process memory. With **Persist passwords** enabled, they
+are also written to `ssh-remote-secrets.json` next to Pi's settings so restarts
+and `-r` resumes can reuse them. The file uses mode `0600` on POSIX; Windows
+relies on the inherited user-profile ACL.
+
+```text
+/ssh-forget-password        Forget target and ProxyJump passwords used by this Pi session
+/ssh-forget-password all    Forget all cached and persisted SSH passwords
+```
+
+Disabling **Password prompt** prevents both user- and model-triggered prompts.
+Disabling **Persist passwords** stops future reads and writes of the secrets
+file but does not erase existing entries; use `/ssh-forget-password` to remove
+them. Passwords already cached by the current process remain available.
+
+### Model-triggered password authentication
+
+**AI password auth** applies only to the model's `ssh_connect` tool:
+
+- **On:** cached passwords may be used, and a required TUI prompt has a live
+  60-second timeout. The user must enter the password directly in Pi and must
+  never send it in chat.
+- **Off:** `ssh_connect` is key-only. It neither reads cached passwords nor
+  opens a prompt; an authentication failure recommends configuring SSH keys or
+  re-enabling the setting.
+
+Manual `/ssh-connect`, `/ssh-reconnect`, and startup `--ssh` actions are not
+subject to the 60-second AI timeout. They may wait until the user submits or
+cancels the prompt.
+
+## Remote platform and shell
 
 The default is automatic detection:
 
@@ -262,23 +343,16 @@ The default is automatic detection:
 pi --ssh devbox --ssh-shell auto
 ```
 
-On Unix hosts, auto probes the remote account's login shell (`getent passwd`,
-falling back to the `sh` symlink target on systems without `getent`, both
-inside `sh -c` so the remote default shell syntax does not matter). Zsh
-accounts get Zsh for the `bash` tool, `!` commands, and background jobs. A
-Zsh login shell implies zsh is installed, so no separate existence check is
-needed. Everything else keeps the deterministic order: Unix Bash, then
-`sh` for ash-only hosts, PowerShell 7, then Windows PowerShell 5.1.
+SSH Remote first probes through POSIX `sh`, which also distinguishes Unix from
+a native Windows host:
 
-Control operations (HOME/cwd probe, paths, file/search tools) are POSIX `sh`
-scripts, so every Unix host works even without Bash: OpenWrt, Alpine, and
-busybox containers all get full read/write/edit/grep/find/ls support through
-`ash`. Commands entered by the model run in the detected shell (`sh` on such
-hosts), so they use POSIX syntax. Known POSIX trade-offs: filenames
-containing newlines are not handled, and grep/find glob patterns containing
-`)` are not supported.
+- a Unix account whose login shell is Zsh uses Zsh;
+- other Unix hosts try Bash, then POSIX `sh` for ash-only systems;
+- Windows hosts try PowerShell 7, then Windows PowerShell 5.1;
+- when probing is inconclusive, the same deterministic candidate order is
+  validated during workspace inspection.
 
-Choose a shell explicitly:
+Choose a shell explicitly when needed:
 
 ```bash
 pi --ssh devbox --ssh-shell bash
@@ -287,222 +361,261 @@ pi --ssh winbox --ssh-shell pwsh
 pi --ssh winbox --ssh-shell powershell
 ```
 
-An explicit shell is probed for existence first. If it is missing, the
-extension warns and falls back: `zsh`/`bash` to `sh` on Unix, `pwsh` to
-PowerShell 5.1 (and vice versa) on Windows.
+An explicit shell is checked first. Missing Bash or Zsh falls back to `sh` with
+a warning; missing `pwsh` or `powershell` falls back to the other PowerShell.
 
-On Windows, PowerShell control scripts and user PowerShell commands use encoded
-UTF-16LE payloads, so content is not exposed in the SSH process arguments.
-File data continues to travel as binary stdin/stdout.
+The Pi tool remains named `bash` for compatibility, but commands use the
+selected remote syntax. The model context and `!`/`!!` commands follow that
+same shell.
 
-## Unix workspaces
+Workspace control operations—path inspection, file tools, and search tools—use
+POSIX `sh` scripts on Unix and encoded PowerShell scripts on Windows. This lets
+OpenWrt, Alpine, BusyBox, and other Bash-free systems use the complete file-tool
+set. On Windows, PowerShell commands are encoded as UTF-16LE payloads so script
+content does not appear directly in `ssh.exe` arguments; file data still moves
+as binary stdin/stdout.
 
-Unix paths use POSIX syntax:
+Known POSIX-control-script limits:
 
-```bash
-pi --ssh devbox:~/project
-pi --ssh devbox:/srv/project
-```
+- filenames containing newlines are not supported;
+- `grep` or `find` glob patterns containing `)` are not supported.
 
-The `bash` tool and user `!` commands execute the remote shell (Bash, Zsh,
-`sh`, or PowerShell). Workspace control operations (paths, file probes) run
-through POSIX `sh` on Unix and the selected PowerShell on Windows regardless
-of that selection.
+## Workspace and session lifecycle
 
-## Windows workspaces
+### Commands
 
-Windows paths support drive-qualified and UNC forms:
+| Command | Effect |
+| --- | --- |
+| `/ssh-connect <host[:path]>` | Enter SSH or switch directly from the active target |
+| `/ssh-exit` | Return this conversation to its local workspace |
+| `/ssh-cd <remote-path>` | Change the persistent remote cwd without reconnecting |
+| `/ssh-status` | Show state, target, platform, shell, transport, cwd, and home |
+| `/ssh-reconnect` | Retry the stored target or apply a transport change |
+| `/ssh-forget-password [all]` | Clear session-scoped or all cached passwords |
 
-```bash
-pi --ssh 'winbox:C:\Users\developer\project'
-pi --ssh 'winbox:D:\source'
-pi --ssh 'winbox:\\server\share\project'
-```
+These commands are always registered, including in ordinary local sessions.
+Environment-changing commands wait for the current agent run to settle before
+switching backends.
 
-Relative paths, `~`, `~/path`, and `~\path` are resolved against the remote
-Windows user profile and working directory. Drive-relative paths such as
-`C:folder` and `~other` paths are rejected because their meaning is ambiguous.
+### Transactional switching and failure behavior
 
-The tool remains named `bash` for Pi compatibility, but its prompt and session
-context tell the model to use PowerShell, Zsh, Bash, or POSIX `sh` syntax as
-appropriate. User `!`/`!!` commands use the same remote shell, and paths and
-file operations continue through the same remote shell.
+Host and cwd changes are validated before they are committed:
 
-## Session resume
+- `/ssh-connect` can switch directly between hosts; do not run `/ssh-exit`
+  first.
+- A failed host switch keeps the previous target, cwd, session name, persisted
+  state, and connection active.
+- A failed `/ssh-cd` keeps the previous cwd and connection unchanged.
+- Existing background tasks remain on the host and cwd where they started.
+  Only later launches follow the new environment.
 
-Pi conversations remain in the local Pi session directory. The extension adds
-a hidden, branch-aware entry containing only:
+Initial failures are handled by source:
 
-- the SSH destination or alias;
-- the resolved remote platform and shell;
-- the resolved remote cwd and home;
-- the optional local OpenSSH config path.
+| Action | Result on failure |
+| --- | --- |
+| Manual `/ssh-connect`, startup `--ssh`, or restore | Session remains **Disconnected** and workspace tools fail closed |
+| Model `ssh_connect` from local | Session automatically returns to its local workspace |
+| Manual or model switch from active SSH | Previous SSH workspace remains active |
+| `/tree` restoration to another branch environment | Fails closed; the previous branch's host is not reused |
 
-It never copies private keys, passwords, SSH config contents, or remote file
-contents into this state. Version 1 Unix/Bash entries are migrated in memory to
-the version 2 platform/shell state, so existing conversations continue to
-resume.
+While SSH is connecting or disconnected after failure, routed tools and
+`bg_start` report the SSH error instead of operating on Pi's local cwd. Use
+`/ssh-reconnect` to retry or `/ssh-exit` to explicitly return local.
 
-A resumed session reconnects its stored target even when Pi was started without
-`--ssh`. Passing a different target, config, cwd, or conflicting explicit shell
-while resuming is rejected to prevent an old conversation from modifying
-another machine.
+### Resume and branch state
 
-Pi groups sessions by its local cwd. Start each remote project from a stable
-local anchor directory and name important sessions. In `/resume`, press Tab to
-switch from **Current Folder** to **All**.
+Pi conversations and session files stay local. SSH Remote stores a hidden,
+branch-aware entry containing only:
 
-Conversation history is restored, but the extension does not snapshot remote
-files or revive running processes. Remote repository contents may have changed
-between sessions.
+- target or alias;
+- resolved remote platform and shell;
+- resolved remote cwd and home;
+- optional local OpenSSH config path.
 
-## Commands
+It does not put passwords, private keys, SSH config contents, or remote file
+contents in session state. Legacy version 1 Unix/Bash entries are migrated in
+memory.
+
+The selected local or SSH environment is restored after `/resume`, `pi -r`,
+`pi -c`, reload, fork, clone, and `/tree`. `/new` inherits the previous remote
+target. `/ssh-exit` writes an explicit local marker, so later resume stays local
+instead of finding an older SSH entry. Passing a conflicting target, config,
+cwd, or explicit shell while resuming is rejected to prevent an old
+conversation from modifying another machine.
+
+Pi still groups sessions by its **local** cwd. Start remote projects from a
+stable local anchor directory; in `/resume`, press Tab to switch from
+**Current Folder** to **All**. Resume restores conversation and environment
+metadata, not a snapshot of remote files or running processes.
+
+### Status and automatic session names
+
+The footer status shows only `SSH: Connecting`, `SSH: Connected`, or
+`SSH: Disconnected`. For unnamed sessions, SSH Remote sets Pi's native session
+name to a stable location and then appends the remote Git branch and first user
+message when available:
 
 ```text
-/ssh-status             Show target, platform, shell, transport, cwd/home
-/ssh-reconnect          Retry the target stored in the current session
-/ssh-forget-passwords   Clear cached SSH passwords (memory and secrets file)
+SSH devbox:/srv/project (main) • Fix the build
 ```
 
-These commands are registered only when the current session requests, resumes,
-or inherits an SSH workspace, so ordinary local sessions do not show them.
+A user-assigned `/name` is never overwritten.
 
-The status line reports only connection state: `SSH:` is muted, while
-`Connecting`, `Connected`, or `Disconnected` uses the matching warning,
-success, or error color. It does not repeat the remote path.
+## AI control tools
 
-When the session has no custom name, SSH Remote uses Pi's session name to show
-the location in both the normal first footer line and the native `/resume`
-list. It queries the current remote Git branch after a successful connection
-and appends the first user message when it arrives, producing a line such as:
+**SSH Remote → AI control tools** defaults to **Off**. Enabling it in
+`/99settings` immediately adds:
 
-```text
-~ • SSH devbox:C:\Users\dev\Desktop\pi-extensions (master) • Fix the build
-```
+| Tool | Purpose |
+| --- | --- |
+| `ssh_connect { target }` | Enter SSH or switch directly to another target |
+| `ssh_exit {}` | Return to the local workspace |
+| `ssh_cd { path }` | Change the active remote cwd |
+| `ssh_status {}` | Inspect the current environment |
 
-The first message is normalized to one line, matching the information Pi uses
-for ordinary unnamed sessions. The SSH location stays first as a stable remote
-identifier; on narrow terminals Pi may truncate the message suffix. This single
-session name preserves Pi's built-in footer, token/model statistics, and other
-extension statuses without installing a custom footer or widget. A
-user-assigned `/name` remains untouched. Temporary `[host:path] title` names
-created by the prefix experiment are migrated back to the automatic
-`SSH target:path (branch) • first message` format when that workspace
-reconnects.
+Disabling the setting removes these tools from the active tool set without
+affecting manual commands or an active SSH workspace. `ssh_connect`, `ssh_exit`,
+and `ssh_cd` execute sequentially so environment transitions cannot race sibling
+tool calls. The model is instructed to complete a transition before issuing
+file or shell calls against the new environment.
 
-If connection setup fails, overridden tools report the SSH failure and do not
-fall back to local operations.
+SSH Remote deliberately provides no permission prompt, allowlist, or approval
+UI. A separate general-purpose extension can gate these stable tool names
+through Pi's `tool_call` event. Environment transitions are also published on
+the `ssh-remote:environment` event bus channel for auditing and integration.
 
-## Shared workspace files
+See [Model-triggered password authentication](#model-triggered-password-authentication)
+for the independent **AI password auth** setting.
+
+## Tool routing and integrations
+
+### Routed and local behavior
+
+| Runs on the SSH workspace | Remains local |
+| --- | --- |
+| `read`, `write`, `edit`, `bash` | Pi TUI and conversation history |
+| Optional `grep`, `find`, `ls` | Model credentials and installed packages |
+| User `!` and `!!` commands | `todo`, `thinking-fold`, `cursor-effect`, `codex_search` |
+| Shared workspace-file providers | Session files, project discovery, and skill definitions |
+| New background tasks | Pi's local anchor cwd |
+
+SSH Remote keeps Pi's native tool schemas, rendering, diffs, truncation, and
+mutation-queue behavior. Optional `grep`, `find`, and `ls` retain Pi's normal
+disabled state and become remote only when enabled through `--tools` or the tool
+selector.
+
+### Shared workspace files and Codex images
 
 SSH Remote registers its active binary file backend through
-`@99percentpeople/pi-workspace-files`. Tools using that shared package follow
-the same remote adapter path as Pi's routed `read` and `write` tools instead of
-adding tool-specific SSH hooks.
+`@99percentpeople/pi-workspace-files`. Consumers follow the same remote adapter
+as Pi's `read` and `write` tools without tool-specific SSH hooks.
 
-`@99percentpeople/pi-codex-api` uses this backend automatically:
+`@99percentpeople/pi-codex-api` uses this provider automatically:
 
-- `output_path` is resolved against the remote workspace. The Base64 PNG from
-  the image API is decoded and written directly through the active SSH adapter,
-  then reported using its native Unix or Windows path.
-- `referenced_image_paths` are read directly through the same remote adapter and
-  converted to data URLs for the image API request.
-- No generated image or reference image is staged in Pi's local workspace, and
-  no reverse SSH or separate `scp` step is required.
-- The default destination remains `output/codex-images/<tool-call>.png`, but it
-  is created remotely.
-- Existing remote files are never overwritten. Paths outside the remote
-  workspace are rejected, matching `codex_image`'s normal workspace boundary.
+- `output_path` resolves inside the remote workspace and is written there
+  directly;
+- `referenced_image_paths` are read remotely and sent to the image API;
+- no image is staged locally and no reverse SSH or `scp` step is required;
+- existing files are never overwritten;
+- paths outside the active remote workspace are rejected.
 
-For example, a Windows SSH session can use:
+Example for a Windows SSH workspace:
 
 ```text
 output_path: C:\Users\dev\Desktop\wallpaper.png
 referenced_image_paths: [C:\Users\dev\Desktop\reference.jpg]
 ```
 
-## Background tasks
+### Background tasks
 
 When `@99percentpeople/pi-background-tasks` is installed, SSH Remote registers a
-remote shell backend for both pipe and PTY jobs. Background Tasks 1.2.7 or newer
-also honors the adapter's local launch cwd, allowing `bg_start.cwd` to name a
-remote-only Unix or Windows directory.
+remote backend for pipe and PTY jobs. Version 1.2.7 or newer also allows
+`bg_start.cwd` to name a remote-only Unix or Windows directory.
 
-Background jobs require a real local process/PTY and therefore always launch
-the system OpenSSH client rather than an `ssh2` foreground channel. With the
-OpenSSH transport on Linux/macOS they receive the same managed ControlPath and
-reuse its connection. With `ssh2`—including Windows `auto`—background jobs use
-separate OpenSSH connections.
+Background jobs require a real local process or PTY, so they always launch the
+system OpenSSH client:
 
-Running jobs are still owned by the current Pi process. Session replacement or
-shutdown terminates the local SSH process and does not attempt to reattach the
-job after resume.
+- Linux/macOS OpenSSH foreground mode shares the managed ControlPath.
+- `ssh2`, Windows `auto`, and native Windows OpenSSH use separate
+  non-interactive OpenSSH connections for background jobs.
+- A foreground password is not forwarded to those separate processes; use an
+  SSH key or agent.
+
+An active SSH workspace reclaims the shared background resolver immediately
+before every `bg_start`, preventing a later local adapter registration from
+redirecting the job. A disconnected SSH workspace blocks `bg_start` instead of
+falling back locally.
+
+Every SSH launch records an immutable label such as
+`SSH devbox:/srv/project`. Background task results—including start,
+status, wait, logs, input, and termination—repeat this label, and task rows show
+it inline in the widget. This lets the model and user distinguish old tasks
+after a host or cwd switch. Finished task snapshots retain the label across
+extension reloads.
+
+Running jobs stay on their original host and cwd across `/ssh-connect`,
+`/ssh-exit`, and `/ssh-cd`. In-session changes stop new ControlMaster reuse
+without terminating existing multiplexed channels. Pi shutdown terminates the
+local SSH job processes; resume does not reattach them.
+
+### Windows PowerShell adapter
+
+On Windows, `@99percentpeople/pi-pwsh-adapter` may register the `bash` tool
+first. SSH Remote uses the shared `bash:delegate` protocol instead of competing
+for that tool name:
+
+- active SSH sessions run the delegated shell remotely;
+- connecting or failed SSH sessions fail closed;
+- local sessions use the normal local PowerShell backend;
+- after `/ssh-exit`, the PowerShell adapter reclaims the local background
+  backend through `ssh-remote:environment`.
+
+Use compatible versions of both packages.
 
 ## Compatibility and limitations
 
-- `todo`, `thinking-fold`, `cursor-effect`, and `codex_search` remain local and
-  work normally.
-- `ssh2` intentionally implements only the compatibility subset documented in
-  [ssh2 mode and OpenSSH compatibility](#ssh2-mode-and-openssh-compatibility),
-  plus TUI password authentication for the destination and `ProxyJump` hops.
-  Use explicit OpenSSH mode for advanced routing, certificates, hardware keys,
-  keyboard-interactive, or GSSAPI authentication.
-- On Windows clients, local sessions are left untouched so
-  `pi-pwsh-adapter` can continue to own the local `bash` tool. SSH Remote
-  registers its tool overrides only for sessions that request, resume, or
-  inherit an SSH workspace.
-- A failed remote connection (unreachable host, missing remote directory, or
-  an unavailable remote shell) reports the error and leaves the
-  session in a `Disconnected` state: tools fail closed with the initialization
-  error, while
-  `/ssh-status` and `/ssh-reconnect` stay available for recovery.
-- Background tasks follow the same rule: while the SSH workspace is
-  unavailable, `bg_start` is blocked with the initialization error instead of silently
-  running on the local machine (the shared background-task backend can be
-  claimed by other adapters such as `pi-pwsh-adapter`, so the block is applied
-  at the tool level to stay independent of registration order).
-- On Windows, `pi-pwsh-adapter` registers the `bash` tool before this
-  extension (Pi keeps the first registration per tool name). SSH Remote
-  claims the bash tool through the `bash:delegate` event protocol instead:
-  the adapter's bash tool and `!` commands execute on the remote while the
-  SSH workspace is active, fail closed while it is unavailable, and fall back
-  to the local PowerShell backend in local sessions. Both packages must be at
-  compatible versions for the delegation to work.
-- Pi's optional standalone `grep`, `find`, and `ls` tools remain disabled by
-  default. If enabled through `--tools` or the tool selector, they execute on
-  the remote workspace and fail closed with the other routed tools.
-- Unix `find` uses remote `rg` when available so `.gitignore` is honored; its
+- `ssh2` implements the documented compatibility subset only. Use explicit
+  OpenSSH for certificates, hardware keys, arbitrary routing, GSSAPI, or
+  keyboard-interactive authentication.
+- Local `AGENTS.md`, `.pi`, project settings, registered skills, and references
+  inside skill directories are not virtualized. They continue to come from
+  Pi's local anchor directory.
+- `read` downloads the complete remote file before applying Pi's line and byte
+  truncation. Use the remote shell to select a range from very large files.
+- Unix `find` uses remote `rg` when available so `.gitignore` is honored. Its
   POSIX fallback and the native Windows implementation always exclude `.git`
-  and `node_modules` but do not parse every `.gitignore` rule.
-- Remote project discovery is not virtualized. Local `AGENTS.md`, `.pi`, skills,
-  and project settings still come from Pi's local anchor directory. Registered
-  skill files and references below their skill directories are therefore read
-  locally; all other `read` paths remain remote.
-- `read` downloads a complete remote file before applying Pi's line and byte
-  truncation. Avoid using it on very large files; use the remote shell to select
-  a range.
-- Remote file paths are encoded into a reserved local logical namespace before
-  Pi's file tools run, then restored in tool output. This keeps Pi's local
-  mutation queue from resolving remote-only paths such as `/root` or `/etc`.
-- `edit` serializes mutations inside the current Pi process, but cannot prevent
+  and `node_modules`, but do not reproduce every `.gitignore` rule.
+- Remote file paths are encoded into a reserved logical namespace before Pi's
+  file tools run. This prevents Pi's local mutation queue from resolving
+  remote-only paths such as `/root` or `/etc` against the local machine.
+- `edit` serializes mutations inside the current Pi process, but cannot stop
   another process on the remote host from changing a file between read and
-  write steps.
-- Remote command Shells inherit safe Pi model/session identifiers but never
-  receive `PI_SESSION_FILE`, because that path exists only on the local host.
-- An explicitly requested shell is probed for existence; a missing Bash/Zsh
-  falls back to `sh`, and a missing `pwsh`/`powershell` falls back to the
-  other PowerShell, with a warning.
+  write.
+- Remote shells receive safe Pi model/session identifiers but never
+  `PI_SESSION_FILE`, because that path exists only on the local host.
+- Conversation resume does not restore remote processes or snapshot repository
+  contents.
 
 ## Security
 
-The package executes either the system `ssh` binary or the bundled `ssh2`
-protocol client and runs remote shell commands with the same account permissions
-as a manual SSH login. `ssh2` refuses unknown or changed host keys and does not
-implement automatic trust enrollment; establish trust with system OpenSSH
-first. File paths are embedded only in encoded control scripts or shell-quoted
-Unix commands, and file contents travel through SSH channels. Model-provided
-shell commands are intentionally executable code. Review the package and use a
-restricted remote account when appropriate.
+The package runs either the system OpenSSH client or the bundled `ssh2`
+protocol client and executes commands with the same permissions as a manual SSH
+login. Model-provided shell commands are executable code; review the package and
+use a restricted remote account where appropriate.
+
+File paths are placed only in encoded control scripts or shell-quoted POSIX
+commands, and file contents travel through SSH stdin/stdout channels. Passwords
+never enter SSH command arguments, but TUI password input is currently unmasked
+and persisted passwords depend on the protections of the local settings
+account. Prefer SSH keys or an agent for unattended and background work.
+
+## Development
+
+```bash
+bun run build:packages
+bun run --cwd extensions/ssh-remote build
+pi -e ./extensions/ssh-remote/index.ts --ssh devbox:/srv/project
+```
 
 ## License
 

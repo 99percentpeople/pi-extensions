@@ -80,7 +80,8 @@ reliable ControlMaster support. The OpenSSH client also requires temp-file
 stdio because anonymous pipes wedge `ssh.exe` (see `client.ts`). This scenario
 exercises both transports, the win32 logical path namespace
 (`C:\__pi_ssh_remote_windows__\...`), and the interactive session surface
-(status bar, `/ssh-status`, `/ssh-reconnect`, `!` commands).
+(status bar, `/ssh-connect`, `/ssh-exit`, `/ssh-cd`, `/ssh-status`,
+`/ssh-reconnect`, and `!` commands).
 
 ### Prerequisites (on the Windows machine)
 
@@ -123,12 +124,32 @@ pi -e <path-to-extension>\dist\index.ts `
 | `/ssh-status` | target/platform/shell/transport/cwd/home; transport is `ssh2 (reused)` |
 | `! Get-Location; whoami` | executes on the remote (remote cwd + remote user) |
 | Ask the model to read/write/edit/bash/grep/find/ls | results land on the remote filesystem |
+| `/ssh-cd C:\Users\<you>\remote-test-dir\child` | cwd changes without a new foreground client and later tools use the child directory |
+| `/ssh-exit` | status clears and later tools use the local Pi cwd |
+| `/ssh-connect localhost:C:\Users\<you>\remote-test-dir` | the same conversation returns to SSH |
+| `/ssh-connect <second-host>:<path>` while connected | switches directly without `/ssh-exit`; a failed candidate leaves `localhost` active |
+| Enable **AI control tools** in `/99settings` | `ssh_connect`, `ssh_exit`, `ssh_cd`, and `ssh_status` become active immediately |
 | `/ssh-reconnect` | reconnects to the same target |
 | Exit (`ctrl+d`) | clean shutdown, status indicator disappears |
 
 Repeat once with `--ssh-transport openssh`; `/ssh-status` should report
 `openssh (single-use)` and all operations should still pass through the
 Windows temp-file stdio workaround.
+
+For an optional password-only target, first clear cached credentials with
+`/ssh-forget-password all` and leave **AI password auth** enabled in
+`/99settings`, then ask the model to connect. It should warn that user input may
+be required, and the password input should display a live countdown from 60
+seconds. Letting it expire must fail `ssh_connect`, clear the SSH status, and
+leave `/ssh-status` reporting the local workspace. Repeating the timeout while
+another SSH target is active must leave that previous target connected.
+
+Next disable **AI password auth**, clear passwords again, and repeat the model
+request. No password input should open; `ssh_connect` should fail immediately
+with a recommendation to configure SSH key-based login. Running `/ssh-connect`
+against the same target manually must still prompt without a countdown;
+cancelling or failing an initial prompt should leave the workspace
+**Disconnected** for inspection or `/ssh-reconnect`.
 
 ### 3. Non-interactive model pass
 
