@@ -1639,25 +1639,67 @@ test("selectRemoteAdapter aborts on password cancellation instead of repeating i
   );
 });
 
-test("probeRemoteHost reports unknown (not windows) when authentication is rejected", async () => {
-  const rejected = new FakeSshClient({ target: "router" });
-  // sh probe returns 255 + Permission denied stderr (password host, no sh run).
-  const probeCmd = "sh -c 'p=$(getent passwd";
-  const originalRun = rejected.run.bind(rejected);
-  (rejected as any).run = async (command: string, options?: SshRunOptions) => {
-    if (command.startsWith(probeCmd)) {
-      return {
-        stdout: Buffer.alloc(0),
-        stderr: Buffer.from("root@router: Permission denied (publickey,password)."),
-        exitCode: 255,
-      };
-    }
-    return originalRun(command, options);
+test("selectRemoteAdapter fails fast and condenses SSH banner timeouts", async () => {
+  const client = new FakeSshClient({ target: "devbox" });
+  let attempts = 0;
+  (client as any).run = async () => {
+    attempts++;
+    return {
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.from(
+        "Connection timed out during banner exchange\nConnection to devbox port 6000 timed out\n",
+      ),
+      exitCode: 255,
+    };
   };
-  const selected = await selectRemoteAdapter(rejected, { preference: "auto" });
-  // Unknown probe -> full candidate list; the fake host has bash, so the
-  // adapter is bash rather than the Windows-only PowerShell pair.
-  assert.equal(selected.adapter.shell, "bash");
+
+  await assert.rejects(
+    selectRemoteAdapter(client, { preference: "auto" }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        error.message,
+        "SSH connection timed out during banner exchange. Check the configured host, port, proxy settings, and sshd.",
+      );
+      assert.doesNotMatch(error.message, /Probe results|bash|pwsh/);
+      return true;
+    },
+  );
+  assert.equal(attempts, 1, "a terminal connection failure must not be retried per shell");
+});
+
+test("selectRemoteAdapter fails fast when its SSH probe hits the hard timeout", async () => {
+  const client = new FakeSshClient({ target: "devbox" });
+  let attempts = 0;
+  (client as any).run = async () => {
+    attempts++;
+    throw new Error("timeout:10");
+  };
+
+  await assert.rejects(
+    selectRemoteAdapter(client, { preference: "auto" }),
+    /SSH connection probe timed out after 10 seconds.*host, port, proxy settings, and sshd/,
+  );
+  assert.equal(attempts, 1);
+});
+
+test("selectRemoteAdapter reports authentication rejection once", async () => {
+  const client = new FakeSshClient({ target: "devbox" });
+  let attempts = 0;
+  (client as any).run = async () => {
+    attempts++;
+    return {
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.from("deploy@devbox: Permission denied (publickey,password)."),
+      exitCode: 255,
+    };
+  };
+
+  await assert.rejects(
+    selectRemoteAdapter(client, { preference: "auto" }),
+    /SSH authentication failed: deploy@devbox: Permission denied \(publickey,password\)/,
+  );
+  assert.equal(attempts, 1);
 });
 
 test("explicit openssh retries a rejected password through sshpass and prompts until cancelled", async () => {
@@ -3550,6 +3592,24 @@ test("auto mode reuses the remote login shell (zsh)", async () => {
   const plainClient = new FakeSshClient({ target: "devbox" });
   const selected = await selectRemoteAdapter(plainClient, { preference: "auto" });
   assert.equal(selected.adapter.shell, "bash");
+});
+
+test("selectRemoteAdapter aggregates only genuine shell incompatibilities", async () => {
+  const client = new FakeSshClient({ target: "devbox" });
+  client.inspectShells.clear();
+
+  await assert.rejects(
+    selectRemoteAdapter(client, { preference: "auto" }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /^Could not find a supported remote shell\./);
+      assert.match(error.message, /Unix Bash, Zsh, or POSIX sh/);
+      assert.match(error.message, /Probe results:/);
+      assert.doesNotMatch(error.message, /SSH connection (?:failed|timed out)/);
+      assert.ok(error.message.length <= 1_100, "shell diagnostics should stay bounded");
+      return true;
+    },
+  );
 });
 
 test("auto mode falls back to the sh symlink target when getent is missing", async () => {

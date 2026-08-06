@@ -2,7 +2,7 @@ import {
   SshPasswordCancelledError,
   SshPasswordFailedError,
 } from "../password-resolver.ts";
-import type { SshExecutor } from "../client.ts";
+import type { SshExecutor, SshRunResult } from "../client.ts";
 import { UnixBashAdapter } from "./unix.ts";
 import type {
   RemoteAdapter,
@@ -47,30 +47,181 @@ async function remoteCommandExists(
       { timeoutSeconds: 10 },
     )
   );
-  if (shProbe && shProbe.exitCode === 0) {
+  if (shProbe) throwIfFatalProbeFailure(shProbe);
+  if (shProbe?.exitCode === 0) {
     return shProbe.stdout.toString("utf8").trim() === "ok";
   }
-  // The probe did not run: no sh on this host (Windows), or a transport
-  // failure. Ask PowerShell; its absence on Unix yields undefined.
+  // The probe did not run because sh is unavailable (normally Windows).
+  // Terminal transport/authentication failures were already rethrown. Ask
+  // PowerShell; its absence on Unix yields undefined.
   const psProbe = await runUnchecked(() =>
     executor.run(
       `powershell -NoProfile -NonInteractive -Command "if (Get-Command '${command}' -ErrorAction SilentlyContinue) { Write-Output ok }"`,
       { timeoutSeconds: 10 },
     )
   );
-  if (psProbe && psProbe.exitCode === 0) {
+  if (psProbe) throwIfFatalProbeFailure(psProbe);
+  if (psProbe?.exitCode === 0) {
     return psProbe.stdout.toString("utf8").trim() === "ok";
   }
   return undefined;
 }
 
-/** Run a probe, mapping transport failures to `undefined`. */
+const SSH_AUTHENTICATION_FAILURE =
+  /authentication (?:failed|failure)|all configured authentication methods failed|no supported authentication methods|unable to authenticate/i;
+const SSH_CONNECTION_FAILURE =
+  /connection (?:refused|reset|closed|timed out)|no route to host|network is unreachable|could not resolve hostname|name or service not known|host key verification failed|remote host identification has changed|kex_exchange_identification|ssh_exchange_identification|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|ENOTFOUND/i;
+const SSH_TRANSPORT_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ENOTFOUND",
+]);
+
+/** A connection/authentication failure, rather than a missing remote shell. */
+class FatalSshProbeError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "FatalSshProbeError";
+  }
+}
+
+function compactFailureText(value: string, maxLength = 360): string {
+  const uniqueLines: string[] = [];
+  for (const line of value.split(/\r?\n/)) {
+    const normalized = line.replace(/\s+/g, " ").trim();
+    if (normalized && !uniqueLines.includes(normalized)) uniqueLines.push(normalized);
+  }
+  const compact = uniqueLines.join(" ");
+  return compact.length > maxLength ? `${compact.slice(0, maxLength)}…` : compact;
+}
+
+function isRunResult(value: unknown): value is SshRunResult {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<SshRunResult>;
+  return (typeof candidate.exitCode === "number" || candidate.exitCode === null)
+    && Buffer.isBuffer(candidate.stdout)
+    && Buffer.isBuffer(candidate.stderr);
+}
+
+function rawProbeFailure(value: unknown): {
+  message: string;
+  detail: string;
+  exitCode?: number | null;
+} {
+  if (isRunResult(value)) {
+    const stderr = value.stderr.toString("utf8").trim();
+    const stdout = value.stdout.toString("utf8").trim();
+    const detail = compactFailureText(stderr || stdout);
+    return {
+      message: `SSH command failed (${value.exitCode ?? "signal"})${detail ? `: ${detail}` : ""}`,
+      detail,
+      exitCode: value.exitCode,
+    };
+  }
+  const message = compactFailureText(
+    value instanceof Error ? value.message : String(value),
+  );
+  const status = /SSH command failed \((\d+|signal)\)/i.exec(message)?.[1];
+  return {
+    message,
+    detail: message.replace(/^SSH command failed \([^)]*\):?\s*/i, ""),
+    exitCode: status === undefined
+      ? undefined
+      : status === "signal"
+        ? null
+        : Number(status),
+  };
+}
+
+/**
+ * Convert terminal SSH failures into one concise error. Probe-language
+ * failures deliberately return undefined so another supported shell can be
+ * attempted.
+ */
+function fatalProbeFailure(value: unknown): Error | undefined {
+  if (value instanceof FatalSshProbeError) return value;
+  if (value instanceof SshPasswordCancelledError || value instanceof SshPasswordFailedError) {
+    return value;
+  }
+
+  const { message, detail, exitCode } = rawProbeFailure(value);
+  const sourceError = value instanceof Error ? value : undefined;
+  const ssh255 = exitCode === 255 || /SSH command failed \(255\)/i.test(message);
+  const connectionErrorName = sourceError?.name === "Ssh2ConnectionError";
+  const code = sourceError && "code" in sourceError
+    ? String((sourceError as Error & { code?: unknown }).code ?? "")
+    : "";
+  const unstructuredFailure = exitCode === undefined;
+  const transportCode = SSH_TRANSPORT_ERROR_CODES.has(code.toUpperCase());
+  const authenticationText = SSH_AUTHENTICATION_FAILURE.test(message);
+  const permissionDenied = /permission denied/i.test(message);
+
+  if (/password authentication was cancelled|authentication .* cancelled/i.test(message)) {
+    return sourceError ?? new FatalSshProbeError(message);
+  }
+  if (
+    authenticationText
+    || (permissionDenied && (ssh255 || connectionErrorName || unstructuredFailure))
+  ) {
+    return new FatalSshProbeError(
+      `SSH authentication failed${detail ? `: ${detail}` : ""}`,
+      value,
+    );
+  }
+  if (/connection timed out during banner exchange/i.test(message)) {
+    return new FatalSshProbeError(
+      "SSH connection timed out during banner exchange. Check the configured host, port, proxy settings, and sshd.",
+      value,
+    );
+  }
+  const timeout = /(?:^|\b)timeout:(\d+(?:\.\d+)?)\b/i.exec(message);
+  if (timeout && (unstructuredFailure || ssh255 || connectionErrorName)) {
+    return new FatalSshProbeError(
+      `SSH connection probe timed out after ${timeout[1]} seconds. Check the configured host, port, proxy settings, and sshd.`,
+      value,
+    );
+  }
+  if (/^(?:aborted|cancelled)$/i.test(message)) {
+    return sourceError ?? new FatalSshProbeError(message);
+  }
+  const connectionText = SSH_CONNECTION_FAILURE.test(message);
+  if (
+    connectionErrorName
+    || ssh255
+    || exitCode === null
+    || transportCode
+    || (unstructuredFailure && connectionText)
+  ) {
+    return new FatalSshProbeError(
+      `SSH connection failed${detail ? `: ${detail}` : ""}`,
+      value,
+    );
+  }
+  if (code === "ENOENT" || code === "EACCES") {
+    return new FatalSshProbeError(
+      `SSH transport could not start${detail ? `: ${detail}` : ""}`,
+      value,
+    );
+  }
+  return undefined;
+}
+
+function throwIfFatalProbeFailure(value: unknown): void {
+  const fatal = fatalProbeFailure(value);
+  if (fatal) throw fatal;
+}
+
+/** Run a shell-discovery probe while preserving terminal SSH failures. */
 async function runUnchecked<T>(
   run: () => Promise<T>,
 ): Promise<T | undefined> {
   try {
     return await run();
-  } catch {
+  } catch (error) {
+    throwIfFatalProbeFailure(error);
     return undefined;
   }
 }
@@ -78,7 +229,8 @@ async function runUnchecked<T>(
 interface RemoteHostProbe {
   /**
    * "unix" when the POSIX probe answered, "windows" when it could not run
-   * (no `sh` on the host), "unknown" on transport failure.
+   * (no `sh` on the host), and "unknown" when output was inconclusive.
+   * Terminal transport/authentication failures are thrown instead.
    */
   kind: "unix" | "windows" | "unknown";
   /** Login shell basename for Unix hosts ("" when unknown). */
@@ -107,20 +259,15 @@ async function probeRemoteHost(executor: SshExecutor): Promise<RemoteHostProbe> 
     )
   );
   if (!result) return unknown;
+  throwIfFatalProbeFailure(result);
   const text = result.stdout.toString("utf8").replace(/\r/g, "").trim();
   const match = /^unix:([^:]*)$/.exec(text);
   if (result.exitCode === 0 && match) {
     return { kind: "unix", loginShell: match[1] };
   }
-  const stderr = result.stderr.toString("utf8");
   if (result.exitCode !== 0 && text === "") {
-    if (/permission denied|authentication failed|no supported authentication/i.test(stderr)) {
-      // The host rejected the connection before the probe could run
-      // (password required). Treat it as unknown so the full candidate
-      // list is tried; inspectWorkspace then triggers the password flow.
-      return unknown;
-    }
-    // The probe could not run: no sh on this host (Windows).
+    // The probe could not run: no sh on this host (Windows). Connection and
+    // authentication failures were classified before output parsing.
     return { kind: "windows", loginShell: "" };
   }
   return unknown;
@@ -185,15 +332,32 @@ async function shellCandidates(
 
 function boundedProbeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  const singleLine = message.replace(/\s+/g, " ").trim();
-  return singleLine.length > 500 ? `${singleLine.slice(0, 500)}…` : singleLine;
+  return compactFailureText(message, 240);
+}
+
+interface ShellProbeFailure {
+  shell: RemoteShell;
+  reason: string;
+}
+
+function formatProbeFailures(failures: readonly ShellProbeFailure[]): string {
+  const grouped = new Map<string, RemoteShell[]>();
+  for (const failure of failures) {
+    const shells = grouped.get(failure.reason) ?? [];
+    shells.push(failure.shell);
+    grouped.set(failure.reason, shells);
+  }
+  const details = Array.from(grouped, ([reason, shells]) =>
+    `${shells.join("/")}: ${reason}`
+  ).join(" | ");
+  return details.length > 800 ? `${details.slice(0, 800)}…` : details;
 }
 
 export async function selectRemoteAdapter(
   executor: SshExecutor,
   options: SelectRemoteAdapterOptions = {},
 ): Promise<SelectedRemote> {
-  const failures: string[] = [];
+  const failures: ShellProbeFailure[] = [];
   const warnings: string[] = [];
   for (const shell of await shellCandidates(executor, options, warnings)) {
     const adapter = createAdapter(
@@ -202,23 +366,20 @@ export async function selectRemoteAdapter(
       options.localPlatform ?? process.platform,
     );
     if (options.expectedPlatform && adapter.platform !== options.expectedPlatform) {
-      failures.push(`${shell}: expected ${options.expectedPlatform}, adapter is ${adapter.platform}`);
+      failures.push({
+        shell,
+        reason: `expected ${options.expectedPlatform}, adapter is ${adapter.platform}`,
+      });
       continue;
     }
     try {
       const workspace = await adapter.inspectWorkspace(options.requestedCwd);
       return { adapter, workspace, warnings };
     } catch (error) {
-      // Password prompt cancellations and rejected-password failures end
-      // the whole selection: the next candidate would hit the same wall
-      // and the aggregated probe list would just repeat the message.
-      if (error instanceof SshPasswordCancelledError || error instanceof SshPasswordFailedError) {
-        throw error;
-      }
-      if (error instanceof Error && /password authentication was cancelled/.test(error.message)) {
-        throw error;
-      }
-      failures.push(`${shell}: ${boundedProbeError(error)}`);
+      // Connection, authentication, and cancellation errors affect every
+      // candidate. Stop immediately instead of reporting one copy per shell.
+      throwIfFatalProbeFailure(error);
+      failures.push({ shell, reason: boundedProbeError(error) });
     }
   }
 
@@ -227,8 +388,8 @@ export async function selectRemoteAdapter(
     : "";
   throw new Error(
     `Could not find a supported remote shell.${expected} `
-      + "The host must provide Unix Bash or Zsh, PowerShell 7, or Windows PowerShell 5.1. "
-      + `Probe results: ${failures.join(" | ")}`,
+      + "The host must provide Unix Bash, Zsh, or POSIX sh, PowerShell 7, or Windows PowerShell 5.1. "
+      + `Probe results: ${formatProbeFailures(failures)}`,
   );
 }
 
