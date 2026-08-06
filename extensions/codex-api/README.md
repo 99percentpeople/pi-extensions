@@ -119,7 +119,7 @@ rate limit redeem
 - The status bar mirrors this compactly: `Codex weekly 65% 5d 3h` →
   `Codex weekly limit reached 5d 14h`
 - When a refresh fails the status never stays on the transient
-  `Codex syncing…`: expired/invalid OAuth tokens show `Codex auth expired — /login`
+  `Codex syncing…`: expired/invalid OAuth tokens show `Codex auth expired`
   (red), other failures keep the last known usage or show `Codex usage unavailable`
   until the next successful refresh
 

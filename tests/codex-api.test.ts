@@ -2059,7 +2059,7 @@ test("Codex usage redeem reports when no credits are available", async () => {
   }
 });
 
-test("Codex usage status replaces syncing with an auth-expired error on 401", async () => {
+test("Codex usage status shows auth expired only while OAuth remains configured", async () => {
   const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
   const pi = {
     registerCommand() {},
@@ -2070,13 +2070,18 @@ test("Codex usage status replaces syncing with an auth-expired error on 401", as
   const temporary = await mkdtemp(join(tmpdir(), "pi-codex-auth-expired-"));
   const authPath = join(temporary, "auth.json");
   await writeFile(authPath, JSON.stringify({ account: "a" }));
+  let usageConfig = { ...DEFAULT_CODEX_API_CONFIG };
   const handle = registerCodexUsageAndFast(pi, {
-    getConfig: () => DEFAULT_CODEX_API_CONFIG,
+    getConfig: () => usageConfig,
     updateConfig: () => {},
   }, { authPath });
 
   const statuses: Array<string | undefined> = [];
   const ctx = context(process.cwd()) as any;
+  const codexModel = ctx.model;
+  let oauthAvailable = true;
+  ctx.modelRegistry.isUsingOAuth = () => oauthAvailable;
+  ctx.modelRegistry.getAll = () => [codexModel];
   let credentialReads = 0;
   ctx.modelRegistry.getApiKeyAndHeaders = async () => {
     credentialReads += 1;
@@ -2098,7 +2103,7 @@ test("Codex usage status replaces syncing with an auth-expired error on 401", as
     await handlers.get("session_start")?.({}, ctx);
     // The transient syncing state must always be replaced by the terminal
     // auth error, even though the refresh itself failed.
-    assert.equal(statuses.at(-1), "[error]Codex auth expired — /login");
+    assert.equal(statuses.at(-1), "[error]Codex auth expired");
     assert.equal(handle.getSnapshots().length, 0);
     // Account checking must reuse its resolved OAuth client; a second
     // credential read after showing syncing could hang outside the fetch timeout.
@@ -2125,7 +2130,26 @@ test("Codex usage status replaces syncing with an auth-expired error on 401", as
       error: "token refresh failed",
     });
     await handlers.get("model_select")?.({}, ctx);
-    assert.equal(statuses.at(-1), "[error]Codex auth expired — /login");
+    assert.equal(statuses.at(-1), "[error]Codex auth expired");
+
+    // /logout removes the OAuth configuration. From this point onward, no
+    // refresh path may reinterpret the inactive state as an expired token.
+    oauthAvailable = false;
+    handle.refreshStatus(ctx);
+    assert.equal(statuses.at(-1), undefined);
+    assert.deepEqual(handle.getSnapshots(), []);
+
+    // /99settings calls refreshStatus followed by a forced refresh when Other
+    // providers is enabled. The forced resolution still rejects for callers,
+    // but the status must remain cleared because no credential exists.
+    ctx.model = { provider: "anthropic", id: "claude-test" };
+    usageConfig = { ...usageConfig, allowOtherProviders: true };
+    handle.refreshStatus(ctx);
+    await assert.rejects(
+      handle.refreshUsage(ctx, true),
+      /Codex subscription OAuth is unavailable/,
+    );
+    assert.equal(statuses.at(-1), undefined);
   } finally {
     globalThis.fetch = originalFetch;
     handlers.get("session_shutdown")?.({}, ctx);
@@ -2609,7 +2633,8 @@ test("Codex usage polls on an interval, throttles inside the window, and stops o
   const statuses: Array<string | undefined> = [];
   const ctx = context(process.cwd()) as any;
   ctx.model = { provider: "openai-codex", id: "gpt-5.4-codex" };
-  ctx.modelRegistry.isUsingOAuth = () => true;
+  let oauthAvailable = true;
+  ctx.modelRegistry.isUsingOAuth = () => oauthAvailable;
   ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: jwt() });
   ctx.ui = {
     setStatus: (_key: string, value: string | undefined) => statuses.push(value),
@@ -2634,13 +2659,23 @@ test("Codex usage polls on an interval, throttles inside the window, and stops o
     assert.equal(scheduled.length, 1);
     assert.equal(scheduled[0].delay, 60_000);
 
+    // A poll after /logout clears account state and stays silent instead of
+    // reviving "Codex auth expired" from a failed credential resolution.
+    oauthAvailable = false;
+    scheduled.shift()!.cb();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(usageFetches, 1);
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(scheduled.length, 1);
+
     // Disabling polling stops the chain after the current round.
     config = { ...config, usagePollInterval: 0 };
     scheduled.shift()!.cb();
     assert.equal(scheduled.length, 0);
     assert.equal(usageFetches, 1);
 
-    // A fresh session with polling disabled schedules nothing.
+    // A fresh logged-in session with polling disabled schedules nothing.
+    oauthAvailable = true;
     const secondCtx = { ...ctx } as any;
     const secondStatuses: Array<string | undefined> = [];
     secondCtx.ui = { ...ctx.ui, setStatus: (_key: string, value: string | undefined) => secondStatuses.push(value) };

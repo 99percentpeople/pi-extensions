@@ -24,7 +24,7 @@ const USAGE_REFRESH_INTERVAL_MS = 60_000;
 const AUTH_WATCH_DEBOUNCE_MS = 100;
 /** Cap usage/redeem requests so a stalled backend cannot wedge the status pipeline. */
 const USAGE_FETCH_TIMEOUT_MS = 15_000;
-const AUTH_EXPIRED_STATUS = "Codex auth expired — /login";
+const AUTH_EXPIRED_STATUS = "Codex auth expired";
 const USAGE_UNAVAILABLE_STATUS = "Codex usage unavailable";
 
 const STATUS_KEY = "codex-api-usage";
@@ -544,6 +544,12 @@ export function registerCodexUsageAndFast(
   let authWatchDebounce: ReturnType<typeof setTimeout> | undefined;
   let pollDelay: ReturnType<typeof setTimeout> | undefined;
 
+  const codexOAuthLoginAvailable = (ctx: ExtensionContext): boolean =>
+    (ctx.model?.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(ctx.model))
+    || (ctx.modelRegistry.getAll?.() ?? []).some((candidate) =>
+      candidate.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(candidate)
+    );
+
   const usageEnabled = (ctx: ExtensionContext): boolean => {
     const config = controller.getConfig();
     return config.usageStatus
@@ -563,11 +569,34 @@ export function registerCodexUsageAndFast(
       : value);
   };
 
+  const resetAccountState = (): void => {
+    credentialRevision += 1;
+    activeAccountId = undefined;
+    usageByAccount.clear();
+    pendingRedeemByAccount.clear();
+  };
+
+  /** Missing OAuth is an inactive state, not an expired-credential error. */
+  const clearIfCodexOAuthUnavailable = (ctx: ExtensionContext): boolean => {
+    if (codexOAuthLoginAvailable(ctx)) return false;
+    if (
+      activeAccountId !== undefined
+      || usageByAccount.size > 0
+      || pendingRedeemByAccount.size > 0
+      || accountCheck !== undefined
+    ) {
+      resetAccountState();
+    }
+    setStatus(ctx, undefined);
+    return true;
+  };
+
   const currentState = (): AccountUsageState | undefined =>
     activeAccountId ? usageByAccount.get(activeAccountId) : undefined;
 
   const refreshStatus = (ctx: ExtensionContext) => {
     latestContext = ctx;
+    if (clearIfCodexOAuthUnavailable(ctx)) return;
     if (!usageEnabled(ctx)) {
       setStatus(ctx, undefined);
       return;
@@ -577,6 +606,7 @@ export function registerCodexUsageAndFast(
 
   const showSyncingStatus = (ctx: ExtensionContext): void => {
     latestContext = ctx;
+    if (clearIfCodexOAuthUnavailable(ctx)) return;
     setStatus(ctx, usageEnabled(ctx) ? "Codex syncing…" : undefined);
   };
 
@@ -587,6 +617,7 @@ export function registerCodexUsageAndFast(
    */
   const showErrorStatus = (ctx: ExtensionContext, error: unknown): void => {
     latestContext = ctx;
+    if (clearIfCodexOAuthUnavailable(ctx)) return;
     if (!usageEnabled(ctx)) {
       setStatus(ctx, undefined);
       return;
@@ -606,10 +637,7 @@ export function registerCodexUsageAndFast(
   };
 
   const invalidateAuthState = (ctx: ExtensionContext, action: "set" | "remove"): void => {
-    credentialRevision += 1;
-    activeAccountId = undefined;
-    usageByAccount.clear();
-    pendingRedeemByAccount.clear();
+    resetAccountState();
     if (action === "set") showSyncingStatus(ctx);
     else setStatus(ctx, undefined);
   };
@@ -759,11 +787,16 @@ export function registerCodexUsageAndFast(
     pollDelay = setTimeout(() => {
       pollDelay = undefined;
       const active = latestContext;
-      const state = currentState();
-      if (active && usageEnabled(active)) {
-        const intervalMs = intervalMinutes * 60_000;
-        if (!state || state.snapshots.length === 0 || Date.now() - state.lastFetchAt >= intervalMs) {
-          void refreshUsage(active).catch(() => {});
+      if (active) {
+        // Reconcile auth before polling so logout cannot revive an expired
+        // status through a credential-resolution failure.
+        const oauthAvailable = !clearIfCodexOAuthUnavailable(active);
+        const state = currentState();
+        if (oauthAvailable && usageEnabled(active)) {
+          const intervalMs = intervalMinutes * 60_000;
+          if (!state || state.snapshots.length === 0 || Date.now() - state.lastFetchAt >= intervalMs) {
+            void refreshUsage(active).catch(() => {});
+          }
         }
       }
       scheduleNextPoll();
@@ -786,12 +819,6 @@ export function registerCodexUsageAndFast(
         : undefined;
     return !!model && ctx.modelRegistry.isUsingOAuth(model);
   };
-
-  const codexOAuthLoginAvailable = (ctx: ExtensionContext): boolean =>
-    (ctx.model?.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(ctx.model))
-    || (ctx.modelRegistry.getAll?.() ?? []).some((candidate) =>
-      candidate.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(candidate)
-    );
 
   const checkCurrentAccount = (
     ctx: ExtensionContext,
