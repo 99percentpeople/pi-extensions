@@ -3813,18 +3813,46 @@ test("Windows background control terminates the real local PowerShell process tr
   );
   const [launchFile, ...launchArgs] = launchCommand.split(" ");
   const task = spawnChild(launchFile, launchArgs, {
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  const taskExit = new Promise<void>((resolve, reject) => {
-    task.once("error", reject);
-    task.once("exit", () => resolve());
+  const launchOutput: Buffer[] = [];
+  task.stdout?.on("data", (chunk: Buffer | string) => {
+    launchOutput.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  task.stderr?.on("data", (chunk: Buffer | string) => {
+    launchOutput.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  let taskExitCode: number | null | undefined;
+  let taskError: Error | undefined;
+  const taskExit = new Promise<void>((resolve) => {
+    task.once("error", (error) => {
+      taskError = error;
+      resolve();
+    });
+    task.once("exit", (code) => {
+      taskExitCode = code;
+      resolve();
+    });
   });
   let childPid = 0;
   try {
-    const deadline = Date.now() + 8_000;
-    while (!existsSync(pidFile) && Date.now() < deadline) {
+    const deadline = Date.now() + 20_000;
+    while (
+      !existsSync(pidFile)
+      && taskExitCode === undefined
+      && taskError === undefined
+      && Date.now() < deadline
+    ) {
       await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!existsSync(pidFile)) {
+      const output = Buffer.concat(launchOutput).toString("utf8").replace(/\s+/g, " ").trim();
+      assert.fail(
+        `PowerShell launcher did not publish its child PID (exit=${taskExitCode ?? "running"}`
+          + `${taskError ? `, error=${taskError.message}` : ""}`
+          + `${output ? `, output=${output.slice(0, 1_000)}` : ""})`,
+      );
     }
     childPid = Number(readFileSync(pidFile, "utf8"));
     assert.ok(childPid > 0, "PowerShell child PID should be published");
