@@ -3396,6 +3396,9 @@ class FakeWindowsSshClient implements SshRemoteClient {
   remoteFileExists = false;
   /** Commands reported by the PowerShell Get-Command probe. */
   availablePowerShellCommands = new Set<string>();
+  /** Windows OpenSSH may use 255 when its remote launcher cannot find sh. */
+  posixProbeExitCode = 1;
+  posixProbeStderr = Buffer.alloc(0);
 
   constructor(readonly options: Readonly<SshClientOptions> = { target: "winbox" }) {}
 
@@ -3405,8 +3408,13 @@ class FakeWindowsSshClient implements SshRemoteClient {
       return { stdout: Buffer.alloc(0), stderr: Buffer.from("bash missing"), exitCode: 127 };
     }
     if (command.includes("getent passwd") || /sh -c 'command -v [a-z0-9_.-]+ /.test(command)) {
-      // A Windows host without sh cannot run POSIX probes: exit 1, no output.
-      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 1 };
+      // A Windows host without sh cannot run POSIX probes. Depending on the
+      // OpenSSH/default-shell combination this is either 1 or 255.
+      return {
+        stdout: Buffer.alloc(0),
+        stderr: this.posixProbeStderr,
+        exitCode: this.posixProbeExitCode,
+      };
     }
     const psProbe = /powershell -NoProfile -NonInteractive -Command "if \(Get-Command '([a-z0-9_.-]+)'/.exec(command);
     if (psProbe) {
@@ -3694,6 +3702,23 @@ test("explicit --ssh-shell probes existence and falls back to sh", async () => {
   assert.ok(
     (missingSelection.warnings ?? []).some((warning) => /falling back to powershell/.test(warning)),
   );
+});
+
+test("Windows shell discovery tolerates an unclassified exit 255 when sh is unavailable", async () => {
+  const automatic = new FakeWindowsSshClient();
+  automatic.posixProbeExitCode = 255;
+  automatic.posixProbeStderr = Buffer.from("The system cannot find the path specified.");
+  const automaticSelection = await selectRemoteAdapter(automatic, { preference: "auto" });
+  assert.equal(automaticSelection.adapter.shell, "pwsh");
+  assert.equal(automaticSelection.workspace.platform, "windows");
+
+  const explicit = new FakeWindowsSshClient();
+  explicit.posixProbeExitCode = 255;
+  explicit.posixProbeStderr = Buffer.from("The system cannot find the path specified.");
+  explicit.availablePowerShellCommands.add("pwsh");
+  const explicitSelection = await selectRemoteAdapter(explicit, { preference: "pwsh" });
+  assert.equal(explicitSelection.adapter.shell, "pwsh");
+  assert.equal(explicitSelection.warnings?.length ?? 0, 0);
 });
 
 test("remote adapter auto-detects Windows PowerShell and streams file content over stdin", async () => {

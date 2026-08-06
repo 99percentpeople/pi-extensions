@@ -41,13 +41,15 @@ async function remoteCommandExists(
   executor: SshExecutor,
   command: string,
 ): Promise<boolean | undefined> {
+  const shProbeOptions = { allowUnknownExit255: true } as const;
   const shProbe = await runUnchecked(() =>
     executor.run(
       `sh -c 'command -v ${command} >/dev/null 2>&1 && printf ok || printf no'`,
       { timeoutSeconds: 10 },
-    )
+    ),
+    shProbeOptions,
   );
-  if (shProbe) throwIfFatalProbeFailure(shProbe);
+  if (shProbe) throwIfFatalProbeFailure(shProbe, shProbeOptions);
   if (shProbe?.exitCode === 0) {
     return shProbe.stdout.toString("utf8").trim() === "ok";
   }
@@ -136,12 +138,24 @@ function rawProbeFailure(value: unknown): {
   };
 }
 
+interface FatalProbeOptions {
+  /**
+   * A remote Windows launcher can return 255 when the probed POSIX shell is
+   * missing. Permit only an otherwise-unclassified 255 where that absence is
+   * expected; authentication and recognizable transport failures still win.
+   */
+  allowUnknownExit255?: boolean;
+}
+
 /**
  * Convert terminal SSH failures into one concise error. Probe-language
  * failures deliberately return undefined so another supported shell can be
  * attempted.
  */
-function fatalProbeFailure(value: unknown): Error | undefined {
+function fatalProbeFailure(
+  value: unknown,
+  options: FatalProbeOptions = {},
+): Error | undefined {
   if (value instanceof FatalSshProbeError) return value;
   if (value instanceof SshPasswordCancelledError || value instanceof SshPasswordFailedError) {
     return value;
@@ -188,9 +202,10 @@ function fatalProbeFailure(value: unknown): Error | undefined {
     return sourceError ?? new FatalSshProbeError(message);
   }
   const connectionText = SSH_CONNECTION_FAILURE.test(message);
+  const terminalSsh255 = ssh255 && (!options.allowUnknownExit255 || connectionText);
   if (
     connectionErrorName
-    || ssh255
+    || terminalSsh255
     || exitCode === null
     || transportCode
     || (unstructuredFailure && connectionText)
@@ -209,19 +224,23 @@ function fatalProbeFailure(value: unknown): Error | undefined {
   return undefined;
 }
 
-function throwIfFatalProbeFailure(value: unknown): void {
-  const fatal = fatalProbeFailure(value);
+function throwIfFatalProbeFailure(
+  value: unknown,
+  options?: FatalProbeOptions,
+): void {
+  const fatal = fatalProbeFailure(value, options);
   if (fatal) throw fatal;
 }
 
 /** Run a shell-discovery probe while preserving terminal SSH failures. */
 async function runUnchecked<T>(
   run: () => Promise<T>,
+  options?: FatalProbeOptions,
 ): Promise<T | undefined> {
   try {
     return await run();
   } catch (error) {
-    throwIfFatalProbeFailure(error);
+    throwIfFatalProbeFailure(error, options);
     return undefined;
   }
 }
@@ -250,16 +269,18 @@ interface RemoteHostProbe {
  */
 async function probeRemoteHost(executor: SshExecutor): Promise<RemoteHostProbe> {
   const unknown = { kind: "unknown", loginShell: "" } as const;
+  const shProbeOptions = { allowUnknownExit255: true } as const;
   const result = await runUnchecked(() =>
     executor.run(
       `sh -c 'p=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); `
         + `[ -n "$p" ] || p=$(readlink -f /bin/sh 2>/dev/null); `
         + `n="\${p##*/}"; printf "unix:%s" "$n"'`,
       { timeoutSeconds: 10 },
-    )
+    ),
+    shProbeOptions,
   );
   if (!result) return unknown;
-  throwIfFatalProbeFailure(result);
+  throwIfFatalProbeFailure(result, shProbeOptions);
   const text = result.stdout.toString("utf8").replace(/\r/g, "").trim();
   const match = /^unix:([^:]*)$/.exec(text);
   if (result.exitCode === 0 && match) {
