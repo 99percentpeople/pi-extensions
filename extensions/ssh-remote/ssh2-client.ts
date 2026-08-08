@@ -152,9 +152,11 @@ export class Ssh2Client implements SshRemoteClient {
     return new Promise<RawSsh2Client>((resolve, reject) => {
       let ready = false;
       let settled = false;
+      let setupTimeout: ReturnType<typeof setTimeout> | undefined;
       const rejectSetup = (error: unknown) => {
         if (settled) return;
         settled = true;
+        if (setupTimeout) clearTimeout(setupTimeout);
         this.connectingClients.delete(client);
         try {
           client.destroy();
@@ -184,10 +186,16 @@ export class Ssh2Client implements SshRemoteClient {
         }
         ready = true;
         settled = true;
+        if (setupTimeout) clearTimeout(setupTimeout);
         this.connectingClients.delete(client);
         this.connectionClients.add(client);
         resolve(client);
       });
+      const timeoutMilliseconds = Math.max(1, endpoint.config.readyTimeout ?? 10_000);
+      setupTimeout = setTimeout(() => {
+        rejectSetup(new Error(`authentication setup timed out after ${timeoutMilliseconds}ms`));
+      }, timeoutMilliseconds);
+      setupTimeout.unref?.();
       try {
         client.connect(socket ? { ...endpoint.config, sock: socket } : endpoint.config);
       } catch (error) {

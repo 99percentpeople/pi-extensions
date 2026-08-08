@@ -859,6 +859,29 @@ export async function resolveSsh2Connection(
     proxyJumps.push(resolved.endpoint);
   }
 
+  if (proxyJumps.length > 0) {
+    // ssh2 1.17 can corrupt a nested `sock` transport when an explicit
+    // cipher preference negotiates chacha20-poly1305 on both layers. Its
+    // default list is unaffected, but config resolution must pass an
+    // explicit intersection. Keep ProxyJump chains on AES-GCM/CTR so the
+    // inner handshake remains intact across Node and Bun runtimes.
+    for (const endpoint of [target.endpoint, ...proxyJumps]) {
+      const algorithms = endpoint.config.algorithms;
+      if (!algorithms || !Array.isArray(algorithms.cipher)) continue;
+      const ciphers = algorithms.cipher.filter(
+        (cipher: CipherAlgorithm) => cipher !== "chacha20-poly1305@openssh.com",
+      );
+      if (ciphers.length === 0) {
+        throw new Ssh2CompatibilityError(
+          "ssh2 ProxyJump requires an AES cipher because chacha20 corrupts nested channels; "
+            + "configure AES-GCM/CTR or select OpenSSH",
+          ["ProxyJump with chacha20-only Ciphers"],
+        );
+      }
+      endpoint.config.algorithms = { ...algorithms, cipher: ciphers };
+    }
+  }
+
   return {
     ...target.endpoint,
     proxyJumps,

@@ -81,10 +81,18 @@ jobs:
 
           fs.appendFileSync(
             process.env.GITHUB_OUTPUT,
-            `directory=${release.directory}\nname=${packageJson.name}\nversion=${packageJson.version}\n`,
+            `directory=${release.directory}\nartifact=${release.directory.split("/").at(-1)}\nname=${packageJson.name}\nversion=${packageJson.version}\n`,
           );
           NODE
 
+      - name: Validate release source
+        run: bun run check
+
+      - name: Build publish staging package
+        run: bun run --cwd ${{ steps.release.outputs.directory }} build
+
+      - name: Validate publish tarball
+        run: bun pm pack --dry-run --cwd dist/${{ steps.release.outputs.artifact }}
+
       - name: Publish ${{ steps.release.outputs.name }}@${{ steps.release.outputs.version }}
-        working-directory: ${{ steps.release.outputs.directory }}
-        run: npm publish --access public
+        run: npm publish --access public ./dist/${{ steps.release.outputs.artifact }}

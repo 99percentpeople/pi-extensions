@@ -1681,11 +1681,11 @@ export function createSshRemoteExtension(
       pi.registerTool({
         name: "ssh_connect",
         label: "SSH Connect",
-        description: "Connect the current Pi session to an SSH workspace, replacing an active SSH target without requiring ssh_exit first. The target accepts host or host:path syntax. When AI password authentication is enabled, a required password must be entered by the user in Pi's UI within 60 seconds; otherwise key-based login is required.",
+        description: "Connect the current Pi session to an SSH workspace, replacing an active SSH target without requiring ssh_exit first. The target accepts host or host:path syntax. When AI password authentication is enabled, each password required by the target or its ProxyJump chain must be entered by the user in Pi's UI within 60 seconds; otherwise key-based login is required.",
         promptSnippet: "Connect or switch the current session to an SSH workspace",
         promptGuidelines: [
           "Use ssh_connect when the user asks to enter an SSH workspace or switch directly from the active SSH target to another one; do not call ssh_exit before switching targets.",
-          "Before calling ssh_connect, tell the user that Pi may show an SSH password prompt when AI password auth is enabled and that they must enter the password themselves within 60 seconds; never ask the user to send the password in chat.",
+          "Before calling ssh_connect, tell the user that Pi may show one or more SSH password prompts when AI password auth is enabled and that they must enter each password themselves within 60 seconds; never ask the user to send a password in chat.",
           "If AI password auth is disabled and key authentication fails, ssh_connect fails immediately and recommends configuring SSH key-based login; do not retry until the key or setting changes.",
           "If ssh_connect fails from a local workspace, it returns to local automatically; if a target switch fails, the previous SSH workspace remains active. Do not call ssh_exit just to clean up either failure.",
           "Do not combine ssh_connect with workspace file or shell operations in the same tool batch; connect first, then inspect the resulting SSH environment.",

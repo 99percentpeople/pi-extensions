@@ -9,7 +9,11 @@ import {
   type SshTransportPreference,
 } from "./client.ts";
 import { Ssh2Client, Ssh2ConnectionError } from "./ssh2-client.ts";
-import { Ssh2CompatibilityError } from "./ssh2-config.ts";
+import {
+  parseOpenSshConfig,
+  runLocalCommand,
+  Ssh2CompatibilityError,
+} from "./ssh2-config.ts";
 import {
   SshPasswordCancelledError,
   SshPasswordFailedError,
@@ -42,6 +46,8 @@ export interface SshTransportFactoryOptions {
   passwordProvider?: SshPasswordProvider;
   /** Override the local `sshpass` availability probe (tests). */
   detectSshpass?: () => Promise<boolean>;
+  /** Override effective ProxyJump detection before password fallback (tests). */
+  detectProxyJump?: () => Promise<boolean>;
 }
 
 function detectSshpassDefault(platform: NodeJS.Platform): Promise<boolean> {
@@ -58,6 +64,30 @@ function detectSshpassDefault(platform: NodeJS.Platform): Promise<boolean> {
     child.once("error", () => resolve(false));
     child.once("close", (code) => resolve(code === 0));
   });
+}
+
+async function detectProxyJumpDefault(
+  options: SshClientOptions,
+  platform: NodeJS.Platform,
+): Promise<boolean> {
+  if (!options.target || options.target.startsWith("-") || /[\s\0\r\n]/.test(options.target)) {
+    return false;
+  }
+  const executable = options.executable ?? (platform === "win32" ? "ssh.exe" : "ssh");
+  const args: string[] = [];
+  if (options.configFile) args.push("-F", options.configFile);
+  args.push("-G", "-o", "BatchMode=yes", options.target);
+  try {
+    const result = await runLocalCommand(executable, args, 15_000);
+    if (result.exitCode !== 0) return false;
+    const config = parseOpenSshConfig(result.stdout.toString("utf8"));
+    const proxyJump = config.get("proxyjump")?.[0]?.trim();
+    return !!proxyJump && proxyJump.toLowerCase() !== "none";
+  } catch {
+    // Keep the existing OpenSSH password flow when effective configuration
+    // cannot be inspected; the original authentication error remains useful.
+    return false;
+  }
 }
 
 /**
@@ -113,6 +143,14 @@ function checkedFailureText(result: SshRunResult): string {
 function checkedResult(result: SshRunResult): SshRunResult {
   if (result.exitCode === 0) return result;
   throw new Error(checkedFailureText(result));
+}
+
+function isMaskedProxyJumpFailure(value: unknown): boolean {
+  const message = value && typeof value === "object" && "stderr" in value
+    ? (value as SshRunResult).stderr.toString("utf8")
+    : boundedReason(value);
+  return /kex_exchange_identification:\s*connection closed by remote host|connection closed by unknown port 65535/i
+    .test(message);
 }
 
 class AutoWindowsSshClient implements SshRemoteClient {
@@ -217,11 +255,23 @@ class AutoWindowsSshClient implements SshRemoteClient {
   }
 }
 
+class ProxyJumpPasswordRequiredError extends Error {
+  constructor(options?: ErrorOptions) {
+    super(
+      "OpenSSH ProxyJump setup requires per-hop handling; switching to ssh2 for password authentication or connection diagnostics",
+      options,
+    );
+    this.name = "ProxyJumpPasswordRequiredError";
+  }
+}
+
 class SshpassRetryClient implements SshRemoteClient {
   private readonly openSshOptionsValue: SshClientOptions;
   private readonly createOpenSsh: (options: SshClientOptions) => SshRemoteClient;
   private readonly passwordProvider?: SshPasswordProvider;
   private readonly detectSshpass: () => Promise<boolean>;
+  private readonly deferPasswordRetry?: () => Promise<boolean>;
+  private deferPasswordRetryPromise?: Promise<boolean>;
   private delegate: SshRemoteClient;
   private openedChannel = false;
   private sshpassAvailable?: boolean;
@@ -235,12 +285,14 @@ class SshpassRetryClient implements SshRemoteClient {
     createOpenSsh: (options: SshClientOptions) => SshRemoteClient,
     passwordProvider: SshPasswordProvider | undefined,
     detectSshpass: () => Promise<boolean>,
+    deferPasswordRetry?: () => Promise<boolean>,
   ) {
     this.delegate = createOpenSsh(openSshOptions);
     this.openSshOptionsValue = openSshOptions;
     this.createOpenSsh = createOpenSsh;
     this.passwordProvider = passwordProvider;
     this.detectSshpass = detectSshpass;
+    this.deferPasswordRetry = deferPasswordRetry;
   }
 
   get options(): Readonly<SshClientOptions> {
@@ -300,6 +352,14 @@ class SshpassRetryClient implements SshRemoteClient {
     return result.exitCode !== 0
       && /permission denied/i.test(stderr)
       && serverAcceptsPassword(stderr);
+  }
+
+  private async shouldDeferPasswordRetry(): Promise<boolean> {
+    if (!this.passwordProvider || !this.deferPasswordRetry) return false;
+    if (!this.deferPasswordRetryPromise) {
+      this.deferPasswordRetryPromise = this.deferPasswordRetry().catch(() => false);
+    }
+    return this.deferPasswordRetryPromise;
   }
 
   private async retryWithPassword(error: unknown): Promise<boolean> {
@@ -364,8 +424,14 @@ class SshpassRetryClient implements SshRemoteClient {
       try {
         const result = await selected.run(command, options);
         if (!this.canRetryResult(result)) {
+          if (isMaskedProxyJumpFailure(result) && await this.shouldDeferPasswordRetry()) {
+            throw new ProxyJumpPasswordRequiredError({ cause: result });
+          }
           this.openedChannel = true;
           return result;
+        }
+        if (await this.shouldDeferPasswordRetry()) {
+          throw new ProxyJumpPasswordRequiredError({ cause: result });
         }
         // OpenSshClient resolves authentication failures as a 255 result
         // (only runChecked throws), so treat them like the catch branch.
@@ -381,7 +447,16 @@ class SshpassRetryClient implements SshRemoteClient {
         await this.retryWithPassword(result);
       } catch (error) {
         if (selected !== this.delegate) continue;
-        if (!this.canRetry(error)) throw error;
+        if (error instanceof ProxyJumpPasswordRequiredError) throw error;
+        if (!this.canRetry(error)) {
+          if (isMaskedProxyJumpFailure(error) && await this.shouldDeferPasswordRetry()) {
+            throw new ProxyJumpPasswordRequiredError({ cause: error });
+          }
+          throw error;
+        }
+        if (await this.shouldDeferPasswordRetry()) {
+          throw new ProxyJumpPasswordRequiredError({ cause: error });
+        }
         if (attempt >= 20) {
           if (this.triedPassword) {
             throw new SshPasswordFailedError(
@@ -427,15 +502,17 @@ class AutoUnixSshClient implements SshRemoteClient {
     createSsh2: (options: SshClientOptions) => SshRemoteClient,
     passwordProvider?: SshPasswordProvider,
     detectSshpass?: () => Promise<boolean>,
+    detectProxyJump?: () => Promise<boolean>,
   ) {
-    // The OpenSSH delegate itself retries a rejected password through
-    // sshpass (cached secret first, then a prompt). Only when that fails
-    // or is unavailable does this client fall back to ssh2.
+    // Direct-host OpenSSH retries a rejected password through sshpass
+    // (cached secret first, then a prompt). Effective ProxyJump failures
+    // are deferred before prompting so ssh2 can authenticate each hop.
     this.delegate = new SshpassRetryClient(
       openSshOptions,
       createOpenSsh,
       passwordProvider,
       detectSshpass ?? (() => Promise.resolve(false)),
+      detectProxyJump,
     );
     this.openSshOptionsValue = openSshOptions;
     this.createSsh2 = createSsh2;
@@ -463,17 +540,18 @@ class AutoUnixSshClient implements SshRemoteClient {
   }
 
   private canFallback(error: unknown): boolean {
-    // A Permission denied or missing sshpass means key/agent auth failed
-    // and the password flow could not complete in place; ssh2 is the
-    // remaining password-capable transport. Never after an OpenSSH
-    // channel has opened (authentication already succeeded then), after
+    // A ProxyJump deferral, Permission denied, or missing sshpass means
+    // key/agent auth failed and the password flow could not complete in
+    // place; ssh2 is the remaining password-capable transport. Never
+    // after an OpenSSH channel has opened (authentication already succeeded), after
     // password attempts were rejected (ssh2 would fail the same way), or
     // when the server does not accept password auth at all (ssh2 would
     // only prompt in a loop).
     const message = boundedReason(error);
     return !this.opensshOpenedChannel
       && !!this.passwordProvider
-      && ((/permission denied/i.test(message) && serverAcceptsPassword(message))
+      && (error instanceof ProxyJumpPasswordRequiredError
+        || (/permission denied/i.test(message) && serverAcceptsPassword(message))
         || /sshpass is not installed/i.test(message));
   }
 
@@ -601,6 +679,8 @@ export function createSshTransportClient(
       createSsh2ForFallback,
       factoryOptions.passwordProvider,
       factoryOptions.detectSshpass ?? (() => detectSshpassDefault(platform)),
+      factoryOptions.detectProxyJump
+        ?? (() => detectProxyJumpDefault(openSshOptions, platform)),
     );
   }
   if (preference === "openssh") {

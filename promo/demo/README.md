@@ -14,7 +14,7 @@ actual extension against a live model.
 1. Build the extension being demonstrated.
 2. Start from a clean scratch directory.
 3. Disable extension discovery with `-ne` and load only the target extension
-   with `-e <extension-entry>`.
+   or explicitly documented integration pair with `-e <extension-entry>`.
 4. Record an English prompt, the extension's defining in-progress state, and a
    stable completed state.
 5. Verify the generated GIF, then copy it into `promo/demo/`.
@@ -61,7 +61,7 @@ Check that:
 
 - the prompt, active state, and completed state are all visible;
 - the screen does not jump back to the startup view;
-- no unrelated extensions, notifications, or local paths appear;
+- no unrelated extensions, notifications, or real local paths appear;
 - the GIF decodes without errors.
 
 Example decode and metadata checks:
@@ -75,6 +75,6 @@ ffprobe -v error \
 
 ## Output specs
 
-- 1000x440, Dracula theme, 20fps; 15fps is acceptable for long takes
+- 1000x440, Dracula theme, 15-25fps
 - Approximately 0.4-2.3MB and 10-36 seconds
 - English terminal content

@@ -7,16 +7,21 @@ import {
 export interface TodoConfig {
   collapsedTaskLimit: number;
   showDependencyNumbers: boolean;
+  reminderInterval: number;
 }
 
 export const TODO_SETTINGS_NAMESPACE = "todo";
 export const TODO_COLLAPSED_TASK_LIMIT_MIN = 1;
 export const TODO_COLLAPSED_TASK_LIMIT_MAX = 10;
 export const TODO_COLLAPSED_TASK_LIMIT_PRESETS = [1, 2, 3, 5, 8, 10] as const;
+export const TODO_REMINDER_INTERVAL_MIN = 0;
+export const TODO_REMINDER_INTERVAL_MAX = 20;
+export const TODO_REMINDER_INTERVAL_PRESETS = [0, 1, 2, 3, 5, 8, 10, 20] as const;
 
 export const DEFAULT_TODO_CONFIG: TodoConfig = {
   collapsedTaskLimit: 3,
   showDependencyNumbers: true,
+  reminderInterval: 3,
 };
 
 function isCollapsedTaskLimit(value: unknown): value is number {
@@ -26,11 +31,19 @@ function isCollapsedTaskLimit(value: unknown): value is number {
     && value <= TODO_COLLAPSED_TASK_LIMIT_MAX;
 }
 
+function isReminderInterval(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= TODO_REMINDER_INTERVAL_MIN
+    && value <= TODO_REMINDER_INTERVAL_MAX;
+}
+
 export function normalizeTodoConfig(value: unknown): TodoConfig {
   if (!value || typeof value !== "object") return { ...DEFAULT_TODO_CONFIG };
   const input = value as {
     collapsedTaskLimit?: unknown;
     showDependencyNumbers?: unknown;
+    reminderInterval?: unknown;
   };
   return {
     collapsedTaskLimit: isCollapsedTaskLimit(input.collapsedTaskLimit)
@@ -39,6 +52,9 @@ export function normalizeTodoConfig(value: unknown): TodoConfig {
     showDependencyNumbers: typeof input.showDependencyNumbers === "boolean"
       ? input.showDependencyNumbers
       : DEFAULT_TODO_CONFIG.showDependencyNumbers,
+    reminderInterval: isReminderInterval(input.reminderInterval)
+      ? input.reminderInterval
+      : DEFAULT_TODO_CONFIG.reminderInterval,
   };
 }
 

@@ -99,7 +99,8 @@ For example:
   },
   "todo": {
     "collapsedTaskLimit": 3,
-    "showDependencyNumbers": true
+    "showDependencyNumbers": true,
+    "reminderInterval": 3
   }
 }
 ```
@@ -338,8 +339,11 @@ tasks leave no cancelled status or archived record.
 The extension deliberately registers no todo-specific slash commands or interactive manager.
 A read-only widget above the input shows a configurable number of tasks when
 collapsed and the complete list when expanded with Pi's standard `Ctrl+O`
-binding. Configure the collapsed-item limit and dependency-number visibility
-through `/99settings`. In-progress task labels are bold. Task keys stay
+binding. Configure the collapsed-item limit, dependency-number visibility, and
+compact model-reminder interval through `/99settings`. While unfinished work
+remains, the default reminder adds only the current revision and key/status list
+to every third LLM call without persisting or accumulating in session history.
+In-progress task labels are bold. Task keys stay
 model-only; when dependency numbers are enabled, participating tasks receive
 compact display-only references such as `○ Implement #2 ← #1`, while independent
 tasks remain unnumbered. The tool call itself remains a compact progress
@@ -353,8 +357,10 @@ for the schema.
 ## Development
 
 The repository uses a private root package as a Bun 1.3.14 workspace. Each
-extension directory is independently publishable. Extensions with configurable
-values depend on the small `pi-shared-settings` infrastructure package.
+extension or shared-library source directory has independent package metadata;
+publishable staging packages are generated under the root `dist/` directory.
+Extensions with configurable values depend on the small `pi-shared-settings`
+infrastructure package.
 
 ```bash
 bun install --frozen-lockfile
@@ -367,13 +373,18 @@ bun run pack:check
 paths, accounts, hosts, emails, private IPs, and credential-shaped material in
 committed test and e2e data.
 
-Each extension and the shared runtime helper bundle their local TypeScript
-modules into `dist/index.ts` before npm packing. Keeping the bundled entrypoint
-as TypeScript lets Pi resolve peer imports against its active runtime, which is
-required by extensions that patch TUI classes. Pi core packages and runtime
-dependencies remain external. The `prepack` lifecycle runs the build for package
-validation and publishing. Use `build:extensions` for `extensions/`,
-`build:packages` for `packages/`, and `build:all` for both groups.
+Each extension and shared runtime helper bundles its local TypeScript modules
+into one minified ESM entrypoint plus a linked source map. Builds never create
+package-local `dist/` directories: complete npm staging packages are written to
+`dist/<package-name>/` at the repository root. Extension entries are
+`index.min.js`; shared libraries additionally include generated declarations.
+Pi core peers and all npm runtime dependencies remain external so Pi retains
+control of peer-module identity and native or dynamic dependencies keep their
+normal package loaders. Source package manifests stay private and point to
+`./index.ts` for local development; the build creates a publishable manifest
+that points to `./index.min.js`. Root `dist/` remains Git-ignored and is rebuilt
+from a release tag. Use `build:extensions` for `extensions/`, `build:packages`
+for `packages/`, and `build:all` for both groups.
 
 Load an extension directly from TypeScript while developing:
 
@@ -492,10 +503,11 @@ newer version of them.
 
 To publish a release:
 
-1. Update the selected package's `version` in `package.json` and update its
-   package README when needed.
-2. Run `bun run pack:check` and commit the release changes.
-3. Push the commit, then create and push the matching tag:
+1. Update the selected source package's `version` in `package.json` and update
+   its package README when needed.
+2. Run `bun run pack:check`; this regenerates and validates the root staging
+   package without committing `dist/`.
+3. Commit and push the release changes, then create and push the matching tag:
 
 ```bash
 git tag background-tasks-v1.1.3

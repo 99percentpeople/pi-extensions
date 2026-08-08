@@ -35,8 +35,22 @@ on the local machine.
 - Integrates with `@99percentpeople/pi-workspace-files`,
   `@99percentpeople/pi-codex-api`, and `@99percentpeople/pi-pwsh-adapter`
 
+## Demo
+
+Switch the same Pi conversation into a disposable SSH workspace and run a
+command in its remote cwd. Every visible host, user, and path is fictional:
+
+![SSH Remote workspace demo](../../promo/demo/ssh-remote.gif)
+
+With Background Tasks installed, start `htop` in a remote PTY, attach to its
+live screen, interact with it, and press `Ctrl+]` to detach without stopping the
+task:
+
+![SSH Remote htop demo](../../promo/demo/ssh-remote-htop.gif)
+
 ## Contents
 
+- [Demo](#demo)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Targets and paths](#targets-and-paths)
@@ -224,9 +238,11 @@ reused.
 
 ### Automatic fallback
 
-- **Linux/macOS `auto`:** starts with multiplexed OpenSSH. If the server needs a
-  password and `sshpass` is unavailable, it can fall back to `ssh2`, which can
-  prompt directly.
+- **Linux/macOS `auto`:** starts with multiplexed OpenSSH. Direct-host password
+  authentication retries through `sshpass`. When an effective `ProxyJump`
+  chain needs authentication or OpenSSH masks the failing hop behind a KEX
+  error, it switches to `ssh2` so every endpoint can prompt independently. A
+  direct host can also fall back to `ssh2` when `sshpass` is unavailable.
 - **Windows `auto`:** starts with `ssh2`. A compatibility or connection-setup
   failure before the first channel opens falls back to single-use OpenSSH and
   reports the reason.
@@ -271,10 +287,11 @@ each foreground operation. It runs `ssh -G` locally to resolve:
 - configured `known_hosts` files.
 
 Single- and multi-hop `ProxyJump` are implemented with `direct-tcpip` channels.
-Each hop receives its own authenticated SSH connection, and the next hop uses
-the preceding channel as its socket. Jump servers do not need `ssh`, `nc`, or
-`socat`, but they must allow TCP forwarding to the next endpoint. Destination
-names are resolved from the preceding jump host's network.
+Each hop receives its own authenticated SSH connection, its own password cache
+key and prompt when needed, and the next hop uses the preceding channel as its
+socket. Jump servers do not need `ssh`, `nc`, or `socat`, but they must allow
+TCP forwarding to the next endpoint. Destination names are resolved from the
+preceding jump host's network.
 
 Supported authentication material includes unencrypted private keys and Unix,
 Windows OpenSSH named-pipe, Cygwin, or Pageant agents where supported by
@@ -297,7 +314,9 @@ choose OpenSSH for those configurations.
 
 Bun does not currently implement `chacha20-poly1305` in `node:crypto`
 ([oven-sh/bun#8072](https://github.com/oven-sh/bun/issues/8072)). SSH Remote
-filters that cipher at runtime and negotiates AES-GCM/CTR instead.
+filters it whenever the runtime cannot provide it. It also excludes chacha20
+from `ProxyJump` chains because ssh2's explicit-cipher path can corrupt a nested
+`sock` transport; those chains negotiate AES-GCM/CTR instead.
 
 ## Authentication
 
@@ -320,14 +339,17 @@ When key or agent authentication fails and **Password prompt** is enabled:
 
 | Mode | Password behavior |
 | --- | --- |
-| Linux/macOS `auto` | Retries OpenSSH through `sshpass` when installed; otherwise falls back to `ssh2` |
-| Windows `auto` or explicit `ssh2` | Prompts through the persistent `ssh2` client |
-| Explicit `openssh` | Requires `sshpass` or `sshpass.exe` |
+| Linux/macOS `auto` | Direct hosts retry through `sshpass`; ProxyJump password failures switch to per-endpoint `ssh2` prompts |
+| Windows `auto` or explicit `ssh2` | Prompts separately for the target and every ProxyJump hop through persistent `ssh2` clients |
+| Explicit `openssh` | Requires `sshpass` or `sshpass.exe`; one password-prompting endpoint per connection chain |
 
 Install `sshpass` with, for example, `apt install sshpass` on Debian/Ubuntu or
 `pacman -S sshpass` in Git Bash on Windows. OpenSSH passwords are placed only in
-the `SSHPASS` environment variable, never in command arguments. `ssh2` sends
-them through its authentication protocol.
+the `SSHPASS` environment variable, never in command arguments. `sshpass` can
+answer only one password-prompting endpoint in a ProxyJump chain; a second
+prompt is treated as rejection even when both passwords are identical. Use
+`auto` or explicit `ssh2` when multiple endpoints require passwords. `ssh2`
+sends each password through that endpoint's authentication protocol.
 
 The password prompt currently uses plain-text input because Pi does not yet
 provide a masked input API. A wrong password re-prompts until cancelled or the
@@ -354,9 +376,9 @@ them. Passwords already cached by the current process remain available.
 
 **AI password auth** applies only to the model's `ssh_connect` tool:
 
-- **On:** cached passwords may be used, and a required TUI prompt has a live
-  60-second timeout. The user must enter the password directly in Pi and must
-  never send it in chat.
+- **On:** cached passwords may be used, and each required target or ProxyJump
+  TUI prompt has a live 60-second timeout. The user must enter every password
+  directly in Pi and must never send one in chat.
 - **Off:** `ssh_connect` is key-only. It neither reads cached passwords nor
   opens a prompt; an authentication failure recommends configuring SSH keys or
   re-enabling the setting.

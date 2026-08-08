@@ -1,19 +1,13 @@
 {
   "name": "@99percentpeople/pi-workspace-files",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "private": true,
   "description": "Composable binary workspace file-system protocol for Pi extensions",
   "type": "module",
-  "main": "./dist/index.ts",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
+  "main": "./index.ts",
+  "types": "./index.ts",
   "scripts": {
-    "build": "bun run ../../scripts/build-package.ts && tsc -p tsconfig.build.json",
-    "prepack": "bun run build",
-    "prepublishOnly": "bun run --cwd ../.. check"
+    "build": "bun run ../../scripts/build-package.ts"
   },
   "keywords": [
     "pi",

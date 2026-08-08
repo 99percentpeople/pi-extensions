@@ -3,8 +3,10 @@
   "compilerOptions": {
     "noEmit": false,
     "emitDeclarationOnly": true,
+    "declarationMap": false,
+    "sourceMap": false,
     "rootDir": ".",
-    "outDir": "dist"
+    "outDir": "../../dist/shared-settings"
   },
   "include": ["index.ts", "sectioned-settings-list.ts"]
 }

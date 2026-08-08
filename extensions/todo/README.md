@@ -27,6 +27,7 @@ from `0/3` to `3/3 completed`:
 - Stable task keys and key-based dependencies
 - Atomic validation with optional optimistic revisions
 - Branch- and compaction-aware state that survives `/reload` and `/tree`
+- Configurable compact reminders that keep the plan salient to the model
 - Read-only collapsible list above the input box
 
 ## Install
@@ -156,6 +157,21 @@ State schema v2 removes internal numeric IDs, archived records, and the
 cancelled legacy tasks are discarded, and one hidden v2 checkpoint updates the
 model on the next prompt.
 
+## Model reminders
+
+While unfinished work remains, the extension periodically appends a compact,
+hidden reminder immediately before an LLM call. The reminder contains only the
+current revision and complete key/status list—not task subjects, descriptions,
+or dependency payloads—and asks the model to reconcile changed progress before
+its final response. It is context-only and is not written to the session, so
+reminders do not accumulate in conversation history.
+
+The default interval is every three LLM calls. The counter resets after a
+successful `todo` write, session or branch restoration, an injected exact
+checkpoint, or a reminder-setting change. No reminder is sent for an empty or
+fully completed plan. Use `/99settings` to select Off, every call, or an interval
+of 2, 3, 5, 8, 10, or 20 calls.
+
 ## Rendering
 
 The task list is rendered in a read-only widget above Pi's input box. It follows
@@ -211,10 +227,12 @@ keys, dependencies, and revision numbers without triggering an extra model turn.
 ## Shared settings
 
 Use the shared `/99settings` menu to choose how many Todo items are shown while
-the widget and streaming tool call are collapsed, and whether display-only
-dependency numbers are shown. Collapsed-item presets are 1, 2, 3, 5, 8, and 10;
-the default remains 3. Dependency numbers default to shown. Values are stored
-under the `todo` namespace in `~/.pi/agent/99extensions.json`.
+the widget and streaming tool call are collapsed, whether display-only
+dependency numbers are shown, and how often compact model reminders are
+injected. Collapsed-item presets are 1, 2, 3, 5, 8, and 10; the default remains
+3. Dependency numbers default to shown. Model reminders default to every three
+LLM calls and can be disabled. Values are stored under the `todo` namespace in
+`~/.pi/agent/99extensions.json`.
 
 ## License
 

@@ -10,6 +10,7 @@ import todoExtension, {
   normalizeTodoConfig,
   saveTodoConfig,
   TODO_COLLAPSED_TASK_LIMIT_PRESETS,
+  TODO_REMINDER_INTERVAL_PRESETS,
   type TodoConfig,
 } from "../extensions/todo/index.ts";
 import {
@@ -341,23 +342,40 @@ test("todo detects when compaction requires a fresh model-facing checkpoint", ()
   assert.equal(needsTodoContextCheckpoint([result, compact, checkpoint]), false);
 });
 
-test("todo settings normalize and persist display preferences", async () => {
+test("todo settings normalize and persist display and reminder preferences", async () => {
   assert.deepEqual(TODO_COLLAPSED_TASK_LIMIT_PRESETS, [1, 2, 3, 5, 8, 10]);
+  assert.deepEqual(TODO_REMINDER_INTERVAL_PRESETS, [0, 1, 2, 3, 5, 8, 10, 20]);
   assert.deepEqual(normalizeTodoConfig(undefined), DEFAULT_TODO_CONFIG);
   assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 1 }), {
     collapsedTaskLimit: 1,
     showDependencyNumbers: true,
+    reminderInterval: 3,
   });
   assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 4 }), {
     collapsedTaskLimit: 4,
     showDependencyNumbers: true,
+    reminderInterval: 3,
   });
   assert.deepEqual(normalizeTodoConfig({ showDependencyNumbers: false }), {
     collapsedTaskLimit: 3,
     showDependencyNumbers: false,
+    reminderInterval: 3,
+  });
+  assert.deepEqual(normalizeTodoConfig({ reminderInterval: 0 }), {
+    collapsedTaskLimit: 3,
+    showDependencyNumbers: true,
+    reminderInterval: 0,
+  });
+  assert.deepEqual(normalizeTodoConfig({ reminderInterval: 20 }), {
+    collapsedTaskLimit: 3,
+    showDependencyNumbers: true,
+    reminderInterval: 20,
   });
   assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 0 }), DEFAULT_TODO_CONFIG);
   assert.deepEqual(normalizeTodoConfig({ collapsedTaskLimit: 11 }), DEFAULT_TODO_CONFIG);
+  assert.deepEqual(normalizeTodoConfig({ reminderInterval: -1 }), DEFAULT_TODO_CONFIG);
+  assert.deepEqual(normalizeTodoConfig({ reminderInterval: 21 }), DEFAULT_TODO_CONFIG);
+  assert.deepEqual(normalizeTodoConfig({ reminderInterval: 2.5 }), DEFAULT_TODO_CONFIG);
 
   const directory = await mkdtemp(join(tmpdir(), "pi-todo-settings-"));
   const path = join(directory, "99extensions.json");
@@ -366,16 +384,19 @@ test("todo settings normalize and persist display preferences", async () => {
     saveTodoConfig({
       collapsedTaskLimit: 5,
       showDependencyNumbers: false,
+      reminderInterval: 8,
     }, path);
     assert.deepEqual(loadTodoConfig(path), {
       collapsedTaskLimit: 5,
       showDependencyNumbers: false,
+      reminderInterval: 8,
     });
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
       unknown: { keep: true },
       todo: {
         collapsedTaskLimit: 5,
         showDependencyNumbers: false,
+        reminderInterval: 8,
       },
     });
   } finally {
@@ -477,6 +498,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.doesNotMatch(JSON.stringify(tool.parameters), /cancelled/);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /define it yourself.*before beginning implementation or other substantive work/i);
   assert.match(tool.promptGuidelines?.join("\n") ?? "", /omitted keys are deleted/i);
+  assert.match(tool.promptGuidelines?.join("\n") ?? "", /reconcile actual progress before the final response/i);
   assert.deepEqual(
     [...commands.keys()],
     ["99settings"],
@@ -484,6 +506,7 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   );
   assert.deepEqual([...handlers.keys()].sort(), [
     "before_agent_start",
+    "context",
     "session_compact",
     "session_shutdown",
     "session_start",
@@ -791,10 +814,145 @@ test("todo extension renders a collapsible read-only list above the editor", asy
   assert.doesNotMatch(lastActiveCollapsed, /Design the database schema|Initialize the project scaffold/);
 });
 
+test("todo injects one compact reminder at the configured LLM-call interval", async () => {
+  const harness = createHarness([], {
+    ...DEFAULT_TODO_CONFIG,
+    reminderInterval: 3,
+  });
+  const tool = harness.tools.get("todo");
+  const context = harness.handlers.get("context");
+  assert.ok(tool);
+  assert.ok(context);
+
+  await harness.handlers.get("session_start")?.({}, harness.ctx);
+  await tool.execute(
+    "todo-reminder-plan",
+    { tasks: initialPlan, baseRevision: 0 },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+
+  const baseMessages = [{ role: "user", content: "Continue", timestamp: 1 }];
+  assert.equal(await context({ type: "context", messages: baseMessages }, harness.ctx), undefined);
+  assert.equal(await context({ type: "context", messages: baseMessages }, harness.ctx), undefined);
+  const third = await context(
+    { type: "context", messages: baseMessages },
+    harness.ctx,
+  ) as { messages: Array<Record<string, unknown>> };
+  assert.ok(third);
+  assert.equal(third.messages.length, 2);
+  const reminder = third.messages.at(-1);
+  assert.equal(reminder?.role, "custom");
+  assert.equal(reminder?.customType, "pi-todo-reminder");
+  assert.equal(reminder?.display, false);
+  const reminderText = String(reminder?.content);
+  assert.match(reminderText, /Todo reminder \(revision 1/);
+  assert.match(reminderText, /inspect=in_progress/);
+  assert.match(reminderText, /design=pending/);
+  assert.match(reminderText, /verify=pending/);
+  assert.match(reminderText, /baseRevision 1/);
+  assert.doesNotMatch(
+    reminderText,
+    /Inspect the existing extension|Review the current architecture|dependsOn/,
+    "periodic reminders should omit subjects, descriptions, and dependency payloads",
+  );
+
+  const filtered = await context(
+    { type: "context", messages: third.messages },
+    harness.ctx,
+  ) as { messages: Array<Record<string, unknown>> };
+  assert.deepEqual(filtered.messages, baseMessages, "a previous transient reminder must not accumulate");
+  assert.equal(await context({ type: "context", messages: baseMessages }, harness.ctx), undefined);
+  const sixth = await context(
+    { type: "context", messages: baseMessages },
+    harness.ctx,
+  ) as { messages: Array<Record<string, unknown>> };
+  assert.equal(sixth.messages.filter((message) => message.customType === "pi-todo-reminder").length, 1);
+
+  await tool.execute(
+    "todo-reminder-reset",
+    {
+      tasks: [
+        { key: "inspect", status: "completed" },
+        { key: "design", status: "in_progress" },
+        { key: "verify" },
+      ],
+      baseRevision: 1,
+    },
+    undefined,
+    undefined,
+    harness.ctx,
+  );
+  assert.equal(await context({ type: "context", messages: baseMessages }, harness.ctx), undefined);
+  assert.equal(await context({ type: "context", messages: baseMessages }, harness.ctx), undefined);
+  const afterUpdate = await context(
+    { type: "context", messages: baseMessages },
+    harness.ctx,
+  ) as { messages: Array<Record<string, unknown>> };
+  const afterUpdateText = String(afterUpdate.messages.at(-1)?.content);
+  assert.match(afterUpdateText, /revision 2/);
+  assert.match(afterUpdateText, /inspect=completed/);
+  assert.match(afterUpdateText, /design=in_progress/);
+});
+
+test("todo reminder interval supports every call and Off", async () => {
+  const offHarness = createHarness([], {
+    ...DEFAULT_TODO_CONFIG,
+    reminderInterval: 0,
+  });
+  const offTool = offHarness.tools.get("todo");
+  const offContext = offHarness.handlers.get("context");
+  assert.ok(offTool);
+  assert.ok(offContext);
+  await offHarness.handlers.get("session_start")?.({}, offHarness.ctx);
+  await offTool.execute(
+    "todo-reminder-off",
+    { tasks: initialPlan, baseRevision: 0 },
+    undefined,
+    undefined,
+    offHarness.ctx,
+  );
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(
+      await offContext({ type: "context", messages: [] }, offHarness.ctx),
+      undefined,
+    );
+  }
+
+  const everyHarness = createHarness([], {
+    ...DEFAULT_TODO_CONFIG,
+    reminderInterval: 1,
+  });
+  const everyTool = everyHarness.tools.get("todo");
+  const everyContext = everyHarness.handlers.get("context");
+  assert.ok(everyTool);
+  assert.ok(everyContext);
+  await everyHarness.handlers.get("session_start")?.({}, everyHarness.ctx);
+  await everyTool.execute(
+    "todo-reminder-every-call",
+    { tasks: initialPlan, baseRevision: 0 },
+    undefined,
+    undefined,
+    everyHarness.ctx,
+  );
+  const first = await everyContext(
+    { type: "context", messages: [] },
+    everyHarness.ctx,
+  ) as { messages: Array<Record<string, unknown>> };
+  assert.equal(first.messages.at(-1)?.customType, "pi-todo-reminder");
+  const second = await everyContext(
+    { type: "context", messages: first.messages },
+    everyHarness.ctx,
+  ) as { messages: Array<Record<string, unknown>> };
+  assert.equal(second.messages.filter((message) => message.customType === "pi-todo-reminder").length, 1);
+});
+
 test("todo collapsed item setting controls widget and tool-call previews", async () => {
   const harness = createHarness([], {
     collapsedTaskLimit: 1,
     showDependencyNumbers: true,
+    reminderInterval: 3,
   });
   const tool = harness.tools.get("todo");
   assert.ok(tool);
@@ -860,6 +1018,7 @@ test("todo bolds the active label and can hide dependency numbers", async () => 
   const harness = createHarness([], {
     collapsedTaskLimit: 3,
     showDependencyNumbers: false,
+    reminderInterval: 3,
   });
   const tool = harness.tools.get("todo");
   assert.ok(tool);

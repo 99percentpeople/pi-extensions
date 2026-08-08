@@ -32,6 +32,7 @@ import {
 } from "./state.ts";
 
 const WIDGET_KEY = "pi-todo-widget";
+const TODO_REMINDER_CONTEXT_TYPE = "pi-todo-reminder";
 
 export interface TodoExtensionDependencies {
   loadConfig?: () => TodoConfig;
@@ -109,6 +110,16 @@ function formatChange(details: TodoState): string {
     return `[${task.status}] ${task.key}: ${task.subject}${description}${deps}`;
   });
   return `Todo plan revision ${details.revision}:\n${lines.join("\n")}`;
+}
+
+function formatTodoReminder(details: TodoState): string {
+  const statuses = getTodoTasks(details)
+    .map((task) => `${task.key}=${task.status}`)
+    .join(", ");
+  return `Todo reminder (revision ${details.revision}; current keys/statuses): ${statuses}.\n`
+    + "Before the final response, compare actual progress with this plan. "
+    + `If task status, order, scope, or dependencies changed, call todo with baseRevision ${details.revision} and include every key to retain. `
+    + "Do not call todo only to acknowledge this reminder.";
 }
 
 function renderTaskLine(
@@ -305,6 +316,7 @@ export default function todoExtension(
   let widgetRegistered = false;
   let widgetTui: TUI | undefined;
   let contextCheckpointNeeded = false;
+  let llmCallsSinceReminder = 0;
 
   const clearWidget = (): void => {
     if (widgetRegistered && uiContext?.hasUI) {
@@ -355,7 +367,11 @@ export default function todoExtension(
   registerTodoSettings(pi, {
     getConfig: () => config,
     updateConfig: (next, ctx) => {
+      const previousReminderInterval = config.reminderInterval;
       config = normalizeTodoConfig(next);
+      if (config.reminderInterval !== previousReminderInterval) {
+        llmCallsSinceReminder = 0;
+      }
       try {
         persistConfig(config);
       } catch (error) {
@@ -379,6 +395,7 @@ export default function todoExtension(
       "Keep keys stable. Existing tasks may omit unchanged fields; new tasks require subject and status. Include baseRevision when available.",
       "Use dependsOn only for real prerequisites; dependencies must be completed before a task starts or completes.",
       "Mark work completed only after implementation and verification succeed. Completed tasks are removed next turn unless they still block unfinished work.",
+      "While a todo plan exists, update todo immediately when task status, order, scope, or dependencies change, and reconcile actual progress before the final response. Do not issue a no-op todo call only to acknowledge a reminder.",
     ],
     parameters: TodoParamsSchema,
     executionMode: "sequential",
@@ -390,6 +407,7 @@ export default function todoExtension(
           : new Error("Todo update cancelled");
       const details = writeTodoSnapshot(state, params);
       state = cloneTodoState(details);
+      llmCallsSinceReminder = 0;
       updateWidget(ctx);
       return {
         content: [{ type: "text", text: formatChange(details) }],
@@ -459,17 +477,46 @@ export default function todoExtension(
     const branch = [...ctx.sessionManager.getBranch()];
     state = replayTodoState({ sessionManager: { getBranch: () => branch } });
     contextCheckpointNeeded = needsTodoContextCheckpoint(branch);
+    llmCallsSinceReminder = 0;
     uiContext = ctx;
     updateWidget(ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => restore(ctx));
   pi.on("session_tree", async (_event, ctx) => restore(ctx));
+  pi.on("context", (event) => {
+    const messages = event.messages.filter((message) =>
+      !(message.role === "custom" && message.customType === TODO_REMINDER_CONTEXT_TYPE)
+    );
+    const tasks = getTodoTasks(state);
+    const hasUnfinishedTasks = tasks.some((task) => task.status !== "completed");
+    if (config.reminderInterval === 0 || !hasUnfinishedTasks) {
+      llmCallsSinceReminder = 0;
+      return messages.length === event.messages.length ? undefined : { messages };
+    }
+
+    llmCallsSinceReminder += 1;
+    if (llmCallsSinceReminder < config.reminderInterval) {
+      return messages.length === event.messages.length ? undefined : { messages };
+    }
+
+    llmCallsSinceReminder = 0;
+    return {
+      messages: [...messages, {
+        role: "custom",
+        customType: TODO_REMINDER_CONTEXT_TYPE,
+        content: formatTodoReminder(state),
+        display: false,
+        timestamp: Date.now(),
+      }],
+    };
+  });
   pi.on("session_compact", async (event, ctx) => {
     const checkpoint = cloneTodoState(state);
     pi.appendEntry(TODO_STATE_CUSTOM_TYPE, checkpoint);
     if (event.willRetry || ctx.hasPendingMessages()) {
       contextCheckpointNeeded = false;
+      llmCallsSinceReminder = 0;
       pi.sendMessage(
         {
           customType: TODO_STATE_CUSTOM_TYPE,
@@ -487,6 +534,7 @@ export default function todoExtension(
     clearWidget();
     uiContext = undefined;
     contextCheckpointNeeded = false;
+    llmCallsSinceReminder = 0;
   });
 
   pi.on("before_agent_start", async () => {
@@ -498,6 +546,7 @@ export default function todoExtension(
     if (!details && !contextCheckpointNeeded) return;
 
     contextCheckpointNeeded = false;
+    llmCallsSinceReminder = 0;
     const checkpoint = details ?? cloneTodoState(state);
     return {
       message: {
@@ -519,6 +568,9 @@ export {
   TODO_COLLAPSED_TASK_LIMIT_MAX,
   TODO_COLLAPSED_TASK_LIMIT_MIN,
   TODO_COLLAPSED_TASK_LIMIT_PRESETS,
+  TODO_REMINDER_INTERVAL_MAX,
+  TODO_REMINDER_INTERVAL_MIN,
+  TODO_REMINDER_INTERVAL_PRESETS,
   TODO_SETTINGS_NAMESPACE,
   type TodoConfig,
 } from "./config.ts";

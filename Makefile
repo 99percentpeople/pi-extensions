@@ -40,10 +40,8 @@ check:
 # Clean build artifacts
 clean:
 	rm -rf node_modules
-	rm -rf dist
+	bun run clean:dist
 	rm -rf build
-	rm -rf extensions/*/dist
-	rm -rf packages/*/dist
 	rm -f *.tsbuildinfo
 
 # Validate independently published packages

@@ -728,6 +728,7 @@ test("ssh2 resolves multi-hop ProxyJump endpoints with per-hop OpenSSH settings"
               "identityagent SSH_AUTH_SOCK",
               "pubkeyauthentication true",
               "identitiesonly no",
+              "ciphers chacha20-poly1305@openssh.com,aes256-ctr",
             ];
             if (target === "private-host") {
               return {
@@ -787,6 +788,12 @@ test("ssh2 resolves multi-hop ProxyJump endpoints with per-hop OpenSSH settings"
     assert.equal(resolved.proxyJumps?.[0].hostLabel, "jumpuser@jump.internal:2200");
     assert.equal(resolved.proxyJumps?.[1].hostLabel, "relay@jump2.internal:22");
     assert.equal(resolved.proxyJumps?.[0].config.port, 2200);
+    for (const endpoint of [resolved, ...(resolved.proxyJumps ?? [])]) {
+      const ciphers = endpoint.config.algorithms?.cipher;
+      assert.ok(Array.isArray(ciphers));
+      assert.equal(ciphers.includes("chacha20-poly1305@openssh.com"), false);
+      assert.ok(ciphers.includes("aes256-ctr"));
+    }
     assert.ok(configCalls[1].includes("ProxyJump=none"));
     assert.deepEqual(configCalls[1].slice(-5), ["-l", "jumpuser", "-p", "2200", "jump"]);
     assert.ok(configCalls[2].includes("ProxyJump=none"));
@@ -1397,6 +1404,207 @@ test("Ssh2Client builds and disposes a recursive ProxyJump connection chain", as
   assert.equal(created, 6);
   await client.dispose();
   assert.deepEqual(rawClients.map((raw) => raw.closed), [true, true, true, true, true, true]);
+});
+
+test("Ssh2Client prompts for each password endpoint in a ProxyJump chain", async () => {
+  const required = new Map([
+    ["jump1.internal", "jump-one-pw"],
+    ["jump2.internal", "jump-two-pw"],
+    ["target.internal", "target-pw"],
+  ]);
+  const cached = new Map<string, string>();
+  const prompts: string[] = [];
+  const rawClients: FakeRawSsh2Client[] = [];
+
+  class EndpointPasswordClient extends FakeRawSsh2Client {
+    connect(config: Record<string, unknown> = {}): void {
+      this.connectCalls++;
+      this.connectConfigs.push(config);
+      const host = String(config.host);
+      if (config.password !== required.get(host)) {
+        const error = new Error("All configured authentication methods failed");
+        (error as { level?: string }).level = "client-authentication";
+        queueMicrotask(() => this.emit("error", error));
+        return;
+      }
+      queueMicrotask(() => this.emit("ready"));
+    }
+  }
+
+  const endpoint = (host: string, username: string) => {
+    const hostLabel = `${username}@${host}:22`;
+    return {
+      config: { host, port: 22, username, password: cached.get(hostLabel), readyTimeout: 100 },
+      hostLabel,
+      warnings: [],
+      verification: {},
+    };
+  };
+  const client = new Ssh2Client(
+    { target: "private-host" },
+    {
+      createClient: () => {
+        const raw = new EndpointPasswordClient();
+        rawClients.push(raw);
+        return raw as any;
+      },
+      resolveConnection: async () => ({
+        ...endpoint("target.internal", "deploy"),
+        proxyJumps: [
+          endpoint("jump1.internal", "relay1"),
+          endpoint("jump2.internal", "relay2"),
+        ],
+      }),
+      promptPassword: async (failedEndpoint) => {
+        prompts.push(failedEndpoint.hostLabel);
+        const password = required.get(failedEndpoint.host);
+        assert.ok(password);
+        cached.set(failedEndpoint.hostLabel, password);
+        return password;
+      },
+    },
+  );
+
+  assert.equal((await client.run("printf ok")).exitCode, 0);
+  assert.deepEqual(prompts, [
+    "relay1@jump1.internal:22",
+    "relay2@jump2.internal:22",
+    "deploy@target.internal:22",
+  ]);
+  assert.equal(rawClients.length, 9, "the chain is rebuilt after each newly supplied password");
+  await client.dispose();
+});
+
+test("Ssh2Client bounds a ProxyJump endpoint that never finishes setup", async () => {
+  class StalledClient extends FakeRawSsh2Client {
+    connect(config: Record<string, unknown> = {}): void {
+      this.connectCalls++;
+      this.connectConfigs.push(config);
+    }
+  }
+  const client = new Ssh2Client(
+    { target: "private-host" },
+    {
+      createClient: () => new StalledClient() as any,
+      resolveConnection: async () => ({
+        config: { host: "private.internal", username: "deploy", readyTimeout: 10 },
+        hostLabel: "deploy@private.internal:22",
+        warnings: [],
+        verification: {},
+      }),
+    },
+  );
+  await assert.rejects(client.run("true"), /authentication setup timed out after 10ms/);
+  await client.dispose();
+});
+
+test("Unix auto routes masked ProxyJump authentication failures to ssh2 before sshpass", async () => {
+  let proxyDetections = 0;
+  let sshpassDetections = 0;
+  let ssh2Runs = 0;
+  const client = createSshTransportClient(
+    { target: "private-host" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: (options) => ({
+        options,
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("kex_exchange_identification: Connection closed by remote host"),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error(
+            "SSH command failed (255): kex_exchange_identification: Connection closed by remote host",
+          );
+        },
+        dispose: () => {},
+      }),
+      createSsh2: (options) => ({
+        options,
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        dispose: () => {},
+      }),
+      passwordProvider: { cached: () => undefined, retry: async () => "pw" },
+      detectProxyJump: async () => {
+        proxyDetections++;
+        return true;
+      },
+      detectSshpass: async () => {
+        sshpassDetections++;
+        return true;
+      },
+    },
+  );
+
+  assert.equal((await client.runChecked("whoami")).stdout.toString(), "ok");
+  assert.equal(client.transport, "ssh2");
+  assert.equal(ssh2Runs, 1);
+  assert.equal(proxyDetections, 1);
+  assert.equal(sshpassDetections, 0);
+  assert.match(client.fallbackReason ?? "", /ProxyJump setup requires per-hop handling/);
+  await client.dispose();
+});
+
+test("Unix auto keeps masked ProxyJump failures key-only when password prompting is disabled", async () => {
+  let ssh2Runs = 0;
+  let proxyDetections = 0;
+  const client = createSshTransportClient(
+    { target: "private-host" },
+    {
+      platform: "linux",
+      preference: "auto",
+      createOpenSsh: (options) => ({
+        options,
+        transport: "openssh",
+        reusesConnection: true,
+        run: async () => ({
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from("kex_exchange_identification: Connection closed by remote host"),
+          exitCode: 255,
+        }),
+        runChecked: async () => {
+          throw new Error("should use run");
+        },
+        dispose: () => {},
+      }),
+      createSsh2: (options) => ({
+        options,
+        transport: "ssh2",
+        reusesConnection: true,
+        run: async () => {
+          ssh2Runs++;
+          return { stdout: Buffer.from("unexpected"), stderr: Buffer.alloc(0), exitCode: 0 };
+        },
+        runChecked: async () => {
+          throw new Error("should not run");
+        },
+        dispose: () => {},
+      }),
+      detectProxyJump: async () => {
+        proxyDetections++;
+        return true;
+      },
+    },
+  );
+
+  await assert.rejects(client.runChecked("whoami"), /kex_exchange_identification/);
+  assert.equal(client.transport, "openssh");
+  assert.equal(ssh2Runs, 0);
+  assert.equal(proxyDetections, 0);
+  await client.dispose();
 });
 
 test("explicit openssh wraps sshpass retry on Windows too", async () => {

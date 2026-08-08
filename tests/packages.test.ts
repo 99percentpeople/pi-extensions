@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import { test } from "node:test";
 import type {
   BashOperations,
@@ -15,13 +15,32 @@ async function readPackage(path: string): Promise<Record<string, any>> {
   return JSON.parse(await readFile(new URL(path, import.meta.url), "utf8"));
 }
 
-function assertBuiltExtensionPackage(packageJson: Record<string, any>): void {
-  assert.deepEqual(packageJson.pi?.extensions, ["./dist/index.ts"]);
-  assert.equal(
-    packageJson.scripts?.build,
-    "bun run ../../scripts/build-package.ts",
-  );
-  assert.equal(packageJson.scripts?.prepack, "bun run build");
+function assertSourceExtensionPackage(packageJson: Record<string, any>): void {
+  assert.equal(packageJson.private, true);
+  assert.equal(packageJson.files, undefined);
+  assert.deepEqual(packageJson.pi?.extensions, ["./index.ts"]);
+  assert.deepEqual(packageJson.scripts, {
+    build: "bun run ../../scripts/build-package.ts",
+  });
+}
+
+async function listRelativeFiles(
+  directory: URL,
+  prefix = "",
+): Promise<string[]> {
+  const files: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const relativePath = `${prefix}${entry.name}`;
+    if (entry.isDirectory()) {
+      files.push(...await listRelativeFiles(
+        new URL(`${entry.name}/`, directory),
+        `${relativePath}/`,
+      ));
+    } else if (entry.isFile()) {
+      files.push(relativePath);
+    }
+  }
+  return files.sort();
 }
 
 test("extensions are independently publishable workspace packages", async () => {
@@ -68,35 +87,31 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(root.scripts?.build, "bun run build:all");
   assert.equal(
     root.scripts?.["build:all"],
-    "bun run build:packages && bun run build:extensions",
+    "bun run clean:dist && bun run build:packages && bun run build:extensions",
   );
+  assert.equal(root.scripts?.["clean:dist"], "bun run scripts/clean-build.ts");
+  assert.match(root.scripts?.test, /^bun run build:all && /);
   assert.equal(
     root.scripts?.["build:packages"],
     "bun run --cwd packages/shared-settings build && bun run --cwd packages/workspace-files build",
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "2.0.0");
-  assertBuiltExtensionPackage(background);
-  assert.deepEqual(background.files, ["dist", "README.md", "LICENSE"]);
-  assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
+  assert.equal(background.version, "2.0.1");
+  assertSourceExtensionPackage(background);
+  assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
   assert.equal(background.dependencies?.["node-pty"], "1.2.0-beta.14");
   assert.equal(background.dependencies?.["@xterm/headless"], "6.0.0");
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
-  assert.equal(codexApi.version, "0.2.7");
-  assertBuiltExtensionPackage(codexApi);
+  assert.equal(codexApi.version, "0.2.8");
+  assertSourceExtensionPackage(codexApi);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
-  assert.deepEqual(codexApi.files, [
-    "dist",
-    "skills",
-    "README.md",
-    "LICENSE",
-  ]);
+  assert.deepEqual(codexApi.piBuild?.assets, ["skills"]);
   assert.equal(codexApi.publishConfig?.access, "public");
-  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
-  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-workspace-files"], "0.1.0");
+  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
+  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-workspace-files"], "0.1.1");
   assert.equal(codexApi.peerDependencies?.["@earendil-works/pi-tui"], "*");
   assert.match(codexApiSkill, /^---\nname: gpt-image-prompts\n/m);
   assert.match(codexApiSkill, /Craft and refine production-ready prompts for GPT Image 2/);
@@ -104,16 +119,14 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.doesNotMatch(codexApiSkill, /codex_search|codex_image|output_path|referenced_image_paths/);
 
   assert.equal(cursorEffect.name, "@99percentpeople/pi-cursor-effect");
-  assert.equal(cursorEffect.version, "0.1.4");
-  assertBuiltExtensionPackage(cursorEffect);
-  assert.deepEqual(cursorEffect.files, ["dist", "README.md", "LICENSE"]);
+  assert.equal(cursorEffect.version, "0.1.5");
+  assertSourceExtensionPackage(cursorEffect);
   assert.equal(cursorEffect.publishConfig?.access, "public");
-  assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
+  assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.1.0");
-  assertBuiltExtensionPackage(pwsh);
-  assert.deepEqual(pwsh.files, ["dist", "README.md", "LICENSE"]);
+  assert.equal(pwsh.version, "1.1.1");
+  assertSourceExtensionPackage(pwsh);
   assert.deepEqual(pwsh.os, ["win32"]);
   assert.equal(
     pwsh.dependencies?.["@99percentpeople/pi-background-tasks"],
@@ -123,53 +136,137 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
-  assert.equal(sshRemote.version, "0.5.2");
-  assertBuiltExtensionPackage(sshRemote);
-  assert.deepEqual(sshRemote.files, ["dist", "README.md", "LICENSE"]);
-  assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
-  assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-workspace-files"], "0.1.0");
+  assert.equal(sshRemote.version, "0.5.3");
+  assertSourceExtensionPackage(sshRemote);
+  assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
+  assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-workspace-files"], "0.1.1");
   assert.equal(sshRemote.publishConfig?.access, "public");
 
   assert.equal(thinkingFold.name, "@99percentpeople/pi-thinking-fold");
-  assert.equal(thinkingFold.version, "0.1.7");
-  assertBuiltExtensionPackage(thinkingFold);
-  assert.deepEqual(thinkingFold.files, ["dist", "README.md", "LICENSE"]);
+  assert.equal(thinkingFold.version, "0.1.8");
+  assertSourceExtensionPackage(thinkingFold);
   assert.deepEqual(thinkingFold.piBuild?.assets, ["model-behaviors.json"]);
   assert.equal(thinkingFold.publishConfig?.access, "public");
-  assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
+  assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.2.5");
-  assertBuiltExtensionPackage(todo);
-  assert.deepEqual(todo.files, ["dist", "README.md", "LICENSE"]);
+  assert.equal(todo.version, "1.2.6");
+  assertSourceExtensionPackage(todo);
   assert.equal(todo.publishConfig?.access, "public");
-  assert.equal(todo.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.2");
+  assert.equal(todo.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
 
   assert.equal(sharedSettings.name, "@99percentpeople/pi-shared-settings");
-  assert.equal(sharedSettings.version, "0.1.2");
+  assert.equal(sharedSettings.version, "0.1.3");
+  assert.equal(sharedSettings.private, true);
   assert.equal(sharedSettings.pi, undefined);
-  assert.equal(sharedSettings.main, "./dist/index.ts");
-  assert.equal(sharedSettings.types, "./dist/index.d.ts");
-  assert.deepEqual(sharedSettings.files, ["dist", "README.md", "LICENSE"]);
-  assert.equal(
-    sharedSettings.scripts?.build,
-    "bun run ../../scripts/build-package.ts && tsc -p tsconfig.build.json",
-  );
-  assert.equal(sharedSettings.scripts?.prepack, "bun run build");
+  assert.equal(sharedSettings.main, "./index.ts");
+  assert.equal(sharedSettings.types, "./index.ts");
+  assert.equal(sharedSettings.files, undefined);
+  assert.deepEqual(sharedSettings.scripts, {
+    build: "bun run ../../scripts/build-package.ts",
+  });
   assert.equal(sharedSettings.publishConfig?.access, "public");
 
   assert.equal(workspaceFiles.name, "@99percentpeople/pi-workspace-files");
-  assert.equal(workspaceFiles.version, "0.1.0");
+  assert.equal(workspaceFiles.version, "0.1.1");
+  assert.equal(workspaceFiles.private, true);
   assert.equal(workspaceFiles.pi, undefined);
-  assert.equal(workspaceFiles.main, "./dist/index.ts");
-  assert.equal(workspaceFiles.types, "./dist/index.d.ts");
-  assert.deepEqual(workspaceFiles.files, ["dist", "README.md", "LICENSE"]);
-  assert.equal(
-    workspaceFiles.scripts?.build,
-    "bun run ../../scripts/build-package.ts && tsc -p tsconfig.build.json",
-  );
-  assert.equal(workspaceFiles.scripts?.prepack, "bun run build");
+  assert.equal(workspaceFiles.main, "./index.ts");
+  assert.equal(workspaceFiles.types, "./index.ts");
+  assert.equal(workspaceFiles.files, undefined);
+  assert.deepEqual(workspaceFiles.scripts, {
+    build: "bun run ../../scripts/build-package.ts",
+  });
   assert.equal(workspaceFiles.publishConfig?.access, "public");
+});
+
+test("root dist contains complete minified publish staging packages", async () => {
+  const packages = [
+    { slug: "background-tasks", source: "extensions/background-tasks", extension: true },
+    { slug: "codex-api", source: "extensions/codex-api", extension: true },
+    { slug: "cursor-effect", source: "extensions/cursor-effect", extension: true },
+    { slug: "pwsh-adapter", source: "extensions/pwsh-adapter", extension: true },
+    { slug: "ssh-remote", source: "extensions/ssh-remote", extension: true },
+    { slug: "thinking-fold", source: "extensions/thinking-fold", extension: true },
+    { slug: "todo", source: "extensions/todo", extension: true },
+    { slug: "shared-settings", source: "packages/shared-settings", extension: false },
+    { slug: "workspace-files", source: "packages/workspace-files", extension: false },
+  ] as const;
+  const buildScript = await readFile(
+    new URL("../scripts/build-package.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(buildScript, /packages: "external"/);
+  assert.match(buildScript, /naming: "\[name\]\.min\.\[ext\]"/);
+  assert.match(buildScript, /sourcemap: "linked"/);
+  assert.match(buildScript, /minify: true/);
+
+  for (const packageInfo of packages) {
+    const source = await readPackage(`../${packageInfo.source}/package.json`);
+    const stageDirectory = new URL(`../dist/${packageInfo.slug}/`, import.meta.url);
+    const stage = await readPackage(`../dist/${packageInfo.slug}/package.json`);
+    const actualFiles = await listRelativeFiles(stageDirectory);
+    const publishedFiles = actualFiles.filter((file) => file !== "package.json");
+    const jsFiles = actualFiles.filter((file) => file.endsWith(".js"));
+    const sourceMaps = actualFiles.filter((file) => file.endsWith(".js.map"));
+    const runtime = await readFile(new URL("index.min.js", stageDirectory), "utf8");
+    const sourceMap = JSON.parse(
+      await readFile(new URL("index.min.js.map", stageDirectory), "utf8"),
+    ) as { sources?: string[]; sourcesContent?: Array<string | null> };
+
+    assert.equal(stage.name, source.name);
+    assert.equal(stage.version, source.version);
+    assert.equal(stage.private, undefined);
+    assert.equal(stage.scripts, undefined);
+    assert.equal(stage.piBuild, undefined);
+    assert.deepEqual(stage.files, publishedFiles);
+    assert.deepEqual(jsFiles, ["index.min.js"]);
+    assert.deepEqual(sourceMaps, ["index.min.js.map"]);
+    assert.ok(actualFiles.includes("README.md"));
+    assert.ok(actualFiles.includes("LICENSE"));
+    assert.match(runtime, /\/\/# sourceMappingURL=index\.min\.js\.map/);
+    assert.doesNotMatch(runtime, /(?:from|import\()["'][^"']+\.ts["']/);
+    assert.ok((sourceMap.sources?.length ?? 0) > 0);
+    assert.equal(sourceMap.sourcesContent?.length, sourceMap.sources?.length);
+    for (const sourcePath of sourceMap.sources ?? []) {
+      assert.ok(!sourcePath.startsWith("/"), `absolute source-map path: ${sourcePath}`);
+      assert.doesNotMatch(sourcePath, /^[A-Za-z]:[\\/]/);
+    }
+    await assert.rejects(
+      access(new URL(`../${packageInfo.source}/dist/`, import.meta.url)),
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+    );
+
+    if (packageInfo.extension) {
+      assert.deepEqual(stage.pi?.extensions, ["./index.min.js"]);
+      assert.equal(stage.main, undefined);
+      assert.equal(stage.types, undefined);
+      assert.match(runtime, /@earendil-works\//);
+      assert.equal(actualFiles.some((file) => file.endsWith(".d.ts")), false);
+      const extensionModule = await import(
+        `${new URL("index.min.js", stageDirectory).href}?package-test=${packageInfo.slug}`
+      );
+      assert.equal(typeof extensionModule.default, "function");
+    } else {
+      assert.equal(stage.pi, undefined);
+      assert.equal(stage.main, "./index.min.js");
+      assert.equal(stage.types, "./index.d.ts");
+      assert.ok(actualFiles.includes("index.d.ts"));
+    }
+  }
+
+  const codexStage = await readPackage("../dist/codex-api/package.json");
+  const thinkingStage = await readPackage("../dist/thinking-fold/package.json");
+  const sharedStageFiles = await listRelativeFiles(
+    new URL("../dist/shared-settings/", import.meta.url),
+  );
+  assert.deepEqual(codexStage.pi?.skills, ["./skills"]);
+  assert.ok(
+    (codexStage.files as string[]).includes("skills/gpt-image-prompts/SKILL.md"),
+  );
+  assert.ok((thinkingStage.files as string[]).includes("model-behaviors.json"));
+  assert.ok(sharedStageFiles.includes("sectioned-settings-list.d.ts"));
 });
 
 test("PowerShell bash tool preserves Pi's built-in timeout and output behavior", async () => {

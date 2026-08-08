@@ -1,25 +1,23 @@
 {
   "name": "@99percentpeople/pi-codex-api",
-  "version": "0.2.7",
+  "version": "0.2.8",
+  "private": true,
   "description": "Expose Codex subscription image, search, Fast, and usage APIs as native Pi tools and commands",
   "type": "module",
-  "files": [
-    "dist",
-    "skills",
-    "README.md",
-    "LICENSE"
-  ],
   "scripts": {
-    "build": "bun run ../../scripts/build-package.ts",
-    "prepack": "bun run build",
-    "prepublishOnly": "bun run --cwd ../.. check"
+    "build": "bun run ../../scripts/build-package.ts"
   },
   "pi": {
     "extensions": [
-      "./dist/index.ts"
+      "./index.ts"
     ],
     "skills": [
       "./skills"
+    ]
+  },
+  "piBuild": {
+    "assets": [
+      "skills"
     ]
   },
   "keywords": [
@@ -47,8 +45,8 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.2",
-    "@99percentpeople/pi-workspace-files": "0.1.0"
+    "@99percentpeople/pi-shared-settings": "0.1.3",
+    "@99percentpeople/pi-workspace-files": "0.1.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
