@@ -62,10 +62,6 @@ test("extensions are independently publishable workspace packages", async () => 
     new URL("../extensions/codex-api/skills/gpt-image-prompts/SKILL.md", import.meta.url),
     "utf8",
   );
-  const publishWorkflow = await readFile(
-    new URL("../.github/workflows/publish.yml", import.meta.url),
-    "utf8",
-  );
 
   assert.equal(
     root.private,
@@ -98,16 +94,6 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(
     root.scripts?.["build:packages"],
     "bun run --cwd packages/shared-settings build && bun run --cwd packages/workspace-files build",
-  );
-  assert.match(publishWorkflow, /workflow_dispatch:/);
-  assert.match(publishWorkflow, /release_tag:/);
-  assert.match(
-    publishWorkflow,
-    /ref: \$\{\{ inputs\.release_tag \|\| github\.ref \}\}/,
-  );
-  assert.match(
-    publishWorkflow,
-    /RELEASE_TAG: \$\{\{ inputs\.release_tag \|\| github\.ref_name \}\}/,
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");

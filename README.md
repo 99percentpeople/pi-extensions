@@ -514,17 +514,8 @@ git tag background-tasks-v1.1.3
 git push origin master background-tasks-v1.1.3
 ```
 
-Push no more than three new tags in one `git push`: GitHub does not create push
-workflow events when a single update contains more than three tags. If a valid
-existing tag needs to be published or retried without moving it, use the manual
-dispatch entrypoint:
-
-```bash
-gh workflow run publish.yml --ref master -f release_tag=background-tasks-v1.1.3
-```
-
-The workflow checks out the immutable requested tag and rejects a tag whose
-version does not exactly match the selected package's `package.json`.
+The workflow rejects a tag whose version does not exactly match the selected
+package's `package.json`.
 
 ## Uninstall
 
