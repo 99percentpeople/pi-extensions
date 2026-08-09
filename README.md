@@ -2,64 +2,283 @@
 
 [![CI](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml/badge.svg)](https://github.com/99percentpeople/pi-extensions/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/99percentpeople/pi-extensions)](LICENSE)
-[![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks)
-[![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api)
-[![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect)
-[![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter)
-[![ssh-remote](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-ssh-remote?label=ssh-remote)](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote)
-[![thinking-fold](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-thinking-fold?label=thinking-fold)](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold)
-[![todo](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-todo?label=todo)](https://www.npmjs.com/package/@99percentpeople/pi-todo)
 
-A focused collection of TypeScript extensions for the
-[Pi coding agent](https://pi.dev/): run and revisit background tasks, expose
-Codex subscription image and search APIs, style the main session status cursors,
-use PowerShell consistently on Windows, route coding tools through reusable SSH,
-fold long reasoning traces, and keep model-authored plans visible in the TUI.
+A focused collection of extensions for the [Pi coding agent](https://pi.dev/).
+Add background tasks, remote SSH workspaces, PowerShell support, Codex subscription
+tools, cursor effects, folded reasoning, or a compact todo workflow without
+installing an all-in-one bundle.
 
-| Extension | npm package | Purpose |
+Every extension is published and versioned independently. Install only the
+capabilities you need.
+
+## Contents
+
+- [Packages](#packages)
+- [Quick start](#quick-start)
+- [Compatibility](#compatibility)
+- [Extension guide](#extension-guide)
+- [Shared infrastructure](#shared-infrastructure)
+- [Development](#development)
+- [Publishing](#publishing)
+- [Uninstall](#uninstall)
+
+## Packages
+
+### Extensions
+
+| Extension | npm | What it adds |
 | --- | --- | --- |
-| background-tasks | [`@99percentpeople/pi-background-tasks`](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Local or SSH-backed background commands with attachable PTY/TUI sessions, logs, signals, and explicit waits |
-| codex-api | [`@99percentpeople/pi-codex-api`](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation/editing, first-party search, Fast mode, and subscription usage status |
-| cursor-effect | [`@99percentpeople/pi-cursor-effect`](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Selectable effects for Pi's working, retry, compaction, and branch-summary cursors |
-| pwsh-adapter | [`@99percentpeople/pi-pwsh-adapter`](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 and Windows PowerShell 5.1 adapter for Pi on Windows |
-| ssh-remote | [`@99percentpeople/pi-ssh-remote`](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Route Pi tools to remote Unix or Windows workspaces and enable remote Background Tasks PTY/TUI sessions |
-| thinking-fold | [`@99percentpeople/pi-thinking-fold`](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Live tail previews for long reasoning traces with full summaries and Ctrl+T expansion |
-| todo | [`@99percentpeople/pi-todo`](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Minimal atomic whole-plan todo writes with dependencies and a read-only list above the input |
+| [Background Tasks](extensions/background-tasks/README.md) | [![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Pipe and PTY background tasks with attach, logs, waits, input, signals, and local or SSH-backed execution |
+| [Codex API](extensions/codex-api/README.md) | [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation, search, Fast mode, and subscription usage tools |
+| [Cursor Effect](extensions/cursor-effect/README.md) | [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Configurable effects for Pi's working, retry, compaction, and branch-summary cursors |
+| [PowerShell Adapter](extensions/pwsh-adapter/README.md) | [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 or Windows PowerShell 5.1 for Pi's shell and background tasks on Windows |
+| [SSH Remote](extensions/ssh-remote/README.md) | [![ssh-remote](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-ssh-remote?label=ssh-remote)](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Remote Unix or Windows workspaces through reusable OpenSSH or `ssh2` transports |
+| [Thinking Fold](extensions/thinking-fold/README.md) | [![thinking-fold](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-thinking-fold?label=thinking-fold)](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Timed, collapsible live-tail previews for long reasoning traces |
+| [Todo](extensions/todo/README.md) | [![todo](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-todo?label=todo)](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Atomic whole-plan updates, dependencies, reminders, and a read-only TUI widget |
 
-The packages have separate versions and releases. Installing one extension does
-not install or enable any of the others.
+### Shared libraries
 
-For Background Control protocol v2 integrations, use this compatible set:
+| Library | npm | Purpose |
+| --- | --- | --- |
+| [`@99percentpeople/pi-shared-settings`](packages/shared-settings/README.md) | [![shared-settings](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-shared-settings?label=shared-settings)](https://www.npmjs.com/package/@99percentpeople/pi-shared-settings) | Shared `/99settings` menu and namespaced settings store |
+| [`@99percentpeople/pi-workspace-files`](packages/workspace-files/README.md) | [![workspace-files](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-workspace-files?label=workspace-files)](https://www.npmjs.com/package/@99percentpeople/pi-workspace-files) | Binary workspace I/O protocol shared by Codex API and SSH Remote |
 
-| Package | Compatible version |
-| --- | --- |
-| `@99percentpeople/pi-background-tasks` | `>=2.0.0` |
-| `@99percentpeople/pi-ssh-remote` | `>=0.5.0` |
-| `@99percentpeople/pi-pwsh-adapter` | `>=1.1.0` |
+The shared libraries are runtime dependencies, not Pi extensions. They register
+no tools or commands on their own.
 
-Background Tasks works alone; the SSH and PowerShell versions matter only when
-those adapters are installed. Background Tasks 2.x rejects unnamed protocol-v1
-providers so an active remote workspace cannot silently fall back to a local
-process. Update installed adapters before updating Background Tasks.
+## Quick start
 
-## Shared settings
+### Install an extension
 
-Extensions in this collection that expose configurable values share one
-configuration command:
+Choose one or more packages:
+
+```bash
+pi install npm:@99percentpeople/pi-background-tasks
+pi install npm:@99percentpeople/pi-codex-api
+pi install npm:@99percentpeople/pi-cursor-effect
+pi install npm:@99percentpeople/pi-ssh-remote
+pi install npm:@99percentpeople/pi-thinking-fold
+pi install npm:@99percentpeople/pi-todo
+```
+
+On Windows, add the PowerShell adapter when Pi's `bash` tool and Background
+Tasks should both use PowerShell syntax:
+
+```powershell
+pi install npm:@99percentpeople/pi-pwsh-adapter
+```
+
+### Common setups
+
+#### Remote workspace with attachable PTY tasks
+
+```bash
+pi install npm:@99percentpeople/pi-background-tasks
+pi install npm:@99percentpeople/pi-ssh-remote
+pi --ssh devbox:/srv/project
+```
+
+SSH Remote uses your existing OpenSSH aliases and credentials. The same
+Background Tasks workflow can then run `htop`, `lazygit`, `nvim`, or another TUI
+on the remote host without leaving the current Pi conversation.
+
+#### Codex subscription tools
+
+```bash
+pi install npm:@99percentpeople/pi-codex-api
+```
+
+Sign in to Pi's `openai-codex` provider. No OpenAI API key or MCP server is
+required. To use the tools while another provider is active, enable **Other
+providers** in `/99settings`.
+
+#### Todo replacement
+
+Remove another extension that owns the same `todo` tool before installing this
+one:
+
+```bash
+pi remove npm:@juicesharp/rpiv-todo
+pi install npm:@99percentpeople/pi-todo
+```
+
+### Configure installed extensions
+
+Open the shared settings menu:
 
 ```text
 /99settings
 ```
 
-The menu discovers installed plugins at runtime and shows only plugins that
-currently expose configurable values. Plugins without settings are omitted.
-Configuration is stored atomically in one file:
+Only installed extensions that expose settings appear in the menu.
+
+## Compatibility
+
+Background Control protocol v2 integrations require this minimum set:
+
+| Package | Minimum version |
+| --- | --- |
+| `@99percentpeople/pi-background-tasks` | `2.0.0` |
+| `@99percentpeople/pi-ssh-remote` | `0.5.0` |
+| `@99percentpeople/pi-pwsh-adapter` | `1.1.0` |
+
+Background Tasks works by itself. SSH Remote and the PowerShell Adapter matter
+only when those integrations are installed. Background Tasks 2.x rejects
+unnamed protocol-v1 providers so an active remote workspace cannot silently
+fall back to a local process.
+
+## Extension guide
+
+### Background Tasks
+
+Run finite commands, long-lived services, and interactive terminal programs
+without blocking the foreground Pi session.
+
+| Tool | Purpose |
+| --- | --- |
+| `bg_start` | Start a pipe or PTY task |
+| `bg_wait` | Wait once for a finite task to finish or time out |
+| `bg_status` | Inspect task state and immutable launch metadata |
+| `bg_logs` | Read retained pipe or PTY output |
+| `bg_send` | Send text, terminal keys, EOF, or an execution-environment signal |
+| `bg_kill` | Terminate a running or disconnected adapter-owned task |
+
+User commands:
+
+- `/bg-attach <id>` attaches to a PTY or follows new pipe output. Press
+  `Ctrl+]` to detach.
+- `/bg-kill` selects and terminates a running task.
+
+Task names can be used anywhere an ID is accepted. Same-task calls emitted in
+one model response execute in source order, while independent task chains run
+in parallel. PTY support uses `node-pty`; systems without a compatible native
+binary may require a C/C++ toolchain.
+
+[Read the Background Tasks documentation →](extensions/background-tasks/README.md)
+
+### SSH Remote
+
+Keep Pi local while routing workspace operations to a remote Unix or Windows
+host. SSH Remote handles:
+
+- `read`, `write`, `edit`, and `bash`;
+- optional `grep`, `find`, and `ls` tools;
+- user `!` and `!!` commands;
+- binary workspace files used by Codex API;
+- Background Tasks PTY and signal control.
+
+Auto transport selection uses managed OpenSSH multiplexing on Linux and macOS,
+and a persistent `ssh2` connection with OpenSSH compatibility fallback on
+Windows. Both transports support `ProxyJump`; explicit OpenSSH mode also keeps
+native `ProxyCommand` behavior.
+
+Session state records the target, remote platform, shell, and cwd. Resume and
+branch navigation restore that state transactionally, while failures block
+remote tools instead of falling back to Pi's local workspace.
+
+| Command | Purpose |
+| --- | --- |
+| `/ssh-connect <target>` | Connect or switch directly to another SSH target |
+| `/ssh-cd <path>` | Change the persistent remote cwd without reconnecting |
+| `/ssh-status` | Show the current local or remote environment |
+| `/ssh-reconnect` | Reconnect the active target |
+| `/ssh-exit` | Return explicitly to the local workspace |
+| `/ssh-forget-password [all]` | Remove cached password entries |
+
+Model-facing environment controls are disabled by default. Model-triggered
+password input has a 60-second deadline; manual connections can wait until the
+user responds.
+
+[Read the SSH Remote documentation →](extensions/ssh-remote/README.md)
+
+### PowerShell Adapter
+
+This Windows-only extension:
+
+- prefers PowerShell 7 (`pwsh.exe`);
+- falls back to Windows PowerShell 5.1 (`powershell.exe`);
+- routes Pi's Bash backend and Background Tasks through the same runtime;
+- configures UTF-8 input and output;
+- preserves interactive PTY behavior.
+
+Without the adapter, Background Tasks follows Pi's configured Bash resolution,
+including Git Bash on Windows.
+
+[Read the PowerShell Adapter documentation →](extensions/pwsh-adapter/README.md)
+
+### Codex API
+
+Use a ChatGPT Codex subscription from Pi without an API key.
+
+| Tool or command | Purpose |
+| --- | --- |
+| `codex_image` | Generate or edit images and save non-overwriting PNG outputs |
+| `codex_search` | Search web/images, navigate pages, capture PDF pages, and query finance, weather, sports, or time data |
+| `/codex-usage` | Show quota, plan information, and reset cards |
+| `/codex-redeem` | Confirm and redeem an available reset card |
+
+The usage commands appear only after Pi confirms an `openai-codex` OAuth login.
+When SSH Remote is active, generated files and image references use the remote
+binary workspace provider instead of a local staging directory.
+
+[Read the Codex API documentation →](extensions/codex-api/README.md)
+
+### Cursor Effect
+
+Style Pi's main working, retry, compaction, and branch-summary cursors without
+changing tool loaders, widgets, messages, or model events. Built-in themes
+include Default, Claude Code, and Codex; Custom mode exposes independent loader
+and label controls.
+
+[Read the Cursor Effect documentation →](extensions/cursor-effect/README.md)
+
+### Thinking Fold
+
+Long reasoning traces render beneath a once-per-second timed header. The live
+view keeps a compact tail, completed thinking defaults to `Thought for xx.xs`,
+and `Ctrl+T` restores the full original reasoning. Display-only patches never
+alter persisted messages or reasoning signatures.
+
+[Read the Thinking Fold documentation →](extensions/thinking-fold/README.md)
+
+### Todo
+
+The `todo` tool writes one authoritative `tasks[]` snapshot instead of issuing
+per-task CRUD calls. It supports:
+
+- stable model-facing keys and same-call dependencies;
+- sparse updates for existing tasks;
+- stale-revision and dependency-graph validation;
+- omission-based deletion with no archive or cancelled state;
+- branch-aware persistence and compaction checkpoints;
+- a read-only widget with configurable reminders.
+
+Completed tasks remain visible for the current response and are removed before
+the next response unless unfinished work still depends on them.
+
+[Read the Todo documentation →](extensions/todo/README.md)
+
+## Shared infrastructure
+
+### Shared settings
+
+Configurable extensions share one atomically written file:
 
 ```text
 ~/.pi/agent/99extensions.json
 ```
 
-For example:
+| Namespace | Main settings |
+| --- | --- |
+| `background-tasks` | Collapsed task count and output previews |
+| `codex-api` | Fast mode, provider access, search, image quality, and usage status |
+| `cursor-effect` | Themes and custom loader/label effects |
+| `ssh-remote` | Transport, password behavior, and AI controls |
+| `thinking-fold` | Fold threshold and streaming/completed display behavior |
+| `todo` | Widget size, dependency numbers, and reminder interval |
+
+<details>
+<summary>Example <code>99extensions.json</code></summary>
 
 ```json
 {
@@ -70,24 +289,7 @@ For example:
   "codex-api": {
     "fastMode": false,
     "allowOtherProviders": false,
-    "searchMode": "auto",
-    "searchContextSize": "medium",
-    "imageQuality": "auto",
-    "usageStatus": true
-  },
-  "cursor-effect": {
-    "theme": "default",
-    "custom": {
-      "loader": { "style": "pi-default", "speed": "normal", "color": "accent" },
-      "label": {
-        "style": "wave",
-        "speed": "normal",
-        "crestWidth": "soft",
-        "palette": "accent",
-        "direction": "left-to-right",
-        "pause": "none"
-      }
-    }
+    "searchMode": "auto"
   },
   "ssh-remote": {
     "transport": "auto"
@@ -105,262 +307,26 @@ For example:
 }
 ```
 
-Operational commands such as `/bg-attach` and `/bg-kill` remain separate.
+</details>
 
-## Shared workspace files
+### Workspace files
 
-`@99percentpeople/pi-workspace-files` provides the common binary workspace I/O
-protocol used by `codex-api` and `ssh-remote`. Consumers request the active file
-system and automatically fall back to a workspace-confined local Node.js
-backend. Remote extensions can register a provider for native path resolution,
-buffered or streaming binary reads/writes through the same methods, directory
-creation, existence checks, and cancellation.
+`@99percentpeople/pi-workspace-files` defines the binary workspace I/O protocol
+used by Codex API and SSH Remote. Consumers request the active file system and
+fall back to a workspace-confined local Node.js backend when no remote provider
+claims it.
 
-It is a library dependency rather than a Pi extension, so it registers no tools,
-commands, or `pi.extensions` entry. See
-[`packages/workspace-files`](packages/workspace-files/README.md).
+The protocol covers native path resolution, buffered or streaming binary
+reads/writes, directory creation, existence checks, and cancellation.
 
-## Highlights
-
-- Install only the capabilities you need; every extension is an independent npm
-  package.
-- Integrate with Pi's native tools, widgets, session history, and terminal UI.
-- Support interactive PTY applications, persistent task snapshots, and
-  cross-platform shell execution.
-- Validate on Linux, macOS, and Windows, with tag-driven npm releases through
-  GitHub Actions Trusted Publishing.
-
-## Installation
-
-Install background task support on Linux, macOS, or Windows:
-
-```bash
-pi install npm:@99percentpeople/pi-background-tasks
-```
-
-On Windows, install the optional adapter when both Pi's `bash` tool and
-`bg_start` should use PowerShell syntax:
-
-```powershell
-pi install npm:@99percentpeople/pi-pwsh-adapter
-```
-
-Without the adapter, `bg_start` follows Pi's configured Bash resolution and
-command prefix, including Git Bash on Windows.
-
-Use local Pi sessions and credentials against a remote Unix or Windows workspace
-through an existing OpenSSH alias and an automatically selected reusable transport:
-
-```bash
-pi install npm:@99percentpeople/pi-ssh-remote
-pi --ssh devbox:/srv/project
-```
-
-Install Codex subscription API tools after signing in to Pi's `openai-codex`
-provider. Build local package directories before installing them from this
-checkout:
-
-```bash
-bun run build:packages
-bun run --cwd extensions/codex-api build
-pi install ./extensions/codex-api
-```
-
-Install the reasoning-fold and optional cursor-effect extensions from this
-checkout while developing:
-
-```bash
-bun run build:packages
-bun run --cwd extensions/thinking-fold build
-bun run --cwd extensions/cursor-effect build
-pi install ./extensions/thinking-fold
-pi install ./extensions/cursor-effect
-```
-
-Install the snapshot-based todo extension after removing another extension that
-registers the same `todo` tool:
-
-```bash
-pi remove npm:@juicesharp/rpiv-todo
-pi install npm:@99percentpeople/pi-todo
-```
-
-## background-tasks
-
-Tools:
-
-- `bg_start` starts a pipe or PTY background task.
-- `bg_wait` waits once for a finite task to finish or time out.
-- `bg_status` reads task metadata or lists known tasks.
-- `bg_logs` is the only tool that reads pipe or parsed PTY output.
-- `bg_send` sends text, terminal keys, or execution-environment signals.
-- `bg_kill` terminates running tasks and can retry cleanup for disconnected
-  adapter-owned tasks.
-
-Commands:
-
-- `/bg-attach <id>` attaches to a PTY or streams new pipe output. Press
-  `Ctrl+]` to detach.
-- `/bg-kill` selects and terminates a running task.
-
-Example:
-
-```text
-bg_start name="git-ui" command="lazygit" pty=true
-/bg-attach <task-id>
-```
-
-When `ssh-remote` is installed and an SSH workspace is active, the same PTY
-workflow runs on the remote host. This makes full-screen applications such as
-`lazygit`, `htop`, `nvim`, and `k9s` remotely attachable without leaving the
-current Pi conversation; workspace switches do not move an existing task away
-from its original SSH host and cwd.
-
-Terminal keys sent through `bg_send` use angle-bracket tokens such as
-`<C-c>`, `<A-f>`, `<Space>`, `<Up>`, and `<F10>`. Escape a literal `<` as `\<`.
-Every model-facing task `id` also accepts its unique name. Same-task calls in
-one model response execute in source order, including `bg_start` by name, so a
-model can emit `bg_start(name=A) → bg_wait(id=A) → bg_logs(id=A)` together
-without first spending a round to learn the generated ID. Different task chains
-run in parallel, and the same sequence works for pipe and PTY tasks. Named shell
-providers are required and use priorities instead of last-writer routing;
-adapter controls implement the complete v2 lifecycle and remain available after
-a local transport exits, so remote cleanup can be confirmed or reported as
-`disconnected` rather than falsely completed.
-
-PTY support uses `node-pty`. If no compatible native binary is available,
-installation may require a C/C++ toolchain. `/99settings` controls how many task
-rows appear in the collapsed widget and which pipe tasks show latest-output
-previews. See the
-[background-tasks package documentation](extensions/background-tasks/README.md)
-for details.
-
-## pwsh-adapter
-
-The adapter is a Windows-only package that:
-
-- prefers PowerShell 7 (`pwsh.exe`) and falls back to Windows PowerShell 5.1
-  (`powershell.exe`);
-- replaces Pi's Bash execution backend with the selected runtime;
-- configures UTF-8 input and output;
-- makes background-tasks use the same PowerShell syntax;
-- keeps PTY tasks interactive.
-
-The startup notification and tool prompt identify the selected version so the
-model can avoid PowerShell 7-only syntax when running Windows PowerShell 5.1.
-
-## ssh-remote
-
-`ssh-remote` keeps Pi local while routing `read`, `write`, `edit`, `bash`, the
-optional `grep`, `find`, and `ls` tools, and user `!`/`!!` commands through a
-selectable `auto`, `openssh`, or `ssh2` transport. Auto mode uses managed
-OpenSSH multiplexing on Linux/macOS and a persistent `ssh2` connection on
-Windows, with compatibility fallback to single-use OpenSSH. Targets retain
-rsync-style syntax such as `devbox:/srv/project`; both transports support
-single- and multi-hop `ProxyJump`, while explicit OpenSSH mode additionally
-supports arbitrary `ProxyCommand` behavior. `ssh2` resolves its documented
-configuration subset through `ssh -G`. Shell selection is one flag:
-`--ssh-shell` chooses Bash, Zsh, PowerShell 7, or Windows PowerShell 5.1
-explicitly, or auto mode detects the remote account's login shell (Zsh
-accounts get Zsh) with a sh/PowerShell fallback and warning when the chosen
-shell is missing. The resolved target, platform, shell, and cwd are stored as
-hidden Pi session state and reconnect on resume; failed user/startup connections
-block remote tools instead of falling back to local files. Existing conversations can
-switch between local and SSH workspaces or directly between SSH targets with
-`/ssh-connect`; `/ssh-exit` returns local, and `/ssh-cd` changes the persistent
-remote cwd without reconnecting. A
-default-off `/99settings` option can expose matching environment-control tools
-to the model. Model-driven password prompts have a 60-second countdown; a
-separate default-on setting can disable AI password authentication and require
-SSH keys without affecting manual connections. Failed initial model connections
-return local, while failed host switches retain the previous remote; explicit
-initial user connections can wait indefinitely and remain disconnected on
-failure. The
-status line shows only the themed connection state, while an automatic
-`SSH target:path (branch) • first message` session name places the remote
-location and opening request in Pi's normal footer and native `/resume` list
-without replacing the footer. When `codex-api` is installed, its image output
-and reference paths use SSH Remote's shared binary workspace backend, including
-native Windows paths, without local staging. See the
-[ssh-remote package documentation](extensions/ssh-remote/README.md).
-
-## codex-api
-
-`codex-api` turns your ChatGPT subscription into Pi tools — `codex_image`
-and `codex_search` — without an OpenAI API key or MCP server. They even work
-while a third-party model (DeepSeek, Google, …) is active: enable **Other
-providers** in `/99settings` and the tools reuse Pi's logged-in
-`openai-codex` subscription. It also provides settings-controlled Fast mode.
-After Pi confirms an `openai-codex` OAuth login, it registers `/codex-usage`
-for quota, plan info, and earned reset cards, plus `/codex-redeem` to
-confirmably redeem a reset card when you run out of messages. Sessions started
-without a Codex login keep these commands hidden. Image outputs are saved as
-non-overwriting PNG files and returned to
-the model for follow-up inspection. Search supports web and image queries, page
-navigation, PDF screenshots, finance, weather, sports, and time operations,
-with Auto routing (Cached / Indexed / Live per call) or fixed user modes.
-Configure Fast, search mode, search context size, and usage status through
-`/99settings`. See the
-[codex-api package documentation](extensions/codex-api/README.md).
-
-## cursor-effect
-
-`cursor-effect` owns visual styling for Pi's main working, retry, compaction,
-and branch-summary status cursors, while leaving tool/bash/extension loaders
-alone. Complete themes include Default, Claude Code, and Codex without tuning
-controls. Selecting Custom reveals independent Loader and Label submenus for
-speed, color, crest width, and palette while preserving those custom values.
-It does not modify Items, tool/bash loaders, widgets, messages, or model events.
-Use the shared `/99settings` menu to configure the persistent effects. See the
-[cursor-effect package documentation](extensions/cursor-effect/README.md).
-
-## thinking-fold
-
-Long reasoning traces stay under a once-per-second timed Item header. Model
-behavior controls the main-cursor status headline, while `/99settings` separately
-controls the fold threshold, the display while thinking, and the display after
-thinking. Completed thinking defaults to `Thought for xx.xs`; `Ctrl+T` restores
-the full original content and keeps that view expanded across later turns until
-toggled again. `Ctrl+T` does not take over Pi's native `Ctrl+O` tool expansion. The
-compatibility patch changes only display copies; session messages and reasoning
-signatures remain untouched. See the
-[thinking-fold package documentation](extensions/thinking-fold/README.md).
-
-## todo
-
-The `todo` tool replaces per-task CRUD calls with one atomic `tasks[]` snapshot.
-Stable task keys allow dependencies to reference tasks created in the same call.
-Updates include the complete current key list but may omit unchanged fields, so
-one compact call can complete the current task and start the next. The list is
-authoritative: omitted keys are deleted directly, stale revisions can be
-rejected, and invalid dependency graphs do not partially mutate state. Deleted
-tasks leave no cancelled status or archived record.
-
-The extension deliberately registers no todo-specific slash commands or interactive manager.
-A read-only widget above the input shows a configurable number of tasks when
-collapsed and the complete list when expanded with Pi's standard `Ctrl+O`
-binding. Configure the collapsed-item limit, dependency-number visibility, and
-compact model-reminder interval through `/99settings`. While unfinished work
-remains, the default reminder adds only the current revision and key/status list
-to every third LLM call without persisting or accumulating in session history.
-In-progress task labels are bold. Task keys stay
-model-only; when dependency numbers are enabled, participating tasks receive
-compact display-only references such as `○ Implement #2 ← #1`, while independent
-tasks remain unnumbered. The tool call itself remains a compact progress
-confirmation. Completed tasks stay
-visible for the current response, then are automatically removed before the
-next response unless unfinished work still depends on them. Exact state follows
-Pi session branches, survives reloads, and is checkpointed back into model
-context after compaction. See the [todo package documentation](extensions/todo/README.md)
-for the schema.
+[Read the Workspace Files documentation →](packages/workspace-files/README.md)
 
 ## Development
 
-The repository uses a private root package as a Bun 1.3.14 workspace. Each
-extension or shared-library source directory has independent package metadata;
-publishable staging packages are generated under the root `dist/` directory.
-Extensions with configurable values depend on the small `pi-shared-settings`
-infrastructure package.
+The repository is a private Bun 1.3.14 workspace containing independently
+published source packages.
+
+### Install, build, and test
 
 ```bash
 bun install --frozen-lockfile
@@ -369,158 +335,109 @@ bun run check
 bun run pack:check
 ```
 
-`bun run check` starts with a privacy scan that rejects developer-specific
+`bun run check` runs the privacy scanner, strict TypeScript checking, and the
+unit/integration test suite. The privacy scanner rejects developer-specific
 paths, accounts, hosts, emails, private IPs, and credential-shaped material in
-committed test and e2e data.
+committed test and e2e fixtures.
 
-Each extension and shared runtime helper bundles its local TypeScript modules
-into one minified ESM entrypoint plus a linked source map. Builds never create
-package-local `dist/` directories: complete npm staging packages are written to
-`dist/<package-name>/` at the repository root. Extension entries are
-`index.min.js`; shared libraries additionally include generated declarations.
-Pi core peers and all npm runtime dependencies remain external so Pi retains
-control of peer-module identity and native or dynamic dependencies keep their
-normal package loaders. Source package manifests stay private and point to
-`./index.ts` for local development; the build creates a publishable manifest
-that points to `./index.min.js`. Root `dist/` remains Git-ignored and is rebuilt
-from a release tag. Use `build:extensions` for `extensions/`, `build:packages`
-for `packages/`, and `build:all` for both groups.
+### Build output
 
-Load an extension directly from TypeScript while developing:
+Builds never create package-local `dist/` directories. Each complete npm staging
+package is generated under the repository root:
+
+```text
+dist/<package-name>/
+├── index.min.js
+├── index.min.js.map
+├── package.json
+├── README.md
+└── LICENSE
+```
+
+Shared libraries additionally include declarations; package-specific skills or
+JSON assets are copied beside the runtime entrypoint. Root `dist/` is ignored by
+Git and rebuilt from release tags.
+
+Pi core peers and all npm runtime dependencies remain external. This preserves
+Pi's peer-module identity and lets native or dynamic dependencies use their
+normal package loaders.
+
+### Load source directly
 
 ```bash
 pi -e ./extensions/background-tasks/index.ts
+pi -e ./extensions/codex-api/index.ts
 pi -e ./extensions/cursor-effect/index.ts
 pi -e ./extensions/ssh-remote/index.ts --ssh devbox:/srv/project
 pi -e ./extensions/thinking-fold/index.ts
 pi -e ./extensions/todo/index.ts
 ```
 
-Repository layout:
+On Windows:
+
+```powershell
+pi -e ./extensions/pwsh-adapter/index.ts
+```
+
+### Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `extensions/` | Seven independently published Pi extensions |
+| `packages/` | Shared settings and workspace-file runtime libraries |
+| `tests/` | Unit and optional live integration tests |
+| `e2e/` | Local and remote Windows smoke tests |
+| `scripts/` | Build, privacy, and package validation scripts |
+| `promo/` | Demo assets used by package documentation |
+
+Windows SSH integration requires a live test host. See
+[`tests/README.md`](tests/README.md) for the integration suite and
+[`e2e/README.md`](e2e/README.md) for local/remote smoke tests.
+
+## Publishing
+
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) publishes only
+from package-specific tags through npm Trusted Publishing and GitHub Actions
+OIDC. No `NPM_TOKEN` is required.
+
+Configure a Trusted Publisher separately for all nine npm packages:
+
+- **Provider:** GitHub Actions
+- **Organization or user:** `99percentpeople`
+- **Repository:** `pi-extensions`
+- **Workflow filename:** `publish.yml`
+- **Allowed action:** `npm publish`
+
+Tags use the source directory name followed by the exact package version:
 
 ```text
-extensions/
-├── background-tasks/
-│   ├── index.ts
-│   ├── package.json
-│   └── README.md
-├── cursor-effect/
-│   ├── index.ts
-│   ├── config.ts
-│   ├── package.json
-│   └── README.md
-├── pwsh-adapter/
-│   ├── index.ts
-│   ├── package.json
-│   └── README.md
-├── ssh-remote/
-│   ├── index.ts
-│   ├── client.ts
-│   ├── operations.ts
-│   ├── package.json
-│   └── README.md
-├── thinking-fold/
-│   ├── index.ts
-│   ├── renderer.ts
-│   ├── config.ts
-│   ├── model-behaviors.ts
-│   ├── model-behaviors.json
-│   ├── package.json
-│   └── README.md
-└── todo/
-    ├── index.ts
-    ├── state.ts
-    ├── package.json
-    └── README.md
-packages/
-├── shared-settings/
-│   ├── index.ts
-│   ├── sectioned-settings-list.ts
-│   ├── package.json
-│   └── README.md
-└── workspace-files/
-    ├── index.ts
-    ├── package.json
-    └── README.md
-tests/
-├── background-tasks.test.ts
-├── cursor-effect.test.ts
-├── shared-settings.test.ts
-├── workspace-files.test.ts
-├── ssh-remote.test.ts
-├── ssh-remote-windows-integration.test.ts
-├── thinking-fold.test.ts
-├── todo.test.ts
-├── README.md
-└── packages.test.ts
-e2e/
-├── README.md
-├── remote-windows-smoke.ts
-└── local-windows-smoke.ts
+background-tasks-v2.0.1
+ssh-remote-v0.5.3
+workspace-files-v0.1.1
 ```
 
-Windows-specific verification needs a live Windows SSH host and is documented
-next to the code, not here:
+To release a package:
 
-- [tests/README.md](tests/README.md) — unit vs integration layout, and how to
-  run the Windows integration suite (`PI_SSH_TEST_HOST` / `PI_SSH_TEST_SHELL`).
-- [e2e/README.md](e2e/README.md) — end-to-end smoke scripts for both
-  directions: `remote-windows-smoke.ts` (Pi on Linux/macOS → Windows remote)
-  and `local-windows-smoke.ts` (Pi running on Windows), no model required.
-
-## Automated npm releases
-
-The [publish workflow](.github/workflows/publish.yml) uses npm Trusted
-Publishing with GitHub Actions OIDC. It does not require an `NPM_TOKEN` GitHub
-secret.
-
-Before the first automated release, configure a Trusted Publisher separately
-for all nine npm packages:
-
-- Provider: GitHub Actions
-- Organization or user: `99percentpeople`
-- Repository: `pi-extensions`
-- Workflow filename: `publish.yml`
-- Allowed action: `npm publish`
-
-Release tags are package-specific because the packages are versioned
-independently:
-
-| Package | Tag format | Example |
-| --- | --- | --- |
-| background-tasks | `background-tasks-v<version>` | `background-tasks-v1.2.2` |
-| codex-api | `codex-api-v<version>` | `codex-api-v0.2.2` |
-| cursor-effect | `cursor-effect-v<version>` | `cursor-effect-v0.1.0` |
-| pwsh-adapter | `pwsh-adapter-v<version>` | `pwsh-adapter-v1.0.6` |
-| ssh-remote | `ssh-remote-v<version>` | `ssh-remote-v0.1.0` |
-| thinking-fold | `thinking-fold-v<version>` | `thinking-fold-v0.1.0` |
-| todo | `todo-v<version>` | `todo-v1.2.0` |
-| shared-settings | `shared-settings-v<version>` | `shared-settings-v0.1.0` |
-| workspace-files | `workspace-files-v<version>` | `workspace-files-v0.1.0` |
-
-Publish shared library packages before releasing an extension that requires a
-newer version of them.
-
-To publish a release:
-
-1. Update the selected source package's `version` in `package.json` and update
-   its package README when needed.
-2. Run `bun run pack:check`; this regenerates and validates the root staging
-   package without committing `dist/`.
-3. Commit and push the release changes, then create and push the matching tag:
+1. Update its source `package.json` version and any internal dependency pins.
+2. Update package documentation when behavior changed.
+3. Run `bun run pack:check`.
+4. Commit and push the release changes.
+5. Create and push the matching tag.
 
 ```bash
-git tag background-tasks-v1.1.3
-git push origin master background-tasks-v1.1.3
+git tag ssh-remote-v0.5.3
+git push origin master ssh-remote-v0.5.3
 ```
 
-The workflow rejects a tag whose version does not exactly match the selected
-package's `package.json`.
+Publish shared libraries before extensions that require their new versions. The
+workflow rejects tags that do not exactly match the selected package's
+`package.json`.
 
 ## Uninstall
 
 ```bash
 pi remove npm:@99percentpeople/pi-background-tasks
+pi remove npm:@99percentpeople/pi-codex-api
 pi remove npm:@99percentpeople/pi-cursor-effect
 pi remove npm:@99percentpeople/pi-pwsh-adapter
 pi remove npm:@99percentpeople/pi-ssh-remote
@@ -530,4 +447,4 @@ pi remove npm:@99percentpeople/pi-todo
 
 ## License
 
-MIT
+[MIT](LICENSE)
