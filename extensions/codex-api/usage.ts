@@ -631,6 +631,8 @@ export function registerCodexUsageAndFast(
 
   function refreshStatus(ctx: ExtensionContext): void {
     latestContext = ctx;
+    if (controller.getConfig().usageStatus) startPolling(ctx);
+    else stopPolling();
     if (clearIfCodexOAuthUnavailable(ctx)) return;
     if (!usageEnabled(ctx)) {
       stopCountdown();
@@ -823,7 +825,9 @@ export function registerCodexUsageAndFast(
    */
   const scheduleNextPoll = (): void => {
     if (pollDelay) return;
-    const intervalMinutes = Math.round(controller.getConfig().usagePollInterval);
+    const config = controller.getConfig();
+    if (!config.usageStatus) return;
+    const intervalMinutes = Math.round(config.usagePollInterval);
     if (intervalMinutes <= 0) return;
     pollDelay = setTimeout(() => {
       pollDelay = undefined;
@@ -1148,12 +1152,13 @@ export function registerCodexUsageAndFast(
 
   pi.on("before_provider_request", (event, ctx) => {
     if (ctx.model?.provider !== "openai-codex") return;
-    refreshInBackground(ctx);
-    return applyFastModePayload(event.payload, controller.getConfig().fastMode);
+    const config = controller.getConfig();
+    if (config.usageStatus) refreshInBackground(ctx);
+    return applyFastModePayload(event.payload, config.fastMode);
   });
 
   pi.on("after_provider_response", (event, ctx) => {
-    if (ctx.model?.provider !== "openai-codex") return;
+    if (ctx.model?.provider !== "openai-codex" || !controller.getConfig().usageStatus) return;
     const parsed = parseCodexRateLimits(event.headers);
     if (parsed.length > 0) {
       void storeHeaderSnapshots(ctx, parsed).catch(() => refreshInBackground(ctx));

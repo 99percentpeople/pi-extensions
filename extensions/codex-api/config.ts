@@ -10,6 +10,8 @@ export type CodexImageQuality = "auto" | "low" | "medium" | "high";
 
 export interface CodexApiConfig {
   fastMode: boolean;
+  searchEnabled: boolean;
+  imageEnabled: boolean;
   allowOtherProviders: boolean;
   searchMode: CodexSearchMode;
   searchContextSize: CodexSearchContextSize;
@@ -23,6 +25,8 @@ export const CODEX_API_SETTINGS_NAMESPACE = "codex-api";
 
 export const DEFAULT_CODEX_API_CONFIG: CodexApiConfig = {
   fastMode: false,
+  searchEnabled: true,
+  imageEnabled: true,
   allowOtherProviders: false,
   searchMode: "auto",
   searchContextSize: "medium",
@@ -42,6 +46,12 @@ export function normalizeCodexApiConfig(value: unknown): CodexApiConfig {
     fastMode: typeof input.fastMode === "boolean"
       ? input.fastMode
       : DEFAULT_CODEX_API_CONFIG.fastMode,
+    searchEnabled: typeof input.searchEnabled === "boolean"
+      ? input.searchEnabled
+      : DEFAULT_CODEX_API_CONFIG.searchEnabled,
+    imageEnabled: typeof input.imageEnabled === "boolean"
+      ? input.imageEnabled
+      : DEFAULT_CODEX_API_CONFIG.imageEnabled,
     allowOtherProviders: typeof input.allowOtherProviders === "boolean"
       ? input.allowOtherProviders
       : DEFAULT_CODEX_API_CONFIG.allowOtherProviders,
@@ -65,7 +75,7 @@ export function normalizeCodexApiConfig(value: unknown): CodexApiConfig {
       : DEFAULT_CODEX_API_CONFIG.usageStatus,
     usagePollInterval: typeof input.usagePollInterval === "number"
         && Number.isFinite(input.usagePollInterval)
-        && input.usagePollInterval > 0
+        && input.usagePollInterval >= 0
       ? Math.min(60, Math.round(input.usagePollInterval))
       : DEFAULT_CODEX_API_CONFIG.usagePollInterval,
   };

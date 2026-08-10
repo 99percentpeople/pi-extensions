@@ -19,13 +19,17 @@ import {
   type WorkspaceFileSystem,
 } from "@99percentpeople/pi-workspace-files";
 import {
+  applyCodexToolFeatureChanges,
   applyFastModePayload,
   CodexApiClient,
   CodexApiError,
   CodexOAuthError,
+  codexFeatureSummary,
   createCodexApiClient,
+  createCodexFeaturesPanel,
   createCodexSearchDisplay,
   DEFAULT_CODEX_API_CONFIG,
+  disableUnavailableCodexTools,
   extractCodexAccountId,
   formatCodexSearchDisplay,
   formatCodexStatus,
@@ -257,6 +261,105 @@ test("Codex client resolves OAuth account, roots, headers, and API errors", asyn
     () => createCodexApiClient(expiredCodex),
     (error) => error instanceof CodexOAuthError
       && /Codex subscription OAuth is unavailable: token refresh failed.*Run \/login/.test(error.message),
+  );
+});
+
+test("Codex feature manager toggles tools and blocks disabled calls", async () => {
+  let activeTools = ["read", "codex_search"];
+  const activeToolUpdates: string[][] = [];
+  const pi = {
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (next: string[]) => {
+      activeTools = [...next];
+      activeToolUpdates.push([...next]);
+    },
+  } as unknown as ExtensionAPI;
+  const toolFeatures = [
+    { toolName: "codex_search", isEnabled: (config: typeof DEFAULT_CODEX_API_CONFIG) => config.searchEnabled },
+    { toolName: "codex_image", isEnabled: (config: typeof DEFAULT_CODEX_API_CONFIG) => config.imageEnabled },
+  ];
+
+  const initiallyDisabled = {
+    ...DEFAULT_CODEX_API_CONFIG,
+    searchEnabled: false,
+  };
+  disableUnavailableCodexTools(pi, initiallyDisabled, toolFeatures);
+  assert.deepEqual(activeTools, ["read"]);
+  assert.deepEqual(activeToolUpdates, [["read"]]);
+
+  // Enabling a feature from settings adds only that feature; startup does not
+  // override a user's narrower initial tool selection by adding Image.
+  applyCodexToolFeatureChanges(
+    pi,
+    initiallyDisabled,
+    { ...initiallyDisabled, searchEnabled: true },
+    toolFeatures,
+  );
+  assert.deepEqual(activeTools, ["read", "codex_search"]);
+  applyCodexToolFeatureChanges(
+    pi,
+    { ...initiallyDisabled, searchEnabled: true },
+    { ...initiallyDisabled, searchEnabled: true, imageEnabled: false },
+    toolFeatures,
+  );
+  assert.deepEqual(activeTools, ["read", "codex_search"]);
+  applyCodexToolFeatureChanges(
+    pi,
+    { ...initiallyDisabled, searchEnabled: true, imageEnabled: false },
+    { ...initiallyDisabled, searchEnabled: false, imageEnabled: true },
+    toolFeatures,
+  );
+  assert.deepEqual(activeTools, ["read", "codex_image"]);
+
+  let config = { ...DEFAULT_CODEX_API_CONFIG };
+  const panel = createCodexFeaturesPanel({
+    getConfig: () => config,
+    updateConfig: (next) => { config = next; },
+  });
+  assert.equal(codexFeatureSummary(config), "3/4 On");
+  assert.deepEqual(
+    panel.settings().map((setting) => [setting.label, setting.currentValue]),
+    [
+      ["Search", "On"],
+      ["Image", "On"],
+      ["Fast mode", "Off"],
+      ["Usage monitor", "On"],
+    ],
+  );
+  panel.onChange?.("searchEnabled", "Off", context(process.cwd()));
+  panel.onChange?.("fastMode", "On", context(process.cwd()));
+  assert.equal(config.searchEnabled, false);
+  assert.equal(config.fastMode, true);
+  assert.equal(panel.currentValue?.(), "3/4 On");
+
+  const disabledSearch = toolRegistry((toolPi) => registerCodexSearchTool(
+    toolPi,
+    () => ({ ...DEFAULT_CODEX_API_CONFIG, searchEnabled: false }),
+  ));
+  await assert.rejects(
+    () => disabledSearch.execute(
+      "disabled-search",
+      { search_query: [{ q: "example" }] },
+      undefined,
+      undefined,
+      context(process.cwd()),
+    ),
+    /codex_search is disabled.*Features/,
+  );
+
+  const disabledImage = toolRegistry((toolPi) => registerCodexImageTool(
+    toolPi,
+    () => ({ ...DEFAULT_CODEX_API_CONFIG, imageEnabled: false }),
+  ));
+  await assert.rejects(
+    () => disabledImage.execute(
+      "disabled-image",
+      { prompt: "example" },
+      undefined,
+      undefined,
+      context(process.cwd()),
+    ),
+    /codex_image is disabled.*Features/,
   );
 });
 
@@ -1334,6 +1437,49 @@ test("Codex usage parsing and Fast payload preserve provider data", () => {
   );
   const payload = { model: "gpt-5.6" };
   assert.equal(applyFastModePayload(payload, false), payload);
+});
+
+test("Usage monitor Off skips automatic provider refreshes", async () => {
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: any, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const config = {
+    ...DEFAULT_CODEX_API_CONFIG,
+    fastMode: true,
+    usageStatus: false,
+  };
+  const handle = registerCodexUsageAndFast(pi, {
+    getConfig: () => config,
+    updateConfig: () => {},
+  });
+  const originalFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    return new Response(JSON.stringify({ rate_limit: {} }));
+  };
+
+  const ctx = context(process.cwd()) as any;
+  ctx.ui = { setStatus() {}, notify() {}, theme: plainTheme };
+  try {
+    const payload = { model: "gpt-5.6" };
+    const updated = handlers.get("before_provider_request")?.({ payload }, ctx);
+    assert.deepEqual(updated, { model: "gpt-5.6", service_tier: "priority" });
+    assert.deepEqual(payload, { model: "gpt-5.6" });
+    handlers.get("after_provider_response")?.({
+      headers: { "X-Codex-Primary-Used-Percent": "25" },
+    }, ctx);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fetches, 0);
+    assert.deepEqual(handle.getSnapshots(), []);
+  } finally {
+    handlers.get("session_shutdown")?.({}, ctx);
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("Codex usage labels server windows and hides inactive placeholders", () => {
@@ -2532,6 +2678,8 @@ test("Codex API config normalizes, saves, and reloads", async () => {
   assert.equal(resolveSearchMode("live", "cached"), "live");
   assert.deepEqual(normalizeCodexApiConfig({
     fastMode: true,
+    searchEnabled: false,
+    imageEnabled: false,
     allowOtherProviders: true,
     searchMode: "live",
     searchContextSize: "high",
@@ -2539,6 +2687,8 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     usageStatus: false,
   }), {
     fastMode: true,
+    searchEnabled: false,
+    imageEnabled: false,
     allowOtherProviders: true,
     searchMode: "live",
     searchContextSize: "high",
@@ -2554,6 +2704,7 @@ test("Codex API config normalizes, saves, and reloads", async () => {
   assert.deepEqual(normalizeCodexApiConfig({
     usagePollInterval: -3,
   }), DEFAULT_CODEX_API_CONFIG);
+  assert.equal(normalizeCodexApiConfig({ usagePollInterval: 0 }).usagePollInterval, 0);
   assert.equal(normalizeCodexApiConfig({ usagePollInterval: 7.7 }).usagePollInterval, 8);
 
   const temporary = await mkdtemp(join(tmpdir(), "pi-codex-config-"));
@@ -2562,6 +2713,8 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     await writeFile(path, JSON.stringify({ untouched: { enabled: true } }));
     saveCodexApiConfig({
       fastMode: true,
+      searchEnabled: false,
+      imageEnabled: true,
       allowOtherProviders: true,
       searchMode: "indexed",
       searchContextSize: "low",
@@ -2570,6 +2723,8 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     }, path);
     assert.deepEqual(loadCodexApiConfig(path), {
       fastMode: true,
+      searchEnabled: false,
+      imageEnabled: true,
       allowOtherProviders: true,
       searchMode: "indexed",
       searchContextSize: "low",

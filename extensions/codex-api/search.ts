@@ -551,6 +551,10 @@ export function registerCodexSearchTool(
     parameters: SearchCommandsSchema,
     executionMode: "parallel",
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const config = getConfig();
+      if (config.searchEnabled === false) {
+        throw new Error("codex_search is disabled in /99settings > Codex API > Features");
+      }
       const { search_mode: requestedMode, ...commands } = params;
       if (!hasCommand(commands as Record<string, unknown>)) {
         throw new Error("codex_search requires at least one search or lookup command");
@@ -562,7 +566,6 @@ export function registerCodexSearchTool(
           item.tool = "sports";
         }
       }
-      const config = getConfig();
       const effectiveMode = resolveSearchModeForCommands(
         config.searchMode,
         requestedMode,

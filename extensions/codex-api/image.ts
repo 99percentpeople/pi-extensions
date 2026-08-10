@@ -227,6 +227,10 @@ export function registerCodexImageTool(
       })),
     }, { additionalProperties: false }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const config = getConfig();
+      if (config.imageEnabled === false) {
+        throw new Error("codex_image is disabled in /99settings > Codex API > Features");
+      }
       const references = params.referenced_image_paths ?? [];
       const recentImageCount = params.num_last_images_to_include;
       if (references.length > MAX_REFERENCE_IMAGES) {
@@ -238,7 +242,6 @@ export function registerCodexImageTool(
       const operation = references.length === 0 && recentImageCount === undefined ? "generate" : "edit";
       const files = resolveWorkspaceFiles(pi, ctx.cwd);
       const savedPath = outputPath(files, toolCallId, params.output_path);
-      const config = getConfig();
       const quality: CodexImageQuality = params.quality ?? config.imageQuality ?? "auto";
       const size = normalizeCodexImageSize(params.size);
       const update = (phase: CodexImagePhase) => onUpdate?.({

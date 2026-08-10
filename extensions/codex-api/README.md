@@ -165,16 +165,21 @@ Redeem Full reset (expires 2026-08-12)? (30s)
 
 Configure under **Codex API** in `/99settings`:
 
-- **Other providers** — let any model (DeepSeek, Google, …) use the logged-in
-  Codex subscription
-- **Fast mode** — priority service tier (lower latency, faster limit use)
-- **Search** — auto routing (Cached / Indexed / Live per call) or a fixed mode,
-  plus context size
-- **Image quality** — default GPT Image 2 quality
-- **Usage status** — show or hide the Codex quota line in the status bar
+- **Features** opens one feature manager where **Search**, **Image**, **Fast
+  mode**, and **Usage monitor** can each be switched **On** or **Off**.
+  Disabled model tools are removed from the active tool prompt immediately;
+  any stale or concurrently queued call is rejected before it reaches Codex.
+  Turning Usage monitor off stops background status refreshes, while the
+  explicit `/codex-usage` and `/codex-redeem` commands remain available.
+- **Other providers** lets any model (DeepSeek, Google, …) use the logged-in
+  Codex subscription.
+- **Search mode** and **Search context** configure search when its feature is on.
+- **Image quality** sets the GPT Image 2 default when its feature is on.
+- **Usage poll** controls the monitor refresh interval when its feature is on.
 
 Settings live in `~/.pi/agent/99extensions.json` under the `codex-api`
-namespace.
+namespace. Existing configurations migrate with Search and Image enabled, so
+upgrading does not remove tools unless you explicitly switch them off.
 
 ## How it works
 

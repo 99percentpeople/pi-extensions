@@ -4,6 +4,11 @@ import {
   saveCodexApiConfig,
   type CodexApiConfig,
 } from "./config.ts";
+import {
+  applyCodexToolFeatureChanges,
+  disableUnavailableCodexTools,
+  type CodexToolFeature,
+} from "./features.ts";
 import { registerCodexImageTool } from "./image.ts";
 import { registerCodexSearchTool } from "./search.ts";
 import { registerCodexApiSettings } from "./settings.ts";
@@ -13,9 +18,24 @@ import {
   type CodexUsageHandle,
 } from "./usage.ts";
 
+const CODEX_TOOL_FEATURES: readonly CodexToolFeature<CodexApiConfig>[] = [
+  {
+    toolName: "codex_search",
+    isEnabled: (config) => config.searchEnabled !== false,
+  },
+  {
+    toolName: "codex_image",
+    isEnabled: (config) => config.imageEnabled !== false,
+  },
+];
+
 export default function (pi: ExtensionAPI) {
   let config = loadCodexApiConfig();
   let usageHandle: CodexUsageHandle | undefined;
+
+  pi.on("session_start", () => {
+    disableUnavailableCodexTools(pi, config, CODEX_TOOL_FEATURES);
+  });
 
   const controller = {
     getConfig: () => config,
@@ -30,6 +50,7 @@ export default function (pi: ExtensionAPI) {
           "error",
         );
       }
+      applyCodexToolFeatureChanges(pi, prev, next, CODEX_TOOL_FEATURES);
       usageHandle?.refreshStatus(ctx);
       // Toggling visibility or cross-provider access changes what the status
       // area may show; pull fresh data immediately instead of waiting for the
@@ -42,6 +63,7 @@ export default function (pi: ExtensionAPI) {
 
   usageHandle = registerCodexUsageAndFast(pi, controller);
   const refreshUsageInBackground = (ctx: Parameters<CodexUsageHandle["refreshUsage"]>[0]) => {
+    if (!config.usageStatus) return;
     void usageHandle?.refreshUsage(ctx).catch(() => {});
   };
   registerCodexImageTool(pi, () => config);
@@ -73,6 +95,11 @@ export {
   type CodexSearchMode,
 } from "./config.ts";
 export {
+  applyCodexToolFeatureChanges,
+  disableUnavailableCodexTools,
+  type CodexToolFeature,
+} from "./features.ts";
+export {
   normalizeCodexImageSize,
   registerCodexImageTool,
   type CodexImageDetails,
@@ -98,10 +125,13 @@ export {
   type CodexSearchDetails,
 } from "./search.ts";
 export {
+  codexFeatureSummary,
   CONTEXT_SIZE_LABELS,
+  createCodexFeaturesPanel,
   IMAGE_QUALITY_LABELS,
   registerCodexApiSettings,
   SEARCH_MODE_LABELS,
+  type CodexSettingsController,
 } from "./settings.ts";
 export {
   applyFastModePayload,

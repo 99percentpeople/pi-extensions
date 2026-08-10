@@ -1,4 +1,7 @@
-import { registerExtensionSettings } from "@99percentpeople/pi-shared-settings";
+import {
+  registerExtensionSettings,
+  type ExtensionSettingsPanel,
+} from "@99percentpeople/pi-shared-settings";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   CODEX_API_SETTINGS_NAMESPACE,
@@ -42,15 +45,77 @@ function keyForLabel<T extends string>(labels: Record<T, string>, value: string)
   return (Object.entries(labels) as Array<[T, string]>).find(([, label]) => label === value)?.[0];
 }
 
-interface CodexSettingsController {
+export interface CodexSettingsController {
   getConfig(): CodexApiConfig;
   updateConfig(config: CodexApiConfig, ctx: ExtensionContext): void;
+}
+
+type CodexFeatureId = "searchEnabled" | "imageEnabled" | "fastMode" | "usageStatus";
+
+interface CodexFeatureDefinition {
+  id: CodexFeatureId;
+  label: string;
+  description: string;
+}
+
+const CODEX_FEATURES: readonly CodexFeatureDefinition[] = [
+  {
+    id: "searchEnabled",
+    label: "Search",
+    description: "Expose codex_search to the model and allow search or lookup calls",
+  },
+  {
+    id: "imageEnabled",
+    label: "Image",
+    description: "Expose codex_image to the model and allow image generation or editing",
+  },
+  {
+    id: "fastMode",
+    label: "Fast mode",
+    description: "Use the priority service tier and consume included limits faster",
+  },
+  {
+    id: "usageStatus",
+    label: "Usage monitor",
+    description: "Show and refresh subscription usage in the background; manual usage commands remain available",
+  },
+];
+
+export function codexFeatureSummary(config: CodexApiConfig): string {
+  const enabled = CODEX_FEATURES.filter((feature) => config[feature.id]).length;
+  return `${enabled}/${CODEX_FEATURES.length} On`;
+}
+
+export function createCodexFeaturesPanel(
+  controller: CodexSettingsController,
+): ExtensionSettingsPanel {
+  return {
+    title: "Codex Features",
+    currentValue: () => codexFeatureSummary(controller.getConfig()),
+    settings: () => {
+      const config = controller.getConfig();
+      return CODEX_FEATURES.map((feature) => ({
+        ...feature,
+        currentValue: config[feature.id] ? "On" : "Off",
+        values: ["Off", "On"],
+      }));
+    },
+    onChange: (id, value, ctx) => {
+      const feature = CODEX_FEATURES.find((candidate) => candidate.id === id);
+      if (!feature) return;
+      controller.updateConfig({
+        ...controller.getConfig(),
+        [feature.id]: value === "On",
+      }, ctx);
+    },
+  };
 }
 
 export function registerCodexApiSettings(
   pi: ExtensionAPI,
   controller: CodexSettingsController,
 ): void {
+  const featurePanel = createCodexFeaturesPanel(controller);
   registerExtensionSettings(pi, {
     namespace: CODEX_API_SETTINGS_NAMESPACE,
     title: "Codex API",
@@ -58,11 +123,11 @@ export function registerCodexApiSettings(
       const config = controller.getConfig();
       return [
         {
-          id: "fastMode",
-          label: "Fast mode",
-          description: "Use the priority service tier and consume included limits faster",
-          currentValue: config.fastMode ? "On" : "Off",
-          values: ["Off", "On"],
+          id: "features",
+          label: "Features",
+          description: "Open the Codex feature manager and toggle each capability On or Off",
+          currentValue: codexFeatureSummary(config),
+          submenu: featurePanel,
         },
         {
           id: "allowOtherProviders",
@@ -93,13 +158,6 @@ export function registerCodexApiSettings(
           values: Object.values(IMAGE_QUALITY_LABELS),
         },
         {
-          id: "usageStatus",
-          label: "Usage status",
-          description: "Show remaining Codex subscription usage in the status area",
-          currentValue: config.usageStatus ? "Show" : "Hide",
-          values: ["Show", "Hide"],
-        },
-        {
           id: "usagePollInterval",
           label: "Usage poll",
           description: "Periodically refresh the usage status while a session is active (Off disables polling)",
@@ -110,9 +168,7 @@ export function registerCodexApiSettings(
     },
     onChange: (id, value, ctx) => {
       const config = controller.getConfig();
-      if (id === "fastMode") {
-        controller.updateConfig({ ...config, fastMode: value === "On" }, ctx);
-      } else if (id === "allowOtherProviders") {
+      if (id === "allowOtherProviders") {
         controller.updateConfig({ ...config, allowOtherProviders: value === "Allow" }, ctx);
       } else if (id === "searchMode") {
         controller.updateConfig({
@@ -130,8 +186,6 @@ export function registerCodexApiSettings(
           ...config,
           imageQuality: keyForLabel(IMAGE_QUALITY_LABELS, value) ?? config.imageQuality,
         }, ctx);
-      } else if (id === "usageStatus") {
-        controller.updateConfig({ ...config, usageStatus: value === "Show" }, ctx);
       } else if (id === "usagePollInterval") {
         controller.updateConfig({ ...config, usagePollInterval: usagePollMinutes(value) }, ctx);
       }
