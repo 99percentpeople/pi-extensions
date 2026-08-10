@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-ssh-remote",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "private": true,
   "description": "Route Pi's file and shell tools to remote Unix or Windows workspaces through reusable OpenSSH or ssh2 transports",
   "type": "module",

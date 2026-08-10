@@ -27,6 +27,13 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isRecoverableAgentError(error: Error): boolean {
+  // ssh2 emits agent-level errors and then advances to the next key or auth
+  // method itself. Keep the listener to consume the EventEmitter error, but
+  // do not tear down setup before password authentication gets its turn.
+  return (error as Error & { level?: unknown }).level === "agent";
+}
+
 function isAuthenticationFailure(
   error: Ssh2ConnectionError,
   endpoint: ResolvedSsh2Endpoint | SshPasswordEndpoint,
@@ -168,7 +175,8 @@ export class Ssh2Client implements SshRemoteClient {
         }));
       };
       const onError = (error: Error) => {
-        if (!ready) rejectSetup(error);
+        if (ready || isRecoverableAgentError(error)) return;
+        rejectSetup(error);
       };
       const onClose = () => {
         this.connectingClients.delete(client);

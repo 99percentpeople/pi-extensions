@@ -1406,7 +1406,7 @@ test("Ssh2Client builds and disposes a recursive ProxyJump connection chain", as
   assert.deepEqual(rawClients.map((raw) => raw.closed), [true, true, true, true, true, true]);
 });
 
-test("Ssh2Client prompts for each password endpoint in a ProxyJump chain", async () => {
+test("Ssh2Client ignores agent errors and prompts for each ProxyJump password", async () => {
   const required = new Map([
     ["jump1.internal", "jump-one-pw"],
     ["jump2.internal", "jump-two-pw"],
@@ -1415,6 +1415,7 @@ test("Ssh2Client prompts for each password endpoint in a ProxyJump chain", async
   const cached = new Map<string, string>();
   const prompts: string[] = [];
   const rawClients: FakeRawSsh2Client[] = [];
+  let agentErrors = 0;
 
   class EndpointPasswordClient extends FakeRawSsh2Client {
     connect(config: Record<string, unknown> = {}): void {
@@ -1422,9 +1423,18 @@ test("Ssh2Client prompts for each password endpoint in a ProxyJump chain", async
       this.connectConfigs.push(config);
       const host = String(config.host);
       if (config.password !== required.get(host)) {
-        const error = new Error("All configured authentication methods failed");
-        (error as { level?: string }).level = "client-authentication";
-        queueMicrotask(() => this.emit("error", error));
+        const agentError = new Error("Failed to connect to agent");
+        (agentError as { level?: string }).level = "agent";
+        const authError = new Error("All configured authentication methods failed");
+        (authError as { level?: string }).level = "client-authentication";
+        queueMicrotask(() => {
+          agentErrors++;
+          // ssh2 reports an unavailable agent, then internally advances to
+          // the next auth method. The client must not destroy this endpoint
+          // before the final authentication failure can trigger a prompt.
+          this.emit("error", agentError);
+          queueMicrotask(() => this.emit("error", authError));
+        });
         return;
       }
       queueMicrotask(() => this.emit("ready"));
@@ -1471,6 +1481,7 @@ test("Ssh2Client prompts for each password endpoint in a ProxyJump chain", async
     "relay2@jump2.internal:22",
     "deploy@target.internal:22",
   ]);
+  assert.equal(agentErrors, 3);
   assert.equal(rawClients.length, 9, "the chain is rebuilt after each newly supplied password");
   await client.dispose();
 });
