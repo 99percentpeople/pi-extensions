@@ -21,6 +21,8 @@ const REDEEM_CONFIRM_WINDOW_MS = 10_000;
 const REDEEM_DIALOG_TIMEOUT_MS = 30_000;
 const REDEEM_RETRY_WINDOW_MS = 5 * 60_000;
 const USAGE_REFRESH_INTERVAL_MS = 60_000;
+/** Re-render the reset countdown locally; network refreshes only re-sync the snapshot. */
+const USAGE_COUNTDOWN_INTERVAL_MS = 60_000;
 const AUTH_WATCH_DEBOUNCE_MS = 100;
 /** Cap usage/redeem requests so a stalled backend cannot wedge the status pipeline. */
 const USAGE_FETCH_TIMEOUT_MS = 15_000;
@@ -543,6 +545,7 @@ export function registerCodexUsageAndFast(
   let authWatcher: FSWatcher | undefined;
   let authWatchDebounce: ReturnType<typeof setTimeout> | undefined;
   let pollDelay: ReturnType<typeof setTimeout> | undefined;
+  let countdownInterval: ReturnType<typeof setInterval> | undefined;
 
   const codexOAuthLoginAvailable = (ctx: ExtensionContext): boolean =>
     (ctx.model?.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(ctx.model))
@@ -569,7 +572,15 @@ export function registerCodexUsageAndFast(
       : value);
   };
 
+  const stopCountdown = (): void => {
+    if (countdownInterval) {
+      clearInterval(countdownInterval);
+      countdownInterval = undefined;
+    }
+  };
+
   const resetAccountState = (): void => {
+    stopCountdown();
     credentialRevision += 1;
     activeAccountId = undefined;
     usageByAccount.clear();
@@ -594,19 +605,46 @@ export function registerCodexUsageAndFast(
   const currentState = (): AccountUsageState | undefined =>
     activeAccountId ? usageByAccount.get(activeAccountId) : undefined;
 
-  const refreshStatus = (ctx: ExtensionContext) => {
+  const hasFutureReset = (state: AccountUsageState | undefined, now = Date.now()): boolean =>
+    state?.snapshots.some((snapshot) => [snapshot.primary, snapshot.secondary].some((window) =>
+      window?.resetsAt !== undefined && window.resetsAt * 1000 > now
+    )) === true;
+
+  const syncCountdown = (ctx: ExtensionContext): void => {
+    if (!usageEnabled(ctx) || !hasFutureReset(currentState())) {
+      stopCountdown();
+      return;
+    }
+    if (countdownInterval) return;
+    countdownInterval = setInterval(() => {
+      const active = latestContext;
+      if (!active) {
+        stopCountdown();
+        return;
+      }
+      // Recompute from the absolute reset timestamp. This intentionally does
+      // not fetch; a normal refresh replaces the snapshot and re-syncs it.
+      refreshStatus(active);
+    }, USAGE_COUNTDOWN_INTERVAL_MS);
+    countdownInterval.unref?.();
+  };
+
+  function refreshStatus(ctx: ExtensionContext): void {
     latestContext = ctx;
     if (clearIfCodexOAuthUnavailable(ctx)) return;
     if (!usageEnabled(ctx)) {
+      stopCountdown();
       setStatus(ctx, undefined);
       return;
     }
     setStatus(ctx, formatCodexStatus(currentState()?.snapshots ?? [], controller.getConfig().fastMode));
-  };
+    syncCountdown(ctx);
+  }
 
   const showSyncingStatus = (ctx: ExtensionContext): void => {
     latestContext = ctx;
     if (clearIfCodexOAuthUnavailable(ctx)) return;
+    stopCountdown();
     setStatus(ctx, usageEnabled(ctx) ? "Codex syncing…" : undefined);
   };
 
@@ -619,6 +657,7 @@ export function registerCodexUsageAndFast(
     latestContext = ctx;
     if (clearIfCodexOAuthUnavailable(ctx)) return;
     if (!usageEnabled(ctx)) {
+      stopCountdown();
       setStatus(ctx, undefined);
       return;
     }
@@ -627,8 +666,10 @@ export function registerCodexUsageAndFast(
     const snapshots = currentState()?.snapshots;
     if (!isAuthError && snapshots && snapshots.length > 0) {
       setStatus(ctx, formatCodexStatus(snapshots, controller.getConfig().fastMode));
+      syncCountdown(ctx);
       return;
     }
+    stopCountdown();
     setStatus(
       ctx,
       isAuthError ? AUTH_EXPIRED_STATUS : USAGE_UNAVAILABLE_STATUS,
@@ -1133,6 +1174,7 @@ export function registerCodexUsageAndFast(
   });
   pi.on("session_shutdown", (_event, ctx) => {
     stopPolling();
+    stopCountdown();
     credentialRevision += 1;
     activeAccountId = undefined;
     usageByAccount.clear();

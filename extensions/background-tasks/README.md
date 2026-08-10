@@ -87,9 +87,17 @@ Start lazygit in a background PTY named local-git so I can attach to it.
 Run the test suite in the background and inspect the failures when it exits.
 ```
 
+Background execution is appropriate when the user asks for it, the process must
+remain available for later interaction, or Pi can perform useful independent
+work while it runs. Runtime alone is not a reason to use these tools. If Pi
+needs a command's result before it can continue, it should use the foreground
+`bash` tool with an appropriate timeout instead of emulating synchronous
+execution with `bg_start` → `bg_wait` → `bg_logs`.
+
 The model can start, wait for, inspect, signal, and stop tasks. Model-facing
-tools have narrow responsibilities: `bg_wait` reports completion, `bg_status`
-reports metadata, `bg_logs` reads output, and `bg_kill` reports termination.
+tools have narrow responsibilities: `bg_wait` reports completion plus the latest
+pipe log line, `bg_status` reports metadata plus the latest pipe log line,
+`bg_logs` reads full retained output, and `bg_kill` reports termination.
 Every model-facing `id` accepts either the generated task ID or its unique,
 case-insensitive name. Users normally need only these interactive commands:
 
@@ -161,10 +169,11 @@ does not need to spend a separate round learning the generated ID before it can
 compose the rest of a finite workflow:
 
 ```text
-bg_start(name=A) → bg_wait(id=A) → bg_logs(id=A)  # start, finish, then read output
-bg_wait(A) → bg_logs(A)                            # wait, then read final/current-at-timeout output
-bg_send(A) → bg_wait(A) → bg_logs(A)              # interact, wait, then read output
-bg_kill(A) → bg_logs(A)                            # terminate, then read final output
+bg_start(name=A) → bg_wait(id=A)                    # start, finish, latest pipe log line
+bg_start(name=A) → bg_wait(id=A) → bg_logs(id=A)   # add full/multiline or PTY output
+bg_status(A)                                        # status plus latest pipe log line
+bg_send(A) → bg_wait(A) → bg_logs(A)               # interact, wait, then read full output
+bg_kill(A) → bg_logs(A)                             # terminate, then read final output
 ```
 
 The model should emit each complete chain in one response instead of waiting for
@@ -293,17 +302,22 @@ dedicated kill operation when the goal is reliable process-tree termination.
 
 ## Output inspection
 
-`bg_logs` is the only model-facing tool that returns process output. Pipe tasks
-retain stdout and stderr separately, while PTY tasks expose the parsed terminal
-buffer rather than raw ANSI escape sequences. Omitting `stream` works in both
-modes: pipe tasks return stdout and stderr, and PTY tasks return terminal output.
-Use `tail` or `from_line`/`max_lines` to select the retained range. An empty
-running task reports `(no output yet)`; once it finishes, the same empty log is
-reported as `(no output)` (or `(no terminal output)` for PTY mode).
+For pipe tasks, `bg_wait` and `bg_status` include the latest non-empty log line
+and identify whether it came from stdout or stderr. The same value is available
+as `latestLog` in tool details; a status list includes it per task. They omit the
+field when no pipe output is available and never expose a PTY terminal snapshot.
 
-`bg_wait`, `bg_status`, and `bg_kill` deliberately return no logs or terminal
-screens. Emit them before `bg_logs` for the same task when output is needed
-after completion, inspection, or termination.
+Use `bg_logs` when one latest line is insufficient or any PTY output is needed.
+Pipe tasks retain stdout and stderr separately, while PTY tasks expose the parsed
+terminal buffer rather than raw ANSI escape sequences. Omitting `stream` works
+in both modes: pipe tasks return stdout and stderr, and PTY tasks return terminal
+output. Use `tail` or `from_line`/`max_lines` to select the retained range. An
+empty running task reports `(no output yet)`; once it finishes, the same empty
+log is reported as `(no output)` (or `(no terminal output)` for PTY mode).
+
+`bg_kill` still returns no process output. Emit `bg_logs` after `bg_wait`,
+`bg_status`, or `bg_kill` only when fuller pipe output or PTY terminal output is
+needed.
 
 ## Pi capabilities
 
@@ -399,6 +413,30 @@ exit. This matters on Windows, where a descendant can keep a pipe handle open
 after the shell PID has already exited; the task status still transitions out
 of `running`, so later status or kill operations do not target a nonexistent
 process.
+
+## Source layout and build
+
+The extension source is split by responsibility while keeping `index.ts` as the
+small public entry point:
+
+- `extension.ts` wires lifecycle events, settings, tools, and commands
+- `runtime.ts` owns task state, shell providers, process control, logs, and snapshots
+- `tools.ts` and `commands.ts` register the model-facing and interactive APIs
+- `attachment.ts` handles live/final terminal attachment
+- `widget.ts` renders and refreshes task status
+- `input.ts` parses model-driven text and terminal key sequences
+- `types.ts` and `memory-log-store.ts` contain shared contracts and storage
+
+The normal package build follows local imports and bundles these modules into one
+minified runtime entry, so the published extension still loads a single file:
+
+```bash
+bun run --cwd extensions/background-tasks build
+# dist/background-tasks/index.min.js
+```
+
+The linked source map retains the original module paths for debugging; the
+individual TypeScript implementation files are not required at runtime.
 
 ## Native dependency
 

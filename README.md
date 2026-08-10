@@ -131,15 +131,19 @@ fall back to a local process.
 
 ### Background Tasks
 
-Run finite commands, long-lived services, and interactive terminal programs
-without blocking the foreground Pi session.
+Run intentionally asynchronous finite commands, long-lived services, and
+interactive terminal programs without blocking the foreground Pi session.
+Use background execution only when the user requests it, the process must remain
+available for later interaction, or Pi can do useful independent work while it
+runs. A command being slow is not enough by itself; when its result is required
+before work can continue, use foreground `bash` with an appropriate timeout.
 
 | Tool | Purpose |
 | --- | --- |
 | `bg_start` | Start a pipe or PTY task |
-| `bg_wait` | Wait once for a finite task to finish or time out |
-| `bg_status` | Inspect task state and immutable launch metadata |
-| `bg_logs` | Read retained pipe or PTY output |
+| `bg_wait` | Wait once for a finite task and return its latest pipe log line |
+| `bg_status` | Inspect task state, launch metadata, and latest pipe log line |
+| `bg_logs` | Read full retained pipe or PTY output |
 | `bg_send` | Send text, terminal keys, EOF, or an execution-environment signal |
 | `bg_kill` | Terminate a running or disconnected adapter-owned task |
 
@@ -411,7 +415,8 @@ Configure a Trusted Publisher separately for all nine npm packages:
 Tags use the source directory name followed by the exact package version:
 
 ```text
-background-tasks-v2.0.1
+background-tasks-v2.1.0
+codex-api-v0.2.9
 ssh-remote-v0.5.3
 workspace-files-v0.1.1
 ```

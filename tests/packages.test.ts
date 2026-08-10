@@ -97,7 +97,7 @@ test("extensions are independently publishable workspace packages", async () => 
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "2.0.1");
+  assert.equal(background.version, "2.1.0");
   assertSourceExtensionPackage(background);
   assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
   assert.equal(background.dependencies?.["node-pty"], "1.2.0-beta.14");
@@ -105,7 +105,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
-  assert.equal(codexApi.version, "0.2.8");
+  assert.equal(codexApi.version, "0.2.9");
   assertSourceExtensionPackage(codexApi);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
   assert.deepEqual(codexApi.piBuild?.assets, ["skills"]);

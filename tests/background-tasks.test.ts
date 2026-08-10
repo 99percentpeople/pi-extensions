@@ -29,6 +29,8 @@ initTheme("dark", false);
 
 interface RegisteredTool {
   name: string;
+  description?: string;
+  promptSnippet?: string;
   promptGuidelines?: string[];
   parameters: {
     properties?: Record<string, { description?: string; minimum?: number; maximum?: number; enum?: string[] }>;
@@ -1331,7 +1333,7 @@ test("background tool calls never render undefined while arguments stream", () =
   assert.match(stripVTControlCharacters(completeList.render(160).join("\n")), /bg_status all/);
 });
 
-test("background task tools keep waiting, status, output, and termination separate", async () => {
+test("background task tools return latest pipe summaries while keeping full output separate", async () => {
   const { tools, commands, lifecycle, messages, children, ctx } = createHarness();
   const bgStart = tools.get("bg_start");
   const bgWait = tools.get("bg_wait");
@@ -1353,6 +1355,21 @@ test("background task tools keep waiting, status, output, and termination separa
     }
   }
   const allGuidelines = registeredTools.flatMap((tool) => tool.promptGuidelines ?? []);
+  const bgStartGuidance = bgStart.promptGuidelines?.join("\n") ?? "";
+  assert.match(bgStart.description ?? "", /only when background execution is genuinely needed/i);
+  assert.match(bgStart.promptSnippet ?? "", /genuinely asynchronous.*concurrent work.*later interaction/i);
+  assert.match(
+    bgStartGuidance,
+    /only when.*explicitly requests background execution.*remain available for later interaction.*independent useful work concurrently/i,
+  );
+  assert.match(
+    bgStartGuidance,
+    /do not use bg_start merely because.*slow.*bash tool.*appropriate timeout.*instead of bg_start.*bg_wait.*bg_logs/i,
+  );
+  assert.match(
+    bgWait.promptGuidelines?.join("\n") ?? "",
+    /never create a bg_start task solely so you can wait on it/i,
+  );
   const orderingRules = allGuidelines.filter((guideline) => /strictly in source order/i.test(guideline));
   assert.equal(orderingRules.length, 1, "same-task ordering should be explained by one shared rule");
   assert.match(orderingRules[0], /compose complete bg_\* workflows in one assistant response/i);
@@ -1365,12 +1382,24 @@ test("background task tools keep waiting, status, output, and termination separa
   assert.match(lifecycleRules[0], /session reload or shutdown terminates it/i);
   assert.match(lifecycleRules[0], /finishing during a run.*retained through that run/i);
   assert.match(lifecycleRules[0], /still running when the agent settled.*finishes while idle.*retained through the next run/i);
-  assert.match(bgStart.promptGuidelines?.join("\n") ?? "", /place bg_logs immediately after bg_wait in the same assistant response/i);
-  assert.match(bgStatus.promptGuidelines?.join("\n") ?? "", /never returns process output/i);
-  assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /only background-task tool that reads process output/i);
-  assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /bg_wait followed by bg_logs in the same assistant response/i);
-  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /do not wait for the bg_wait result before emitting bg_logs/i);
-  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /timeout leaves the task running/i);
+  assert.match(
+    bgStart.promptGuidelines?.join("\n") ?? "",
+    /bg_wait includes the latest pipe log line.*place bg_logs.*only when full or multiline pipe output or PTY terminal output/i,
+  );
+  assert.match(
+    bgStatus.promptGuidelines?.join("\n") ?? "",
+    /includes the latest pipe log line.*bg_logs.*full or multiline pipe output.*PTY terminal output/i,
+  );
+  assert.match(
+    bgLogs.promptGuidelines?.join("\n") ?? "",
+    /more than the latest pipe log line returned by bg_wait or bg_status.*PTY terminal output/i,
+  );
+  assert.match(bgLogs.promptGuidelines?.join("\n") ?? "", /fuller finite output.*bg_wait followed by bg_logs/i);
+  assert.match(
+    bgWait.promptGuidelines?.join("\n") ?? "",
+    /completion status plus the latest pipe log line.*only when full or multiline pipe output or PTY terminal output.*do not wait for the bg_wait result/i,
+  );
+  assert.match(bgWait.promptGuidelines?.join("\n") ?? "", /timeout leaves the task running.*latest pipe log line/i);
   assert.match(bgSend.promptGuidelines?.join("\n") ?? "", /Use bg_send input for terminal keys/i);
   assert.match(bgKill.promptGuidelines?.join("\n") ?? "", /termination status only.*bg_kill followed by bg_logs/i);
   for (const tool of [bgWait, bgStatus, bgLogs, bgSend, bgKill]) {
@@ -1406,7 +1435,7 @@ test("background task tools keep waiting, status, output, and termination separa
     ctx,
   );
   const firstId = first.details.id as string;
-  assert.match(first.content[0].text, /emit bg_wait then bg_logs together in one assistant response/i);
+  assert.match(first.content[0].text, /bg_wait.*includes the latest pipe log line.*bg_logs only for full or PTY output/i);
   let firstWaitSettled = false;
   const firstWait = bgWait.execute("wait-1", { id: firstId, timeout: 1 }, undefined, undefined, ctx)
     .then((result) => {
@@ -1419,14 +1448,27 @@ test("background task tools keep waiting, status, output, and termination separa
   children[0].finish(0, null);
   const waitResult = await firstWait;
   assert.match(waitResult.content[0].text, /completed/);
-  assert.doesNotMatch(waitResult.content[0].text, /first|last|Latest log|stdout|stderr/i);
+  assert.match(waitResult.content[0].text, /Latest log:\s+\[stdout\] last/);
+  assert.doesNotMatch(waitResult.content[0].text, /\bfirst\b/);
   assert.equal(waitResult.details.timedOut, false);
+  assert.equal(waitResult.details.latestLog.stream, "stdout");
+  assert.equal(waitResult.details.latestLog.text, "last");
+  assert.equal(typeof waitResult.details.latestLog.at, "number");
   assert.equal(messages.length, 0, "completion should not enqueue an AI follow-up notification");
 
   const detailResult = await bgStatus.execute("status-detail", { id: firstId }, undefined, undefined, ctx);
   assert.match(detailResult.content[0].text, /Status:\s+completed/);
-  assert.doesNotMatch(detailResult.content[0].text, /first|last|Latest log|stdout|stderr/i);
-  assert.equal(detailResult.details.latestLog, undefined);
+  assert.match(detailResult.content[0].text, /Latest log:\s+\[stdout\] last/);
+  assert.doesNotMatch(detailResult.content[0].text, /\bfirst\b/);
+  assert.equal(detailResult.details.latestLog.stream, "stdout");
+  assert.equal(detailResult.details.latestLog.text, "last");
+
+  const listResult = await bgStatus.execute("status-list", {}, undefined, undefined, ctx);
+  const listedPipe = listResult.details.tasks.find((task: { id: string }) => task.id === firstId);
+  assert.ok(listedPipe);
+  assert.match(listResult.content[0].text, /Latest log:\s+\[stdout\] last/);
+  assert.equal(listedPipe.latestLog.stream, "stdout");
+  assert.equal(listedPipe.latestLog.text, "last");
 
   const longRunning = await bgStart.execute(
     "start-2",
@@ -1457,11 +1499,15 @@ test("background task tools keep waiting, status, output, and termination separa
   abortController.abort(new Error("cancelled by test"));
   await assert.rejects(waitPromise, /cancelled by test/);
 
+  children[1].stderr.write("still working\n");
   const timeoutResult = await bgWait.execute("wait-timeout", { id: longRunningId, timeout: 0.02 }, undefined, undefined, ctx);
   assert.match(timeoutResult.content[0].text, /Timed out/);
   assert.match(timeoutResult.content[0].text, /timeout did not stop it/);
+  assert.match(timeoutResult.content[0].text, /Latest log:\s+\[stderr\] still working/);
   assert.equal(timeoutResult.details.timedOut, true);
   assert.equal(timeoutResult.details.status, "running");
+  assert.equal(timeoutResult.details.latestLog.stream, "stderr");
+  assert.equal(timeoutResult.details.latestLog.text, "still working");
 
   children[1].stdout.write("older kill output\nlatest kill output\n");
   const killResult = await bgKill.execute(

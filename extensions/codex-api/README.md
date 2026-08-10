@@ -123,8 +123,11 @@ rate limit redeem
   (red), other failures keep the last known usage or show `Codex usage unavailable`
   until the next successful refresh
 
-Usage refreshes automatically on session start and model select;
-`/codex-usage` always forces a fresh read. Every usage request is capped at a
+Usage refreshes automatically on session start, model select, and the configured
+usage-poll interval; `/codex-usage` always forces a fresh read. Between refreshes,
+the status-bar reset countdown advances locally from the last server timestamp
+once per minute without making another request. A refresh simply re-synchronizes
+that timestamp and the usage snapshot. Every usage request is capped at a
 15-second timeout so a stalled backend cannot leave the status bar spinning.
 
 ### `/codex-redeem`

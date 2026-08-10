@@ -2584,6 +2584,108 @@ test("Codex API config normalizes, saves, and reloads", async () => {
   }
 });
 
+test("Codex usage reset countdown ticks locally and refresh only re-syncs it", async () => {
+  const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: any, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-countdown-"));
+  const authPath = join(temporary, "auth.json");
+  await writeFile(authPath, JSON.stringify({}));
+
+  const handle = registerCodexUsageAndFast(pi, {
+    getConfig: () => ({
+      ...DEFAULT_CODEX_API_CONFIG,
+      usagePollInterval: 0,
+    }),
+    updateConfig: () => {},
+  }, { authPath });
+
+  const originalNow = Date.now;
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  let now = 1_700_000_000_000;
+  Date.now = () => now;
+  const intervals: Array<{ delay: number; cb: () => void }> = [];
+  let clearedIntervals = 0;
+  globalThis.setInterval = ((cb: () => void, delay: number) => {
+    const handle = { delay, cb, unref: () => {} };
+    intervals.push(handle);
+    return handle as unknown as ReturnType<typeof setInterval>;
+  }) as unknown as typeof setInterval;
+  globalThis.clearInterval = ((handle: unknown) => {
+    if (handle !== undefined && handle !== null) clearedIntervals += 1;
+  }) as unknown as typeof clearInterval;
+
+  const originalFetch = globalThis.fetch;
+  let usageFetches = 0;
+  let resetMinutes = 90;
+  globalThis.fetch = async () => {
+    usageFetches += 1;
+    return new Response(JSON.stringify({
+      rate_limit: {
+        primary_window: {
+          used_percent: 10,
+          limit_window_seconds: 5 * 60 * 60,
+          reset_at: Math.floor(Date.now() / 1000) + resetMinutes * 60,
+        },
+      },
+    }));
+  };
+  const statuses: Array<string | undefined> = [];
+  const ctx = context(process.cwd()) as any;
+  ctx.ui = {
+    setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+    theme: { fg: (color: string, text: string) => `[${color}]${text}`, bold: (text: string) => `[bold]${text}` },
+    notify() {},
+  };
+
+  try {
+    await handlers.get("session_start")!({}, ctx);
+    assert.equal(usageFetches, 1);
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 90% 1h 30m");
+    assert.equal(intervals.length, 1);
+    assert.equal(intervals[0].delay, 60_000);
+
+    // A local tick recomputes from reset_at without issuing a usage request.
+    now += 60_000;
+    intervals[0].cb();
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 90% 1h 29m");
+    assert.equal(usageFetches, 1);
+
+    // A real refresh replaces the absolute timestamp; the same local ticker
+    // then continues from the newly synchronized value.
+    resetMinutes = 120;
+    await handle.refreshUsage(ctx, true);
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 90% 2h");
+    assert.equal(usageFetches, 2);
+    assert.equal(intervals.length, 1);
+
+    now += 60_000;
+    intervals[0].cb();
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 90% 1h 59m");
+    assert.equal(usageFetches, 2);
+
+    // Once the synchronized reset timestamp passes, no further countdown
+    // updates are needed until another server refresh supplies a new one.
+    now += 120 * 60_000;
+    intervals[0].cb();
+    assert.equal(statuses.at(-1), "[muted]Codex 5h 90%");
+    assert.equal(clearedIntervals, 1);
+    assert.equal(usageFetches, 2);
+  } finally {
+    handlers.get("session_shutdown")?.({}, ctx);
+    Date.now = originalNow;
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    globalThis.fetch = originalFetch;
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("Codex usage polls on an interval, throttles inside the window, and stops on shutdown", async () => {
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
   const pi = {
