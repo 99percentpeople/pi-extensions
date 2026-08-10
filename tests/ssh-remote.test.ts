@@ -22,6 +22,10 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import type {
+  AutocompleteProvider,
+  AutocompleteProviderFactory,
+} from "@earendil-works/pi-tui";
 import {
   selectRemoteAdapter,
   UnixBashAdapter,
@@ -37,6 +41,11 @@ import {
   encodeWindowsToolPath,
   resolveWindowsRemotePath,
 } from "../extensions/ssh-remote/adapters/windows.ts";
+import {
+  createRemoteAutocompleteProvider,
+  extractRemoteAtPrefix,
+  type RemoteAutocompleteEnvironment,
+} from "../extensions/ssh-remote/autocomplete.ts";
 import {
   buildUnixBackgroundProbeCommand,
   buildUnixBackgroundShellCommand,
@@ -845,6 +854,170 @@ test("OpenSSH config, ProxyJump, and known_hosts parsers preserve effective valu
   assert.ok(parsed.accepted.has("aG9zdC1rZXk="));
   assert.ok(parsed.revoked.has("cmV2b2tlZA=="));
   assert.equal(parsed.hasCertificateAuthority, true);
+});
+
+test("remote @ autocomplete mirrors Pi path completion and fails closed", async () => {
+  assert.deepEqual(extractRemoteAtPrefix("inspect @src/in"), {
+    prefix: "@src/in",
+    rawPrefix: "src/in",
+    quoted: false,
+  });
+  assert.deepEqual(extractRemoteAtPrefix("inspect @\"my dir/fi"), {
+    prefix: "@\"my dir/fi",
+    rawPrefix: "my dir/fi",
+    quoted: true,
+  });
+  assert.equal(extractRemoteAtPrefix("mail@example.test"), undefined);
+
+  const calls: Array<{ kind: "list" | "find"; path: string; signal: AbortSignal }> = [];
+  const adapter = {
+    toToolPath: (path: string) => path,
+    listDirectory: async (path: string, signal: AbortSignal) => {
+      calls.push({ kind: "list", path, signal });
+      if (path === "/srv/project/src") {
+        return [
+          { name: "internal", isDirectory: true },
+          { name: "index.ts", isDirectory: false },
+          { name: "my file.ts", isDirectory: false },
+        ];
+      }
+      return [
+        { name: "src", isDirectory: true },
+        { name: "README.md", isDirectory: false },
+        { name: "my notes.txt", isDirectory: false },
+      ];
+    },
+    findEntries: async (path: string, _pattern: string, _limit: number, signal: AbortSignal) => {
+      calls.push({ kind: "find", path, signal });
+      if (path === "/srv/project/src") {
+        return [
+          { path: "index.ts", isDirectory: false },
+          { path: "internal/config.ts", isDirectory: false },
+        ];
+      }
+      return [
+        { path: "README.md", isDirectory: false },
+        { path: "src/index.ts", isDirectory: false },
+        { path: ".git/config", isDirectory: false },
+      ];
+    },
+  } as unknown as RemoteAdapter;
+  const connection = {
+    adapter,
+    workspace: {
+      platform: "unix" as const,
+      shell: "sh" as const,
+      home: "/home/deploy",
+      cwd: "/srv/project",
+    },
+  };
+  let environment: RemoteAutocompleteEnvironment = { kind: "active", connection };
+  let localCalls = 0;
+  let applyCalls = 0;
+  const current: AutocompleteProvider = {
+    triggerCharacters: ["#"],
+    async getSuggestions() {
+      localCalls++;
+      return { items: [{ value: "@local.txt", label: "local.txt" }], prefix: "@" };
+    },
+    applyCompletion() {
+      applyCalls++;
+      return { lines: ["delegated"], cursorLine: 0, cursorCol: 9 };
+    },
+    shouldTriggerFileCompletion: () => false,
+  };
+  const provider = createRemoteAutocompleteProvider(current, () => environment);
+  const suggest = (text: string, signal = new AbortController().signal) =>
+    provider.getSuggestions([text], 0, text.length, { signal });
+
+  assert.deepEqual(provider.triggerCharacters, ["#", "@"]);
+  const root = await suggest("inspect @");
+  assert.ok(root);
+  assert.equal(root.prefix, "@");
+  const rootItems = new Map(root.items.map((item) => [item.description, item]));
+  assert.equal(rootItems.get("src")?.value, "@src/");
+  assert.equal(rootItems.get("README.md")?.value, "@README.md");
+  assert.equal(rootItems.get("my notes.txt")?.value, "@\"my notes.txt\"");
+  assert.equal(rootItems.has(".git/config"), false);
+  assert.equal(localCalls, 0);
+
+  const cached = await suggest("inspect @read");
+  assert.equal(cached?.items[0]?.value, "@README.md");
+  assert.equal(calls.filter((call) => call.path === "/srv/project").length, 2);
+
+  const scoped = await suggest("inspect @src/in");
+  assert.ok(scoped);
+  assert.equal(scoped.prefix, "@src/in");
+  const scopedItems = new Map(scoped.items.map((item) => [item.description, item]));
+  assert.equal(scopedItems.get("src/index.ts")?.value, "@src/index.ts");
+  assert.equal(scopedItems.get("src/internal")?.value, "@src/internal/");
+  assert.ok(calls.some((call) => call.path === "/srv/project/src"));
+
+  const quoted = await suggest("inspect @\"src/my");
+  assert.equal(
+    quoted?.items.find((item) => item.description === "src/my file.ts")?.value,
+    "@\"src/my file.ts\"",
+  );
+
+  assert.deepEqual(
+    provider.applyCompletion(["inspect @read"], 0, 13, cached!.items[0]!, "@read"),
+    { lines: ["delegated"], cursorLine: 0, cursorCol: 9 },
+  );
+  assert.equal(applyCalls, 1);
+  assert.equal(provider.shouldTriggerFileCompletion?.([""], 0, 0), false);
+
+  environment = { kind: "unavailable" };
+  assert.equal(await suggest("inspect @read"), null);
+  assert.equal(localCalls, 0, "unavailable SSH must not expose local path suggestions");
+  await suggest("plain text");
+  assert.equal(localCalls, 1, "non-path completion still delegates to Pi");
+
+  environment = { kind: "local" };
+  assert.equal((await suggest("inspect @"))?.items[0]?.value, "@local.txt");
+  assert.equal(localCalls, 2);
+});
+
+test("remote @ autocomplete resolves scoped Windows and home paths", async () => {
+  const toolPaths: string[] = [];
+  const adapter = {
+    toToolPath: (path: string) => {
+      toolPaths.push(path);
+      return path;
+    },
+    listDirectory: async () => [{ name: "my file.ts", isDirectory: false }],
+    findEntries: async () => [],
+  } as unknown as RemoteAdapter;
+  const connection = {
+    adapter,
+    workspace: {
+      platform: "windows" as const,
+      shell: "pwsh" as const,
+      home: "C:\\Users\\dev",
+      cwd: "C:\\Users\\dev\\project",
+    },
+  };
+  const current: AutocompleteProvider = {
+    async getSuggestions() { return null; },
+    applyCompletion: (lines, cursorLine, cursorCol) => ({ lines, cursorLine, cursorCol }),
+  };
+  const provider = createRemoteAutocompleteProvider(
+    current,
+    () => ({ kind: "active", connection }),
+  );
+  const signal = new AbortController().signal;
+  const scopedText = "inspect @\"src/my";
+  const scoped = await provider.getSuggestions(
+    [scopedText],
+    0,
+    scopedText.length,
+    { signal },
+  );
+  assert.equal(scoped?.items[0]?.value, "@\"src/my file.ts\"");
+  assert.equal(toolPaths[0], "C:\\Users\\dev\\project\\src");
+
+  const homeText = "inspect @~/";
+  await provider.getSuggestions([homeText], 0, homeText.length, { signal });
+  assert.equal(toolPaths[1], "C:\\Users\\dev");
 });
 
 class FakeSsh2Channel extends EventEmitter {
@@ -4173,6 +4346,7 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     placeholder?: string;
     options?: { timeout?: number; signal?: AbortSignal };
   }> = [];
+  const autocompleteFactories: AutocompleteProviderFactory[] = [];
   const statuses = new Map<string, unknown>();
   const themeCalls: Array<{ color: string; text: string }> = [];
   let shutdowns = 0;
@@ -4274,6 +4448,9 @@ function createExtensionHarness(options: HarnessOptions = {}) {
         else statuses.set(key, value);
       },
       notify: (message: string, level?: string) => notifications.push({ message, level }),
+      addAutocompleteProvider: (factory: AutocompleteProviderFactory) => {
+        autocompleteFactories.push(factory);
+      },
       input: async (
         title: string,
         placeholder?: string,
@@ -4303,6 +4480,7 @@ function createExtensionHarness(options: HarnessOptions = {}) {
     entries,
     notifications,
     inputCalls,
+    autocompleteFactories,
     statuses,
     themeCalls,
     emit,
@@ -4327,6 +4505,53 @@ function localSessionEntry() {
     data: SSH_LOCAL_SESSION_STATE,
   };
 }
+
+test("extension routes @ completion to SSH and restores Pi completion on exit", async () => {
+  const harness = createExtensionHarness({ flag: "devbox:/srv/project" });
+  const workspace: RemoteWorkspace = {
+    platform: "unix",
+    shell: "sh",
+    home: "/home/deploy",
+    cwd: "/srv/project",
+  };
+  const adapter = {
+    platform: "unix",
+    shell: "sh",
+    toToolPath: (path: string) => path,
+    listDirectory: async () => [{ name: "remote.ts", isDirectory: false }],
+    findEntries: async () => [{ path: "remote.ts", isDirectory: false }],
+    runShell: async () => 1,
+  } as unknown as RemoteAdapter;
+  const client = new FakeSshClient({ target: "devbox" });
+  createSshRemoteExtension({
+    createClient: () => client,
+    selectRemote: async () => ({ adapter, workspace }),
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(harness.autocompleteFactories.length, 1);
+  let localCalls = 0;
+  const localProvider: AutocompleteProvider = {
+    async getSuggestions() {
+      localCalls++;
+      return { items: [{ value: "@local.ts", label: "local.ts" }], prefix: "@" };
+    },
+    applyCompletion: (lines, cursorLine, cursorCol) => ({ lines, cursorLine, cursorCol }),
+  };
+  const provider = harness.autocompleteFactories[0]!(localProvider);
+  const signal = new AbortController().signal;
+  const remote = await provider.getSuggestions(["@rem"], 0, 4, { signal });
+  assert.equal(remote?.items[0]?.value, "@remote.ts");
+  assert.equal(localCalls, 0);
+
+  await harness.commands.get("ssh-exit").handler("", harness.ctx);
+  const local = await provider.getSuggestions(["@loc"], 0, 4, { signal });
+  assert.equal(local?.items[0]?.value, "@local.ts");
+  assert.equal(localCalls, 1);
+
+  await harness.emit("session_start", { reason: "switch" });
+  assert.equal(harness.autocompleteFactories.length, 1, "session changes must not stack wrappers");
+});
 
 test("SSH commands stay available while local sessions keep AI controls disabled", async () => {
   const harness = createExtensionHarness();

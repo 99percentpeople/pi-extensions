@@ -13,8 +13,8 @@ on the local machine.
 
 ## Highlights
 
-- Routes `read`, `write`, `edit`, `bash`, optional `grep`/`find`/`ls`, and user
-  `!`/`!!` commands to the remote workspace
+- Routes `read`, `write`, `edit`, `bash`, optional `grep`/`find`/`ls`, user
+  `!`/`!!` commands, and TUI `@` path completion to the remote workspace
 - Switches the same Pi session between local and SSH workspaces, or directly
   between SSH hosts
 - Supports `auto`, `openssh`, and `ssh2` transports
@@ -553,12 +553,32 @@ for the independent **AI password auth** setting.
 | Optional `grep`, `find`, `ls` | Model credentials and installed packages |
 | User `!` and `!!` commands | `todo`, `thinking-fold`, `cursor-effect`, `codex_search` |
 | Shared workspace-file providers | Session files, project discovery, and skill definitions |
+| TUI `@` path lookup | Pi's editor and autocomplete UI |
 | New background tasks | Pi's local anchor cwd |
 
 SSH Remote keeps Pi's native tool schemas, rendering, diffs, truncation, and
 mutation-queue behavior. Optional `grep`, `find`, and `ls` retain Pi's normal
 disabled state and become remote only when enabled through `--tools` or the tool
 selector.
+
+### Remote `@` path completion
+
+While an SSH workspace is active, Pi's TUI `@` completion searches files and
+directories under the current remote cwd rather than the local anchor cwd. It
+keeps Pi's normal token, quoting, scoped-path, fuzzy-ranking, and insertion
+behavior, including paths containing spaces:
+
+```text
+@src/
+@config
+@"docs/release notes.md"
+```
+
+`/ssh-cd` and host switches update the completion root immediately. Returning
+to local mode restores Pi's built-in local provider. A connecting or unavailable
+SSH workspace returns no `@` paths instead of falling back to local files. This
+is an interactive TUI feature; print and RPC modes do not display completion
+menus.
 
 ### Shared workspace files and Codex images
 

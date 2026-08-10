@@ -25,6 +25,7 @@ import {
   type SshShellPreference,
 } from "./adapters/index.ts";
 import { createSshBackgroundShellResolver, type BackgroundShellResolverContext } from "./background.ts";
+import { createRemoteAutocompleteProvider } from "./autocomplete.ts";
 import {
   OpenSshClient,
   type SshClientOptions,
@@ -524,6 +525,22 @@ export function createSshRemoteExtension(
     let remoteBackendsRegistered = false;
     let backgroundBackendProtocolVersion = 0;
     let backgroundTaskControlSupported = false;
+    let remoteAutocompleteRegistered = false;
+
+    const ensureRemoteAutocomplete = (ctx: ExtensionContext): void => {
+      if (!ctx.hasUI || remoteAutocompleteRegistered) return;
+      remoteAutocompleteRegistered = true;
+      ctx.ui.addAutocompleteProvider((current) => createRemoteAutocompleteProvider(
+        current,
+        () => {
+          if (runtime.kind === "disabled") return { kind: "local" };
+          if (runtime.kind === "active") {
+            return { kind: "active", connection: runtime };
+          }
+          return { kind: "unavailable" };
+        },
+      ));
+    };
 
     const emitEnvironmentEvent = (event: SshEnvironmentEvent): void => {
       pi.events.emit(SSH_ENVIRONMENT_EVENT, event);
@@ -1895,6 +1912,7 @@ export function createSshRemoteExtension(
 
     pi.on("session_start", async (event, ctx) => {
       runtime = { kind: "disabled" };
+      ensureRemoteAutocomplete(ctx);
       autoSessionName = undefined;
       autoSessionTitle = undefined;
       syncAiControlTools();
