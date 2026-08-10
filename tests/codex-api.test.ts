@@ -264,7 +264,7 @@ test("Codex client resolves OAuth account, roots, headers, and API errors", asyn
   );
 });
 
-test("Codex feature manager toggles tools and blocks disabled calls", async () => {
+test("Codex tool manager toggles tools and blocks disabled calls", async () => {
   let activeTools = ["read", "codex_search"];
   const activeToolUpdates: string[][] = [];
   const pi = {
@@ -287,7 +287,7 @@ test("Codex feature manager toggles tools and blocks disabled calls", async () =
   assert.deepEqual(activeTools, ["read"]);
   assert.deepEqual(activeToolUpdates, [["read"]]);
 
-  // Enabling a feature from settings adds only that feature; startup does not
+  // Enabling a tool from settings adds only that tool; startup does not
   // override a user's narrower initial tool selection by adding Image.
   applyCodexToolFeatureChanges(
     pi,
@@ -316,21 +316,20 @@ test("Codex feature manager toggles tools and blocks disabled calls", async () =
     getConfig: () => config,
     updateConfig: (next) => { config = next; },
   });
-  assert.equal(codexFeatureSummary(config), "3/4 On");
+  assert.equal(panel.title, "Codex Tools");
+  assert.equal(codexFeatureSummary(config), "2/2 On");
   assert.deepEqual(
     panel.settings().map((setting) => [setting.label, setting.currentValue]),
     [
       ["Search", "On"],
       ["Image", "On"],
-      ["Fast mode", "Off"],
-      ["Usage monitor", "On"],
     ],
   );
   panel.onChange?.("searchEnabled", "Off", context(process.cwd()));
   panel.onChange?.("fastMode", "On", context(process.cwd()));
   assert.equal(config.searchEnabled, false);
-  assert.equal(config.fastMode, true);
-  assert.equal(panel.currentValue?.(), "3/4 On");
+  assert.equal(config.fastMode, false, "non-tool settings are ignored by the tool submenu");
+  assert.equal(panel.currentValue?.(), "1/2 On");
 
   const disabledSearch = toolRegistry((toolPi) => registerCodexSearchTool(
     toolPi,
@@ -344,7 +343,7 @@ test("Codex feature manager toggles tools and blocks disabled calls", async () =
       undefined,
       context(process.cwd()),
     ),
-    /codex_search is disabled.*Features/,
+    /codex_search is disabled.*Tools/,
   );
 
   const disabledImage = toolRegistry((toolPi) => registerCodexImageTool(
@@ -359,7 +358,7 @@ test("Codex feature manager toggles tools and blocks disabled calls", async () =
       undefined,
       context(process.cwd()),
     ),
-    /codex_image is disabled.*Features/,
+    /codex_image is disabled.*Tools/,
   );
 });
 

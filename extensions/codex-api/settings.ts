@@ -50,7 +50,7 @@ export interface CodexSettingsController {
   updateConfig(config: CodexApiConfig, ctx: ExtensionContext): void;
 }
 
-type CodexFeatureId = "searchEnabled" | "imageEnabled" | "fastMode" | "usageStatus";
+type CodexFeatureId = "searchEnabled" | "imageEnabled";
 
 interface CodexFeatureDefinition {
   id: CodexFeatureId;
@@ -69,16 +69,6 @@ const CODEX_FEATURES: readonly CodexFeatureDefinition[] = [
     label: "Image",
     description: "Expose codex_image to the model and allow image generation or editing",
   },
-  {
-    id: "fastMode",
-    label: "Fast mode",
-    description: "Use the priority service tier and consume included limits faster",
-  },
-  {
-    id: "usageStatus",
-    label: "Usage monitor",
-    description: "Show and refresh subscription usage in the background; manual usage commands remain available",
-  },
 ];
 
 export function codexFeatureSummary(config: CodexApiConfig): string {
@@ -90,7 +80,7 @@ export function createCodexFeaturesPanel(
   controller: CodexSettingsController,
 ): ExtensionSettingsPanel {
   return {
-    title: "Codex Features",
+    title: "Codex Tools",
     currentValue: () => codexFeatureSummary(controller.getConfig()),
     settings: () => {
       const config = controller.getConfig();
@@ -123,11 +113,25 @@ export function registerCodexApiSettings(
       const config = controller.getConfig();
       return [
         {
-          id: "features",
-          label: "Features",
-          description: "Open the Codex feature manager and toggle each capability On or Off",
+          id: "tools",
+          label: "Tools",
+          description: "Open the Codex tool manager and toggle each model-callable tool On or Off",
           currentValue: codexFeatureSummary(config),
           submenu: featurePanel,
+        },
+        {
+          id: "fastMode",
+          label: "Fast mode",
+          description: "Use the priority service tier and consume included limits faster",
+          currentValue: config.fastMode ? "On" : "Off",
+          values: ["Off", "On"],
+        },
+        {
+          id: "usageStatus",
+          label: "Usage monitor",
+          description: "Show and refresh subscription usage in the background; manual usage commands remain available",
+          currentValue: config.usageStatus ? "On" : "Off",
+          values: ["Off", "On"],
         },
         {
           id: "allowOtherProviders",
@@ -168,7 +172,11 @@ export function registerCodexApiSettings(
     },
     onChange: (id, value, ctx) => {
       const config = controller.getConfig();
-      if (id === "allowOtherProviders") {
+      if (id === "fastMode") {
+        controller.updateConfig({ ...config, fastMode: value === "On" }, ctx);
+      } else if (id === "usageStatus") {
+        controller.updateConfig({ ...config, usageStatus: value === "On" }, ctx);
+      } else if (id === "allowOtherProviders") {
         controller.updateConfig({ ...config, allowOtherProviders: value === "Allow" }, ctx);
       } else if (id === "searchMode") {
         controller.updateConfig({

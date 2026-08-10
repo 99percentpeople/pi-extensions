@@ -222,10 +222,10 @@ Use a ChatGPT Codex subscription from Pi without an API key.
 | `/codex-redeem` | Confirm and redeem an available reset card |
 
 The usage commands appear only after Pi confirms an `openai-codex` OAuth login.
-Use the **Features** submenu in `/99settings` to toggle Search, Image, Fast mode,
-and Usage monitor independently. When SSH Remote is active, generated files and
-image references use the remote binary workspace provider instead of a local
-staging directory.
+Use the **Tools** submenu in `/99settings` to toggle Search and Image. Fast mode
+and Usage monitor remain direct Codex API settings. When SSH Remote is active,
+generated files and image references use the remote binary workspace provider
+instead of a local staging directory.
 
 [Read the Codex API documentation →](extensions/codex-api/README.md)
 
@@ -277,7 +277,7 @@ Configurable extensions share one atomically written file:
 | Namespace | Main settings |
 | --- | --- |
 | `background-tasks` | Collapsed task count and output previews |
-| `codex-api` | Feature switches, provider access, search, image quality, and usage polling |
+| `codex-api` | Tool switches, Fast mode, usage monitoring, provider access, search, and image quality |
 | `cursor-effect` | Themes and custom loader/label effects |
 | `ssh-remote` | Transport, password behavior, and AI controls |
 | `thinking-fold` | Fold threshold and streaming/completed display behavior |

@@ -229,7 +229,7 @@ export function registerCodexImageTool(
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const config = getConfig();
       if (config.imageEnabled === false) {
-        throw new Error("codex_image is disabled in /99settings > Codex API > Features");
+        throw new Error("codex_image is disabled in /99settings > Codex API > Tools");
       }
       const references = params.referenced_image_paths ?? [];
       const recentImageCount = params.num_last_images_to_include;

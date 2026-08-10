@@ -553,7 +553,7 @@ export function registerCodexSearchTool(
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const config = getConfig();
       if (config.searchEnabled === false) {
-        throw new Error("codex_search is disabled in /99settings > Codex API > Features");
+        throw new Error("codex_search is disabled in /99settings > Codex API > Tools");
       }
       const { search_mode: requestedMode, ...commands } = params;
       if (!hasCommand(commands as Record<string, unknown>)) {

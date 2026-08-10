@@ -165,12 +165,14 @@ Redeem Full reset (expires 2026-08-12)? (30s)
 
 Configure under **Codex API** in `/99settings`:
 
-- **Features** opens one feature manager where **Search**, **Image**, **Fast
-  mode**, and **Usage monitor** can each be switched **On** or **Off**.
-  Disabled model tools are removed from the active tool prompt immediately;
-  any stale or concurrently queued call is rejected before it reaches Codex.
-  Turning Usage monitor off stops background status refreshes, while the
-  explicit `/codex-usage` and `/codex-redeem` commands remain available.
+- **Tools** opens one tool manager where **Search** and **Image** can each be
+  switched **On** or **Off**. Disabled tools are removed from the active model
+  prompt immediately; stale or concurrently queued calls are rejected before
+  they reach Codex.
+- **Fast mode** remains a direct On/Off setting for the priority service tier.
+- **Usage monitor** remains a direct On/Off setting. Turning it off stops
+  background status refreshes, while explicit `/codex-usage` and
+  `/codex-redeem` commands remain available.
 - **Other providers** lets any model (DeepSeek, Google, …) use the logged-in
   Codex subscription.
 - **Search mode** and **Search context** configure search when its feature is on.
