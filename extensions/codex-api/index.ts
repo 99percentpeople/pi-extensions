@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerCodexAskTool } from "./ask.ts";
 import {
   loadCodexApiConfig,
   saveCodexApiConfig,
@@ -26,6 +27,10 @@ const CODEX_TOOL_FEATURES: readonly CodexToolFeature<CodexApiConfig>[] = [
   {
     toolName: "codex_image",
     isEnabled: (config) => config.imageEnabled !== false,
+  },
+  {
+    toolName: "codex_ask",
+    isEnabled: (config) => config.askEnabled !== false,
   },
 ];
 
@@ -66,6 +71,7 @@ export default function (pi: ExtensionAPI) {
     if (!config.usageStatus) return;
     void usageHandle?.refreshUsage(ctx).catch(() => {});
   };
+  registerCodexAskTool(pi, () => config, refreshUsageInBackground);
   registerCodexImageTool(pi, () => config);
   registerCodexSearchTool(pi, () => config, refreshUsageInBackground);
   registerCodexApiSettings(pi, controller);
@@ -83,6 +89,15 @@ export {
   type CodexFetch,
 } from "./client.ts";
 export {
+  completeCodexAsk,
+  registerCodexAskTool,
+  resolveCodexAskModel,
+  type CodexAskDetails,
+  type CodexAskPhase,
+  type CodexAskReasoning,
+  type CodexTextModel,
+} from "./ask.ts";
+export {
   CODEX_API_SETTINGS_NAMESPACE,
   DEFAULT_CODEX_API_CONFIG,
   getCodexApiConfigPath,
@@ -91,6 +106,7 @@ export {
   saveCodexApiConfig,
   type CodexApiConfig,
   type CodexImageQuality,
+  type CodexResponseVerbosity,
   type CodexSearchContextSize,
   type CodexSearchMode,
 } from "./config.ts";
@@ -130,11 +146,14 @@ export {
   createCodexFeaturesPanel,
   IMAGE_QUALITY_LABELS,
   registerCodexApiSettings,
+  RESPONSE_VERBOSITY_LABELS,
   SEARCH_MODE_LABELS,
   type CodexSettingsController,
 } from "./settings.ts";
 export {
+  applyCodexProviderPayload,
   applyFastModePayload,
+  applyResponseVerbosityPayload,
   formatCodexStatus,
   formatCodexUsage,
   formatCodexRedeemCredits,

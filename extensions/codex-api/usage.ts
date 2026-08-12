@@ -474,6 +474,27 @@ export function applyFastModePayload(payload: unknown, enabled: boolean): unknow
   return { ...(payload as Record<string, unknown>), service_tier: "priority" };
 }
 
+export function applyResponseVerbosityPayload(
+  payload: unknown,
+  verbosity: CodexApiConfig["responseVerbosity"],
+): unknown {
+  if (verbosity === "auto" || !payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return payload;
+  }
+  const record = payload as Record<string, unknown>;
+  const text = record.text && typeof record.text === "object" && !Array.isArray(record.text)
+    ? record.text as Record<string, unknown>
+    : {};
+  return { ...record, text: { ...text, verbosity } };
+}
+
+export function applyCodexProviderPayload(payload: unknown, config: CodexApiConfig): unknown {
+  return applyResponseVerbosityPayload(
+    applyFastModePayload(payload, config.fastMode),
+    config.responseVerbosity,
+  );
+}
+
 interface UsageController {
   getConfig(): CodexApiConfig;
   updateConfig(config: CodexApiConfig, ctx: ExtensionContext): void;
@@ -1154,7 +1175,7 @@ export function registerCodexUsageAndFast(
     if (ctx.model?.provider !== "openai-codex") return;
     const config = controller.getConfig();
     if (config.usageStatus) refreshInBackground(ctx);
-    return applyFastModePayload(event.payload, config.fastMode);
+    return applyCodexProviderPayload(event.payload, config);
   });
 
   pi.on("after_provider_response", (event, ctx) => {

@@ -1,8 +1,8 @@
 {
   "name": "@99percentpeople/pi-codex-api",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "private": true,
-  "description": "Expose Codex subscription image, search, Fast, and usage APIs as native Pi tools and commands",
+  "description": "Expose Codex subscription text, vision, image, search, Fast, and usage APIs to Pi",
   "type": "module",
   "scripts": {
     "build": "bun run ../../scripts/build-package.ts"
@@ -26,6 +26,8 @@
     "coding-agent",
     "codex",
     "chatgpt",
+    "multilingual",
+    "second-opinion",
     "image-generation",
     "web-search"
   ],

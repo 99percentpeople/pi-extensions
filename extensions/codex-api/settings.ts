@@ -7,6 +7,7 @@ import {
   CODEX_API_SETTINGS_NAMESPACE,
   type CodexApiConfig,
   type CodexImageQuality,
+  type CodexResponseVerbosity,
   type CodexSearchContextSize,
   type CodexSearchMode,
 } from "./config.ts";
@@ -31,6 +32,13 @@ const IMAGE_QUALITY_LABELS: Record<CodexImageQuality, string> = {
   high: "High",
 };
 
+const RESPONSE_VERBOSITY_LABELS: Record<CodexResponseVerbosity, string> = {
+  auto: "Model default",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+};
+
 function usagePollLabel(minutes: number): string {
   if (minutes <= 0) return "Off";
   return `${minutes}m`;
@@ -50,7 +58,7 @@ export interface CodexSettingsController {
   updateConfig(config: CodexApiConfig, ctx: ExtensionContext): void;
 }
 
-type CodexFeatureId = "searchEnabled" | "imageEnabled";
+type CodexFeatureId = "searchEnabled" | "imageEnabled" | "askEnabled";
 
 interface CodexFeatureDefinition {
   id: CodexFeatureId;
@@ -68,6 +76,11 @@ const CODEX_FEATURES: readonly CodexFeatureDefinition[] = [
     id: "imageEnabled",
     label: "Image",
     description: "Expose codex_image to the model and allow image generation or editing",
+  },
+  {
+    id: "askEnabled",
+    label: "Ask Codex",
+    description: "Expose codex_ask for explicit standalone text or vision delegation",
   },
 ];
 
@@ -134,6 +147,13 @@ export function registerCodexApiSettings(
           values: ["Off", "On"],
         },
         {
+          id: "responseVerbosity",
+          label: "Answer detail",
+          description: "Override Codex response verbosity for normal replies and codex_ask",
+          currentValue: RESPONSE_VERBOSITY_LABELS[config.responseVerbosity],
+          values: Object.values(RESPONSE_VERBOSITY_LABELS),
+        },
+        {
           id: "allowOtherProviders",
           label: "Other providers",
           description: "Allow non-Codex models to use Codex tools with your logged-in ChatGPT subscription",
@@ -176,6 +196,12 @@ export function registerCodexApiSettings(
         controller.updateConfig({ ...config, fastMode: value === "On" }, ctx);
       } else if (id === "usageStatus") {
         controller.updateConfig({ ...config, usageStatus: value === "On" }, ctx);
+      } else if (id === "responseVerbosity") {
+        controller.updateConfig({
+          ...config,
+          responseVerbosity:
+            keyForLabel(RESPONSE_VERBOSITY_LABELS, value) ?? config.responseVerbosity,
+        }, ctx);
       } else if (id === "allowOtherProviders") {
         controller.updateConfig({ ...config, allowOtherProviders: value === "Allow" }, ctx);
       } else if (id === "searchMode") {
@@ -201,4 +227,9 @@ export function registerCodexApiSettings(
   });
 }
 
-export { CONTEXT_SIZE_LABELS, IMAGE_QUALITY_LABELS, SEARCH_MODE_LABELS };
+export {
+  CONTEXT_SIZE_LABELS,
+  IMAGE_QUALITY_LABELS,
+  RESPONSE_VERBOSITY_LABELS,
+  SEARCH_MODE_LABELS,
+};

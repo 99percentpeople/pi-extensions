@@ -29,7 +29,7 @@ capabilities you need.
 | Extension | npm | What it adds |
 | --- | --- | --- |
 | [Background Tasks](extensions/background-tasks/README.md) | [![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Pipe and PTY background tasks with attach, logs, waits, input, signals, and local or SSH-backed execution |
-| [Codex API](extensions/codex-api/README.md) | [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth image generation, search, Fast mode, and subscription usage tools |
+| [Codex API](extensions/codex-api/README.md) | [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth text/vision delegation, image generation, search, Fast mode, and subscription usage |
 | [Cursor Effect](extensions/cursor-effect/README.md) | [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Configurable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | [PowerShell Adapter](extensions/pwsh-adapter/README.md) | [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 or Windows PowerShell 5.1 for Pi's shell and background tasks on Windows |
 | [SSH Remote](extensions/ssh-remote/README.md) | [![ssh-remote](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-ssh-remote?label=ssh-remote)](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Remote Unix or Windows workspaces through reusable OpenSSH or `ssh2` transports |
@@ -216,16 +216,19 @@ Use a ChatGPT Codex subscription from Pi without an API key.
 
 | Tool or command | Purpose |
 | --- | --- |
+| `codex_ask` | Ask a live Codex model for an explicit multilingual text or vision second opinion |
 | `codex_image` | Generate or edit images and save non-overwriting PNG outputs |
 | `codex_search` | Search web/images, navigate pages, capture PDF pages, and query finance, weather, sports, or time data |
 | `/codex-usage` | Show quota, plan information, and reset cards |
 | `/codex-redeem` | Confirm and redeem an available reset card |
 
 The usage commands appear only after Pi confirms an `openai-codex` OAuth login.
-Use the **Tools** submenu in `/99settings` to toggle Search and Image. Fast mode
-and Usage monitor remain direct Codex API settings. When SSH Remote is active,
-generated files and image references use the remote binary workspace provider
-instead of a local staging directory.
+`codex_ask` requires Pi 0.84.1 or newer and uses Pi's model registry rather than
+a duplicate model catalog. Use the **Tools** submenu in `/99settings` to toggle
+Search, Image, and Ask Codex. Fast mode, Usage monitor, and Answer detail remain
+direct Codex API settings. When SSH Remote is active, generated files and image
+references use the remote binary workspace provider instead of a local staging
+directory.
 
 [Read the Codex API documentation →](extensions/codex-api/README.md)
 
@@ -277,7 +280,7 @@ Configurable extensions share one atomically written file:
 | Namespace | Main settings |
 | --- | --- |
 | `background-tasks` | Collapsed task count and output previews |
-| `codex-api` | Tool switches, Fast mode, usage monitoring, provider access, search, and image quality |
+| `codex-api` | Tool switches, Answer detail, Fast mode, usage monitoring, provider access, search, and image quality |
 | `cursor-effect` | Themes and custom loader/label effects |
 | `ssh-remote` | Transport, password behavior, and AI controls |
 | `thinking-fold` | Fold threshold and streaming/completed display behavior |
@@ -295,7 +298,9 @@ Configurable extensions share one atomically written file:
   "codex-api": {
     "searchEnabled": true,
     "imageEnabled": true,
+    "askEnabled": true,
     "fastMode": false,
+    "responseVerbosity": "auto",
     "usageStatus": true,
     "allowOtherProviders": false,
     "searchMode": "auto"

@@ -105,7 +105,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
-  assert.equal(codexApi.version, "0.2.9");
+  assert.equal(codexApi.version, "0.3.0");
   assertSourceExtensionPackage(codexApi);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
   assert.deepEqual(codexApi.piBuild?.assets, ["skills"]);
@@ -116,7 +116,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.match(codexApiSkill, /^---\nname: gpt-image-prompts\n/m);
   assert.match(codexApiSkill, /Craft and refine production-ready prompts for GPT Image 2/);
   assert.match(codexApiSkill, /prompt-writing skill only/);
-  assert.doesNotMatch(codexApiSkill, /codex_search|codex_image|output_path|referenced_image_paths/);
+  assert.doesNotMatch(codexApiSkill, /codex_search|codex_image|output_path|referenced_(?:image_)?paths/);
 
   assert.equal(cursorEffect.name, "@99percentpeople/pi-cursor-effect");
   assert.equal(cursorEffect.version, "0.1.5");

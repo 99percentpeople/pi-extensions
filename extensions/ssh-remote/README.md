@@ -590,7 +590,7 @@ as Pi's `read` and `write` tools without tool-specific SSH hooks.
 
 - `output_path` resolves inside the remote workspace and is written there
   directly;
-- `referenced_image_paths` are read remotely and sent to the image API;
+- `referenced_paths` are read remotely and sent to the image API;
 - no image is staged locally and no reverse SSH or `scp` step is required;
 - existing files are never overwritten;
 - paths outside the active remote workspace are rejected.
@@ -599,7 +599,7 @@ Example for a Windows SSH workspace:
 
 ```text
 output_path: C:\Users\dev\Desktop\wallpaper.png
-referenced_image_paths: [C:\Users\dev\Desktop\reference.jpg]
+referenced_paths: [C:\Users\dev\Desktop\reference.jpg]
 ```
 
 ### Background tasks

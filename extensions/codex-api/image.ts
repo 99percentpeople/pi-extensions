@@ -197,7 +197,7 @@ export function registerCodexImageTool(
     promptGuidelines: [
       "Use codex_image for requested raster images, illustrations, mockups, textures, or edits when the active model uses openai-codex OAuth, or Other providers is enabled in /99settings and Codex OAuth is logged in.",
       "Load the gpt-image-prompts skill before generating or editing an image; it covers prompt structure, composition, aspect-ratio control, exact text, and edit patterns.",
-      "For a new image, omit both reference fields. For an edit, use referenced_image_paths for local files or num_last_images_to_include for recent attached/generated conversation images; never provide both.",
+      "For a new image, omit both reference fields. For an edit, use referenced_paths for workspace files or num_last_images_to_include for recent attached/generated conversation images; never provide both.",
       "Omit size and quality unless the user explicitly requests a draft or quality level; the size and aspect_ratio parameters may be ignored by the backend — control the aspect ratio with composition words in the prompt (see the skill).",
       "Use a new output_path and do not overwrite an existing asset; report the saved path after generation.",
     ],
@@ -206,14 +206,14 @@ export function registerCodexImageTool(
         minLength: 1,
         description: "Detailed image generation or editing prompt",
       }),
-      referenced_image_paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+      referenced_paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
         maxItems: MAX_REFERENCE_IMAGES,
-        description: "Local PNG, JPEG, WebP, or GIF paths used for an edit",
+        description: "Workspace PNG, JPEG, WebP, or GIF paths used for an edit",
       })),
       num_last_images_to_include: Type.Optional(Type.Integer({
         minimum: 1,
         maximum: MAX_REFERENCE_IMAGES,
-        description: "Use the smallest number of recent attached or generated conversation images needed for an edit; do not combine with referenced_image_paths",
+        description: "Use the smallest number of recent attached or generated conversation images needed for an edit; do not combine with referenced_paths",
       })),
       size: Type.Optional(Type.String({
         minLength: 1,
@@ -226,18 +226,30 @@ export function registerCodexImageTool(
         description: "Destination PNG path; defaults under output/codex-images",
       })),
     }, { additionalProperties: false }),
+    prepareArguments(args) {
+      if (!args || typeof args !== "object" || Array.isArray(args)) return args as never;
+      const input = args as Record<string, unknown>;
+      if (Array.isArray(input.referenced_image_paths)) {
+        const { referenced_image_paths, ...rest } = input;
+        return {
+          ...rest,
+          referenced_paths: rest.referenced_paths ?? referenced_image_paths,
+        } as never;
+      }
+      return input as never;
+    },
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const config = getConfig();
       if (config.imageEnabled === false) {
         throw new Error("codex_image is disabled in /99settings > Codex API > Tools");
       }
-      const references = params.referenced_image_paths ?? [];
+      const references = params.referenced_paths ?? [];
       const recentImageCount = params.num_last_images_to_include;
       if (references.length > MAX_REFERENCE_IMAGES) {
-        throw new Error(`referenced_image_paths accepts at most ${MAX_REFERENCE_IMAGES} images`);
+        throw new Error(`referenced_paths accepts at most ${MAX_REFERENCE_IMAGES} images`);
       }
       if (references.length > 0 && recentImageCount !== undefined) {
-        throw new Error("Provide only one of referenced_image_paths or num_last_images_to_include");
+        throw new Error("Provide only one of referenced_paths or num_last_images_to_include");
       }
       const operation = references.length === 0 && recentImageCount === undefined ? "generate" : "edit";
       const files = resolveWorkspaceFiles(pi, ctx.cwd);
@@ -302,8 +314,8 @@ export function registerCodexImageTool(
     },
     renderCall(args, theme, context) {
       const text = reusableText(context);
-      const references = Array.isArray(args.referenced_image_paths)
-        ? args.referenced_image_paths
+      const references = Array.isArray(args.referenced_paths)
+        ? args.referenced_paths
         : [];
       const recentImageCount = typeof args.num_last_images_to_include === "number"
         ? args.num_last_images_to_include

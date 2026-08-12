@@ -19,8 +19,10 @@ import {
   type WorkspaceFileSystem,
 } from "@99percentpeople/pi-workspace-files";
 import {
+  applyCodexProviderPayload,
   applyCodexToolFeatureChanges,
   applyFastModePayload,
+  applyResponseVerbosityPayload,
   CodexApiClient,
   CodexApiError,
   CodexOAuthError,
@@ -43,11 +45,14 @@ import {
   maskCodexEmail,
   parseCodexAccountInfo,
   parseCodexRedeemCredits,
+  registerCodexAskTool,
   registerCodexImageTool,
   registerCodexSearchTool,
   registerCodexUsageAndFast,
   resolveCodexApiRoot,
+  resolveCodexAskModel,
   resolveSearchMode,
+  RESPONSE_VERBOSITY_LABELS,
   saveCodexApiConfig,
   SEARCH_MODE_LABELS,
   usageRefreshNeeded,
@@ -264,8 +269,44 @@ test("Codex client resolves OAuth account, roots, headers, and API errors", asyn
   );
 });
 
+test("codex_ask resolves models from Pi's existing model registry", () => {
+  const first = {
+    id: "gpt-codex-first",
+    name: "Codex First",
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128000,
+    maxTokens: 8192,
+  };
+  const second = { ...first, id: "gpt-codex-second", input: ["text", "image"] };
+  const ctx = context(process.cwd()) as any;
+  ctx.model = { id: "other-model", provider: "anthropic" };
+  ctx.modelRegistry = {
+    getAll: () => [first, second],
+    isUsingOAuth: () => true,
+  };
+
+  assert.equal(resolveCodexAskModel(ctx, true).id, "gpt-codex-first");
+  assert.equal(resolveCodexAskModel(ctx, true, "gpt-codex-second").id, "gpt-codex-second");
+  assert.throws(
+    () => resolveCodexAskModel(ctx, true, "missing-model"),
+    /Pi's model list/,
+  );
+  assert.throws(
+    () => resolveCodexAskModel(ctx, false),
+    /active openai-codex model.*Other providers/,
+  );
+
+  ctx.model = second;
+  assert.equal(resolveCodexAskModel(ctx, false).id, "gpt-codex-second");
+});
+
 test("Codex tool manager toggles tools and blocks disabled calls", async () => {
-  let activeTools = ["read", "codex_search"];
+  let activeTools = ["read", "codex_search", "codex_ask"];
   const activeToolUpdates: string[][] = [];
   const pi = {
     getActiveTools: () => [...activeTools],
@@ -277,6 +318,7 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
   const toolFeatures = [
     { toolName: "codex_search", isEnabled: (config: typeof DEFAULT_CODEX_API_CONFIG) => config.searchEnabled },
     { toolName: "codex_image", isEnabled: (config: typeof DEFAULT_CODEX_API_CONFIG) => config.imageEnabled },
+    { toolName: "codex_ask", isEnabled: (config: typeof DEFAULT_CODEX_API_CONFIG) => config.askEnabled },
   ];
 
   const initiallyDisabled = {
@@ -284,8 +326,8 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
     searchEnabled: false,
   };
   disableUnavailableCodexTools(pi, initiallyDisabled, toolFeatures);
-  assert.deepEqual(activeTools, ["read"]);
-  assert.deepEqual(activeToolUpdates, [["read"]]);
+  assert.deepEqual(activeTools, ["read", "codex_ask"]);
+  assert.deepEqual(activeToolUpdates, [["read", "codex_ask"]]);
 
   // Enabling a tool from settings adds only that tool; startup does not
   // override a user's narrower initial tool selection by adding Image.
@@ -295,18 +337,20 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
     { ...initiallyDisabled, searchEnabled: true },
     toolFeatures,
   );
-  assert.deepEqual(activeTools, ["read", "codex_search"]);
+  assert.deepEqual(activeTools, ["read", "codex_ask", "codex_search"]);
+  const searchEnabled = { ...initiallyDisabled, searchEnabled: true };
+  const modelToolsDisabled = {
+    ...searchEnabled,
+    searchEnabled: false,
+    imageEnabled: false,
+    askEnabled: false,
+  };
+  applyCodexToolFeatureChanges(pi, searchEnabled, modelToolsDisabled, toolFeatures);
+  assert.deepEqual(activeTools, ["read"]);
   applyCodexToolFeatureChanges(
     pi,
-    { ...initiallyDisabled, searchEnabled: true },
-    { ...initiallyDisabled, searchEnabled: true, imageEnabled: false },
-    toolFeatures,
-  );
-  assert.deepEqual(activeTools, ["read", "codex_search"]);
-  applyCodexToolFeatureChanges(
-    pi,
-    { ...initiallyDisabled, searchEnabled: true, imageEnabled: false },
-    { ...initiallyDisabled, searchEnabled: false, imageEnabled: true },
+    modelToolsDisabled,
+    { ...modelToolsDisabled, imageEnabled: true },
     toolFeatures,
   );
   assert.deepEqual(activeTools, ["read", "codex_image"]);
@@ -317,19 +361,20 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
     updateConfig: (next) => { config = next; },
   });
   assert.equal(panel.title, "Codex Tools");
-  assert.equal(codexFeatureSummary(config), "2/2 On");
+  assert.equal(codexFeatureSummary(config), "3/3 On");
   assert.deepEqual(
     panel.settings().map((setting) => [setting.label, setting.currentValue]),
     [
       ["Search", "On"],
       ["Image", "On"],
+      ["Ask Codex", "On"],
     ],
   );
   panel.onChange?.("searchEnabled", "Off", context(process.cwd()));
   panel.onChange?.("fastMode", "On", context(process.cwd()));
   assert.equal(config.searchEnabled, false);
   assert.equal(config.fastMode, false, "non-tool settings are ignored by the tool submenu");
-  assert.equal(panel.currentValue?.(), "1/2 On");
+  assert.equal(panel.currentValue?.(), "2/3 On");
 
   const disabledSearch = toolRegistry((toolPi) => registerCodexSearchTool(
     toolPi,
@@ -360,6 +405,143 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
     ),
     /codex_image is disabled.*Tools/,
   );
+
+  const disabledAsk = toolRegistry((toolPi) => registerCodexAskTool(
+    toolPi,
+    () => ({ ...DEFAULT_CODEX_API_CONFIG, askEnabled: false }),
+  ));
+  await assert.rejects(
+    () => disabledAsk.execute(
+      "disabled-ask",
+      { prompt: "example" },
+      undefined,
+      undefined,
+      context(process.cwd()),
+    ),
+    /codex_ask is disabled.*Tools/,
+  );
+});
+
+test("codex_ask delegates standalone multilingual and vision requests with explicit controls", async () => {
+  const temporary = await mkdtemp(join(tmpdir(), "pi-codex-ask-"));
+  const inputPath = join(temporary, "diagram.png");
+  await writeFile(inputPath, Buffer.from("image bytes"));
+  let completion: { model: any; context: any; options: any } | undefined;
+  let usageRefreshes = 0;
+  const tool = toolRegistry((pi) => registerCodexAskTool(
+    pi,
+    () => ({
+      ...DEFAULT_CODEX_API_CONFIG,
+      allowOtherProviders: true,
+      fastMode: true,
+      responseVerbosity: "medium",
+    }),
+    () => { usageRefreshes += 1; },
+  ));
+  try {
+    const codexModel = {
+      id: "gpt-5.6-sol",
+      name: "GPT-5.6-Sol",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      baseUrl: "https://chatgpt.com/backend-api",
+      reasoning: true,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 272000,
+      maxTokens: 128000,
+    };
+    const ctx = otherProviderContext(temporary) as any;
+    ctx.modelRegistry = {
+      getAll: () => [codexModel],
+      isUsingOAuth: (model: { provider?: string }) => model.provider === "openai-codex",
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: jwt() }),
+      complete: async (model: any, requestContext: any, options: any) => {
+        completion = { model, context: requestContext, options };
+        return {
+          role: "assistant",
+          content: [{ type: "text", text: "这是 Codex 的独立答案。" }],
+          provider: "openai-codex",
+          model: model.id,
+          stopReason: "stop",
+          timestamp: Date.now(),
+          usage: {
+            input: 120,
+            output: 20,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 140,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
+      },
+    };
+    const updates: any[] = [];
+    const result = await tool.execute(
+      "ask-call",
+      {
+        prompt: "请用中文分析这张图。",
+        reasoning: "xhigh",
+        verbosity: "high",
+        image_paths: [inputPath],
+        max_output_tokens: 4096,
+      },
+      undefined,
+      (update) => updates.push(update),
+      ctx,
+    );
+    assert.equal(completion?.model.id, "gpt-5.6-sol");
+    assert.equal(completion?.context.systemPrompt.includes("standalone request"), true);
+    assert.equal(completion?.context.messages[0].content[0].text, "请用中文分析这张图。");
+    assert.equal(completion?.context.messages[0].content[1].mimeType, "image/png");
+    assert.equal(completion?.context.messages[0].content[1].data, Buffer.from("image bytes").toString("base64"));
+    assert.equal(completion?.options.reasoningEffort, "xhigh");
+    assert.equal(completion?.options.textVerbosity, "high");
+    assert.equal(completion?.options.serviceTier, "priority");
+    assert.equal(completion?.options.maxTokens, 4096);
+    assert.equal(completion?.options.cacheRetention, "none");
+    assert.equal(typeof completion?.options.sessionId, "string");
+    assert.deepEqual(result.content, [{ type: "text", text: "这是 Codex 的独立答案。" }]);
+    assert.equal((result.details as any).model, "gpt-5.6-sol");
+    assert.equal((result.details as any).imageCount, 1);
+    assert.equal("prompt" in (result.details as any), false);
+    assert.equal(result.usage?.totalTokens, 140);
+    assert.equal(usageRefreshes, 1);
+    assert.deepEqual(
+      updates.map((update) => update.details.phase),
+      ["selecting-model", "reading-images", "asking"],
+    );
+
+    const collapsed = render(tool.renderResult!(
+      result,
+      { expanded: false, isPartial: false },
+      plainTheme,
+      renderContext(false),
+    ));
+    assert.match(collapsed, /Codex answered with gpt-5\.6-sol/);
+    assert.doesNotMatch(collapsed, /独立答案/);
+    const expanded = render(tool.renderResult!(
+      result,
+      { expanded: true, isPartial: false },
+      plainTheme,
+      renderContext(true),
+    ));
+    assert.match(expanded, /这是 Codex 的独立答案/);
+
+    const disabled = otherProviderContext(temporary);
+    await assert.rejects(
+      () => toolRegistry((pi) => registerCodexAskTool(pi)).execute(
+        "disabled-ask",
+        { prompt: "Ask Codex" },
+        undefined,
+        undefined,
+        disabled,
+      ),
+      /active openai-codex model.*Other providers/,
+    );
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 });
 
 test("codex_image generates, edits, saves PNGs, and returns image content", async () => {
@@ -377,7 +559,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
   const imageProperties = (tool.parameters as any).properties;
   assert.deepEqual(Object.keys(imageProperties), [
     "prompt",
-    "referenced_image_paths",
+    "referenced_paths",
     "num_last_images_to_include",
     "size",
     "quality",
@@ -387,6 +569,22 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
   assert.equal(imageProperties.background, undefined);
   assert.equal(imageProperties.n, undefined);
   assert.equal(imageProperties.output_format, undefined);
+  assert.equal(imageProperties.referenced_image_paths, undefined);
+  assert.deepEqual(tool.prepareArguments?.({
+    prompt: "legacy edit",
+    referenced_image_paths: ["legacy.png"],
+  }), {
+    prompt: "legacy edit",
+    referenced_paths: ["legacy.png"],
+  });
+  assert.deepEqual(tool.prepareArguments?.({
+    prompt: "mixed edit",
+    referenced_paths: ["current.png"],
+    referenced_image_paths: ["legacy.png"],
+  }), {
+    prompt: "mixed edit",
+    referenced_paths: ["current.png"],
+  });
   try {
     const ctx = context(temporary);
     const generatedPath = join(temporary, "generated.png");
@@ -450,7 +648,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     const styledImageCall = tool.renderCall!(
       {
         prompt: "a red fox",
-        referenced_image_paths: ["source.png", "texture.webp"],
+        referenced_paths: ["source.png", "texture.webp"],
         size: "1536x1024",
         quality: "high",
         output_path: "result.png",
@@ -459,7 +657,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
       renderContext(false, {
         args: {
           prompt: "a red fox",
-          referenced_image_paths: ["source.png", "texture.webp"],
+          referenced_paths: ["source.png", "texture.webp"],
           size: "1536x1024",
           quality: "high",
           output_path: "result.png",
@@ -500,7 +698,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
       "image-call-2",
       {
         prompt: "add a blue hat",
-        referenced_image_paths: [generatedPath],
+        referenced_paths: [generatedPath],
         size: "1536x1024",
         quality: "high",
         output_path: editedPath,
@@ -556,14 +754,14 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
         "image-call-conflict",
         {
           prompt: "invalid edit",
-          referenced_image_paths: [generatedPath],
+          referenced_paths: [generatedPath],
           num_last_images_to_include: 1,
         },
         undefined,
         undefined,
         recentCtx,
       ),
-      /Provide only one of referenced_image_paths or num_last_images_to_include/,
+      /Provide only one of referenced_paths or num_last_images_to_include/,
     );
     assert.equal(calls.length, 3);
 
@@ -642,7 +840,7 @@ test("codex_image uses a claimed workspace file system for binary output and ref
       "remote-image",
       {
         prompt: "Use the remote reference",
-        referenced_image_paths: ["Desktop\\reference.jpg"],
+        referenced_paths: ["Desktop\\reference.jpg"],
         output_path: "Desktop\\generated",
       },
       undefined,
@@ -1408,7 +1606,7 @@ test("Codex search display formats weather, finance, sports, and time lookups", 
   assert.equal(failedLookup.kind, "data");
 });
 
-test("Codex usage parsing and Fast payload preserve provider data", () => {
+test("Codex usage, Fast mode, and answer detail preserve provider payload data", () => {
   const snapshots = parseCodexRateLimits({
     "X-Codex-Primary-Used-Percent": "25.5",
     "X-Codex-Primary-Window-Minutes": "300",
@@ -1436,6 +1634,18 @@ test("Codex usage parsing and Fast payload preserve provider data", () => {
   );
   const payload = { model: "gpt-5.6" };
   assert.equal(applyFastModePayload(payload, false), payload);
+  assert.deepEqual(
+    applyResponseVerbosityPayload({ model: "gpt-5.6", text: { format: "plain" } }, "high"),
+    { model: "gpt-5.6", text: { format: "plain", verbosity: "high" } },
+  );
+  assert.equal(applyResponseVerbosityPayload(payload, "auto"), payload);
+  assert.deepEqual(
+    applyCodexProviderPayload(
+      { model: "gpt-5.6", text: { verbosity: "low" } },
+      { ...DEFAULT_CODEX_API_CONFIG, fastMode: true, responseVerbosity: "medium" },
+    ),
+    { model: "gpt-5.6", service_tier: "priority", text: { verbosity: "medium" } },
+  );
 });
 
 test("Usage monitor Off skips automatic provider refreshes", async () => {
@@ -2662,6 +2872,14 @@ test("Codex usage watches auth.json for account switches and ignores stale reque
 
 test("Codex API config normalizes, saves, and reloads", async () => {
   assert.equal(DEFAULT_CODEX_API_CONFIG.searchMode, "auto");
+  assert.equal(DEFAULT_CODEX_API_CONFIG.responseVerbosity, "auto");
+  assert.equal(DEFAULT_CODEX_API_CONFIG.askEnabled, true);
+  assert.deepEqual(RESPONSE_VERBOSITY_LABELS, {
+    auto: "Model default",
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+  });
   assert.deepEqual(SEARCH_MODE_LABELS, {
     auto: "Auto",
     cached: "Cached",
@@ -2677,8 +2895,10 @@ test("Codex API config normalizes, saves, and reloads", async () => {
   assert.equal(resolveSearchMode("live", "cached"), "live");
   assert.deepEqual(normalizeCodexApiConfig({
     fastMode: true,
+    responseVerbosity: "high",
     searchEnabled: false,
     imageEnabled: false,
+    askEnabled: false,
     allowOtherProviders: true,
     searchMode: "live",
     searchContextSize: "high",
@@ -2686,8 +2906,10 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     usageStatus: false,
   }), {
     fastMode: true,
+    responseVerbosity: "high",
     searchEnabled: false,
     imageEnabled: false,
+    askEnabled: false,
     allowOtherProviders: true,
     searchMode: "live",
     searchContextSize: "high",
@@ -2712,8 +2934,10 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     await writeFile(path, JSON.stringify({ untouched: { enabled: true } }));
     saveCodexApiConfig({
       fastMode: true,
+      responseVerbosity: "medium",
       searchEnabled: false,
       imageEnabled: true,
+      askEnabled: false,
       allowOtherProviders: true,
       searchMode: "indexed",
       searchContextSize: "low",
@@ -2722,8 +2946,10 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     }, path);
     assert.deepEqual(loadCodexApiConfig(path), {
       fastMode: true,
+      responseVerbosity: "medium",
       searchEnabled: false,
       imageEnabled: true,
+      askEnabled: false,
       allowOtherProviders: true,
       searchMode: "indexed",
       searchContextSize: "low",

@@ -1,10 +1,21 @@
 # @99percentpeople/pi-codex-api
 
-Turn your ChatGPT subscription into Pi superpowers — image generation, web
-search, Fast mode, and usage monitoring — **no OpenAI API key required**.
+Turn your ChatGPT subscription into Pi superpowers — multilingual text and
+vision delegation, image generation, web search, Fast mode, and usage
+monitoring — **no OpenAI API key required**.
 
 ## Highlights
 
+- **Ask Codex from any model** — `codex_ask` sends a standalone multilingual
+  text or vision request to a live Codex subscription model. Use it for an
+  explicit Codex second opinion, translation, rewrite, review, or screenshot
+  analysis while DeepSeek, Google, Claude, or another provider remains active.
+- **Tool manager** — one `/99settings` submenu independently switches Search,
+  Image, and Ask Codex On or Off. Disabled model tools disappear from the
+  active prompt immediately.
+- **Answer detail** — `/99settings` can leave Codex verbosity at the model
+  default or override normal Codex replies and `codex_ask` with Low, Medium,
+  or High detail.
 - **Image generation & editing** — `codex_image` creates or edits images via
   your Codex subscription's `gpt-image-2`, and works from **any model**:
   even with a third-party provider active (DeepSeek, Google, …), it reuses Pi's
@@ -33,6 +44,27 @@ Web search with clean result cards (search → open a result → summarize):
 Image generation with `gpt-image-2` (saved PNG + description):
 
 ![codex image demo](../../promo/demo/codex-image.gif)
+
+## Ask Codex
+
+`codex_ask` is deliberately opt-in. The active model should call it only when
+someone explicitly asks to consult Codex or requests a Codex second opinion;
+it must not recursively delegate routine work just because Codex is available.
+
+Each call is standalone. Pi does **not** copy the surrounding conversation or
+workspace into the request automatically, so the tool prompt must contain the
+necessary context, target language, and output format. Optional controls include:
+
+- an exact `openai-codex` model ID from Pi's existing model list (otherwise the
+  active Codex model or first logged-in Codex model is selected);
+- reasoning effort and per-call answer detail;
+- up to five workspace images or recent conversation images for vision;
+- an explicit output-token cap when the default 8,192 tokens is unsuitable.
+
+Text calls reuse Pi's model-provider implementation and record their nested LLM
+usage on the tool result. One-off delegated requests use a fresh routing session
+and disable prompt-cache retention. With SSH Remote active, workspace image
+inputs are read through the remote binary file adapter.
 
 ## Search output
 
@@ -74,6 +106,7 @@ pi install npm:@99percentpeople/pi-codex-api
 
 Requirements:
 
+- Pi 0.84.1 or newer for `codex_ask`
 - Pi logged in with `/login` for `openai-codex`
 - An active `openai-codex` model, or **Other providers** enabled in
   `/99settings` to use the subscription from any model
@@ -82,7 +115,7 @@ That's it — just ask *"generate an image of a neon ramen shop"* or *"search
 the web for today's Rust releases"* and the model calls the tools for you.
 
 When `@99percentpeople/pi-ssh-remote` is active, `codex_image.output_path` and
-`referenced_image_paths` resolve through `@99percentpeople/pi-workspace-files`
+`referenced_paths` resolve through `@99percentpeople/pi-workspace-files`
 and its remote binary backend. Generated
 Base64 data is written directly through the remote adapter and references are
 read directly from it, without creating local staging files.
@@ -165,14 +198,16 @@ Redeem Full reset (expires 2026-08-12)? (30s)
 
 Configure under **Codex API** in `/99settings`:
 
-- **Tools** opens one tool manager where **Search** and **Image** can each be
-  switched **On** or **Off**. Disabled tools are removed from the active model
+- **Tools** opens one tool manager where **Search**, **Image**, and **Ask Codex**
+  can each be switched **On** or **Off**. Disabled tools are removed from the active model
   prompt immediately; stale or concurrently queued calls are rejected before
   they reach Codex.
 - **Fast mode** remains a direct On/Off setting for the priority service tier.
 - **Usage monitor** remains a direct On/Off setting. Turning it off stops
   background status refreshes, while explicit `/codex-usage` and
   `/codex-redeem` commands remain available.
+- **Answer detail** selects model default, Low, Medium, or High verbosity for
+  normal Codex replies and `codex_ask` unless a call overrides it.
 - **Other providers** lets any model (DeepSeek, Google, …) use the logged-in
   Codex subscription.
 - **Search mode** and **Search context** configure search when its feature is on.
@@ -180,8 +215,9 @@ Configure under **Codex API** in `/99settings`:
 - **Usage poll** controls the monitor refresh interval when its feature is on.
 
 Settings live in `~/.pi/agent/99extensions.json` under the `codex-api`
-namespace. Existing configurations migrate with Search and Image enabled, so
-upgrading does not remove tools unless you explicitly switch them off.
+namespace. Existing configurations migrate with Search, Image, and Ask Codex
+enabled, so upgrading does not remove tools unless you explicitly switch them
+off.
 
 ## How it works
 
@@ -189,7 +225,9 @@ upgrading does not remove tools unless you explicitly switch them off.
   separate search provider
 - Tokens are fetched per call from Pi's model registry, never stored in
   settings or tool results
-- Images and search requests go to OpenAI's Codex backend and follow your
+- `codex_ask` uses Pi 0.84+'s authenticated model completion API so OAuth,
+  provider overrides, and request transport stay inside Pi's model registry
+- Text, image, and search requests go to OpenAI's Codex backend and follow your
   ChatGPT workspace's policies
 - The extension also ships the **`gpt-image-prompts`** skill for crafting
   production-grade image prompts — invoke it with `/skill:gpt-image-prompts`

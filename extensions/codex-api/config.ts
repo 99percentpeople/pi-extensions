@@ -7,11 +7,14 @@ import {
 export type CodexSearchMode = "auto" | "cached" | "indexed" | "live";
 export type CodexSearchContextSize = "low" | "medium" | "high";
 export type CodexImageQuality = "auto" | "low" | "medium" | "high";
+export type CodexResponseVerbosity = "auto" | "low" | "medium" | "high";
 
 export interface CodexApiConfig {
   fastMode: boolean;
+  responseVerbosity: CodexResponseVerbosity;
   searchEnabled: boolean;
   imageEnabled: boolean;
+  askEnabled: boolean;
   allowOtherProviders: boolean;
   searchMode: CodexSearchMode;
   searchContextSize: CodexSearchContextSize;
@@ -25,8 +28,10 @@ export const CODEX_API_SETTINGS_NAMESPACE = "codex-api";
 
 export const DEFAULT_CODEX_API_CONFIG: CodexApiConfig = {
   fastMode: false,
+  responseVerbosity: "auto",
   searchEnabled: true,
   imageEnabled: true,
+  askEnabled: true,
   allowOtherProviders: false,
   searchMode: "auto",
   searchContextSize: "medium",
@@ -46,12 +51,20 @@ export function normalizeCodexApiConfig(value: unknown): CodexApiConfig {
     fastMode: typeof input.fastMode === "boolean"
       ? input.fastMode
       : DEFAULT_CODEX_API_CONFIG.fastMode,
+    responseVerbosity: oneOf(
+      input.responseVerbosity,
+      ["auto", "low", "medium", "high"],
+      DEFAULT_CODEX_API_CONFIG.responseVerbosity,
+    ),
     searchEnabled: typeof input.searchEnabled === "boolean"
       ? input.searchEnabled
       : DEFAULT_CODEX_API_CONFIG.searchEnabled,
     imageEnabled: typeof input.imageEnabled === "boolean"
       ? input.imageEnabled
       : DEFAULT_CODEX_API_CONFIG.imageEnabled,
+    askEnabled: typeof input.askEnabled === "boolean"
+      ? input.askEnabled
+      : DEFAULT_CODEX_API_CONFIG.askEnabled,
     allowOtherProviders: typeof input.allowOtherProviders === "boolean"
       ? input.allowOtherProviders
       : DEFAULT_CODEX_API_CONFIG.allowOtherProviders,
