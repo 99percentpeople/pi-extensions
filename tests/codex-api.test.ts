@@ -51,6 +51,7 @@ import {
   registerCodexUsageAndFast,
   resolveCodexApiRoot,
   resolveCodexAskModel,
+  resolveOfficialCodexAskModel,
   resolveSearchMode,
   RESPONSE_VERBOSITY_LABELS,
   saveCodexApiConfig,
@@ -305,6 +306,78 @@ test("codex_ask resolves models from Pi's existing model registry", () => {
   assert.equal(resolveCodexAskModel(ctx, false).id, "gpt-codex-second");
 });
 
+test("codex_ask follows ChatGPT's official default model priority", async () => {
+  const officialDefault = {
+    id: "gpt-official-default",
+    name: "Official Default",
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128000,
+    maxTokens: 8192,
+  };
+  const oldest = { ...officialDefault, id: "gpt-oldest" };
+  const ctx = context(process.cwd()) as any;
+  ctx.model = { id: "other-model", provider: "anthropic" };
+  ctx.modelRegistry = {
+    getAll: () => [oldest, officialDefault],
+    isUsingOAuth: (model: { provider?: string }) => model.provider === "openai-codex",
+    getApiKeyAndHeaders: async () => ({ ok: true, apiKey: jwt() }),
+  };
+  const fetchCatalog = async (input: string | URL | Request, init?: RequestInit) => {
+    const request = new Request(input, init);
+    assert.equal(new URL(request.url).pathname, "/backend-api/codex/models");
+    assert.equal(new URL(request.url).searchParams.get("client_version"), "0.0.0");
+    return new Response(JSON.stringify({
+      models: [
+        { slug: "gpt-hidden", priority: 0, visibility: "hide" },
+        { slug: "gpt-oldest", priority: 20, visibility: "list" },
+        { slug: "gpt-official-default", priority: 1, visibility: "list" },
+      ],
+    }), { status: 200 });
+  };
+  const unexpectedCatalogFetch = async () => {
+    throw new Error("explicit model selection must not fetch the official catalog");
+  };
+
+  assert.equal(
+    (await resolveOfficialCodexAskModel(
+      ctx,
+      true,
+      undefined,
+      undefined,
+      fetchCatalog as typeof fetch,
+    )).id,
+    "gpt-official-default",
+  );
+  assert.equal(
+    (await resolveOfficialCodexAskModel(
+      ctx,
+      true,
+      "gpt-oldest",
+      undefined,
+      unexpectedCatalogFetch as typeof fetch,
+    )).id,
+    "gpt-oldest",
+    "an explicit model bypasses official-default lookup",
+  );
+
+  ctx.modelRegistry.getAll = () => [oldest];
+  await assert.rejects(
+    () => resolveOfficialCodexAskModel(
+      ctx,
+      true,
+      undefined,
+      undefined,
+      fetchCatalog as typeof fetch,
+    ),
+    /official Codex default model.*unavailable.*Update Pi/,
+  );
+});
+
 test("Codex tool manager toggles tools and blocks disabled calls", async () => {
   let activeTools = ["read", "codex_search", "codex_ask"];
   const activeToolUpdates: string[][] = [];
@@ -422,7 +495,7 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
   );
 });
 
-test("codex_ask delegates standalone multilingual and vision requests with explicit controls", async () => {
+test("codex_ask delegates standalone text and vision requests with explicit controls", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "pi-codex-ask-"));
   const inputPath = join(temporary, "diagram.png");
   await writeFile(inputPath, Buffer.from("image bytes"));
@@ -460,7 +533,7 @@ test("codex_ask delegates standalone multilingual and vision requests with expli
         completion = { model, context: requestContext, options };
         return {
           role: "assistant",
-          content: [{ type: "text", text: "这是 Codex 的独立答案。" }],
+          content: [{ type: "text", text: "This is Codex's standalone answer." }],
           provider: "openai-codex",
           model: model.id,
           stopReason: "stop",
@@ -480,7 +553,8 @@ test("codex_ask delegates standalone multilingual and vision requests with expli
     const result = await tool.execute(
       "ask-call",
       {
-        prompt: "请用中文分析这张图。",
+        prompt: "Analyze this image and reply concisely.",
+        model: "gpt-5.6-sol",
         reasoning: "xhigh",
         verbosity: "high",
         image_paths: [inputPath],
@@ -492,7 +566,7 @@ test("codex_ask delegates standalone multilingual and vision requests with expli
     );
     assert.equal(completion?.model.id, "gpt-5.6-sol");
     assert.equal(completion?.context.systemPrompt.includes("standalone request"), true);
-    assert.equal(completion?.context.messages[0].content[0].text, "请用中文分析这张图。");
+    assert.equal(completion?.context.messages[0].content[0].text, "Analyze this image and reply concisely.");
     assert.equal(completion?.context.messages[0].content[1].mimeType, "image/png");
     assert.equal(completion?.context.messages[0].content[1].data, Buffer.from("image bytes").toString("base64"));
     assert.equal(completion?.options.reasoningEffort, "xhigh");
@@ -501,7 +575,7 @@ test("codex_ask delegates standalone multilingual and vision requests with expli
     assert.equal(completion?.options.maxTokens, 4096);
     assert.equal(completion?.options.cacheRetention, "none");
     assert.equal(typeof completion?.options.sessionId, "string");
-    assert.deepEqual(result.content, [{ type: "text", text: "这是 Codex 的独立答案。" }]);
+    assert.deepEqual(result.content, [{ type: "text", text: "This is Codex's standalone answer." }]);
     assert.equal((result.details as any).model, "gpt-5.6-sol");
     assert.equal((result.details as any).imageCount, 1);
     assert.equal("prompt" in (result.details as any), false);
@@ -518,15 +592,34 @@ test("codex_ask delegates standalone multilingual and vision requests with expli
       plainTheme,
       renderContext(false),
     ));
+    assert.match(collapsed, /This is Codex's standalone answer/);
     assert.match(collapsed, /Codex answered with gpt-5\.6-sol/);
-    assert.doesNotMatch(collapsed, /独立答案/);
+    assert.doesNotMatch(collapsed, /to expand/);
+
+    const longResult = {
+      ...result,
+      content: [{ type: "text" as const, text: `Preview starts here ${"Long answer content. ".repeat(60)}` }],
+      details: { ...(result.details as any), outputChars: 488 },
+    };
+    initTheme("dark", false);
+    const longCollapsed = render(tool.renderResult!(
+      longResult,
+      { expanded: false, isPartial: false },
+      plainTheme,
+      renderContext(false),
+    ));
+    assert.match(longCollapsed, /^\n?Preview starts here/);
+    assert.match(longCollapsed, /…\nCodex answered with gpt-5\.6-sol · 488 chars/);
+    assert.match(longCollapsed, /to expand/);
+    assert.ok(Array.from(longCollapsed.split("\n")[0]).length <= 320);
+
     const expanded = render(tool.renderResult!(
       result,
       { expanded: true, isPartial: false },
       plainTheme,
       renderContext(true),
     ));
-    assert.match(expanded, /这是 Codex 的独立答案/);
+    assert.match(expanded, /This is Codex's standalone answer/);
 
     const disabled = otherProviderContext(temporary);
     await assert.rejects(
@@ -2005,6 +2098,7 @@ test("Codex account and redeem credits parse and display", () => {
   assert.deepEqual(account, { planType: "plus", email: "alice@example.com" });
   assert.equal(parseCodexAccountInfo({ user_id: "user-x" }), undefined);
 
+  const creditExpiry = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
   const redeem = parseCodexRedeemCredits({
     credits: [{
       id: "RateLimitResetCredit_90c666dc336481918f61dbee048f2f0e",
@@ -2012,7 +2106,7 @@ test("Codex account and redeem credits parse and display", () => {
       is_supported_by_plan: true,
       status: "available",
       granted_at: "2026-07-13T18:14:16.753394Z",
-      expires_at: "2026-08-12T18:14:16.753394Z",
+      expires_at: creditExpiry,
       title: "Full reset",
       description: "Thanks for using Codex! You've been granted one free rate limit reset.",
     }],
@@ -2042,7 +2136,7 @@ test("Codex account and redeem credits parse and display", () => {
   });
   const text = formatCodexUsage(snapshots, Date.now(), { account, redeemCredits: redeem });
   assert.match(text, /^Codex usage\n\naccount · Plus \(ali\*\*\*@example\.com\)\n\ncodex\n/);
-  assert.ok(text.includes(`\n\nrate limit redeem\n  Full reset (available, expires ${formatLocalDateTime(Date.parse("2026-08-12T18:14:16.753394Z"))})`));
+  assert.ok(text.includes(`\n\nrate limit redeem\n  Full reset (available, expires ${formatLocalDateTime(Date.parse(creditExpiry))})`));
   assert.doesNotMatch(text, /unknown plan/);
 
   const emptyRedeem = formatCodexUsage(snapshots, Date.now(), {

@@ -92,6 +92,7 @@ export {
   completeCodexAsk,
   registerCodexAskTool,
   resolveCodexAskModel,
+  resolveOfficialCodexAskModel,
   type CodexAskDetails,
   type CodexAskPhase,
   type CodexAskReasoning,

@@ -13,9 +13,10 @@ import {
   type OpenAICodexResponsesOptions,
   type TextContent,
 } from "@earendil-works/pi-ai";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  keyHint,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -23,6 +24,7 @@ import {
   type CodexApiConfig,
   type CodexResponseVerbosity,
 } from "./config.ts";
+import { createCodexApiClient, type CodexFetch } from "./client.ts";
 import {
   reusableText,
   streamingSuffix,
@@ -32,6 +34,7 @@ import {
 const MAX_ASK_IMAGES = 5;
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 const MAX_OUTPUT_TOKENS = 32768;
+const CODEX_MODELS_CLIENT_VERSION = "0.0.0";
 const CODEX_ASK_SYSTEM_PROMPT = `You are Codex answering a standalone request delegated by another Pi agent.
 Answer the request directly and accurately. Use only the prompt and images provided in this request.
 Do not assume access to the surrounding conversation, repository, files, or tools unless their relevant contents are included.
@@ -150,6 +153,61 @@ function abbreviatedPrompt(value: unknown): string {
   return JSON.stringify(compact.length > 180 ? `${compact.slice(0, 177)}…` : compact);
 }
 
+function answerPreview(value: string, maxChars = 320): { text: string; truncated: boolean } {
+  const compact = value.replace(/\s+/g, " ").trim();
+  const characters = Array.from(compact);
+  if (characters.length <= maxChars) return { text: compact, truncated: false };
+  return {
+    text: `${characters.slice(0, Math.max(0, maxChars - 1)).join("").trimEnd()}…`,
+    truncated: true,
+  };
+}
+
+interface CodexModelsCatalogEntry {
+  slug?: unknown;
+  priority?: unknown;
+  visibility?: unknown;
+}
+
+interface CodexModelsCatalog {
+  models?: unknown;
+}
+
+function officialDefaultModelId(catalog: CodexModelsCatalog): string | undefined {
+  if (!Array.isArray(catalog.models)) return undefined;
+  return (catalog.models as CodexModelsCatalogEntry[])
+    .filter((model) =>
+      typeof model.slug === "string"
+      && model.visibility === "list"
+      && typeof model.priority === "number"
+      && Number.isFinite(model.priority)
+    )
+    .sort((left, right) => (left.priority as number) - (right.priority as number))[0]
+    ?.slug as string | undefined;
+}
+
+async function resolveOfficialCodexDefaultModelId(
+  ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+  allowOtherProviders: boolean,
+  signal?: AbortSignal,
+  fetchImpl?: CodexFetch,
+): Promise<string> {
+  const client = await createCodexApiClient(
+    ctx,
+    { allowOtherProviders },
+    fetchImpl,
+  );
+  const catalog = await client.get<CodexModelsCatalog>(
+    `/models?client_version=${encodeURIComponent(CODEX_MODELS_CLIENT_VERSION)}`,
+    signal,
+  );
+  const modelId = officialDefaultModelId(catalog);
+  if (!modelId) {
+    throw new Error("Codex did not return an official default model");
+  }
+  return modelId;
+}
+
 export function resolveCodexAskModel(
   ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
   allowOtherProviders: boolean,
@@ -187,6 +245,33 @@ export function resolveCodexAskModel(
     );
   }
   return selected as CodexTextModel;
+}
+
+export async function resolveOfficialCodexAskModel(
+  ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+  allowOtherProviders: boolean,
+  requestedModelId?: string,
+  signal?: AbortSignal,
+  fetchImpl?: CodexFetch,
+): Promise<CodexTextModel> {
+  const requested = requestedModelId?.trim();
+  if (requested) return resolveCodexAskModel(ctx, allowOtherProviders, requested);
+  const officialDefault = await resolveOfficialCodexDefaultModelId(
+    ctx,
+    allowOtherProviders,
+    signal,
+    fetchImpl,
+  );
+  try {
+    return resolveCodexAskModel(ctx, allowOtherProviders, officialDefault);
+  } catch (error) {
+    if (error instanceof Error && /unavailable or not logged in/.test(error.message)) {
+      throw new Error(
+        `The official Codex default model (${officialDefault}) is unavailable in Pi's model registry. Update Pi and retry.`,
+      );
+    }
+    throw error;
+  }
 }
 
 interface CompleteCapableRegistry {
@@ -235,7 +320,7 @@ export function registerCodexAskTool(
       }),
       model: Type.Optional(Type.String({
         minLength: 1,
-        description: "Exact openai-codex model ID from Pi's model list; omit for the active or first logged-in Codex model",
+        description: "Exact openai-codex model ID from Pi's model list; omit to use ChatGPT's current official Codex default",
       })),
       reasoning: Type.Optional(ReasoningSchema),
       verbosity: Type.Optional(VerbositySchema),
@@ -270,7 +355,12 @@ export function registerCodexAskTool(
       });
 
       update("selecting-model");
-      const selected = resolveCodexAskModel(ctx, config.allowOtherProviders, params.model);
+      const selected = await resolveOfficialCodexAskModel(
+        ctx,
+        config.allowOtherProviders,
+        params.model,
+        signal,
+      );
 
       let images: ImageContent[] = [];
       if (paths.length > 0) {
@@ -377,9 +467,18 @@ export function registerCodexAskTool(
         text.setText(output ? theme.fg("toolOutput", output) : "");
         return text;
       }
+      const preview = answerPreview(output);
       const model = details.model ? ` with ${details.model}` : "";
       const length = details.outputChars === undefined ? "" : ` · ${details.outputChars.toLocaleString("en-US")} chars`;
-      text.setText(theme.fg("toolOutput", `Codex answered${model}${length}`));
+      const expandHint = preview.truncated
+        ? theme.fg("muted", " (") + keyHint("app.tools.expand", "to expand") + theme.fg("muted", ")")
+        : "";
+      const summary = theme.fg("success", `Codex answered${model}`)
+        + theme.fg("muted", length)
+        + expandHint;
+      text.setText(preview.text
+        ? `\n${theme.fg("toolOutput", preview.text)}\n${summary}`
+        : summary);
       return text;
     },
   });

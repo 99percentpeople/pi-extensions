@@ -56,7 +56,7 @@ workspace into the request automatically, so the tool prompt must contain the
 necessary context, target language, and output format. Optional controls include:
 
 - an exact `openai-codex` model ID from Pi's existing model list (otherwise the
-  active Codex model or first logged-in Codex model is selected);
+  current official ChatGPT Codex default is resolved from its live model catalog);
 - reasoning effort and per-call answer detail;
 - up to five workspace images or recent conversation images for vision;
 - an explicit output-token cap when the default 8,192 tokens is unsuitable.
