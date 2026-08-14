@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-thinking-fold",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "description": "Fold streaming reasoning into a live tail preview and expand it with Pi's thinking shortcut",
   "type": "module",
@@ -15,6 +15,9 @@
   "piBuild": {
     "assets": [
       "model-behaviors.json"
+    ],
+    "bundlePackages": [
+      "@99percentpeople/pi-shared-settings"
     ]
   },
   "keywords": [

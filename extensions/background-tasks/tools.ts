@@ -7,8 +7,9 @@ import {
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import * as nodePty from "node-pty";
+import type * as NodePty from "node-pty";
 import { MAX_INPUT_BYTES, parseInput, type ParsedInput } from "./input.ts";
+import { nodePty } from "./runtime-dependencies.ts";
 import {
   BACKGROUND_SEND_SIGNALS,
   MAX_TERMINAL_COLS,
@@ -136,7 +137,7 @@ export function registerBackgroundTaskTools(
 
       try {
         if (mode === "pty") {
-          let ptyProcess: nodePty.IPty;
+          let ptyProcess: NodePty.IPty;
           ptyProcess = (shell.ptySpawnProcess ?? dependencies.ptySpawnProcess ?? nodePty.spawn)(shell.file, shell.args, {
             name: shell.env.TERM || "xterm-256color",
             cols,

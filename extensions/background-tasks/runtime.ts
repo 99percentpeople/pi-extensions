@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 import { stripVTControlCharacters } from "node:util";
 import {
@@ -8,8 +7,12 @@ import {
   type ExtensionContext,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import * as nodePty from "node-pty";
 import { MemoryLogStore } from "./memory-log-store.ts";
+import {
+  HeadlessTerminal,
+  nodePty,
+  SerializeAddon,
+} from "./runtime-dependencies.ts";
 import type {
   BackgroundShellProviderRegistration,
   BackgroundSignal,
@@ -29,10 +32,6 @@ import type {
   ShellResolverContext,
   WindowsProcessTreeKiller,
 } from "./types.ts";
-
-const cjsRequire = createRequire(import.meta.url);
-const { Terminal: HeadlessTerminal } = cjsRequire("@xterm/headless") as typeof import("@xterm/headless");
-const { SerializeAddon } = cjsRequire("@xterm/addon-serialize") as typeof import("@xterm/addon-serialize");
 
 // ── Execution Backend ─────────────────────────────────────────────────
 

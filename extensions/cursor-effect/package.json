@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-cursor-effect",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Apply selectable visual effects to Pi's main working cursor status",
   "type": "module",
@@ -10,6 +10,11 @@
   "pi": {
     "extensions": [
       "./index.ts"
+    ]
+  },
+  "piBuild": {
+    "bundlePackages": [
+      "@99percentpeople/pi-shared-settings"
     ]
   },
   "keywords": [

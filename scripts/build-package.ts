@@ -24,12 +24,15 @@ interface PackageManifest {
   types?: string;
   files?: string[];
   scripts?: Record<string, string>;
+  dependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
   pi?: {
     extensions?: string[];
     [key: string]: unknown;
   };
   piBuild?: {
     assets?: string[];
+    bundlePackages?: string[];
   };
   [key: string]: unknown;
 }
@@ -69,6 +72,28 @@ function validatePackageDirectory(): void {
   if (!isInside(rootOutdir, outdir) || !isInside(rootOutdir, temporaryOutdir)) {
     throw new Error(`Invalid root build destination for ${packageDir}`);
   }
+}
+
+function validateBundlePackages(): void {
+  const dependencies = manifest.dependencies ?? {};
+  for (const packageName of manifest.piBuild?.bundlePackages ?? []) {
+    if (!packageName || !(packageName in dependencies)) {
+      throw new Error(
+        `Bundled package must be declared in dependencies for ${manifest.name ?? packageSlug}: ${packageName}`,
+      );
+    }
+  }
+}
+
+function getExternalPackages(): string[] {
+  const bundledPackages = new Set(manifest.piBuild?.bundlePackages ?? []);
+  const packageNames = new Set([
+    ...Object.keys(manifest.dependencies ?? {}).filter(
+      (packageName) => !bundledPackages.has(packageName),
+    ),
+    ...Object.keys(manifest.peerDependencies ?? {}),
+  ]);
+  return [...packageNames].flatMap((packageName) => [packageName, `${packageName}/*`]);
 }
 
 function validateAsset(asset: string): string {
@@ -142,6 +167,13 @@ function createPublishManifest(files: string[]): PackageManifest {
   delete publishManifest.scripts;
   delete publishManifest.piBuild;
 
+  for (const packageName of manifest.piBuild?.bundlePackages ?? []) {
+    delete publishManifest.dependencies?.[packageName];
+  }
+  if (publishManifest.dependencies && Object.keys(publishManifest.dependencies).length === 0) {
+    delete publishManifest.dependencies;
+  }
+
   publishManifest.files = files.filter((file) => file !== "package.json").sort();
   if (publishManifest.pi?.extensions) {
     if (
@@ -161,6 +193,7 @@ function createPublishManifest(files: string[]): PackageManifest {
 
 if (!manifest.name) throw new Error(`${manifestPath} has no package name`);
 validatePackageDirectory();
+validateBundlePackages();
 
 await mkdir(rootOutdir, { recursive: true });
 await rm(temporaryOutdir, { recursive: true, force: true });
@@ -174,7 +207,10 @@ try {
     root: packageDir,
     target: "node",
     format: "esm",
-    packages: "external",
+    // Runtime dependencies and Pi-provided peers remain external by default.
+    // Packages explicitly listed in piBuild.bundlePackages are compiled into
+    // the single-file extension and removed from the publish manifest.
+    external: getExternalPackages(),
     naming: "[name].min.[ext]",
     sourcemap: "linked",
     minify: true,

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import {
   initTheme,
@@ -24,6 +26,7 @@ import backgroundTasks, {
   saveBackgroundTasksConfig,
   type BackgroundTasksConfig,
 } from "../extensions/background-tasks/index.ts";
+import { createRealpathRequire } from "../extensions/background-tasks/realpath-require.ts";
 
 initTheme("dark", false);
 
@@ -183,6 +186,55 @@ afterEach(async () => {
   const cleanups = Array.from(harnessCleanups).reverse();
   harnessCleanups.clear();
   await Promise.all(cleanups.map((cleanup) => cleanup()));
+});
+
+test("realpath require resolves dependencies beside a pnpm physical package", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-background-pnpm-"));
+  harnessCleanups.add(() => rm(root, { recursive: true, force: true }));
+
+  const virtualNodeModules = join(
+    root,
+    "node_modules",
+    ".pnpm",
+    "example-extension@1.0.0",
+    "node_modules",
+  );
+  const physicalPackage = join(virtualNodeModules, "@example", "extension");
+  const physicalDependency = join(virtualNodeModules, "runtime-dependency");
+  const visibleScope = join(root, "node_modules", "@example");
+  const visiblePackage = join(visibleScope, "extension");
+  const visibleEntry = join(visiblePackage, "index.js");
+
+  await Promise.all([
+    mkdir(physicalPackage, { recursive: true }),
+    mkdir(physicalDependency, { recursive: true }),
+    mkdir(visibleScope, { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(join(physicalPackage, "index.js"), "module.exports = {};\n", "utf8"),
+    writeFile(
+      join(physicalDependency, "package.json"),
+      `${JSON.stringify({ name: "runtime-dependency", main: "index.js" })}\n`,
+      "utf8",
+    ),
+    writeFile(join(physicalDependency, "index.js"), "module.exports = 42;\n", "utf8"),
+  ]);
+  await symlink(
+    physicalPackage,
+    visiblePackage,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+
+  assert.throws(
+    () => createRequire(visibleEntry).resolve("runtime-dependency"),
+    (error: NodeJS.ErrnoException) => error.code === "MODULE_NOT_FOUND",
+  );
+  assert.equal(
+    createRealpathRequire(pathToFileURL(visibleEntry).href).resolve(
+      "runtime-dependency",
+    ),
+    join(physicalDependency, "index.js"),
+  );
 });
 
 function createHarness(

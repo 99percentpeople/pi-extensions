@@ -18,7 +18,9 @@ chat, and the status widget tracks it:
 ![background-tasks demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/background-tasks.gif)
 
 The same start → attach → detach workflow works for a remote TUI when SSH Remote
-is active.
+is active—here, `htop` runs in a remote PTY:
+
+![background-tasks SSH Remote htop demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/ssh-remote-htop.gif)
 
 ## Highlights
 
@@ -60,6 +62,12 @@ Add SSH Remote when tasks should run in the active remote workspace:
 ```bash
 pi install npm:@99percentpeople/pi-ssh-remote
 ```
+
+> **Native `node-pty` dependency:** `pnpm` and `bun` may report
+> `Ignored build scripts: node-pty`. On platforms covered by node-pty's shipped
+> prebuilt binaries, the warning alone is not an installation failure and no
+> approval is required. A source build on an unsupported platform still needs
+> the package manager to allow node-pty's install script.
 
 The packages are independent: Background Tasks works locally by itself, while
 SSH Remote automatically registers a higher-priority remote provider when both

@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-background-tasks",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "description": "Background commands and attachable PTY/TUI sessions for Pi, with SSH Remote integration",
   "type": "module",
@@ -10,6 +10,11 @@
   "pi": {
     "extensions": [
       "./index.ts"
+    ]
+  },
+  "piBuild": {
+    "bundlePackages": [
+      "@99percentpeople/pi-shared-settings"
     ]
   },
   "keywords": [
