@@ -396,7 +396,13 @@ test("OpenSSH multiplex arguments reuse Unix connections and disable Windows Con
   assert.ok(singleUse.includes("ControlPath=none"));
 });
 
-test("OpenSSH client owns and closes its generated ControlMaster", async () => {
+const controlMasterTestOptions = {
+  skip: process.platform === "win32"
+    ? "OpenSSH ControlMaster is unavailable on Windows"
+    : false,
+};
+
+test("OpenSSH client owns and closes its generated ControlMaster", controlMasterTestOptions, async () => {
   class FakeProcess extends EventEmitter {
     readonly stdin = new PassThrough();
     readonly stdout = new PassThrough();
@@ -472,7 +478,7 @@ test("OpenSSH client owns and closes its generated ControlMaster", async () => {
   assert.ok(spawned.at(-1)?.includes("exit"));
 });
 
-test("OpenSSH ControlMaster close events notify listeners without command polling", async () => {
+test("OpenSSH ControlMaster close events notify listeners without command polling", controlMasterTestOptions, async () => {
   class FakeProcess extends EventEmitter {
     readonly stdin = new PassThrough();
     readonly stdout = new PassThrough();
@@ -518,7 +524,7 @@ test("OpenSSH ControlMaster close events notify listeners without command pollin
   await client.dispose();
 });
 
-test("SSH task leases keep signal control available when workspace shutdown runs first", async () => {
+test("SSH task leases keep signal control available when workspace shutdown runs first", controlMasterTestOptions, async () => {
   class FakeProcess extends EventEmitter {
     readonly stdin = new PassThrough();
     readonly stdout = new PassThrough();

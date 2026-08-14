@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -233,7 +241,7 @@ test("realpath require resolves dependencies beside a pnpm physical package", as
     createRealpathRequire(pathToFileURL(visibleEntry).href).resolve(
       "runtime-dependency",
     ),
-    join(physicalDependency, "index.js"),
+    await realpath(join(physicalDependency, "index.js")),
   );
 });
 
