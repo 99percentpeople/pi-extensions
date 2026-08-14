@@ -5,7 +5,6 @@ import {
   mkdir,
   mkdtemp,
   readFile,
-  realpath,
   rm,
   symlink,
   writeFile,
@@ -238,10 +237,8 @@ test("realpath require resolves dependencies beside a pnpm physical package", as
     (error: NodeJS.ErrnoException) => error.code === "MODULE_NOT_FOUND",
   );
   assert.equal(
-    createRealpathRequire(pathToFileURL(visibleEntry).href).resolve(
-      "runtime-dependency",
-    ),
-    await realpath(join(physicalDependency, "index.js")),
+    createRealpathRequire(pathToFileURL(visibleEntry).href)("runtime-dependency"),
+    42,
   );
 });
 
