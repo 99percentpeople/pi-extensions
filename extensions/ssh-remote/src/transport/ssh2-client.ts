@@ -4,6 +4,7 @@ import ssh2, {
 } from "ssh2";
 import {
   type SshClientOptions,
+  type SshDisconnectListener,
   type SshRemoteClient,
   type SshRunOptions,
   type SshRunResult,
@@ -99,6 +100,7 @@ export class Ssh2Client implements SshRemoteClient {
   private connectPromise?: Promise<RawSsh2Client>;
   private activeChannels = 0;
   private warningList: string[] = [];
+  private readonly disconnectListeners = new Set<SshDisconnectListener>();
   private passwordPromptCancelled = false;
   private disposed = false;
 
@@ -124,6 +126,21 @@ export class Ssh2Client implements SshRemoteClient {
 
   get compatibilityWarnings(): readonly string[] {
     return this.warningList;
+  }
+
+  onDisconnect(listener: SshDisconnectListener): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
+  }
+
+  private notifyDisconnect(error: Error): void {
+    for (const listener of [...this.disconnectListeners]) {
+      try {
+        listener(error);
+      } catch {
+        // One observer must not prevent the others from seeing the close.
+      }
+    }
   }
 
   private invalidateConnection(source?: RawSsh2Client): void {
@@ -180,8 +197,15 @@ export class Ssh2Client implements SshRemoteClient {
       };
       const onClose = () => {
         this.connectingClients.delete(client);
-        if (this.connectionClients.has(client)) this.invalidateConnection(client);
-        if (!ready) rejectSetup(new Error("connection closed before authentication completed"));
+        const established = this.connectionClients.has(client);
+        if (established) this.invalidateConnection(client);
+        if (!ready) {
+          rejectSetup(new Error("connection closed before authentication completed"));
+        } else if (established && !this.disposed) {
+          this.notifyDisconnect(new Ssh2ConnectionError(
+            `ssh2 connection to ${endpoint.hostLabel} closed`,
+          ));
+        }
       };
 
       client.on("error", onError);
@@ -601,6 +625,7 @@ export class Ssh2Client implements SshRemoteClient {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.disconnectListeners.clear();
     for (const waiter of this.channelWaiters.splice(0)) {
       if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
       waiter.reject(new Error("SSH client is closed"));

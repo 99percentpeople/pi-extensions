@@ -12,7 +12,7 @@ import type {
   RemoteDirectoryEntry,
   RemoteFindEntry,
   RemoteGrepMatch,
-} from "./adapters/index.ts";
+} from "../adapters/index.ts";
 
 export const DEFAULT_REMOTE_GREP_LIMIT = 100;
 export const DEFAULT_REMOTE_FIND_LIMIT = 1_000;

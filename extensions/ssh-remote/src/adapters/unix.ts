@@ -1,10 +1,10 @@
-import type { SshExecutor, SshRunOptions } from "../client.ts";
+import type { SshExecutor, SshRunOptions } from "../transport/client.ts";
 import {
   mapCwdToRemote,
   normalizeRemoteToolPath,
   normalizeRemoteHomePath,
   shellQuote,
-} from "../target.ts";
+} from "../workspace/target.ts";
 import { posix, win32 } from "node:path";
 import type {
   RemoteAdapter,
@@ -123,7 +123,11 @@ export function buildUnixBashCommand(
   env?: NodeJS.ProcessEnv,
   shell: UnixUserShell = "bash",
 ): string {
-  return `cd -- ${shellQuote(cwd)} && ${remoteSessionExports(env)}exec ${shell} -lc ${shellQuote(command)}`;
+  // A login shell (-l) re-runs /etc/profile for every SSH operation. On
+  // OpenWrt that profile prints /etc/banner, polluting every bash result.
+  // SSH has already established the account environment, so execute the
+  // selected shell non-interactively without replaying login startup files.
+  return `cd -- ${shellQuote(cwd)} && ${remoteSessionExports(env)}exec ${shell} -c ${shellQuote(command)}`;
 }
 
 export class UnixBashAdapter implements RemoteAdapter {
@@ -243,7 +247,7 @@ export class UnixBashAdapter implements RemoteAdapter {
     // Control scripts are POSIX sh (no bashisms) and therefore run through
     // `sh` on every Unix host: dash, bash, busybox ash, or macOS bash.
     return this.executor.runChecked(
-      `exec sh -lc ${shellQuote(script)}`,
+      `exec sh -c ${shellQuote(script)}`,
       { signal },
     ).then((result) => result.stdout);
   }

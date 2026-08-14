@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import type { RemoteAdapter, RemoteWorkspace } from "./adapters/types.ts";
+import type { RemoteAdapter, RemoteWorkspace } from "../adapters/types.ts";
 import {
   UNIX_BACKGROUND_SIGNALS,
   UNIX_TERMINATING_SIGNALS,
@@ -8,51 +8,51 @@ import {
   validateControlToken,
   type BackgroundSignal,
   type BackgroundTaskControl,
-} from "./background-control.ts";
+} from "./control.ts";
 import {
   buildUnixBackgroundProbeCommand,
   buildUnixBackgroundShellCommand,
   buildUnixBackgroundSignalCommand,
-} from "./background-unix.ts";
+} from "./unix.ts";
 import {
   buildWindowsBackgroundProbeCommand,
   buildWindowsBackgroundShellCommand,
   buildWindowsBackgroundSignalCommand,
-} from "./background-windows.ts";
+} from "./windows.ts";
 import {
   buildOpenSshLaunch,
   controlErrorDetail,
   runControlProcess,
   runSignalControl,
   SshSignalControlError,
-} from "./background-transport.ts";
+} from "./transport.ts";
 import type {
   SpawnFunction,
   SshBackgroundLease,
   SshClientOptions,
-} from "./client.ts";
+} from "../transport/client.ts";
 
 export type {
   BackgroundControlOptions,
   BackgroundSignal,
   BackgroundTaskControl,
   BackgroundTransportExitDisposition,
-} from "./background-control.ts";
+} from "./control.ts";
 export {
   UNIX_BACKGROUND_SIGNALS,
   UNIX_TERMINATING_SIGNALS,
   WINDOWS_BACKGROUND_SIGNALS,
-} from "./background-control.ts";
+} from "./control.ts";
 export {
   buildUnixBackgroundProbeCommand,
   buildUnixBackgroundShellCommand,
   buildUnixBackgroundSignalCommand,
-} from "./background-unix.ts";
+} from "./unix.ts";
 export {
   buildWindowsBackgroundProbeCommand,
   buildWindowsBackgroundShellCommand,
   buildWindowsBackgroundSignalCommand,
-} from "./background-windows.ts";
+} from "./windows.ts";
 
 export interface BackgroundShellLaunch {
   file: string;

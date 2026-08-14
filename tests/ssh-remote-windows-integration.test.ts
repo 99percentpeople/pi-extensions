@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import type { TestContext } from "node:test";
 import { after, before, test } from "node:test";
-import { selectRemoteAdapter } from "../extensions/ssh-remote/adapters/index.ts";
-import type { RemoteWorkspace } from "../extensions/ssh-remote/adapters/types.ts";
-import { WindowsPowerShellAdapter } from "../extensions/ssh-remote/adapters/windows.ts";
-import { OpenSshClient } from "../extensions/ssh-remote/client.ts";
+import { selectRemoteAdapter } from "../extensions/ssh-remote/src/adapters/index.ts";
+import type { RemoteWorkspace } from "../extensions/ssh-remote/src/adapters/types.ts";
+import { WindowsPowerShellAdapter } from "../extensions/ssh-remote/src/adapters/windows.ts";
+import { OpenSshClient } from "../extensions/ssh-remote/src/transport/client.ts";
 
 /**
  * Integration tests for the SSH remote extension against a real Windows host

@@ -20,6 +20,8 @@ on the local machine.
 - Supports `auto`, `openssh`, and `ssh2` transports
 - Reuses authenticated connections by default: OpenSSH multiplexing on
   Linux/macOS and a persistent `ssh2` connection on Windows
+- Listens for persistent transport close events, updating the footer and
+  failing closed when a device reboot or network loss is detected
 - Uses normal OpenSSH aliases and configuration, including multi-hop
   `ProxyJump`
 - Detects Unix and Windows shells automatically, with an explicit shell option
@@ -230,11 +232,11 @@ a transport change applies on the next connection or `/ssh-reconnect`.
 
 | Local platform | `auto` foreground transport | Connection reuse |
 | --- | --- | --- |
-| Linux / macOS | OpenSSH | Managed `ControlMaster` and `ControlPersist` |
+| Linux / macOS | OpenSSH | Supervised foreground `ControlMaster` |
 | Windows | `ssh2` | One persistent TCP/authentication connection; one exec channel per operation |
 
-Use `/ssh-status` to see the effective transport and whether its connection is
-reused.
+Use `/ssh-status` to run a live reachability check and see the effective
+transport and whether its connection is reused.
 
 ### Automatic fallback
 
@@ -259,10 +261,18 @@ alias unchanged. Without `--ssh-config`, the client reads its normal user and
 system configuration, including `~/.ssh/config`. This is the best choice for
 advanced OpenSSH behavior that `ssh2` cannot reproduce.
 
-On Linux and macOS, SSH Remote creates a private short-lived ControlPath. Each
-operation still starts a lightweight local `ssh` process, but that process opens
-a channel on the existing authenticated connection. The remote host may be
-Unix or Windows.
+On Linux and macOS, SSH Remote creates a private ControlPath and owns a
+foreground `ssh -M -N` ControlMaster process for the workspace lifetime. Each
+operation still starts a lightweight local `ssh` process, but that process
+opens a channel on the existing authenticated connection. SSH Remote listens
+to the master process directly, so an unexpected exit updates the footer
+without running periodic remote commands. The remote host may be Unix or
+Windows.
+
+The managed master sends SSH protocol keepalives every 10 seconds and closes
+after three unanswered replies. A clean FIN/RST is observed immediately;
+power loss or a silent network partition is normally reported within about
+30 seconds. These are transport keepalives, not shell-command polling.
 
 Native Win32 OpenSSH still builds its mux entry points as
 [no-ops](https://github.com/PowerShell/openssh-portable/blob/v10.0.0.0/contrib/win32/win32compat/no-ops.c#L59-L86),
@@ -420,6 +430,12 @@ The Pi tool remains named `bash` for compatibility, but commands use the
 selected remote syntax. The model context and `!`/`!!` commands follow that
 same shell.
 
+Unix commands use a non-login shell. This avoids replaying `/etc/profile` for
+every operation—most notably, OpenWrt no longer prints `/etc/banner` before
+each command. SSH's account environment is retained, but login-only profile
+customizations are not re-sourced; source a specific profile explicitly when a
+command needs it.
+
 Workspace control operations—path inspection, file tools, and search tools—use
 POSIX `sh` scripts on Unix and encoded PowerShell scripts on Windows. This lets
 OpenWrt, Alpine, BusyBox, and other Bash-free systems use the complete file-tool
@@ -445,7 +461,7 @@ Known POSIX-control-script limits:
 | `/ssh-connect <host[:path]>` | Enter SSH or switch directly from the active target |
 | `/ssh-exit` | Return this conversation to its local workspace |
 | `/ssh-cd <remote-path>` | Change the persistent remote cwd without reconnecting |
-| `/ssh-status` | Show state, target, platform, shell, transport, cwd, and home |
+| `/ssh-status` | Live-check and show state, target, platform, shell, transport, cwd, and home |
 | `/ssh-reconnect` | Retry the stored target or apply a transport change |
 | `/ssh-forget-password [all]` | Clear session-scoped or all cached passwords |
 
@@ -507,7 +523,14 @@ metadata, not a snapshot of remote files or running processes.
 ### Status and automatic session names
 
 The footer status shows only `SSH: Connecting`, `SSH: Connected`, or
-`SSH: Disconnected`. For unnamed sessions, SSH Remote sets Pi's native session
+`SSH: Disconnected`. Persistent OpenSSH and `ssh2` transports publish close
+events directly; no periodic remote command is run. Any foreground operation
+that observes a transport failure also updates the footer immediately.
+`/ssh-status` remains an explicit live probe, while single-use OpenSSH
+connections are checked only on demand because there is no persistent
+transport to observe.
+
+For unnamed sessions, SSH Remote sets Pi's native session
 name to a stable location and then appends the remote Git branch and first user
 message when available:
 
@@ -715,6 +738,19 @@ and persisted passwords depend on the protections of the local settings
 account. Prefer SSH keys or an agent for unattended and background work.
 
 ## Development
+
+The source tree keeps the Pi entrypoint thin and groups implementation by
+responsibility:
+
+```text
+index.ts                 # package entrypoint
+src/extension.ts         # Pi registration and workspace lifecycle
+src/adapters/            # Unix and Windows remote shell adapters
+src/background/          # background launch, control, and signaling
+src/transport/           # OpenSSH, ssh2, authentication, and selection
+src/workspace/           # paths, tools, completion, and file operations
+src/{config,settings,session-state}.ts
+```
 
 ```bash
 bun run build:packages

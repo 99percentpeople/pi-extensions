@@ -4,8 +4,8 @@ import type {
   ReadOperations,
   WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { buildUnixBashCommand } from "./adapters/unix.ts";
-import type { RemoteAdapter } from "./adapters/types.ts";
+import { buildUnixBashCommand } from "../adapters/unix.ts";
+import type { RemoteAdapter } from "../adapters/types.ts";
 
 export const buildRemoteBashCommand = buildUnixBashCommand;
 

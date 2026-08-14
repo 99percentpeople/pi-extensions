@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import {
   OpenSshClient,
   type SshClientOptions,
+  type SshDisconnectListener,
   type SshDisposeOptions,
   type SshRemoteClient,
   type SshRunOptions,
@@ -243,6 +244,10 @@ class AutoWindowsSshClient implements SshRemoteClient {
     return checkedResult(await this.run(command, options));
   }
 
+  onDisconnect(listener: SshDisconnectListener): () => void {
+    return this.delegate.onDisconnect?.(listener) ?? (() => {});
+  }
+
   acquireBackgroundLease() {
     return this.delegate.acquireBackgroundLease?.();
   }
@@ -475,6 +480,10 @@ class SshpassRetryClient implements SshRemoteClient {
     return checkedResult(await this.run(command, options));
   }
 
+  onDisconnect(listener: SshDisconnectListener): () => void {
+    return this.delegate.onDisconnect?.(listener) ?? (() => {});
+  }
+
   acquireBackgroundLease() {
     return this.delegate.acquireBackgroundLease?.();
   }
@@ -626,6 +635,10 @@ class AutoUnixSshClient implements SshRemoteClient {
 
   async runChecked(command: string, options?: SshRunOptions): Promise<SshRunResult> {
     return checkedResult(await this.run(command, options));
+  }
+
+  onDisconnect(listener: SshDisconnectListener): () => void {
+    return this.delegate.onDisconnect?.(listener) ?? (() => {});
   }
 
   acquireBackgroundLease() {

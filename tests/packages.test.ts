@@ -136,7 +136,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
-  assert.equal(sshRemote.version, "0.5.5");
+  assert.equal(sshRemote.version, "0.5.6");
   assertSourceExtensionPackage(sshRemote);
   assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
   assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-workspace-files"], "0.1.1");

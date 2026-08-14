@@ -4,7 +4,7 @@ import {
   SSH_REMOTE_SETTINGS_NAMESPACE,
   type SshRemoteConfig,
 } from "./config.ts";
-import type { SshTransportPreference } from "./client.ts";
+import type { SshTransportPreference } from "./transport/client.ts";
 
 const TRANSPORT_LABELS: Record<SshTransportPreference, string> = {
   auto: "Auto",

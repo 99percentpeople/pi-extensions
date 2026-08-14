@@ -1,8 +1,8 @@
 import {
   SshPasswordCancelledError,
   SshPasswordFailedError,
-} from "../password-resolver.ts";
-import type { SshExecutor, SshRunResult } from "../client.ts";
+} from "../transport/password-resolver.ts";
+import type { SshExecutor, SshRunResult } from "../transport/client.ts";
 import { UnixBashAdapter } from "./unix.ts";
 import type {
   RemoteAdapter,
@@ -230,6 +230,11 @@ function throwIfFatalProbeFailure(
 ): void {
   const fatal = fatalProbeFailure(value, options);
   if (fatal) throw fatal;
+}
+
+/** Classify a runtime SSH transport/authentication failure without throwing. */
+export function classifySshTransportFailure(value: unknown): Error | undefined {
+  return fatalProbeFailure(value);
 }
 
 /** Run a shell-discovery probe while preserving terminal SSH failures. */

@@ -5,7 +5,7 @@ import {
   type WorkspaceFileSystem,
 } from "@99percentpeople/pi-workspace-files";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { RemoteAdapter, RemoteWorkspace } from "./adapters/index.ts";
+import type { RemoteAdapter, RemoteWorkspace } from "../adapters/index.ts";
 
 export interface RemoteWorkspaceFileConnection {
   adapter: RemoteAdapter;

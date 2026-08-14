@@ -3,8 +3,8 @@ import {
   remoteSignalName,
   UNIX_TERMINATING_SIGNALS,
   type BackgroundSignal,
-} from "./background-control.ts";
-import { shellQuote } from "./target.ts";
+} from "./control.ts";
+import { shellQuote } from "../workspace/target.ts";
 
 const TERMINATING_SIGNALS = new Set<BackgroundSignal>(UNIX_TERMINATING_SIGNALS);
 

@@ -1,4 +1,4 @@
-import type { SshRunOptions } from "../client.ts";
+import type { SshRunOptions } from "../transport/client.ts";
 
 export type RemotePlatform = "unix" | "windows";
 export type RemoteShell = "bash" | "zsh" | "sh" | "pwsh" | "powershell";

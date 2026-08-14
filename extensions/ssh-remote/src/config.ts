@@ -3,7 +3,7 @@ import {
   readSettingsNamespace,
   writeSettingsNamespace,
 } from "@99percentpeople/pi-shared-settings";
-import type { SshTransportPreference } from "./client.ts";
+import type { SshTransportPreference } from "./transport/client.ts";
 
 export interface SshRemoteConfig {
   transport: SshTransportPreference;

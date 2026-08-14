@@ -5,15 +5,18 @@ import {
 } from "node:child_process";
 import {
   closeSync,
+  existsSync,
   fstatSync,
   mkdtempSync,
   openSync,
   readSync,
   rmSync,
+  watch,
   writeFileSync,
+  type FSWatcher,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export type SshTransportPreference = "auto" | "openssh" | "ssh2";
 export type SshTransportKind = Exclude<SshTransportPreference, "auto">;
@@ -67,6 +70,8 @@ export interface SshBackgroundLease {
   release(): void | Promise<void>;
 }
 
+export type SshDisconnectListener = (error: Error) => void;
+
 export interface SshRemoteClient extends SshExecutor {
   readonly options: Readonly<SshClientOptions>;
   /** Effective foreground transport. Optional for third-party/test implementations. */
@@ -77,6 +82,8 @@ export interface SshRemoteClient extends SshExecutor {
   readonly fallbackReason?: string;
   /** Non-fatal OpenSSH options or identities that ssh2 could not reproduce. */
   readonly compatibilityWarnings?: readonly string[];
+  /** Listen for an established persistent transport closing unexpectedly. */
+  onDisconnect?(listener: SshDisconnectListener): () => void;
   /** Keep a managed ControlMaster available until one background task finishes. */
   acquireBackgroundLease?(): SshBackgroundLease | undefined;
   dispose(options?: SshDisposeOptions): void | Promise<void>;
@@ -184,6 +191,62 @@ export function buildSshArguments(
   return args;
 }
 
+function buildSshControlChannelArguments(
+  options: SshClientOptions,
+  allocatePty: boolean,
+  redirectStdin: boolean,
+): string[] {
+  if (options.multiplex !== true || !options.controlPath) {
+    throw new Error("OpenSSH control channel requires a managed control path");
+  }
+  const args = buildSshArguments(
+    { ...options, multiplex: undefined },
+    allocatePty,
+    redirectStdin,
+  );
+  const target = args.pop()!;
+  args.push(
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPersist=no",
+    "-S",
+    options.controlPath,
+    target,
+  );
+  return args;
+}
+
+export function buildSshControlMasterArguments(
+  options: SshClientOptions,
+): string[] {
+  if (options.multiplex !== true || !options.controlPath) {
+    throw new Error("OpenSSH ControlMaster requires a managed control path");
+  }
+  const args = buildSshArguments(
+    { ...options, multiplex: undefined },
+    false,
+    true,
+  );
+  const target = args.pop()!;
+  args.push(
+    "-o",
+    "ControlMaster=yes",
+    "-o",
+    "ControlPersist=no",
+    "-S",
+    options.controlPath,
+    "-o",
+    "ServerAliveInterval=10",
+    "-o",
+    "ServerAliveCountMax=3",
+    "-M",
+    "-N",
+    target,
+  );
+  return args;
+}
+
 export class OpenSshClient implements SshRemoteClient {
   readonly options: Readonly<SshClientOptions>;
   readonly transport = "openssh" as const;
@@ -191,6 +254,11 @@ export class OpenSshClient implements SshRemoteClient {
   private readonly spawnFn: SpawnFunction;
   private readonly children = new Set<ChildProcess>();
   private readonly controlDirectory?: string;
+  private readonly disconnectListeners = new Set<SshDisconnectListener>();
+  private controlMaster?: ChildProcess;
+  private controlMasterPromise?: Promise<void>;
+  private controlMasterReady = false;
+  private controlClosing = false;
   private backgroundLeaseCount = 0;
   private pendingControlClose: "stop" | "exit" | undefined;
   private controlClosePromise: Promise<void> | undefined;
@@ -208,6 +276,165 @@ export class OpenSshClient implements SshRemoteClient {
     this.reusesConnection = options.multiplex === true;
     this.controlDirectory = controlDirectory;
     this.spawnFn = spawnFn;
+  }
+
+  onDisconnect(listener: SshDisconnectListener): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
+  }
+
+  private notifyDisconnect(error: Error): void {
+    for (const listener of [...this.disconnectListeners]) {
+      try {
+        listener(error);
+      } catch {
+        // One consumer must not prevent other connection observers.
+      }
+    }
+  }
+
+  private ensureControlMaster(): Promise<void> {
+    if (this.options.multiplex !== true) return Promise.resolve();
+    if (this.controlMasterReady && this.controlMaster) return Promise.resolve();
+    if (this.controlMasterPromise) return this.controlMasterPromise;
+    if (this.disposed || this.controlClosed) {
+      return Promise.reject(new Error("SSH client is closed"));
+    }
+
+    const pending = this.startControlMaster();
+    const tracked = pending.finally(() => {
+      if (this.controlMasterPromise === tracked) {
+        this.controlMasterPromise = undefined;
+      }
+    });
+    void tracked.catch(() => {});
+    this.controlMasterPromise = tracked;
+    return tracked;
+  }
+
+  private startControlMaster(): Promise<void> {
+    const sshProgram = this.options.executable ?? "ssh";
+    const sshpassMode = !!this.options.sshpassPassword;
+    const effectiveOptions = sshpassMode
+      ? { ...this.options, batchMode: false }
+      : this.options;
+    const executable = sshpassMode ? "sshpass" : sshProgram;
+    const args = [
+      ...(sshpassMode
+        ? ["-e", sshProgram, "-o", "NumberOfPasswordPrompts=1"]
+        : []),
+      ...buildSshControlMasterArguments(effectiveOptions),
+    ];
+    const env = sshpassMode
+      ? { ...process.env, SSHPASS: this.options.sshpassPassword }
+      : process.env;
+    const controlPath = this.options.controlPath!;
+
+    return new Promise<void>((resolve, reject) => {
+      const stderr: Buffer[] = [];
+      let stderrBytes = 0;
+      let child: ChildProcess | undefined;
+      let watcher: FSWatcher | undefined;
+      let setupTimeout: ReturnType<typeof setTimeout> | undefined;
+      let setupSettled = false;
+      let ready = false;
+      let disconnectEmitted = false;
+
+      const detail = (): string => Buffer.concat(stderr).toString("utf8").trim();
+      const cleanupSetup = () => {
+        if (setupTimeout) clearTimeout(setupTimeout);
+        setupTimeout = undefined;
+        try {
+          watcher?.close();
+        } catch {}
+        watcher = undefined;
+      };
+      const rejectSetup = (error: Error) => {
+        if (setupSettled) return;
+        setupSettled = true;
+        cleanupSetup();
+        if (child && this.controlMaster === child) {
+          this.controlMaster = undefined;
+          this.controlMasterReady = false;
+        }
+        reject(error);
+      };
+      const resolveSetup = () => {
+        if (setupSettled || !child) return;
+        setupSettled = true;
+        ready = true;
+        this.controlMasterReady = true;
+        cleanupSetup();
+        resolve();
+      };
+      const inspectControlPath = () => {
+        if (existsSync(controlPath)) resolveSetup();
+      };
+      const emitDisconnect = (error: Error) => {
+        if (disconnectEmitted || this.disposed || this.controlClosing) return;
+        disconnectEmitted = true;
+        this.notifyDisconnect(error);
+      };
+
+      try {
+        watcher = watch(dirname(controlPath), inspectControlPath);
+        watcher.once("error", (error) => {
+          if (!ready) rejectSetup(error);
+        });
+        child = this.spawnFn(executable, args, {
+          env,
+          stdio: ["ignore", "ignore", "pipe"],
+          windowsHide: true,
+        });
+        this.controlMaster = child;
+        this.controlMasterReady = false;
+      } catch (error) {
+        rejectSetup(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+
+      child.stderr?.on("data", (chunk: Buffer | string) => {
+        if (stderrBytes >= 4_000) return;
+        const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const retained = data.subarray(0, 4_000 - stderrBytes);
+        if (retained.length > 0) stderr.push(retained);
+        stderrBytes += retained.length;
+      });
+      child.once("error", (error) => {
+        if (!ready) {
+          rejectSetup(error);
+          return;
+        }
+        emitDisconnect(error);
+      });
+      child.once("close", (code, signal) => {
+        if (this.controlMaster === child) {
+          this.controlMaster = undefined;
+          this.controlMasterReady = false;
+        }
+        const suffix = detail();
+        const error = new Error(
+          `OpenSSH ControlMaster closed (${code ?? signal ?? "unknown"})${suffix ? `: ${suffix}` : ""}`,
+        );
+        if (!ready) {
+          rejectSetup(error);
+          return;
+        }
+        emitDisconnect(error);
+      });
+
+      const timeoutMs = (this.options.connectTimeoutSeconds ?? 10) * 1_000 + 5_000;
+      setupTimeout = setTimeout(() => {
+        rejectSetup(new Error(
+          `OpenSSH ControlMaster setup timed out after ${Math.ceil(timeoutMs / 1_000)} seconds`,
+        ));
+        try {
+          child?.kill("SIGKILL");
+        } catch {}
+      }, timeoutMs);
+      setupTimeout.unref?.();
+      inspectControlPath();
+    });
   }
 
   acquireBackgroundLease(): SshBackgroundLease | undefined {
@@ -246,24 +473,40 @@ export class OpenSshClient implements SshRemoteClient {
       throw new Error("SSH timeout must be a positive number of seconds");
     }
 
+    if (this.options.multiplex === true) {
+      await this.ensureControlMaster();
+      if (this.disposed) throw new Error("SSH client is closed");
+      if (options.signal?.aborted) throw new Error("aborted");
+    }
+
     const sshProgram = this.options.executable ?? "ssh";
     const hasInput = options.input !== undefined;
     const windowsClient = isWindowsSshExecutable(this.options.executable);
-    // sshpass mode: run `sshpass -e ssh ...` with the password in the
-    // SSHPASS environment variable (never in argv). BatchMode must be off
-    // or ssh will not offer password auth, and a single prompt attempt
-    // keeps the retry loop inside this extension instead of ssh repeating
-    // the same password. Works with sshpass.exe on Windows too.
-    const sshpassMode = !!this.options.sshpassPassword;
-    const effectiveOptions = sshpassMode ? { ...this.options, batchMode: false } : this.options;
+    // Password authentication is needed only while establishing a dedicated
+    // ControlMaster. Multiplexed command channels reuse that authenticated
+    // transport and therefore invoke plain OpenSSH in BatchMode.
+    const sshpassMode = this.options.multiplex !== true
+      && !!this.options.sshpassPassword;
+    const effectiveOptions = sshpassMode
+      ? { ...this.options, batchMode: false }
+      : this.options;
     const executable = sshpassMode ? "sshpass" : sshProgram;
+    const sshArguments = this.options.multiplex === true
+      ? buildSshControlChannelArguments(
+          this.options,
+          false,
+          windowsClient && !hasInput,
+        )
+      : buildSshArguments(
+          effectiveOptions,
+          false,
+          windowsClient && !hasInput,
+        );
     const args = [
-      ...(sshpassMode ? ["-e", sshProgram, "-o", "NumberOfPasswordPrompts=1"] : []),
-      ...buildSshArguments(
-        effectiveOptions,
-        false,
-        windowsClient && !hasInput,
-      ),
+      ...(sshpassMode
+        ? ["-e", sshProgram, "-o", "NumberOfPasswordPrompts=1"]
+        : []),
+      ...sshArguments,
       command,
     ];
     const env = sshpassMode
@@ -497,8 +740,14 @@ export class OpenSshClient implements SshRemoteClient {
     if (this.controlClosePromise) return this.controlClosePromise;
 
     const pending = (async () => {
+      this.controlClosing = true;
       const controlPath = this.options.controlPath;
-      if (this.options.multiplex === true && controlPath) {
+      if (
+        this.options.multiplex === true
+        && controlPath
+        && this.controlMaster
+        && this.controlMasterReady
+      ) {
         const executable = this.options.executable ?? "ssh";
         const args: string[] = [];
         if (this.options.configFile) args.push("-F", this.options.configFile);
@@ -545,6 +794,15 @@ export class OpenSshClient implements SshRemoteClient {
         });
       }
 
+      const master = this.controlMaster;
+      this.controlMaster = undefined;
+      this.controlMasterReady = false;
+      if (master) {
+        try {
+          master.kill("SIGTERM");
+        } catch {}
+      }
+
       if (this.controlDirectory) {
         try {
           rmSync(this.controlDirectory, { recursive: true, force: true });
@@ -563,6 +821,7 @@ export class OpenSshClient implements SshRemoteClient {
   async dispose(options: SshDisposeOptions = {}): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.disconnectListeners.clear();
     for (const child of this.children) {
       try {
         child.kill("SIGTERM");

@@ -32,7 +32,7 @@ import {
   WindowsPowerShellAdapter,
   type RemoteAdapter,
   type RemoteWorkspace,
-} from "../extensions/ssh-remote/adapters/index.ts";
+} from "../extensions/ssh-remote/src/adapters/index.ts";
 import {
   buildPowerShellInvocation,
   buildWindowsPowerShellCommand,
@@ -40,12 +40,12 @@ import {
   encodePowerShell,
   encodeWindowsToolPath,
   resolveWindowsRemotePath,
-} from "../extensions/ssh-remote/adapters/windows.ts";
+} from "../extensions/ssh-remote/src/adapters/windows.ts";
 import {
   createRemoteAutocompleteProvider,
   extractRemoteAtPrefix,
   type RemoteAutocompleteEnvironment,
-} from "../extensions/ssh-remote/autocomplete.ts";
+} from "../extensions/ssh-remote/src/workspace/autocomplete.ts";
 import {
   buildUnixBackgroundProbeCommand,
   buildUnixBackgroundShellCommand,
@@ -54,7 +54,7 @@ import {
   buildWindowsBackgroundShellCommand,
   buildWindowsBackgroundSignalCommand,
   createSshBackgroundShellResolver,
-} from "../extensions/ssh-remote/background.ts";
+} from "../extensions/ssh-remote/src/background/index.ts";
 import {
   buildSshArguments,
   OpenSshClient,
@@ -63,23 +63,23 @@ import {
   type SshRemoteClient,
   type SshRunOptions,
   type SshRunResult,
-} from "../extensions/ssh-remote/client.ts";
+} from "../extensions/ssh-remote/src/transport/client.ts";
 import {
   DEFAULT_SSH_REMOTE_CONFIG,
   normalizeSshRemoteConfig,
   saveSshRemoteConfig,
   loadSshRemoteConfig,
-} from "../extensions/ssh-remote/config.ts";
+} from "../extensions/ssh-remote/src/config.ts";
 import {
   AI_SSH_PASSWORD_PROMPT_TIMEOUT_MS,
   SSH_ENVIRONMENT_EVENT,
   createSshRemoteExtension as createSshRemoteExtensionBase,
 } from "../extensions/ssh-remote/index.ts";
-import { Ssh2Client, Ssh2ConnectionError } from "../extensions/ssh-remote/ssh2-client.ts";
+import { Ssh2Client, Ssh2ConnectionError } from "../extensions/ssh-remote/src/transport/ssh2-client.ts";
 import {
   SshPasswordResolver,
   SshPasswordTimeoutError,
-} from "../extensions/ssh-remote/password-resolver.ts";
+} from "../extensions/ssh-remote/src/transport/password-resolver.ts";
 import {
   expandProxyJumpTokens,
   parseKnownHostSearchOutput,
@@ -87,17 +87,17 @@ import {
   parseProxyJump,
   resolveSsh2Connection,
   Ssh2CompatibilityError,
-} from "../extensions/ssh-remote/ssh2-config.ts";
+} from "../extensions/ssh-remote/src/transport/ssh2-config.ts";
 import {
   createSshTransportClient,
   type SshPasswordProvider,
-} from "../extensions/ssh-remote/transport.ts";
+} from "../extensions/ssh-remote/src/transport/index.ts";
 import {
   buildRemoteBashCommand,
   createRemoteEditOperations,
   createRemoteReadOperations,
   createRemoteWriteOperations,
-} from "../extensions/ssh-remote/operations.ts";
+} from "../extensions/ssh-remote/src/workspace/operations.ts";
 import {
   findSshEnvironmentState,
   findSshSessionState,
@@ -106,13 +106,13 @@ import {
   SSH_LOCAL_SESSION_STATE_TYPE,
   SSH_SESSION_STATE_TYPE,
   type SshSessionState,
-} from "../extensions/ssh-remote/session-state.ts";
+} from "../extensions/ssh-remote/src/session-state.ts";
 import {
   mapCwdToRemote,
   normalizeRemoteToolPath,
   parseSshTarget,
   shellQuote,
-} from "../extensions/ssh-remote/target.ts";
+} from "../extensions/ssh-remote/src/workspace/target.ts";
 
 function createSshRemoteExtension(
   dependencies: Parameters<typeof createSshRemoteExtensionBase>[0] = {},
@@ -279,6 +279,39 @@ class FakeSshClient implements SshRemoteClient {
   }
 }
 
+class ReachabilitySshClient extends FakeSshClient {
+  reachable = true;
+  failEveryCommand = false;
+  private readonly disconnectListeners = new Set<(error: Error) => void>();
+
+  constructor(
+    options: Readonly<SshClientOptions>,
+    readonly reusesConnection: boolean,
+  ) {
+    super(options);
+  }
+
+  onDisconnect(listener: (error: Error) => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
+  }
+
+  emitDisconnect(error = new Ssh2ConnectionError("ssh2 connection closed")): void {
+    for (const listener of [...this.disconnectListeners]) listener(error);
+  }
+
+  override async run(
+    command: string,
+    options?: SshRunOptions,
+  ): Promise<SshRunResult> {
+    if (!this.reachable && (this.failEveryCommand || command.includes("exit 0"))) {
+      this.calls.push({ command, options, checked: false });
+      throw new Ssh2ConnectionError("ssh2 connection closed");
+    }
+    return super.run(command, options);
+  }
+}
+
 test("SSH targets use rsync-style syntax and robust shell quoting", () => {
   assert.deepEqual(parseSshTarget("devbox"), { target: "devbox", requestedCwd: undefined });
   assert.deepEqual(parseSshTarget("deploy@devbox:/srv/app"), {
@@ -383,6 +416,11 @@ test("OpenSSH client owns and closes its generated ControlMaster", async () => {
     spawned.push([...args]);
     const child = new FakeProcess();
     queueMicrotask(() => {
+      if (args.includes("-M") && args.includes("-N")) {
+        const controlPath = args[args.indexOf("-S") + 1];
+        writeFileSync(controlPath, "ready");
+        return;
+      }
       child.stdout.end();
       child.stderr.end();
       child.emit("close", 0);
@@ -395,10 +433,14 @@ test("OpenSSH client owns and closes its generated ControlMaster", async () => {
   assert.equal(client.reusesConnection, true);
   await client.run("echo ok");
   await client.dispose();
-  assert.ok(spawned[0].includes("ControlMaster=auto"));
+  assert.ok(spawned[0].includes("-M"));
+  assert.ok(spawned[0].includes("-N"));
+  assert.ok(spawned[0].includes("ServerAliveInterval=10"));
   assert.ok(spawned[0].includes(client.options.controlPath!));
-  assert.ok(spawned[1].includes("-O"));
-  assert.ok(spawned[1].includes("exit"));
+  assert.ok(spawned[0].every((arg) => !arg.startsWith("LocalCommand=")));
+  assert.ok(spawned[1].includes("ControlMaster=no"));
+  assert.ok(spawned[2].includes("-O"));
+  assert.ok(spawned[2].includes("exit"));
 
   const graceful = new OpenSshClient(
     { target: "devbox", multiplex: true },
@@ -406,14 +448,15 @@ test("OpenSSH client owns and closes its generated ControlMaster", async () => {
   );
   await graceful.run("watch build");
   await graceful.dispose({ preserveBackgroundSessions: true });
-  assert.ok(spawned[3].includes("-O"));
-  assert.ok(spawned[3].includes("stop"));
-  assert.ok(!spawned[3].includes("exit"));
+  assert.ok(spawned[5].includes("-O"));
+  assert.ok(spawned[5].includes("stop"));
+  assert.ok(!spawned[5].includes("exit"));
 
   const leased = new OpenSshClient(
     { target: "devbox", multiplex: true },
     spawn,
   );
+  await leased.run("true");
   const lease = leased.acquireBackgroundLease();
   assert.ok(lease);
   const beforeDispose = spawned.length;
@@ -427,6 +470,52 @@ test("OpenSSH client owns and closes its generated ControlMaster", async () => {
   assert.equal(spawned.length, beforeDispose + 1);
   assert.ok(spawned.at(-1)?.includes("-O"));
   assert.ok(spawned.at(-1)?.includes("exit"));
+});
+
+test("OpenSSH ControlMaster close events notify listeners without command polling", async () => {
+  class FakeProcess extends EventEmitter {
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    kill(): boolean {
+      queueMicrotask(() => this.emit("close", null, "SIGTERM"));
+      return true;
+    }
+  }
+
+  let master: FakeProcess | undefined;
+  const spawn = (
+    _file: string,
+    args: readonly string[],
+    _options: SpawnOptions,
+  ): ChildProcess => {
+    const child = new FakeProcess();
+    queueMicrotask(() => {
+      if (args.includes("-M") && args.includes("-N")) {
+        master = child;
+        const controlPath = args[args.indexOf("-S") + 1];
+        writeFileSync(controlPath, "ready");
+        return;
+      }
+      child.emit("close", 0, null);
+    });
+    return child as unknown as ChildProcess;
+  };
+  const client = new OpenSshClient(
+    { target: "router", multiplex: true },
+    spawn,
+  );
+  const disconnects: Error[] = [];
+  client.onDisconnect((error) => disconnects.push(error));
+
+  await client.run("true");
+  assert.ok(master);
+  master.stderr.write("Connection reset by peer\n");
+  master.emit("close", 255, null);
+
+  assert.equal(disconnects.length, 1);
+  assert.match(disconnects[0].message, /ControlMaster closed \(255\).*Connection reset/is);
+  await client.dispose();
 });
 
 test("SSH task leases keep signal control available when workspace shutdown runs first", async () => {
@@ -449,6 +538,11 @@ test("SSH task leases keep signal control available when workspace shutdown runs
     spawned.push([...args]);
     const child = new FakeProcess();
     queueMicrotask(() => {
+      if (args.includes("-M") && args.includes("-N")) {
+        const controlPath = args[args.indexOf("-S") + 1];
+        writeFileSync(controlPath, "ready");
+        return;
+      }
       child.stdout.end();
       child.stderr.end();
       child.emit("close", 0, null);
@@ -456,6 +550,8 @@ test("SSH task leases keep signal control available when workspace shutdown runs
     return child as unknown as ChildProcess;
   };
   const client = new OpenSshClient({ target: "devbox", multiplex: true }, spawn);
+  await client.run("true");
+  spawned.splice(0);
   const resolver = createSshBackgroundShellResolver({
     ssh: { ...client.options },
     adapter: new UnixBashAdapter(new FakeSshClient({ target: "devbox" })),
@@ -1141,6 +1237,8 @@ test("Ssh2Client reuses one authenticated connection for multiple command channe
       }),
     },
   );
+  const disconnects: Error[] = [];
+  client.onDisconnect((error) => disconnects.push(error));
   const streamed: string[] = [];
   const first = await client.run("one", {
     input: Buffer.from("payload"),
@@ -1156,6 +1254,10 @@ test("Ssh2Client reuses one authenticated connection for multiple command channe
   assert.equal(first.stderr.toString("utf8"), "stderr:");
   assert.equal(second.exitCode, 0);
   assert.deepEqual(streamed, ["stdout:"]);
+  raw.end();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(disconnects.length, 1);
+  assert.match(disconnects[0].message, /ssh2 connection.*closed/i);
   await client.dispose();
   assert.equal(raw.closed, true);
 });
@@ -3063,7 +3165,8 @@ test("remote Bash exports safe session metadata but not the local session path",
   assert.match(command, /PI_SESSION_ID='session-1'/);
   assert.match(command, /PI_PROVIDER='provider'/);
   assert.doesNotMatch(command, /PI_SESSION_FILE|session\.jsonl/);
-  assert.match(command, /exec bash -lc/);
+  assert.match(command, /exec bash -c/);
+  assert.doesNotMatch(command, /exec bash -lc/);
 });
 
 test("background resolver maps remote cwd and signals the immutable SSH host", async () => {
@@ -3985,7 +4088,7 @@ test("auto mode reuses the remote login shell (zsh)", async () => {
   assert.equal(zshSelection.warnings?.length ?? 0, 0);
   assert.match(
     zshSelection.adapter.buildShellCommand("echo $0", "/srv/project"),
-    /exec zsh -lc/,
+    /exec zsh -c/,
   );
 
   // Unknown login shells keep the deterministic Bash-first order.
@@ -4037,7 +4140,8 @@ test("auto mode falls back to sh on ash-only hosts (OpenWrt)", async () => {
   const selected = await selectRemoteAdapter(openWrt, { preference: "auto" });
   assert.equal(selected.adapter.shell, "sh");
   assert.equal(selected.workspace.shell, "sh");
-  assert.match(selected.adapter.buildShellCommand("echo $0", "/etc"), /exec sh -lc/);
+  assert.match(selected.adapter.buildShellCommand("echo $0", "/etc"), /exec sh -c/);
+  assert.doesNotMatch(selected.adapter.buildShellCommand("echo $0", "/etc"), /exec sh -lc/);
   assert.equal(selected.warnings?.length ?? 0, 0);
 
   // Control scripts run through sh on every Unix host, even when the user
@@ -4052,7 +4156,8 @@ test("auto mode falls back to sh on ash-only hosts (OpenWrt)", async () => {
     bashAdapter.toToolPath("/srv/project", bashSelection.workspace),
   );
   assert.equal(control.length, 2);
-  assert.ok(withBash.calls.some((call) => call.command.includes("exec sh -lc")));
+  assert.ok(withBash.calls.some((call) => call.command.includes("exec sh -c")));
+  assert.ok(withBash.calls.every((call) => !call.command.includes("exec sh -lc")));
 });
 
 test("explicit --ssh-shell probes existence and falls back to sh", async () => {
@@ -4681,6 +4786,82 @@ test("SSH commands appear for remote sessions and reconnect the active target", 
   assert.equal(clients.length, 2);
   assert.equal(clients[0].disposed, true);
   assert.equal(clients[1].options.target, "devbox");
+});
+
+test("ssh-status live-checks reachability and fails closed after a reboot", async () => {
+  const client = new ReachabilitySshClient({ target: "router" }, false);
+  const harness = createExtensionHarness({ flag: "router:/etc" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: () => client,
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  client.reachable = false;
+  await harness.commands.get("ssh-status").handler("", harness.ctx);
+
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Disconnected");
+  assert.match(
+    harness.notifications.at(-1)?.message ?? "",
+    /Workspace: SSH unavailable.*target: router.*connection closed/is,
+  );
+  assert.deepEqual(client.disposeOptions, [{ preserveBackgroundSessions: true }]);
+  await assert.rejects(
+    () => harness.tools.get("bash").execute(
+      "bash-after-reboot",
+      { command: "pwd" },
+      undefined,
+      undefined,
+      harness.ctx,
+    ),
+    /SSH remote is unavailable:.*connection closed/is,
+  );
+  await harness.emit("session_shutdown", { reason: "quit" });
+});
+
+test("foreground SSH transport failures update the footer immediately", async () => {
+  const client = new ReachabilitySshClient({ target: "router" }, false);
+  const harness = createExtensionHarness({ flag: "router:/etc" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: () => client,
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  client.reachable = false;
+  client.failEveryCommand = true;
+  await assert.rejects(
+    () => harness.tools.get("bash").execute(
+      "bash-during-reboot",
+      { command: "pwd" },
+      undefined,
+      undefined,
+      harness.ctx,
+    ),
+    /connection closed/i,
+  );
+
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Disconnected");
+  await harness.emit("session_shutdown", { reason: "quit" });
+});
+
+test("persistent SSH disconnect events update the footer without polling", async () => {
+  const client = new ReachabilitySshClient({ target: "router" }, true);
+  const harness = createExtensionHarness({ flag: "router:/etc" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: () => client,
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Connected");
+  client.emitDisconnect();
+
+  assert.equal(harness.statuses.get("ssh-remote"), "SSH: Disconnected");
+  assert.ok(harness.notifications.some((notification) =>
+    /SSH connection lost:.*connection closed/i.test(notification.message)
+  ));
+  await harness.emit("session_shutdown", { reason: "quit" });
 });
 
 test("local sessions can connect and explicitly exit without resuming the old SSH target", async () => {
@@ -6197,7 +6378,8 @@ test("Windows clients route Unix workspaces through ssh.exe", async () => {
     harness.ctx,
   );
   assert.equal(result.content[0].text, "(no output)");
-  assert.ok(clients[0].calls.some((call) => call.command.includes("exec bash -lc")));
+  assert.ok(clients[0].calls.some((call) => call.command.includes("exec bash -c")));
+  assert.ok(clients[0].calls.every((call) => !call.command.includes("exec bash -lc")));
   const background = harness.events.find((event) => event.name === "bg:register")
     ?.payload as {
       resolveShell: (

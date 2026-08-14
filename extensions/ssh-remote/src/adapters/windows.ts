@@ -7,8 +7,8 @@ import {
   sep as localSeparator,
   win32,
 } from "node:path";
-import { controlDirectoryName } from "../background-control.ts";
-import type { SshExecutor, SshRunOptions, SshRunResult } from "../client.ts";
+import { controlDirectoryName } from "../background/control.ts";
+import type { SshExecutor, SshRunOptions, SshRunResult } from "../transport/client.ts";
 import type {
   RemoteAdapter,
   RemoteDirectoryEntry,

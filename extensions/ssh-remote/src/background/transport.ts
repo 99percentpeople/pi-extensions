@@ -1,9 +1,9 @@
-import type { BackgroundSignal } from "./background-control.ts";
+import type { BackgroundSignal } from "./control.ts";
 import {
   buildSshArguments,
   type SpawnFunction,
   type SshClientOptions,
-} from "./client.ts";
+} from "../transport/client.ts";
 
 export interface SshProcessLaunch {
   file: string;

@@ -4,7 +4,7 @@ import type {
   AutocompleteProvider,
   AutocompleteSuggestions,
 } from "@earendil-works/pi-tui";
-import type { RemoteAdapter, RemoteWorkspace } from "./adapters/index.ts";
+import type { RemoteAdapter, RemoteWorkspace } from "../adapters/index.ts";
 
 const MAX_REMOTE_CANDIDATES = 100;
 const MAX_REMOTE_SUGGESTIONS = 20;

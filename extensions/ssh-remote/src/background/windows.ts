@@ -1,15 +1,15 @@
-import type { RemoteAdapter } from "./adapters/types.ts";
+import type { RemoteAdapter } from "../adapters/types.ts";
 import {
   buildPowerShellInvocation,
   buildWindowsPowerShellCommand,
   buildWindowsProcessControlHooks,
   buildWindowsProcessTreeKillCommand,
-} from "./adapters/windows.ts";
+} from "../adapters/windows.ts";
 import {
   controlDirectoryName,
   WINDOWS_BACKGROUND_SIGNALS,
   type BackgroundSignal,
-} from "./background-control.ts";
+} from "./control.ts";
 
 const WINDOWS_TERMINATION_SIGNALS = new Set<BackgroundSignal>(
   WINDOWS_BACKGROUND_SIGNALS,
