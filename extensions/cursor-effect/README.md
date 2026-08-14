@@ -11,7 +11,7 @@ rainbow), speed, color, and direction — all from `/99settings`.
 
 Animated working cursor while the model is busy (Claude Code preset):
 
-![cursor-effect demo](../../promo/demo/cursor-effect.gif)
+![cursor-effect demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/cursor-effect.gif)
 
 ## Scope
 

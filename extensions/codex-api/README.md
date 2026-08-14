@@ -35,15 +35,15 @@ monitoring — **no OpenAI API key required**.
 
 Subscription usage, limit-reached state, and reset-card redemption:
 
-![codex usage demo](../../promo/demo/codex-api.gif)
+![codex usage demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/codex-api.gif)
 
 Web search with clean result cards (search → open a result → summarize):
 
-![codex search demo](../../promo/demo/codex-search.gif)
+![codex search demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/codex-search.gif)
 
 Image generation with `gpt-image-2` (saved PNG + description):
 
-![codex image demo](../../promo/demo/codex-image.gif)
+![codex image demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/codex-image.gif)
 
 ## Ask Codex
 

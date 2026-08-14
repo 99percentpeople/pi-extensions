@@ -42,13 +42,13 @@ on the local machine.
 Switch the same Pi conversation into a disposable SSH workspace and run a
 command in its remote cwd. Every visible host, user, and path is fictional:
 
-![SSH Remote workspace demo](../../promo/demo/ssh-remote.gif)
+![SSH Remote workspace demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/ssh-remote.gif)
 
 With Background Tasks installed, start `htop` in a remote PTY, attach to its
 live screen, interact with it, and press `Ctrl+]` to detach without stopping the
 task:
 
-![SSH Remote htop demo](../../promo/demo/ssh-remote-htop.gif)
+![SSH Remote htop demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/ssh-remote-htop.gif)
 
 ## Contents
 

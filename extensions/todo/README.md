@@ -17,7 +17,7 @@ is rendered above Pi's input box.
 The model creates the plan, works through it, and the widget tracks progress
 from `0/3` to `3/3 completed`:
 
-![todo demo](../../promo/demo/todo.gif)
+![todo demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/todo.gif)
 
 ## Features
 

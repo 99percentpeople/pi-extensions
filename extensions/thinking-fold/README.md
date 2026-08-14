@@ -16,14 +16,14 @@ after-thinking strategies).
 A reasoning trace collapses to a stable tail preview with a timer, then to
 `Thought for Xs (ctrl+t to expand)` — no more scroll-storms:
 
-![thinking-fold trace demo](../../promo/demo/thinking-fold.gif)
+![thinking-fold trace demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/thinking-fold.gif)
 
 ### Summary models
 
 A reasoning summary keeps its content folded while the working row shows the
 latest summary headline, then collapses to the same completed timer:
 
-![thinking-fold summary demo](../../promo/demo/thinking-fold-summary.gif)
+![thinking-fold summary demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/thinking-fold-summary.gif)
 
 ## Behavior
 
