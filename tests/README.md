@@ -18,8 +18,11 @@ bun run test:integration # Windows integration tests (see below)
   OpenSSH multiplexing and task leases, persistent ssh2 channels, recursive
   ProxyJump/config compatibility, path mapping, session state, provider
   routing, transport-loss cleanup, Unix pipe/PTY signals, and Windows process
-  tree command generation. Windows CI additionally executes the real local
-  PowerShell/taskkill tree test.
+  tree command generation. `pwsh-adapter.test.ts` covers bounded exit/close,
+  timeout, abort, taskkill failure/hang, cwd error classification, partial
+  output, and race handling;
+  Windows CI also executes its real inherited-stdio regression fixture and the
+  real local PowerShell/taskkill tree test in `ssh-remote.test.ts`.
 - `ssh-remote-windows-integration.test.ts` — integration tests against a real
   Windows host over OpenSSH. They are **skipped automatically** when no host
   is configured, so `bun run check` stays safe in CI.

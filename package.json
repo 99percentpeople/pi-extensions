@@ -22,7 +22,7 @@
     "build:all": "bun run clean:dist && bun run build:packages && bun run build:extensions",
     "build:packages": "bun run --cwd packages/shared-settings build && bun run --cwd packages/workspace-files build",
     "build:extensions": "bun run --cwd extensions/background-tasks build && bun run --cwd extensions/codex-api build && bun run --cwd extensions/cursor-effect build && bun run --cwd extensions/pwsh-adapter build && bun run --cwd extensions/ssh-remote build && bun run --cwd extensions/thinking-fold build && bun run --cwd extensions/todo build",
-    "test": "bun run build:all && node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/codex-api.test.ts tests/cursor-effect.test.ts tests/shared-settings.test.ts tests/workspace-files.test.ts tests/ssh-remote.test.ts tests/ssh-remote-windows-integration.test.ts tests/thinking-fold.test.ts tests/todo.test.ts tests/packages.test.ts",
+    "test": "bun run build:all && node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/codex-api.test.ts tests/cursor-effect.test.ts tests/pwsh-adapter.test.ts tests/shared-settings.test.ts tests/workspace-files.test.ts tests/ssh-remote.test.ts tests/ssh-remote-windows-integration.test.ts tests/thinking-fold.test.ts tests/todo.test.ts tests/packages.test.ts",
     "test:integration": "bun run build:packages && node --import tsx --test --test-isolation=process tests/ssh-remote-windows-integration.test.ts",
     "test:e2e": "bun run e2e/remote-windows-smoke.ts",
     "test:e2e:local": "bun run e2e/local-windows-smoke.ts",

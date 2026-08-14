@@ -125,7 +125,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.1.1");
+  assert.equal(pwsh.version, "1.1.2");
   assertSourceExtensionPackage(pwsh);
   assert.deepEqual(pwsh.os, ["win32"]);
   assert.equal(

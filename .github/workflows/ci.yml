@@ -58,9 +58,9 @@ jobs:
       if: runner.os != 'Windows'
       run: bun run test
 
-    - name: SSH Remote and Background Tasks Windows tests
+    - name: Windows-specific tests
       if: runner.os == 'Windows'
-      run: node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/ssh-remote.test.ts
+      run: node --import tsx --test --test-isolation=process tests/background-tasks.test.ts tests/pwsh-adapter.test.ts tests/ssh-remote.test.ts
 
   packages:
     needs: validate

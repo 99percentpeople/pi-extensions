@@ -3,7 +3,13 @@ import {
   type ExtensionAPI,
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
-import { spawn, spawnSync } from "node:child_process";
+import {
+  type ChildProcess,
+  spawn,
+  spawnSync,
+} from "node:child_process";
+import { constants } from "node:fs";
+import { access as fsAccess } from "node:fs/promises";
 
 const UTF8_PRELUDE = `
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -16,6 +22,9 @@ const PWSH_EXECUTABLE = "pwsh.exe";
 const WINDOWS_POWERSHELL_EXECUTABLE = "powershell.exe";
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
+const EXIT_CLOSE_GRACE_MS = 100;
+const TASKKILL_TIMEOUT_MS = 1_000;
+const POST_KILL_GRACE_MS = 100;
 
 export interface PowerShellRuntime {
   file: string;
@@ -103,30 +112,126 @@ function resolveTimeoutMs(timeout?: number): number | undefined {
   return timeoutMs;
 }
 
-function killProcessTree(pid?: number) {
+function workingDirectoryError(cwd: string): Error {
+  return new Error(
+    `Working directory does not exist: ${cwd}\nCannot execute PowerShell commands.`,
+  );
+}
+
+async function assertWorkingDirectory(cwd: string): Promise<void> {
+  try {
+    await fsAccess(cwd, constants.F_OK);
+  } catch {
+    throw workingDirectoryError(cwd);
+  }
+}
+
+type SpawnProcess = typeof spawn;
+type KillProcess = (
+  pid: number,
+  signal?: NodeJS.Signals | number,
+) => boolean;
+
+export interface PowerShellProcessOptions {
+  spawn?: SpawnProcess;
+  kill?: KillProcess;
+  exitCloseGraceMs?: number;
+  taskkillTimeoutMs?: number;
+  postKillGraceMs?: number;
+}
+
+function waitForTaskkill(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+    const cleanup = () => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      child.removeListener("exit", onExit);
+      child.removeListener("close", onClose);
+      // Keep the once(error) listener installed after a timeout so a late spawn
+      // error cannot become an unhandled EventEmitter error.
+    };
+
+    const finish = (success: boolean) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(success);
+    };
+
+    const onError = () => finish(false);
+    const onExit = (code: number | null) => finish(code === 0);
+    const onClose = (code: number | null) => finish(code === 0);
+
+    child.once("error", onError);
+    child.once("exit", onExit);
+    child.once("close", onClose);
+    timeoutHandle = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {}
+      finish(false);
+    }, timeoutMs);
+  });
+}
+
+async function terminateProcessTree(
+  pid: number | undefined,
+  spawnProcess: SpawnProcess,
+  killProcess: KillProcess,
+  taskkillTimeoutMs: number,
+): Promise<void> {
   if (!pid) return;
 
+  let treeKilled = false;
   try {
-    spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-  } catch {
+    const taskkill = spawnProcess(
+      "taskkill",
+      ["/F", "/T", "/PID", String(pid)],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    treeKilled = await waitForTaskkill(taskkill, taskkillTimeoutMs);
+  } catch {}
+
+  if (!treeKilled) {
     try {
-      process.kill(pid, "SIGTERM");
+      killProcess(pid, "SIGTERM");
     } catch {}
   }
 }
 
-function createPwshBashOperations(runtime: PowerShellRuntime): BashOperations {
-  return {
-    exec(command, cwd, { onData, signal, timeout, env }) {
-      return new Promise((resolve, reject) => {
-        const timeoutMs = resolveTimeoutMs(timeout);
-        let timedOut = false;
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+export function createPwshBashOperations(
+  runtime: PowerShellRuntime,
+  options: PowerShellProcessOptions = {},
+): BashOperations {
+  const spawnProcess = options.spawn ?? spawn;
+  const killProcess = options.kill ?? process.kill.bind(process);
+  const exitCloseGraceMs = options.exitCloseGraceMs ?? EXIT_CLOSE_GRACE_MS;
+  const taskkillTimeoutMs = options.taskkillTimeoutMs ?? TASKKILL_TIMEOUT_MS;
+  const postKillGraceMs = options.postKillGraceMs ?? POST_KILL_GRACE_MS;
 
-        const child = spawn(
+  return {
+    async exec(command, cwd, { onData, signal, timeout, env }) {
+      const timeoutMs = resolveTimeoutMs(timeout);
+      if (signal?.aborted) throw new Error("aborted");
+      await assertWorkingDirectory(cwd);
+      if (signal?.aborted) throw new Error("aborted");
+
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let timedOut = false;
+        let terminationStarted = false;
+        let observedExitCode: number | null = null;
+        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+        let exitCloseHandle: ReturnType<typeof setTimeout> | undefined;
+        let terminationDeadlineHandle: ReturnType<typeof setTimeout> | undefined;
+        let postKillHandle: ReturnType<typeof setTimeout> | undefined;
+
+        const child = spawnProcess(
           runtime.file,
           [
             "-NoProfile",
@@ -150,46 +255,27 @@ function createPwshBashOperations(runtime: PowerShellRuntime): BashOperations {
 
         const cleanup = () => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (exitCloseHandle) clearTimeout(exitCloseHandle);
+          if (terminationDeadlineHandle) clearTimeout(terminationDeadlineHandle);
+          if (postKillHandle) clearTimeout(postKillHandle);
           signal?.removeEventListener("abort", onAbort);
+          // Keep the once(error) listener installed so a late spawn error after
+          // forced finalization cannot become an unhandled EventEmitter error.
+          child.removeListener("exit", onExit);
+          child.removeListener("close", onClose);
+          child.stdout?.removeListener("data", onData);
+          child.stderr?.removeListener("data", onData);
         };
 
-        const onAbort = () => {
-          killProcessTree(child.pid);
-        };
-
-        child.stdout?.on("data", onData);
-        child.stderr?.on("data", onData);
-
-        if (timeoutMs !== undefined) {
-          timeoutHandle = setTimeout(() => {
-            timedOut = true;
-            killProcessTree(child.pid);
-          }, timeoutMs);
-        }
-
-        if (signal?.aborted) {
-          onAbort();
-        } else {
-          signal?.addEventListener("abort", onAbort, { once: true });
-        }
-
-        child.on("error", (error: NodeJS.ErrnoException) => {
+        const finish = (
+          exitCode: number | null,
+          spawnError?: NodeJS.ErrnoException,
+        ) => {
+          if (settled) return;
+          settled = true;
           cleanup();
-
-          if (error.code === "ENOENT") {
-            reject(
-              new Error(
-                `${runtime.label} executable \`${runtime.file}\` was not found.`,
-              ),
-            );
-            return;
-          }
-
-          reject(error);
-        });
-
-        child.on("close", (exitCode) => {
-          cleanup();
+          child.stdout?.destroy();
+          child.stderr?.destroy();
 
           if (signal?.aborted) {
             reject(new Error("aborted"));
@@ -201,8 +287,88 @@ function createPwshBashOperations(runtime: PowerShellRuntime): BashOperations {
             return;
           }
 
+          if (spawnError) {
+            if (spawnError.code === "ENOENT") {
+              reject(
+                new Error(
+                  `${runtime.label} executable \`${runtime.file}\` was not found.`,
+                ),
+              );
+              return;
+            }
+            reject(spawnError);
+            return;
+          }
+
           resolve({ exitCode });
-        });
+        };
+
+        const beginTermination = () => {
+          if (settled || terminationStarted) return;
+          terminationStarted = true;
+
+          terminationDeadlineHandle = setTimeout(
+            () => finish(child.exitCode ?? observedExitCode),
+            taskkillTimeoutMs + postKillGraceMs,
+          );
+
+          void terminateProcessTree(
+            child.pid,
+            spawnProcess,
+            killProcess,
+            taskkillTimeoutMs,
+          ).finally(() => {
+            if (settled) return;
+            postKillHandle = setTimeout(
+              () => finish(child.exitCode ?? observedExitCode),
+              postKillGraceMs,
+            );
+          });
+        };
+
+        const onAbort = () => beginTermination();
+        const onError = (error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") {
+            finish(child.exitCode ?? observedExitCode, error);
+            return;
+          }
+
+          // uv_spawn reports ENOENT for both a missing executable and a cwd
+          // deleted between the preflight check and spawn. Recheck cwd before
+          // deciding which user-facing error to return.
+          void fsAccess(cwd, constants.F_OK).then(
+            () => finish(child.exitCode ?? observedExitCode, error),
+            () => finish(
+              child.exitCode ?? observedExitCode,
+              workingDirectoryError(cwd),
+            ),
+          );
+        };
+        const onExit = (exitCode: number | null) => {
+          observedExitCode = exitCode;
+          exitCloseHandle ??= setTimeout(
+            () => finish(observedExitCode),
+            exitCloseGraceMs,
+          );
+        };
+        const onClose = (exitCode: number | null) => {
+          finish(exitCode ?? observedExitCode);
+        };
+
+        child.stdout?.on("data", onData);
+        child.stderr?.on("data", onData);
+        child.once("error", onError);
+        child.once("exit", onExit);
+        child.once("close", onClose);
+
+        if (timeoutMs !== undefined) {
+          timeoutHandle = setTimeout(() => {
+            timedOut = true;
+            beginTermination();
+          }, timeoutMs);
+        }
+
+        signal?.addEventListener("abort", onAbort, { once: true });
       });
     },
   };

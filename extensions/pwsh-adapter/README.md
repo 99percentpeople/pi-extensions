@@ -19,11 +19,16 @@ At startup it selects PowerShell once for the whole session:
 2. Otherwise Windows PowerShell 5.1 through `powershell.exe`.
 
 The selected executable is explicit, so both pipe and PTY background tasks work
-without relying on Windows `PATHEXT` expansion. When SSH Remote is installed,
-the adapter registers a named local Background Tasks provider below SSH's
-priority. Active/connecting SSH therefore owns routing, while local SSH mode
-falls through automatically to PowerShell without last-writer registration
-races or dependence on extension startup order.
+without relying on Windows `PATHEXT` expansion. Foreground shell calls finalize
+after the direct PowerShell child exits even when a longer-lived descendant
+inherits its output handles. Timeout and cancellation paths bound the
+`taskkill /T /F` wait, preserve output collected before termination, and force
+stdio cleanup if Windows never reports `close`.
+
+When SSH Remote is installed, the adapter registers a named local Background
+Tasks provider below SSH's priority. Active/connecting SSH therefore owns
+routing, while local SSH mode falls through automatically to PowerShell without
+last-writer registration races or dependence on extension startup order.
 
 ## Requirements
 
