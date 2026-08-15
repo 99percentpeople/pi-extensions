@@ -55,6 +55,7 @@ test("extensions are independently publishable workspace packages", async () => 
   const codexApi = await readPackage("../extensions/codex-api/package.json");
   const cursorEffect = await readPackage("../extensions/cursor-effect/package.json");
   const pwsh = await readPackage("../extensions/pwsh-adapter/package.json");
+  const deepSeekAnchor = await readPackage("../extensions/deepseek-anchor/package.json");
   const sshRemote = await readPackage("../extensions/ssh-remote/package.json");
   const thinkingFold = await readPackage(
     "../extensions/thinking-fold/package.json",
@@ -82,6 +83,7 @@ test("extensions are independently publishable workspace packages", async () => 
     "extensions/codex-api",
     "extensions/cursor-effect",
     "extensions/pwsh-adapter",
+    "extensions/deepseek-anchor",
     "extensions/ssh-remote",
     "extensions/thinking-fold",
     "extensions/todo",
@@ -149,6 +151,19 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.dependencies?.["@99percentpeople/pi-shared-settings"], undefined);
   assert.equal(pwsh.publishConfig?.access, "public");
 
+  assert.equal(deepSeekAnchor.name, "@99percentpeople/pi-deepseek-anchor");
+  assert.equal(deepSeekAnchor.version, "0.1.0");
+  assertSourceExtensionPackage(deepSeekAnchor);
+  assert.deepEqual(deepSeekAnchor.piBuild?.bundlePackages, [
+    "@99percentpeople/pi-shared-settings",
+  ]);
+  assert.equal(deepSeekAnchor.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
+  assert.equal(deepSeekAnchor.publishConfig?.access, "public");
+  assert.equal(deepSeekAnchor.peerDependencies?.["@earendil-works/pi-ai"], "*");
+  assert.equal(deepSeekAnchor.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
+  assert.equal(deepSeekAnchor.peerDependencies?.["@earendil-works/pi-tui"], "*");
+  assert.equal(deepSeekAnchor.peerDependencies?.typebox, "*");
+
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
   assert.equal(sshRemote.version, "0.5.7");
   assertSourceExtensionPackage(sshRemote);
@@ -210,6 +225,7 @@ test("root dist contains complete minified publish staging packages", async () =
     { slug: "codex-api", source: "extensions/codex-api", extension: true },
     { slug: "cursor-effect", source: "extensions/cursor-effect", extension: true },
     { slug: "pwsh-adapter", source: "extensions/pwsh-adapter", extension: true },
+    { slug: "deepseek-anchor", source: "extensions/deepseek-anchor", extension: true },
     { slug: "ssh-remote", source: "extensions/ssh-remote", extension: true },
     { slug: "thinking-fold", source: "extensions/thinking-fold", extension: true },
     { slug: "todo", source: "extensions/todo", extension: true },

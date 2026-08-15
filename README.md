@@ -32,6 +32,7 @@ capabilities you need.
 | [Codex API](extensions/codex-api/README.md) | [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth text/vision delegation, image generation, search, Fast mode, and subscription usage |
 | [Cursor Effect](extensions/cursor-effect/README.md) | [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Configurable effects for Pi's working, retry, compaction, and branch-summary cursors |
 | [PowerShell Adapter](extensions/pwsh-adapter/README.md) | [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 or Windows PowerShell 5.1 for Pi's shell and background tasks on Windows |
+| [DeepSeek Anchor](extensions/deepseek-anchor/README.md) | [![deepseek-anchor](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-deepseek-anchor?label=deepseek-anchor)](https://www.npmjs.com/package/@99percentpeople/pi-deepseek-anchor) | Simulate DSH minimal mode's first request to induce a stronger DeepSeek V4 Pro agent trajectory |
 | [SSH Remote](extensions/ssh-remote/README.md) | [![ssh-remote](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-ssh-remote?label=ssh-remote)](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Remote Unix or Windows workspaces through reusable OpenSSH or `ssh2` transports |
 | [Thinking Fold](extensions/thinking-fold/README.md) | [![thinking-fold](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-thinking-fold?label=thinking-fold)](https://www.npmjs.com/package/@99percentpeople/pi-thinking-fold) | Timed, collapsible live-tail previews for long reasoning traces |
 | [Todo](extensions/todo/README.md) | [![todo](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-todo?label=todo)](https://www.npmjs.com/package/@99percentpeople/pi-todo) | Atomic whole-plan updates, dependencies, reminders, and a read-only TUI widget |
@@ -56,6 +57,7 @@ Choose one or more packages:
 pi install npm:@99percentpeople/pi-background-tasks
 pi install npm:@99percentpeople/pi-codex-api
 pi install npm:@99percentpeople/pi-cursor-effect
+pi install npm:@99percentpeople/pi-deepseek-anchor
 pi install npm:@99percentpeople/pi-ssh-remote
 pi install npm:@99percentpeople/pi-thinking-fold
 pi install npm:@99percentpeople/pi-todo
@@ -101,6 +103,22 @@ one:
 pi remove npm:@juicesharp/rpiv-todo
 pi install npm:@99percentpeople/pi-todo
 ```
+
+#### DeepSeek first-request anchoring
+
+```bash
+pi install npm:@99percentpeople/pi-deepseek-anchor
+```
+
+Start a fresh `deepseek/deepseek-v4-pro` session. The extension simulates DSH
+minimal mode's first-request scaffold to induce a more effective tool-use
+trajectory. The default Pi-native profile keeps a one-sentence system anchor
+for the session, starts with `bash` and `edit`, then restores the full tool set
+after the bootstrap tool batch. A POSIX-only `exact-dsh` profile adds the
+DSH-compatible persistent Bash and
+`str_replace_editor` schemas for the bootstrap request. Configure the profile,
+mode, scope, and native tools through the shared `/99settings` menu; DeepSeek
+Anchor adds no private slash command.
 
 ### Configure installed extensions
 
@@ -210,6 +228,26 @@ including Git Bash on Windows.
 
 [Read the PowerShell Adapter documentation →](extensions/pwsh-adapter/README.md)
 
+### DeepSeek Anchor
+
+Simulate DSH minimal mode's RL-aligned first request to place DeepSeek V4 Pro
+on a more effective agent trajectory without keeping the whole session on a
+two-tool catalog. Anchored mode keeps the profile's complete system prompt on
+every request, while restoring Pi's full
+tool set after the bootstrap tool batch. The default profile preserves Pi's
+normal Bash and editor implementations; the opt-in `exact-dsh` profile fixes
+the bootstrap schemas and uses a persistent local Bash process on POSIX during
+bootstrap. Profile/model gates are branch-aware, anchored phase survives
+reload, non-target models never lose tools, and non-`max` thinking is warned
+about rather than changed automatically. Settings apply immediately through
+`/99settings`; no extension-specific slash command is registered.
+
+This is an experimental client scaffold, not a performance guarantee, hidden
+chain-of-thought extractor, or server-route selector.
+
+[Read the DeepSeek Anchor documentation →](extensions/deepseek-anchor/README.md) ·
+[中文文档 →](extensions/deepseek-anchor/README.zh-CN.md)
+
 ### Codex API
 
 Use a ChatGPT Codex subscription from Pi without an API key.
@@ -282,6 +320,7 @@ Configurable extensions share one atomically written file:
 | `background-tasks` | Collapsed task count and output previews |
 | `codex-api` | Tool switches, Answer detail, Fast mode, usage monitoring, provider access, search, and image quality |
 | `cursor-effect` | Themes and custom loader/label effects |
+| `deepseek-anchor` | Profile, mode, anchor scope, and bootstrap tools |
 | `ssh-remote` | Transport, password behavior, and AI controls |
 | `thinking-fold` | Fold threshold and streaming/completed display behavior |
 | `todo` | Widget size, dependency numbers, and reminder interval |
@@ -304,6 +343,16 @@ Configurable extensions share one atomically written file:
     "usageStatus": true,
     "allowOtherProviders": false,
     "searchMode": "auto"
+  },
+  "deepseek-anchor": {
+    "version": 1,
+    "profile": "pi-native",
+    "mode": "anchored",
+    "scope": "session",
+    "targetProvider": "deepseek",
+    "targetModelId": "deepseek-v4-pro",
+    "nativeBootstrapTools": ["bash", "edit"],
+    "nativeSystemPrompt": "You are a helpful software engineer assistant."
   },
   "ssh-remote": {
     "transport": "auto"
@@ -382,6 +431,7 @@ normal package loaders.
 pi -e ./extensions/background-tasks/index.ts
 pi -e ./extensions/codex-api/index.ts
 pi -e ./extensions/cursor-effect/index.ts
+pi -e ./extensions/deepseek-anchor/index.ts
 pi -e ./extensions/ssh-remote/index.ts --ssh devbox:/srv/project
 pi -e ./extensions/thinking-fold/index.ts
 pi -e ./extensions/todo/index.ts
@@ -397,7 +447,7 @@ pi -e ./extensions/pwsh-adapter/index.ts
 
 | Path | Contents |
 | --- | --- |
-| `extensions/` | Seven independently published Pi extensions |
+| `extensions/` | Eight independently published Pi extensions |
 | `packages/` | Shared settings and workspace-file runtime libraries |
 | `tests/` | Unit and optional live integration tests |
 | `e2e/` | Local and remote Windows smoke tests |
@@ -414,7 +464,7 @@ Windows SSH integration requires a live test host. See
 from package-specific tags through npm Trusted Publishing and GitHub Actions
 OIDC. No `NPM_TOKEN` is required.
 
-Configure a Trusted Publisher separately for all nine npm packages:
+Configure a Trusted Publisher separately for all ten npm packages:
 
 - **Provider:** GitHub Actions
 - **Organization or user:** `99percentpeople`
@@ -427,6 +477,7 @@ Tags use the source directory name followed by the exact package version:
 ```text
 background-tasks-v2.1.0
 codex-api-v0.2.9
+deepseek-anchor-v0.1.0
 ssh-remote-v0.5.3
 workspace-files-v0.1.1
 ```
@@ -455,6 +506,7 @@ pi remove npm:@99percentpeople/pi-background-tasks
 pi remove npm:@99percentpeople/pi-codex-api
 pi remove npm:@99percentpeople/pi-cursor-effect
 pi remove npm:@99percentpeople/pi-pwsh-adapter
+pi remove npm:@99percentpeople/pi-deepseek-anchor
 pi remove npm:@99percentpeople/pi-ssh-remote
 pi remove npm:@99percentpeople/pi-thinking-fold
 pi remove npm:@99percentpeople/pi-todo

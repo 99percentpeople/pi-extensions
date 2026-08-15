@@ -7,6 +7,7 @@ on:
       - "codex-api-v*"
       - "cursor-effect-v*"
       - "pwsh-adapter-v*"
+      - "deepseek-anchor-v*"
       - "ssh-remote-v*"
       - "thinking-fold-v*"
       - "todo-v*"
@@ -60,6 +61,7 @@ jobs:
             { prefix: "codex-api-v", directory: "extensions/codex-api" },
             { prefix: "cursor-effect-v", directory: "extensions/cursor-effect" },
             { prefix: "pwsh-adapter-v", directory: "extensions/pwsh-adapter" },
+            { prefix: "deepseek-anchor-v", directory: "extensions/deepseek-anchor" },
             { prefix: "ssh-remote-v", directory: "extensions/ssh-remote" },
             { prefix: "thinking-fold-v", directory: "extensions/thinking-fold" },
             { prefix: "todo-v", directory: "extensions/todo" },

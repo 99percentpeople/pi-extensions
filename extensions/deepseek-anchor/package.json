@@ -1,0 +1,56 @@
+{
+  "name": "@99percentpeople/pi-deepseek-anchor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Simulate DSH minimal mode's first request to induce a stronger DeepSeek V4 Pro agent trajectory",
+  "type": "module",
+  "scripts": {
+    "build": "bun run ../../scripts/build-package.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "piBuild": {
+    "assets": [
+      "README.zh-CN.md"
+    ],
+    "bundlePackages": [
+      "@99percentpeople/pi-shared-settings"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "deepseek",
+    "harness",
+    "reasoning",
+    "anchored-standard"
+  ],
+  "author": "99percentpeople",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/99percentpeople/pi-extensions.git",
+    "directory": "extensions/deepseek-anchor"
+  },
+  "bugs": {
+    "url": "https://github.com/99percentpeople/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/99percentpeople/pi-extensions#deepseek-anchor",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "@99percentpeople/pi-shared-settings": "0.1.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
