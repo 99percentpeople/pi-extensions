@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -30,6 +30,7 @@ import {
   shapeAnchoredPayload,
   shapeBootstrapPayload,
 } from "../extensions/deepseek-anchor/payload.ts";
+import { loadHostBashOptions } from "../extensions/deepseek-anchor/host-bash.ts";
 import {
   updateDeepSeekAnchorConfigSetting,
 } from "../extensions/deepseek-anchor/settings.ts";
@@ -48,6 +49,8 @@ interface MockHarness {
   allEntries: any[];
   notifications: Array<{ message: string; level: string }>;
   commandNames: string[];
+  registeredToolNames: string[];
+  getToolDefinition(name: string): any;
   emit(name: string, event?: unknown): Promise<unknown[]>;
   shape(payload: unknown): Promise<unknown>;
   payload(): Record<string, unknown>;
@@ -79,6 +82,7 @@ function createHarness(options: {
   }
   let active = [...definitions.keys()];
   const commandNames: string[] = [];
+  const registeredToolNames: string[] = [];
   let sequence = 0;
   const branch = options.branch ?? [];
   const allEntries = options.allEntries ?? branch;
@@ -89,6 +93,7 @@ function createHarness(options: {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
     },
     registerTool(definition: any) {
+      registeredToolNames.push(definition.name);
       const existed = definitions.has(definition.name);
       definitions.set(definition.name, definition);
       if (!existed) active.push(definition.name);
@@ -135,6 +140,7 @@ function createHarness(options: {
     mode: "tui",
     hasUI: true,
     cwd: "/local/workspace",
+    isProjectTrusted: () => true,
     sessionManager: {
       getBranch: () => branch,
       getEntries: () => allEntries,
@@ -143,7 +149,14 @@ function createHarness(options: {
     },
     ui: {
       notify(message: string, level: string) {
-        notifications.push({ message, level });
+        // Mirror Pi's TUI behavior: consecutive info notifications update the
+        // same status line, while warning/error append new lines.
+        const previous = notifications.at(-1);
+        if (level === "info" && previous?.level === "info") {
+          notifications[notifications.length - 1] = { message, level };
+        } else {
+          notifications.push({ message, level });
+        }
       },
     },
   } as unknown as ExtensionContext;
@@ -164,6 +177,8 @@ function createHarness(options: {
     allEntries,
     notifications,
     commandNames,
+    registeredToolNames,
+    getToolDefinition: (name: string) => definitions.get(name),
     emit,
     async shape(payload: unknown) {
       let current = payload;
@@ -199,14 +214,14 @@ function createHarness(options: {
 
 async function withAgentDirectory<T>(
   config: DeepSeekAnchorConfig | undefined,
-  operation: () => Promise<T>,
+  operation: (directory: string) => Promise<T>,
 ): Promise<T> {
   const directory = await mkdtemp(join(tmpdir(), "pi-deepseek-anchor-agent-"));
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = directory;
   try {
     if (config) saveConfig(config);
-    return await operation();
+    return await operation(directory);
   } finally {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
@@ -228,11 +243,10 @@ test("shared settings map labels to durable DeepSeek Anchor values", () => {
   assert.equal(exact?.profile, "exact-dsh");
   const minimal = updateDeepSeekAnchorConfigSetting(exact!, "mode", "Minimal");
   assert.equal(minimal?.mode, "minimal");
-  const promptScope = updateDeepSeekAnchorConfigSetting(minimal!, "scope", "Every prompt");
-  assert.equal(promptScope?.scope, "prompt");
-  const tools = updateDeepSeekAnchorConfigSetting(promptScope!, "nativeBootstrapTools", "bash + read");
+  const tools = updateDeepSeekAnchorConfigSetting(minimal!, "nativeBootstrapTools", "bash + read");
   assert.deepEqual(tools?.nativeBootstrapTools, ["bash", "read"]);
   assert.equal(updateDeepSeekAnchorConfigSetting(initial, "profile", "unknown"), undefined);
+  assert.equal(updateDeepSeekAnchorConfigSetting(initial, "scope", "Every prompt"), undefined);
 });
 
 test("configuration normalizes and persists only durable settings", async () => {
@@ -244,7 +258,7 @@ test("configuration normalizes and persists only durable settings", async () => 
     fullTools: ["must", "not", "persist"],
   });
   assert.equal(normalized.mode, "minimal");
-  assert.equal(normalized.scope, "prompt");
+  assert.equal("scope" in normalized, false, "the removed scope field must not survive normalization");
   assert.deepEqual(normalized.nativeBootstrapTools, ["bash", "edit"]);
   assert.equal(normalized.nativeSystemPrompt, "Custom prompt");
   assert.equal("fullTools" in normalized, false);
@@ -252,7 +266,7 @@ test("configuration normalizes and persists only durable settings", async () => 
   const directory = await mkdtemp(join(tmpdir(), "pi-deepseek-anchor-config-"));
   const path = join(directory, "99extensions.json");
   try {
-    const expected = config({ profile: "exact-dsh", scope: "prompt" });
+    const expected = config({ profile: "exact-dsh" });
     saveConfig(expected, path);
     assert.deepEqual(loadConfig(path), expected);
     const raw = JSON.parse(await readFile(path, "utf8"));
@@ -353,7 +367,6 @@ test("session phase entries prevent re-anchoring after reload", async () => {
           phase: "anchored",
           profile: "pi-native",
           targetKey: "deepseek/deepseek-v4-pro",
-          scope: "session",
           tools: ["read", "bash", "edit", "write", "grep"],
         },
       },
@@ -431,6 +444,145 @@ test("exact profile emits the fixed DSH prompt and schemas, then removes its edi
       system: DSH_SYSTEM_PROMPT,
       tools: ["read", "bash", "edit", "write", "grep"],
     });
+    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+  });
+});
+
+test("pi-native never registers the Bash compatibility wrapper", async () => {
+  await withAgentDirectory(config(), async () => {
+    const harness = createHarness();
+    deepSeekAnchorExtension(harness.pi);
+    await harness.emit("session_start", { type: "session_start", reason: "startup" });
+    assert.equal(harness.registeredToolNames.includes("bash"), false);
+    assert.equal(
+      harness.registeredToolNames.includes("str_replace_editor"),
+      process.platform !== "win32",
+      "the exact editor should only be registered on POSIX hosts",
+    );
+    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+  });
+});
+
+test("exact profile fails closed when another extension owns the bash tool", {
+  skip: process.platform === "win32" ? "exact-dsh requires POSIX" : false,
+}, async () => {
+  await withAgentDirectory(config({ profile: "exact-dsh" }), async () => {
+    const harness = createHarness();
+    deepSeekAnchorExtension(harness.pi);
+
+    // Simulate Pi's first-registration-wins registry being owned by another
+    // extension: our wrapper is registered, but a foreign bash definition is
+    // what the tool registry resolves for the model.
+    harness.pi.registerTool(mockTool("bash"));
+
+    await harness.emit("session_start", { type: "session_start", reason: "startup" });
+    await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "fix" });
+    assert.deepEqual(harness.activeTools(), ["read", "bash", "edit", "write", "grep"]);
+
+    const payload = harness.payload();
+    const shaped = await harness.shape(payload);
+    assert.equal(shaped, payload, "requests must stay untouched while ownership is unresolved");
+    assert.deepEqual(inspectPayload(shaped), {
+      system: "normal Pi prompt",
+      tools: ["read", "bash", "edit", "write", "grep"],
+    });
+    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+  });
+});
+
+test("tweaking settings on an anchored session neither re-stages nor spams", async () => {
+  await withAgentDirectory(config(), async () => {
+    const harness = createHarness();
+    deepSeekAnchorExtension(harness.pi);
+    await harness.emit("session_start", { type: "session_start", reason: "startup" });
+    await harness.emit("before_agent_start", { type: "before_agent_start", prompt: "fix" });
+    await harness.shape(harness.payload());
+    await harness.emit("tool_call", { type: "tool_call", toolName: "bash", toolCallId: "call-1", input: {} });
+    await harness.emit("turn_end", { type: "turn_end", toolResults: [] });
+    assert.deepEqual(harness.activeTools(), ["read", "bash", "edit", "write", "grep"]);
+
+    const registry = (globalThis as any)[Symbol.for("@99percentpeople/pi-shared-settings/registry-v1")];
+    const section = registry?.sections.get("deepseek-anchor");
+    assert.ok(section?.onChange, "the registered settings section must expose onChange");
+
+    const transitionsBefore = harness.branch.filter(
+      (entry: any) => entry.customType === "deepseek-anchor-transition",
+    ).length;
+    const noticesBefore = harness.notifications.length;
+
+    section.onChange("nativeBootstrapTools", "bash + read", harness.ctx);
+    section.onChange("nativeBootstrapTools", "bash + edit", harness.ctx);
+
+    assert.equal(
+      harness.notifications.length,
+      noticesBefore + 1,
+      "consecutive settings changes should keep a single status notification",
+    );
+    assert.equal(
+      harness.branch.filter((entry: any) => entry.customType === "deepseek-anchor-transition").length,
+      transitionsBefore,
+      "an anchored session must not re-stage on unrelated setting changes",
+    );
+    assert.deepEqual(harness.activeTools(), ["read", "bash", "edit", "write", "grep"]);
+    assert.deepEqual(loadConfig().nativeBootstrapTools, ["bash", "edit"]);
+    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+  });
+});
+
+test("host Bash options merge global and trusted project settings", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-deepseek-anchor-host-"));
+  const project = await mkdtemp(join(tmpdir(), "pi-deepseek-anchor-project-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = directory;
+  try {
+    await writeFile(join(directory, "settings.json"), JSON.stringify({
+      shellPath: "/global/shell",
+      shellCommandPrefix: "global prefix",
+    }));
+    await mkdir(join(project, ".pi"), { recursive: true });
+    await writeFile(join(project, ".pi", "settings.json"), JSON.stringify({
+      shellPath: "/project/shell",
+    }));
+
+    assert.deepEqual(loadHostBashOptions(project, true), {
+      shellPath: "/project/shell",
+      commandPrefix: "global prefix",
+    });
+    assert.deepEqual(loadHostBashOptions(project, false), {
+      shellPath: "/global/shell",
+      commandPrefix: "global prefix",
+    });
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("exact wrapper preserves host Bash settings outside bootstrap", {
+  skip: process.platform === "win32" ? "exact-dsh requires POSIX" : false,
+}, async () => {
+  await withAgentDirectory(config({ profile: "exact-dsh" }), async (directory) => {
+    await writeFile(join(directory, "settings.json"), JSON.stringify({
+      shellCommandPrefix: "export DEEPSEEK_ANCHOR_HOST_MARKER=preserved",
+    }));
+
+    const harness = createHarness();
+    deepSeekAnchorExtension(harness.pi);
+    harness.ctx.cwd = directory;
+    await harness.emit("session_start", { type: "session_start", reason: "startup" });
+
+    const bash = harness.getToolDefinition("bash");
+    assert.ok(bash);
+    const result = await bash.execute(
+      "bash-call",
+      { command: 'printf "%s" "$DEEPSEEK_ANCHOR_HOST_MARKER"' },
+      undefined,
+      undefined,
+      harness.ctx,
+    );
+    assert.equal(result.content[0].text, "preserved");
     await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
   });
 });

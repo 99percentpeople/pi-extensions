@@ -4,7 +4,6 @@ import {
   DEEPSEEK_ANCHOR_SETTINGS_NAMESPACE,
   type AnchorMode,
   type AnchorProfile,
-  type AnchorScope,
   type DeepSeekAnchorConfig,
 } from "./config.ts";
 
@@ -17,11 +16,6 @@ const MODE_LABELS: Record<AnchorMode, string> = {
   anchored: "Anchored",
   minimal: "Minimal",
   off: "Off",
-};
-
-const SCOPE_LABELS: Record<AnchorScope, string> = {
-  session: "Session first",
-  prompt: "Every prompt",
 };
 
 function keyForLabel<T extends string>(labels: Record<T, string>, label: string): T | undefined {
@@ -59,10 +53,6 @@ export function updateDeepSeekAnchorConfigSetting(
     const mode = keyForLabel(MODE_LABELS, value);
     return mode ? { ...config, mode } : undefined;
   }
-  if (id === "scope") {
-    const scope = keyForLabel(SCOPE_LABELS, value);
-    return scope ? { ...config, scope } : undefined;
-  }
   if (id === "nativeBootstrapTools") {
     const tools = value.split("+").map((name) => name.trim()).filter(Boolean);
     return tools.length > 0 ? { ...config, nativeBootstrapTools: tools } : undefined;
@@ -90,17 +80,10 @@ export function registerDeepSeekAnchorSettings(
         {
           id: "mode",
           label: "Mode",
-          description: "Keep a session anchor with staged tools, stay minimal, or leave requests unchanged",
+          description: "Anchor the session with staged bootstrap tools, stay minimal, or leave requests unchanged",
           currentValue: MODE_LABELS[config.mode],
           values: Object.values(MODE_LABELS),
         },
-        ...(config.mode === "anchored" ? [{
-          id: "scope",
-          label: "Anchor scope",
-          description: "Expand tools once per session or restage them for every user prompt",
-          currentValue: SCOPE_LABELS[config.scope],
-          values: Object.values(SCOPE_LABELS),
-        }] : []),
         ...(config.profile === "pi-native" ? [{
           id: "nativeBootstrapTools",
           label: "Bootstrap tools",
@@ -120,5 +103,4 @@ export function registerDeepSeekAnchorSettings(
 export {
   MODE_LABELS as DEEPSEEK_ANCHOR_MODE_LABELS,
   PROFILE_LABELS as DEEPSEEK_ANCHOR_PROFILE_LABELS,
-  SCOPE_LABELS as DEEPSEEK_ANCHOR_SCOPE_LABELS,
 };

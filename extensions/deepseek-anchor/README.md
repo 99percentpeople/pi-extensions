@@ -49,10 +49,11 @@ Uses Pi's normal tools during execution:
 - `bash` and `edit` by default, with their existing Pi schemas during bootstrap;
 - full pre-bootstrap active tool set restored after the bootstrap tool batch.
 
-This profile never uses the persistent DSH shell: on POSIX its compatibility
-wrapper delegates to an active SSH Bash backend or Pi's normal local Bash
-implementation, while PowerShell Adapter remains untouched on Windows. It is
-the interoperable approximation, not the DSH schema contract.
+This profile never registers the DSH Bash wrapper, so Pi's own `bash` tool is
+left untouched, including any configured `shellPath` or `shellCommandPrefix`
+settings. It never uses the persistent DSH shell, and the PowerShell Adapter
+keeps owning Bash on Windows. It is the interoperable approximation, not the
+DSH schema contract.
 
 ### `exact-dsh`
 
@@ -63,6 +64,14 @@ Reproduces the model-facing DSH bootstrap contract more closely:
 - DSH-compatible names, descriptions, JSON schemas, and editor output;
 - a per-session persistent local Bash process during bootstrap;
 - the compatibility editor is removed when the normal Pi catalog returns.
+
+The Bash compatibility wrapper is only registered while this profile is
+enabled. Outside exact bootstrap it delegates to an active SSH Bash backend or
+rebuilds Pi's normal local Bash with the host's `shellPath` and
+`shellCommandPrefix` settings, so ordinary Bash calls keep Pi's configured
+behavior. If another extension owns the `bash` or `str_replace_editor` tool
+name, activation is refused instead of advertising DSH schemas while executing
+a foreign implementation.
 
 `exact-dsh` is POSIX-only. Its bootstrap uses the local filesystem and is
 refused while another extension delegates Bash to a remote or unavailable
@@ -83,7 +92,7 @@ messages.
 
 ## Lifecycle
 
-The default `anchored/session` lifecycle is:
+The default Anchored-mode lifecycle is:
 
 1. Require the configured provider/model and a fresh conversation.
 2. Record a profile/model-specific gate in the active session branch.
@@ -102,10 +111,9 @@ If the first response contains no tool call, the session remains in bootstrap
 until a later bootstrap response calls a tool. Tool restrictions are always
 restored on model mismatch, disable, session replacement, reload, or shutdown.
 
-The experimental `prompt` scope restages the bootstrap tool catalog for every
-user prompt while retaining both the complete system anchor and prior
-conversation history. It is useful for ablation, but it is not equivalent to a
-fresh DSH task session.
+Tool staging is fixed to the session: the catalog changes once (bootstrap →
+anchored) per session, so the complete system prompt and the post-bootstrap
+tool catalog stay stable across later requests.
 
 ## Thinking level
 
@@ -141,23 +149,67 @@ shared settings menu instead:
 /99settings
 ```
 
-Select **DeepSeek Anchor** and configure:
+Select **DeepSeek Anchor**. Each option is described below, including what it
+changes and which other options it affects:
 
-| Setting | Values | Default |
-| --- | --- | --- |
-| Profile | Pi native, Exact DSH | Pi native |
-| Mode | Anchored, Minimal, Off | Anchored |
-| Anchor scope | Session first, Every prompt | Session first |
-| Bootstrap tools | bash + edit, bash + read | bash + edit |
+| Setting | What it controls | Values | Default | Visible when |
+| --- | --- | --- | --- | --- |
+| Profile | Which bootstrap contract and system anchor shape eligible requests. | Pi native, Exact DSH | Pi native | Always |
+| Mode | Whether and when the minimal bootstrap catalog is staged, or whether requests are left untouched. | Anchored, Minimal, Off | Anchored | Always |
+| Bootstrap tools | Which Pi tools the pi-native bootstrap request exposes. | bash + edit, bash + read | bash + edit | Pi native only |
 
-Anchored mode keeps the complete profile system prompt for the session and
-stages the minimal tool catalog only until the bootstrap tool batch completes.
-Minimal mode keeps both that prompt and the minimal tool catalog for every
-request. Anchor scope appears only in Anchored mode; Bootstrap tools appears
-only in the Pi-native profile. Exact DSH keeps its prompt and bootstrap schemas
-immutable. Changes are persisted and applied immediately. If a profile change
-makes the current non-empty conversation ineligible, the settings notification
-asks for `/new` instead of silently re-anchoring old history.
+### Profile
+
+- **Pi native** — uses Pi's own `bash` and `edit` (or configured) schemas for
+  the bootstrap request and injects `nativeSystemPrompt` as the session-long
+  system anchor. It never registers the DSH Bash wrapper and never uses the
+  persistent DSH shell.
+- **Exact DSH** — mirrors the DSH minimal preset more strictly: fixed
+  `You are a helpful software engineer assistant.` system prompt, DSH
+  `bash` + `str_replace_editor` schemas and editor output, and a persistent
+  local Bash process during bootstrap. Requires POSIX and a local Bash backend
+  (an SSH Bash delegate makes the profile refuse to activate).
+
+Related options: `Bootstrap tools` only affects Pi native; Exact DSH keeps its
+prompt and bootstrap tools immutable. Gates are profile-specific — changing
+Profile in a conversation that already contains messages requires `/new` for
+the new profile to take effect.
+
+### Mode
+
+- **Anchored** (default) — start with the profile's minimal bootstrap tool
+  catalog, keep the complete profile system prompt for the whole session, and
+  restore Pi's full tool catalog after the first bootstrap response that calls
+  a tool. Once expanded, the catalog stays expanded for the rest of the
+  session.
+- **Minimal** — keep the minimal bootstrap catalog (and the complete profile
+  system prompt) for every provider request. The catalog never expands; use it
+  to compare the minimal trajectory against full Pi tools.
+- **Off** — leave provider payloads and Pi's active tool catalog untouched.
+  This is the clean baseline for A/B comparisons. The full tool catalog is
+  restored immediately.
+
+Related options: `Bootstrap tools` remains visible for Pi native even in Off
+so you can prepare a baseline before switching the mode back on.
+
+### Bootstrap tools
+
+- **bash + edit** (default) — the two-tool pair closest to the DSH minimal
+  bootstrap while still using Pi's normal schemas.
+- **bash + read** — an inspection-oriented variant: read files during
+  bootstrap while deferring Pi's dedicated file-editing tools until the full
+  catalog returns.
+
+The JSON field `nativeBootstrapTools` accepts any registered Pi tool names
+(e.g. `["bash", "read", "grep"]`). If a configured tool is not registered or is
+missing from the provider payload, the extension restores the full catalog and
+refuses to shape that request instead of sending an incomplete bootstrap.
+
+Related options: Exact DSH ignores this setting and always bootstraps with
+`bash` + `str_replace_editor`. The setting is shown for Pi native even when
+Mode is Off, but it only changes requests when Mode is Anchored or Minimal.
+
+### Advanced JSON fields
 
 Configuration shares the repository-wide settings file:
 
@@ -165,10 +217,35 @@ Configuration shares the repository-wide settings file:
 ~/.pi/agent/99extensions.json
 ```
 
-under the `deepseek-anchor` namespace. Advanced fields such as the exact target
-model and native complete system prompt remain normal namespaced JSON settings.
-Runtime tool snapshots stay session-local and are never written to global
-settings.
+under the `deepseek-anchor` namespace:
+
+```json
+{
+  "deepseek-anchor": {
+    "version": 1,
+    "profile": "pi-native",
+    "mode": "anchored",
+    "targetProvider": "deepseek",
+    "targetModelId": "deepseek-v4-pro",
+    "nativeBootstrapTools": ["bash", "edit"],
+    "nativeSystemPrompt": "You are a helpful software engineer assistant."
+  }
+}
+```
+
+| Field | Purpose |
+| --- | --- |
+| `version` | Namespace schema version; keep at `1`. |
+| `profile` / `mode` | Same values as the `/99settings` menu. |
+| `targetProvider` | Provider part of the model gate; only this provider is eligible. |
+| `targetModelId` | Model-id part of the gate; the provider payload model must also match this id. |
+| `nativeBootstrapTools` | Pi tool names exposed by the Pi-native bootstrap request; ignored by Exact DSH. |
+| `nativeSystemPrompt` | Complete system instruction injected into every eligible Pi-native request; Exact DSH uses the fixed DSH prompt. |
+
+Missing or invalid fields normalize back to defaults when the extension loads.
+Menu changes are saved and applied immediately; edits made directly to the
+JSON file are picked up on the next extension reload or session. Runtime tool
+snapshots stay session-local and are never written to this file.
 
 ## Debugging
 

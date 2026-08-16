@@ -22,7 +22,8 @@ import {
   shapeBootstrapPayload,
 } from "./payload.ts";
 import { registerDeepSeekAnchorSettings } from "./settings.ts";
-import { registerStrReplaceEditor } from "./str-replace-editor.ts";
+import { loadHostBashOptions } from "./host-bash.ts";
+import { registerStrReplaceEditor, strReplaceEditorSchema } from "./str-replace-editor.ts";
 
 export type AnchorPhase = "bootstrap" | "anchored";
 
@@ -43,7 +44,6 @@ interface PhaseData {
   phase?: AnchorPhase;
   profile?: AnchorProfile;
   targetKey?: string;
-  scope?: "session" | "prompt";
   tools?: string[];
 }
 
@@ -63,6 +63,9 @@ interface Runtime {
   reasoningBuffer: string;
   reasoningLogged: boolean;
   exactSupported: boolean;
+  ownedBashParameters?: unknown;
+  ownedEditorParameters?: unknown;
+  lastRecordedPhase?: string;
   exactBash?: PersistentBashSession;
 }
 
@@ -115,7 +118,6 @@ function latestRecordedPhase(ctx: ExtensionContext, config: DeepSeekAnchorConfig
       (data?.phase === "bootstrap" || data?.phase === "anchored")
       && data.profile === config.profile
       && data.targetKey === expectedTarget
-      && data.scope === config.scope
     );
   });
   if (!entry || entry.type !== "custom") return undefined;
@@ -148,35 +150,90 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
       ?.resolveOperations;
   });
 
-  // Register the compatibility definitions once on POSIX so profile changes in
-  // /99settings are hot and never require a private reload command. The editor
-  // remains inactive outside exact bootstrap, while the Bash wrapper delegates
-  // to Pi (or an active SSH backend) for every non-exact call.
+  // The DSH editor is registered once on POSIX so profile changes in
+  // /99settings stay hot without a private reload command. It stays inactive
+  // outside exact bootstrap.
+  //
+  // The Bash wrapper is deliberately NOT registered for pi-native or off:
+  // Pi lets extension tools override built-in tools and keeps the first
+  // registration per name, so an unconditional "bash" registration would
+  // replace Pi's configured Bash implementation everywhere. It is only
+  // installed while the exact-dsh profile is actually enabled, and its
+  // non-exact path rebuilds the host Bash definition with the same
+  // shellPath/shellCommandPrefix settings Pi passes to the built-in tool.
   const exactToolsRegistered = runtime.exactSupported;
-  if (exactToolsRegistered) {
-    const standardBash = createBashToolDefinition(process.cwd());
-    pi.registerTool({
-      ...standardBash,
-      async execute(toolCallId, params, signal, onUpdate, ctx) {
-        const exactBootstrap =
-          runtime.config.profile === "exact-dsh"
-          && runtime.active
-          && runtime.phase === "bootstrap"
-          && runtime.bootstrapResponsePending;
-        if (!exactBootstrap) {
-          const delegated = bashDelegate?.();
-          return createBashToolDefinition(
-            ctx.cwd,
-            delegated ? { operations: delegated } : undefined,
-          ).execute(toolCallId, params, signal, onUpdate, ctx);
-        }
-        runtime.exactBash ??= new PersistentBashSession({ cwd: ctx.cwd });
-        const text = await runtime.exactBash.run(params.command, { signal });
-        return { content: [{ type: "text", text }], details: undefined };
-      },
-    });
-    registerStrReplaceEditor(pi);
+  let bashWrapperRegistered = false;
+  let strReplaceEditorRegistered = false;
+
+  function ownsRegisteredTool(name: string, parameters: unknown): boolean {
+    if (parameters === undefined) return false;
+    return pi.getAllTools().some((tool) =>
+      tool.name === name && tool.parameters === parameters);
   }
+
+  function exactToolsOwned(): boolean {
+    if (
+      runtime.config.profile !== "exact-dsh"
+      || !runtime.exactSupported
+      || runtime.config.mode === "off"
+    ) return true;
+    return ownsRegisteredTool("bash", runtime.ownedBashParameters)
+      && ownsRegisteredTool("str_replace_editor", runtime.ownedEditorParameters);
+  }
+
+  function registerExactTools(): void {
+    if (!runtime.exactSupported) return;
+
+    if (!strReplaceEditorRegistered) {
+      registerStrReplaceEditor(pi);
+      runtime.ownedEditorParameters = strReplaceEditorSchema;
+      strReplaceEditorRegistered = true;
+    }
+
+    if (
+      !bashWrapperRegistered
+      && runtime.config.profile === "exact-dsh"
+      && runtime.config.mode !== "off"
+    ) {
+      const standardBash = createBashToolDefinition(process.cwd());
+      const wrapper: ReturnType<typeof createBashToolDefinition> = {
+        ...standardBash,
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
+          const exactBootstrap =
+            runtime.config.profile === "exact-dsh"
+            && runtime.active
+            && runtime.phase === "bootstrap"
+            && runtime.bootstrapResponsePending;
+          if (!exactBootstrap) {
+            const delegated = bashDelegate?.();
+            if (delegated) {
+              return createBashToolDefinition(
+                ctx.cwd,
+                { operations: delegated },
+              ).execute(toolCallId, params, signal, onUpdate, ctx);
+            }
+            // Keep the host's configured shell behavior (shellPath and
+            // shellCommandPrefix) instead of silently reverting to defaults.
+            const hostOptions = loadHostBashOptions(
+              ctx.cwd,
+              ctx.isProjectTrusted(),
+            );
+            return createBashToolDefinition(ctx.cwd, hostOptions)
+              .execute(toolCallId, params, signal, onUpdate, ctx);
+          }
+          runtime.exactBash ??= new PersistentBashSession({ cwd: ctx.cwd });
+          const text = await runtime.exactBash.run(params.command, { signal });
+          return { content: [{ type: "text" as const, text }], details: undefined };
+        },
+      };
+      runtime.ownedBashParameters = wrapper.parameters;
+      pi.registerTool(wrapper);
+      bashWrapperRegistered = true;
+    }
+  }
+
+  // Editor first: pi-native/off sessions must never observe a Bash override.
+  registerExactTools();
 
   function configuredTools(): string[] {
     return bootstrapToolsFor(runtime.config);
@@ -217,6 +274,13 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
   }
 
   function applyBootstrap(): boolean {
+    registerExactTools();
+    if (runtime.config.profile === "exact-dsh" && !exactToolsOwned()) {
+      runtime.active = false;
+      runtime.gateReason = "exact-dsh requires DeepSeek Anchor to own the bash and str_replace_editor tools; another extension is using those names";
+      expand();
+      return false;
+    }
     const requested = configuredTools();
     const registered = availableToolNames();
     const missing = requested.filter((name) => !registered.has(name));
@@ -241,15 +305,23 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
   }
 
   function recordPhase(phase: AnchorPhase): void {
+    const tools = phase === "bootstrap" ? configuredTools() : runtime.restoreTools;
+    const signature = [
+      phase,
+      runtime.config.profile,
+      targetKey(runtime.config),
+      tools.join("\u0000"),
+    ].join("\u0000");
+    if (runtime.lastRecordedPhase === signature) return;
     pi.appendEntry(TRANSITION_ENTRY, {
       version: 1,
       phase,
       profile: runtime.config.profile,
       targetKey: targetKey(runtime.config),
-      scope: runtime.config.scope,
       timestamp: Date.now(),
-      tools: phase === "bootstrap" ? configuredTools() : runtime.restoreTools,
+      tools,
     } satisfies PhaseData & { timestamp: number });
+    runtime.lastRecordedPhase = signature;
   }
 
   function setPhase(
@@ -307,18 +379,22 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
     const modelOk = modelMatches(model);
     const profileSupported = runtime.config.profile !== "exact-dsh" || runtime.exactSupported;
     const localEnvironment = !exactHasExternalBash();
-    runtime.conversationEligible = profileSupported && localEnvironment
+    const exactToolsAvailable = exactToolsOwned();
+    runtime.conversationEligible = profileSupported && localEnvironment && exactToolsAvailable
       ? ensureConversationGate(model, ctx)
       : matchingGate(ctx, runtime.config);
     runtime.active =
       modelOk
       && runtime.conversationEligible
       && profileSupported
-      && localEnvironment;
+      && localEnvironment
+      && exactToolsAvailable;
     if (!profileSupported) {
       runtime.gateReason = "exact-dsh requires a POSIX host";
     } else if (!localEnvironment) {
       runtime.gateReason = "exact-dsh requires a local session without Bash delegation";
+    } else if (!exactToolsAvailable) {
+      runtime.gateReason = "exact-dsh requires DeepSeek Anchor to own the bash and str_replace_editor tools; another extension is using those names";
     } else if (!modelOk) {
       runtime.gateReason = `model ${modelKey(model)} ≠ ${targetKey(runtime.config)}`;
     } else if (!runtime.conversationEligible) {
@@ -336,10 +412,6 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
     }
     if (runtime.config.mode === "off") {
       runtime.phase = "anchored";
-      return;
-    }
-    if (runtime.config.scope === "prompt") {
-      runtime.phase = "bootstrap";
       return;
     }
     runtime.phase = latestRecordedPhase(ctx, runtime.config) ?? "bootstrap";
@@ -361,29 +433,42 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
     // count as bootstrap-only.
     expand();
     runtime.config = next;
-    runtime.phase = next.mode === "off" ? "anchored" : "bootstrap";
+    registerExactTools();
+
+    // Only restage when the change actually alters the staging contract.
+    // In anchored mode, unrelated tweaks (e.g. bootstrap tools) keep the
+    // current phase so an already anchored session is not re-restricted and
+    // no duplicate transition entries are written.
+    const previousPhase = runtime.phase;
+    if (next.mode === "off") {
+      runtime.phase = "anchored";
+    } else if (next.mode === "minimal" || previous.profile !== next.profile) {
+      runtime.phase = "bootstrap";
+    }
     runtime.bootstrapResponsePending = false;
     runtime.bootstrapToolCallCount = 0;
     runtime.payloadReason = "";
-    runtime.maxWarningShown = false;
     if (previous.profile !== next.profile || next.mode === "off") {
       void runtime.exactBash?.close();
       runtime.exactBash = undefined;
     }
 
+    const phaseChanged = runtime.phase !== previousPhase;
     recomputeActive(ctx.model, ctx);
     if (runtime.active && next.mode !== "off") {
-      applyBootstrap();
-      recordPhase("bootstrap");
+      const applied = runtime.phase === "bootstrap"
+        ? applyBootstrap()
+        : (expand(), true);
+      if (applied && phaseChanged) recordPhase(runtime.phase);
     } else {
       expand();
     }
 
+    // Pi merges consecutive info notifications into a single status line;
+    // warning/error would append new lines, so always use info here.
     const changedProfile = previous.profile !== next.profile;
-    const suffix = changedProfile && !runtime.active
-      ? `; ${runtime.gateReason}`
-      : "";
-    ctx.ui.notify(`DeepSeek Anchor settings updated${suffix}`, runtime.active || next.mode === "off" ? "info" : "warning");
+    const suffix = changedProfile && !runtime.active ? `; ${runtime.gateReason}` : "";
+    ctx.ui.notify(`DeepSeek Anchor settings updated${suffix}`, "info");
   }
 
   registerDeepSeekAnchorSettings(pi, {
@@ -401,7 +486,9 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
     runtime.reasoningBuffer = "";
     runtime.reasoningLogged = false;
     runtime.toolsRestricted = false;
+    runtime.lastRecordedPhase = undefined;
     runtime.exactSupported = process.platform !== "win32";
+    registerExactTools();
     await runtime.exactBash?.close();
     runtime.exactBash = undefined;
 
@@ -417,7 +504,7 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
       expand();
     }
     log(
-      `session · profile=${runtime.config.profile} · mode=${runtime.config.mode}/${runtime.config.scope} · target=${targetKey(runtime.config)} · model=${modelKey(ctx.model)} · active=${runtime.active} · phase=${runtime.phase}`,
+      `session · profile=${runtime.config.profile} · mode=${runtime.config.mode} · target=${targetKey(runtime.config)} · model=${modelKey(ctx.model)} · active=${runtime.active} · phase=${runtime.phase}`,
     );
   });
 
@@ -454,8 +541,6 @@ export default function deepSeekAnchorExtension(pi: ExtensionAPI): void {
 
     if (runtime.config.mode === "minimal") {
       runtime.phase = "bootstrap";
-    } else if (runtime.config.scope === "prompt") {
-      setPhase("bootstrap", { forceRecord: runtime.phase !== "bootstrap" });
     }
 
     if (runtime.phase === "bootstrap") applyBootstrap();

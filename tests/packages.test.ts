@@ -152,7 +152,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(deepSeekAnchor.name, "@99percentpeople/pi-deepseek-anchor");
-  assert.equal(deepSeekAnchor.version, "0.1.0");
+  assert.equal(deepSeekAnchor.version, "0.1.1");
   assertSourceExtensionPackage(deepSeekAnchor);
   assert.deepEqual(deepSeekAnchor.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",

@@ -6,13 +6,11 @@ import {
 
 export type AnchorProfile = "pi-native" | "exact-dsh";
 export type AnchorMode = "anchored" | "minimal" | "off";
-export type AnchorScope = "session" | "prompt";
 
 export interface DeepSeekAnchorConfig {
   version: 1;
   profile: AnchorProfile;
   mode: AnchorMode;
-  scope: AnchorScope;
   targetProvider: string;
   targetModelId: string;
   nativeBootstrapTools: string[];
@@ -26,7 +24,6 @@ export const DEFAULT_CONFIG: DeepSeekAnchorConfig = {
   version: 1,
   profile: "pi-native",
   mode: "anchored",
-  scope: "session",
   targetProvider: "deepseek",
   targetModelId: "deepseek-v4-pro",
   nativeBootstrapTools: ["bash", "edit"],
@@ -65,9 +62,6 @@ export function normalizeConfig(value: unknown): DeepSeekAnchorConfig {
   }
   if (raw.mode === "anchored" || raw.mode === "minimal" || raw.mode === "off") {
     config.mode = raw.mode;
-  }
-  if (raw.scope === "session" || raw.scope === "prompt") {
-    config.scope = raw.scope;
   }
 
   config.targetProvider = nonEmptyString(raw.targetProvider) ?? config.targetProvider;

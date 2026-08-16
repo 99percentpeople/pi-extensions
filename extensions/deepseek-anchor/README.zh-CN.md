@@ -30,7 +30,7 @@ DeepSeek Anchor 在 Pi 中应用这一客户端诱导方式：让首次请求对
 - bootstrap 阶段默认使用 `bash` 和 `edit`，并保留 Pi 原有 schema；
 - bootstrap 工具批次完成后，恢复启动前的完整活动工具集。
 
-此 profile 不使用 DSH 持久化 shell。在 POSIX 上，它的兼容 wrapper 会委托给当前 SSH Bash 后端或 Pi 的普通本地 Bash；在 Windows 上不会影响 PowerShell Adapter。它是可互操作的近似方案，而不是 DSH schema 契约。
+此 profile 不会注册 DSH Bash wrapper，因此 Pi 自身的 `bash` 工具完全不被改动，包括用户配置的 `shellPath` 和 `shellCommandPrefix`。它不使用 DSH 持久化 shell，Windows 上仍由 PowerShell Adapter 管理 Bash。它是可互操作的近似方案，而不是 DSH schema 契约。
 
 ### `exact-dsh`
 
@@ -42,6 +42,8 @@ DeepSeek Anchor 在 Pi 中应用这一客户端诱导方式：让首次请求对
 - bootstrap 期间使用会话级持久化本地 Bash；
 - 恢复 Pi 普通工具目录时移除兼容编辑器。
 
+Bash 兼容 wrapper 只会在启用此 profile 后注册。在 exact bootstrap 之外，它会委托给当前 SSH Bash 后端，或使用宿主的 `shellPath` / `shellCommandPrefix` 配置重建 Pi 的普通本地 Bash，因此普通 Bash 调用仍保持 Pi 原有行为。如果其他扩展占用了 `bash` 或 `str_replace_editor` 工具名，扩展会拒绝激活，而不是对外宣称 DSH schema 却执行其他实现。
+
 `exact-dsh` 仅支持 POSIX。它的 bootstrap 直接操作本地文件系统；如果其他扩展把 Bash 委托给远程或不可用环境，扩展会拒绝激活。离开 exact bootstrap 后，wrapper 会跟随当前 SSH Bash 委托，否则退回 Pi 的普通本地 Bash。Windows 上仍由 PowerShell Adapter 管理 Bash，只能使用 `pi-native`。
 
 该 profile 在 bootstrap prompt/schema 边界上保持精确，并在之后继续保持同一个完整 prompt，但它并不是 DSH runtime 的完整复制。扩展不会复制 DSH 服务端路由、关闭 Pi 自动压缩、强制实现 DSH 的网络或软件包镜像描述，也不会增加文件系统 sandbox。持久化 shell 和绝对路径编辑器拥有与 Pi 进程相同的操作系统权限。
@@ -50,7 +52,7 @@ DeepSeek Anchor 在 Pi 中应用这一客户端诱导方式：让首次请求对
 
 ## 生命周期
 
-默认 `anchored/session` 生命周期如下：
+默认 Anchored 模式的生命周期如下：
 
 1. 要求当前 provider/model 与配置匹配，并且对话是新会话。
 2. 在活动 session branch 中记录与 profile/model 绑定的 gate。
@@ -63,7 +65,8 @@ DeepSeek Anchor 在 Pi 中应用这一客户端诱导方式：让首次请求对
 
 如果第一次响应没有调用工具，会话会继续停留在 bootstrap，直到之后的 bootstrap 响应产生工具调用。模型不匹配、关闭扩展、更换会话、reload 或 shutdown 时，工具限制都会被安全恢复。
 
-实验性的 `prompt` scope 会在每个用户 prompt 开始时重新启用 bootstrap 工具目录，同时保留完整 system anchor 和之前的对话历史。它适合做行为对照，但不等同于新的 DSH 任务会话。
+工具 staging 固定为会话作用域：每个会话只在 bootstrap → anchored 时切换一次，
+因此完整 system prompt 和展开后的工具目录在后续请求中保持稳定。
 
 ## Thinking level
 
@@ -96,20 +99,60 @@ DeepSeek Anchor 不注册私有 slash command。请打开共享设置菜单：
 /99settings
 ```
 
-选择 **DeepSeek Anchor**：
+选择 **DeepSeek Anchor**。下表说明每个选项的作用、可选值以及它会影响哪些相关选项：
 
-| 设置 | 可选值 | 默认值 |
-| --- | --- | --- |
-| Profile | Pi native、Exact DSH | Pi native |
-| Mode | Anchored、Minimal、Off | Anchored |
-| Anchor scope | Session first、Every prompt | Session first |
-| Bootstrap tools | bash + edit、bash + read | bash + edit |
+| 设置 | 作用 | 可选值 | 默认值 | 显示条件 |
+| --- | --- | --- | --- | --- |
+| Profile | 选择首个请求使用的 bootstrap 契约与整个会话的 system anchor | Pi native、Exact DSH | Pi native | 始终显示 |
+| Mode | 控制何时启用 bootstrap 工具目录，以及是否修改 provider 请求 | Anchored、Minimal、Off | Anchored | 始终显示 |
+| Bootstrap tools | 决定 `pi-native` 首个请求暴露哪些 Pi 工具 | bash + edit、bash + read | bash + edit | 仅 Pi native |
 
-Anchored 模式会在整个会话中保持完整 profile system prompt，并只在 bootstrap 工具批次完成前使用精简工具目录。Minimal 模式会让每次请求都保持该 prompt 和精简工具目录。
+### Profile
 
-Anchor scope 仅在 Anchored 模式显示；Bootstrap tools 仅在 `pi-native` profile 显示。Exact DSH 的 prompt 和 bootstrap schema 不可修改。
+- **Pi native**：兼容性更强的近似方案。bootstrap 请求使用 Pi 自身的 `bash`
+  和 `edit`（或自定义工具）schema，并把 `nativeSystemPrompt` 作为整个会话的
+  system anchor。它不会注册 DSH Bash wrapper，也不会使用 DSH 持久化 shell。
+- **Exact DSH**：更严格地复现 DSH minimal preset。system prompt 固定为
+  `You are a helpful software engineer assistant.`，使用 DSH 的
+  `bash` + `str_replace_editor` schema 和编辑器输出，bootstrap 期间运行会话级
+  持久化本地 Bash。需要 POSIX 主机和本地 Bash 后端；存在 SSH Bash 委托时
+  该 profile 会拒绝激活。
 
-所有更改都会立即应用并持久化。如果切换 profile 后当前非空会话不再符合 gate，设置通知会提示使用 `/new`，而不会静默修改旧轨迹。
+相关选项：`Bootstrap tools` 只影响 Pi native；Exact DSH 的 prompt 和
+bootstrap 工具不可修改。会话 gate 与 profile 绑定，因此在已有消息的会话中
+切换 Profile 需要 `/new` 才能让新 profile 生效。
+
+### Mode
+
+- **Anchored**（默认）：会话开始时使用 profile 的精简 bootstrap 工具目录，
+  整个会话保持完整 profile system prompt；首个包含工具调用的 bootstrap 响应
+  结束后恢复 Pi 完整工具目录，之后该会话的后续请求一直保持完整目录。
+- **Minimal**：每次 provider 请求都使用精简 bootstrap 工具目录，同时保持
+  完整 profile system prompt。目录永远不会展开，适合与完整 Pi 工具集做
+  对照实验。
+- **Off**：完全不修改 provider payload 和 Pi 当前活动工具目录，是 A/B 对比
+  的干净基线。切换后完整工具目录会立即恢复。
+
+相关选项：Pi native 下即使 Mode 为 Off，`Bootstrap tools` 仍会显示，
+方便先准备好基线再重新开启模式。
+
+### Bootstrap tools
+
+- **bash + edit**（默认）：最接近 DSH minimal 的两工具组合，但继续使用 Pi
+  自身 schema。
+- **bash + read**：偏只读检查的组合；bootstrap 阶段允许用 read 读取文件，
+  并把 Pi 的专用文件编辑工具推迟到完整工具目录恢复之后。
+
+JSON 字段 `nativeBootstrapTools` 可以填写任何已注册的 Pi 工具名，例如
+`["bash", "read", "grep"]`。如果配置的工具未注册，或 provider payload 中缺少
+该工具，扩展会恢复完整工具目录并拒绝修改请求，而不会发送不完整的
+bootstrap。
+
+相关选项：Exact DSH 忽略该设置，始终使用 `bash` + `str_replace_editor`
+bootstrap。Pi native 下即使 Mode 为 Off 也会显示该设置，但它只在 Anchored
+或 Minimal 模式下影响请求。
+
+### 高级 JSON 字段
 
 配置保存在仓库扩展共享的设置文件中：
 
@@ -117,9 +160,7 @@ Anchor scope 仅在 Anchored 模式显示；Bootstrap tools 仅在 `pi-native` p
 ~/.pi/agent/99extensions.json
 ```
 
-使用 `deepseek-anchor` 命名空间。目标模型、Pi 原生完整 system prompt 等高级字段也存储在该命名空间中。运行时工具快照仅存在于当前会话，不会写入全局设置。
-
-默认配置：
+使用 `deepseek-anchor` 命名空间，默认配置如下：
 
 ```json
 {
@@ -127,7 +168,6 @@ Anchor scope 仅在 Anchored 模式显示；Bootstrap tools 仅在 `pi-native` p
     "version": 1,
     "profile": "pi-native",
     "mode": "anchored",
-    "scope": "session",
     "targetProvider": "deepseek",
     "targetModelId": "deepseek-v4-pro",
     "nativeBootstrapTools": ["bash", "edit"],
@@ -135,6 +175,19 @@ Anchor scope 仅在 Anchored 模式显示；Bootstrap tools 仅在 `pi-native` p
   }
 }
 ```
+
+| 字段 | 作用 |
+| --- | --- |
+| `version` | 命名空间 schema 版本，保持 `1` |
+| `profile` / `mode` | 与 `/99settings` 菜单相同的取值 |
+| `targetProvider` | 模型 gate 的 provider 部分；只有该 provider 符合条件 |
+| `targetModelId` | 模型 gate 的 model id 部分；provider payload 的 model 也必须匹配 |
+| `nativeBootstrapTools` | Pi native bootstrap 请求暴露的 Pi 工具名；Exact DSH 会忽略 |
+| `nativeSystemPrompt` | 注入到每个符合条件 Pi native 请求的完整 system instruction；Exact DSH 使用固定的 DSH prompt |
+
+缺失或非法字段会在扩展加载时归一化回默认值。通过菜单修改会立即保存并
+生效；直接编辑 JSON 文件需要下次扩展 reload 或新会话才会被读取。运行时工具
+快照仅存在于当前会话，不会写入该文件。
 
 ## 调试
 

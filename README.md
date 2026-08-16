@@ -477,7 +477,7 @@ Tags use the source directory name followed by the exact package version:
 ```text
 background-tasks-v2.1.0
 codex-api-v0.2.9
-deepseek-anchor-v0.1.0
+deepseek-anchor-v0.1.1
 ssh-remote-v0.5.3
 workspace-files-v0.1.1
 ```
