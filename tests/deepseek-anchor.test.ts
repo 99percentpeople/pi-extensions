@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -530,12 +531,21 @@ test("persistent Bash preserves cwd and environment and recovers after timeout",
   const shell = new PersistentBashSession({ cwd: directory, timeoutMs: 50 });
   try {
     assert.equal(await shell.run("export KEEP=state; mkdir nested; cd nested"), "");
-    assert.equal(await shell.run('printf "%s:%s\\n" "$KEEP" "$PWD"'), `state:${join(directory, "nested")}`);
+    // Bash resolves the starting cwd to its canonical path. On macOS /var
+    // is a symlink to /private/var, so compare against realpath() rather
+    // than the logical tmpdir() spelling.
+    assert.equal(
+      await shell.run('printf "%s:%s\\n" "$KEEP" "$PWD"'),
+      `state:${realpathSync(join(directory, "nested"))}`,
+    );
     assert.equal(await shell.run("false"), "[exit code: 1]");
     const timedOut = await shell.run("printf partial; sleep 5");
     assert.match(timedOut, /timed out/);
     assert.match(timedOut, /partial/);
-    assert.equal(await shell.run('printf "%s" "$PWD"'), directory);
+    assert.equal(
+      await shell.run('printf "%s" "$PWD"'),
+      realpathSync(directory),
+    );
   } finally {
     await shell.close();
     await rm(directory, { recursive: true, force: true });
