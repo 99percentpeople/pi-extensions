@@ -57,7 +57,9 @@ import {
 } from "../extensions/ssh-remote/src/background/index.ts";
 import {
   buildSshArguments,
+  buildSshControlMasterArguments,
   OpenSshClient,
+  parseSshPort,
   type SshClientOptions,
   type SshDisposeOptions,
   type SshRemoteClient,
@@ -101,6 +103,7 @@ import {
 import {
   findSshEnvironmentState,
   findSshSessionState,
+  formatRemoteLocation,
   normalizeSshSessionState,
   SSH_LOCAL_SESSION_STATE,
   SSH_LOCAL_SESSION_STATE_TYPE,
@@ -312,22 +315,51 @@ class ReachabilitySshClient extends FakeSshClient {
   }
 }
 
-test("SSH targets use rsync-style syntax and robust shell quoting", () => {
-  assert.deepEqual(parseSshTarget("devbox"), { target: "devbox", requestedCwd: undefined });
+test("SSH targets parse hosts, ports, and paths from one unified argument", () => {
+  assert.deepEqual(parseSshTarget("devbox"), {
+    target: "devbox",
+    requestedCwd: undefined,
+  });
   assert.deepEqual(parseSshTarget("deploy@devbox:/srv/app"), {
     target: "deploy@devbox",
     requestedCwd: "/srv/app",
   });
+  assert.deepEqual(parseSshTarget("deploy@devbox:2201"), {
+    target: "deploy@devbox",
+    port: 2201,
+    requestedCwd: undefined,
+  });
+  assert.deepEqual(parseSshTarget("deploy@devbox:2201:/srv/app"), {
+    target: "deploy@devbox",
+    port: 2201,
+    requestedCwd: "/srv/app",
+  });
+  assert.deepEqual(parseSshTarget("deploy@devbox:./2201"), {
+    target: "deploy@devbox",
+    requestedCwd: "./2201",
+  });
   assert.deepEqual(parseSshTarget("deploy@[2001:db8::10]:~/app"), {
     target: "deploy@2001:db8::10",
+    requestedCwd: "~/app",
+  });
+  assert.deepEqual(parseSshTarget("deploy@[2001:db8::10]:2201:~/app"), {
+    target: "deploy@2001:db8::10",
+    port: 2201,
     requestedCwd: "~/app",
   });
   assert.deepEqual(parseSshTarget("winbox:C:\\Users\\Admin\\project"), {
     target: "winbox",
     requestedCwd: "C:\\Users\\Admin\\project",
   });
+  assert.deepEqual(parseSshTarget("winbox:2201:C:\\Users\\Admin"), {
+    target: "winbox",
+    port: 2201,
+    requestedCwd: "C:\\Users\\Admin",
+  });
   assert.throws(() => parseSshTarget("-oProxyCommand=bad"), /cannot start/);
   assert.throws(() => parseSshTarget("bad host:/tmp"), /whitespace/);
+  assert.throws(() => parseSshTarget("devbox:0"), /Invalid SSH port.*devbox:\.\/0/);
+  assert.throws(() => parseSshTarget("devbox:65536"), /Invalid SSH port.*devbox:\.\/65536/);
   assert.equal(shellQuote("a'b c"), "'a'\\''b c'");
   assert.equal(normalizeRemoteToolPath("@~/src/index.ts", "/home/deploy"), "/home/deploy/src/index.ts");
   assert.throws(() => normalizeRemoteToolPath("~other/file", "/home/deploy"), /~user/);
@@ -378,6 +410,39 @@ test("OpenSSH arguments preserve config aliases and run non-interactively", () =
   assert.deepEqual(
     buildSshArguments({ target: "devbox" }, false, true),
     ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-T", "-n", "devbox"],
+  );
+});
+
+test("ControlMaster startup never combines -M with ControlMaster=yes", () => {
+  const args = buildSshControlMasterArguments({
+    target: "devbox",
+    port: 2201,
+    multiplex: true,
+    controlPath: "/tmp/pi-ssh/mux",
+  });
+  assert.ok(args.includes("-M"));
+  assert.ok(args.includes("-N"));
+  assert.equal(args.includes("ControlMaster=yes"), false);
+  assert.ok(args.includes("-p"));
+  assert.ok(args.includes("2201"));
+});
+
+test("explicit SSH ports reach every OpenSSH invocation", () => {
+  assert.equal(parseSshPort(undefined), undefined);
+  assert.equal(parseSshPort(""), undefined);
+  assert.equal(parseSshPort("2201"), 2201);
+  assert.equal(parseSshPort(22), 22);
+  assert.throws(() => parseSshPort("0"), /SSH port must be an integer from 1 to 65535/);
+  assert.throws(() => parseSshPort("65536"), /SSH port must be an integer from 1 to 65535/);
+  assert.throws(() => parseSshPort("22x"), /SSH port must be an integer from 1 to 65535/);
+  assert.throws(() => parseSshPort(22.5), /SSH port must be an integer from 1 to 65535/);
+
+  const args = buildSshArguments({ target: "devbox", port: 2201 });
+  assert.deepEqual(args.slice(0, 3), ["-p", "2201", "-o"]);
+  assert.equal(args.at(-1), "devbox");
+  assert.throws(
+    () => buildSshArguments({ target: "devbox", port: 0 }),
+    /SSH port must be an integer from 1 to 65535/,
   );
 });
 
@@ -812,6 +877,60 @@ test("ssh2 config uses ssh -G, OpenSSH known_hosts, agent auth, and algorithm in
     assert.equal(calls.length, 2);
     assert.ok(calls[0].args.includes("-G"));
     assert.ok(calls[1].args.includes("-F"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ssh2 applies an explicit target port to ssh -G and known_hosts lookups", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-ssh2-port-config-test-"));
+  const knownHosts = join(directory, "known_hosts");
+  writeFileSync(knownHosts, "placeholder\n");
+  const hostKey = Buffer.from("test-host-key-blob");
+  const encodedHostKey = hostKey.toString("base64");
+  const calls: Array<{ executable: string; args: readonly string[] }> = [];
+  try {
+    const resolved = await resolveSsh2Connection(
+      { target: "alias", port: 2201, connectTimeoutSeconds: 10 },
+      {
+        platform: "linux",
+        home: directory,
+        env: { SSH_AUTH_SOCK: "/tmp/test-agent" },
+        runLocal: async (executable, args) => {
+          calls.push({ executable, args });
+          if (args.includes("-G")) {
+            return {
+              stdout: Buffer.from([
+                "user deploy",
+                "hostname server.example.test",
+                "port 2201",
+                "identityagent SSH_AUTH_SOCK",
+                `userknownhostsfile ${knownHosts}`,
+                "globalknownhostsfile none",
+                "pubkeyauthentication true",
+                "identitiesonly no",
+              ].join("\n") + "\n"),
+              stderr: Buffer.alloc(0),
+              exitCode: 0,
+            };
+          }
+          return {
+            stdout: Buffer.from(`[server.example.test]:2201 ssh-ed25519 ${encodedHostKey}\n`),
+            stderr: Buffer.alloc(0),
+            exitCode: 0,
+          };
+        },
+      },
+    );
+
+    assert.equal(resolved.config.host, "server.example.test");
+    assert.equal(resolved.config.port, 2201);
+    assert.equal(resolved.hostLabel, "deploy@server.example.test:2201");
+    assert.ok(calls[0].args.includes("-p"));
+    assert.ok(calls[0].args.includes("2201"));
+    assert.equal(calls[1].args[calls[1].args.indexOf("-F") + 1], "[server.example.test]:2201");
+    const verify = resolved.config.hostVerifier as (key: Buffer) => boolean;
+    assert.equal(verify(hostKey), true);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -2076,6 +2195,59 @@ test("explicit openssh retries when auth failure arrives as a 255 result, not an
   // transports share one cached password.
   assert.deepEqual(prompts, ["root@router:22"]);
   assert.equal(created[1].sshpassPassword, "pw");
+});
+
+test("explicit openssh uses explicit ports in password cache keys", async () => {
+  const endpoints: Array<{ hostLabel: string; host: string; port?: number }> = [];
+  const client = createSshTransportClient(
+    { target: "root@router", port: 2201 },
+    {
+      platform: "linux",
+      preference: "openssh",
+      createOpenSsh: (options) => {
+        const { sshpassPassword } = options;
+        return {
+          options,
+          transport: "openssh",
+          reusesConnection: false,
+          run: async () => {
+            if (!sshpassPassword) {
+              return {
+                stdout: Buffer.alloc(0),
+                stderr: Buffer.from("root@router: Permission denied (publickey,password)."),
+                exitCode: 255,
+              };
+            }
+            return { stdout: Buffer.from("ok"), stderr: Buffer.alloc(0), exitCode: 0 };
+          },
+          runChecked: async () => {
+            throw new Error("SSH command failed (255): Permission denied (publickey,password)");
+          },
+          dispose: () => {},
+        };
+      },
+      passwordProvider: {
+        cached: () => undefined,
+        retry: async (endpoint) => {
+          endpoints.push({
+            hostLabel: endpoint.hostLabel,
+            host: endpoint.host,
+            port: endpoint.port,
+          });
+          return "pw";
+        },
+      },
+      detectSshpass: async () => true,
+    },
+  );
+  const result = await client.runChecked("probe");
+  assert.equal(result.exitCode, 0);
+  // The retry delegate uses the explicit port in its shared cache key.
+  assert.deepEqual(endpoints, [{
+    hostLabel: "root@router:2201",
+    host: "router",
+    port: 2201,
+  }]);
 });
 
 test("Unix auto falls back on a 255 permission-denied result", async () => {
@@ -4772,6 +4944,113 @@ test("invalid SSH transport flags fail closed before creating a client", async (
   );
 });
 
+test("unified --ssh targets carry their port into clients, status, and reconnects", async () => {
+  const clients: FakeSshClient[] = [];
+  const harness = createExtensionHarness({
+    flag: "deploy@devbox:2201:/srv/project",
+  });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      clients.push(client);
+      return client;
+    },
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(clients[0].options.target, "deploy@devbox");
+  assert.equal(clients[0].options.port, 2201);
+  const stored = findSshSessionState(harness.entries);
+  assert.equal(stored?.target, "deploy@devbox");
+  assert.equal(stored?.port, 2201);
+
+  await harness.commands.get("ssh-status").handler("", harness.ctx);
+  assert.match(
+    harness.notifications.at(-1)?.message ?? "",
+    /target: deploy@devbox.*port: 2201/s,
+  );
+
+  await harness.commands.get("ssh-reconnect").handler("", harness.ctx);
+  assert.equal(clients.length, 2);
+  assert.equal(clients[1].options.target, "deploy@devbox");
+  assert.equal(clients[1].options.port, 2201);
+  await harness.emit("session_shutdown", { reason: "quit" });
+});
+
+test("resumed sessions reuse their stored SSH port and reject explicit conflicts", async () => {
+  const stored: SshSessionState = {
+    version: 2,
+    target: "devbox",
+    port: 2201,
+    remotePlatform: "unix",
+    remoteShell: "bash",
+    remoteCwd: "/srv/project",
+    remoteHome: "/home/deploy",
+  };
+
+  const resumedClients: FakeSshClient[] = [];
+  const resumed = createExtensionHarness({ branch: [sessionEntry(stored)] });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      resumedClients.push(client);
+      return client;
+    },
+  })(resumed.pi);
+  await resumed.emit("session_start", { reason: "resume" });
+  assert.equal(resumedClients[0].options.target, "devbox");
+  assert.equal(resumedClients[0].options.port, 2201);
+  await resumed.emit("session_shutdown", { reason: "quit" });
+
+  const sameHostNoPort = createExtensionHarness({
+    flag: "devbox",
+    branch: [sessionEntry(stored)],
+  });
+  const sameHostClients: FakeSshClient[] = [];
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: (options) => {
+      const client = new FakeSshClient(options);
+      sameHostClients.push(client);
+      return client;
+    },
+  })(sameHostNoPort.pi);
+  await sameHostNoPort.emit("session_start", { reason: "resume" });
+  assert.equal(sameHostClients[0].options.port, 2201);
+  await sameHostNoPort.emit("session_shutdown", { reason: "quit" });
+
+  const conflicting = createExtensionHarness({
+    flag: "devbox:22:/srv/project",
+    branch: [sessionEntry(stored)],
+  });
+  createSshRemoteExtension({ platform: "linux" })(conflicting.pi);
+  await conflicting.emit("session_start", { reason: "resume" });
+  assert.match(
+    conflicting.notifications.at(-1)?.message ?? "",
+    /bound to devbox:2201:\/srv\/project/,
+  );
+  assert.equal(conflicting.statuses.get("ssh-remote"), "SSH: Disconnected");
+  await conflicting.emit("session_shutdown", { reason: "quit" });
+});
+
+test("invalid ports in --ssh fail before creating an SSH client", async () => {
+  let clients = 0;
+  const harness = createExtensionHarness({ flag: "devbox:0" });
+  createSshRemoteExtension({
+    platform: "linux",
+    createClient: () => {
+      clients++;
+      throw new Error("must not create a client");
+    },
+  })(harness.pi);
+
+  await harness.emit("session_start", { reason: "startup" });
+  assert.equal(clients, 0);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /Invalid SSH port/);
+});
+
 test("SSH commands appear for remote sessions and reconnect the active target", async () => {
   const clients: FakeSshClient[] = [];
   const harness = createExtensionHarness({ flag: "devbox:/srv/project" });
@@ -6488,6 +6767,32 @@ test("session state migrates Unix v1 entries and validates Windows v2 paths", ()
     remoteCwd: "/etc",
     remoteHome: "/root",
   })?.remoteShell, "sh");
+  assert.equal(
+    formatRemoteLocation({ target: "devbox", port: 2201, remoteCwd: "/srv/project" }),
+    "devbox:2201:/srv/project",
+  );
+
+  const ported = normalizeSshSessionState({
+    version: 2,
+    target: "router",
+    port: 2201,
+    remotePlatform: "unix",
+    remoteShell: "sh",
+    remoteCwd: "/etc",
+    remoteHome: "/root",
+  });
+  assert.equal(ported?.port, 2201);
+  for (const invalidPort of [0, 65_536, "2201"]) {
+    assert.equal(normalizeSshSessionState({
+      version: 2,
+      target: "router",
+      port: invalidPort,
+      remotePlatform: "unix",
+      remoteShell: "sh",
+      remoteCwd: "/etc",
+      remoteHome: "/root",
+    }), undefined);
+  }
 });
 
 test("local session tombstones override earlier remote state per branch", () => {

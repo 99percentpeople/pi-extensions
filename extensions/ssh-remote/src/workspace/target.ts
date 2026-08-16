@@ -9,6 +9,7 @@ import { posix, win32 } from "node:path";
 
 export interface ParsedSshTarget {
   target: string;
+  port?: number;
   requestedCwd?: string;
 }
 
@@ -27,12 +28,46 @@ function normalizeBracketedTarget(user: string | undefined, host: string): strin
 }
 
 /**
- * Parse rsync-style SSH locations such as host:/srv/project. IPv6 literals must
- * use brackets, for example user@[2001:db8::1]:/srv/project.
+ * Parse the part after the host (for example `2201`, `2201:/srv`, or
+ * `/srv`). A pure number is an SSH port; a number followed by `:path` is a
+ * port plus remote cwd. Every other value keeps the legacy rsync-style cwd
+ * meaning. Numeric directories must be written with an explicit `./` prefix.
+ */
+function parseSuffix(
+  suffix: string | undefined,
+  input: string,
+): { port?: number; requestedCwd?: string } {
+  const value = suffix?.trim() || "";
+  if (!value) return { requestedCwd: undefined };
+
+  const portAndCwd = /^(\d+)(?::(.*))?$/.exec(value);
+  if (!portAndCwd) return { requestedCwd: value };
+
+  const port = Number(portAndCwd[1]);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    const target = input.slice(0, input.indexOf(value));
+    throw new Error(
+      `Invalid SSH port in ${JSON.stringify(input)}; use ${JSON.stringify(`${target}./${value}`)} for a numeric remote directory`,
+    );
+  }
+  return {
+    port,
+    requestedCwd: portAndCwd[2]?.trim() || undefined,
+  };
+}
+
+/**
+ * Parse rsync-style SSH locations such as host:/srv/project or unified
+ * host:2201:/srv/project targets. IPv6 literals must use brackets, for
+ * example user@[2001:db8::1]:2201:/srv/project.
  */
 export function parseSshTarget(value: string): ParsedSshTarget {
   const input = value.trim();
-  if (!input) throw new Error("--ssh requires a host or host:path value");
+  if (!input) {
+    throw new Error(
+      "--ssh requires a host, host:path, host:port, or host:port:path value",
+    );
+  }
   if (/[\0\r\n]/.test(input)) {
     throw new Error("SSH location cannot contain control characters");
   }
@@ -44,8 +79,7 @@ export function parseSshTarget(value: string): ParsedSshTarget {
       bracketed[2],
     );
     assertSafeTarget(target);
-    const requestedCwd = bracketed[3]?.trim() || undefined;
-    return { target, requestedCwd };
+    return { target, ...parseSuffix(bracketed[3], input) };
   }
 
   const separator = input.indexOf(":");
@@ -55,10 +89,10 @@ export function parseSshTarget(value: string): ParsedSshTarget {
     throw new Error(`Malformed bracketed SSH target: ${target}`);
   }
 
-  const requestedCwd = separator === -1
-    ? undefined
-    : input.slice(separator + 1).trim() || undefined;
-  return { target, requestedCwd };
+  return {
+    target,
+    ...parseSuffix(separator === -1 ? undefined : input.slice(separator + 1), input),
+  };
 }
 
 export function shellQuote(value: string): string {

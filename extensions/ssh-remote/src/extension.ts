@@ -151,6 +151,7 @@ interface ConnectionIntent {
   target: string;
   requestedCwd?: string;
   configFile?: string;
+  port?: number;
   shellPreference?: SshShellPreference;
   storedState?: SshSessionState;
   persistOnSuccess: boolean;
@@ -254,7 +255,11 @@ function sameStoredTarget(
   configFile: string | undefined,
   stored: SshSessionState,
 ): boolean {
-  if (parsed.target !== stored.target || configFile !== stored.configFile) return false;
+  if (
+    parsed.target !== stored.target
+    || configFile !== stored.configFile
+    || (parsed.port !== undefined && parsed.port !== stored.port)
+  ) return false;
   if (!parsed.requestedCwd) return true;
   return (
     parsed.requestedCwd === stored.requestedCwd
@@ -619,7 +624,7 @@ export function createSshRemoteExtension(
 
     pi.registerFlag("ssh", {
       description:
-        "SSH remote workspace: host or host:path (uses OpenSSH config)",
+        "SSH remote workspace: host, host:path, host:port, or host:port:path",
       type: "string",
     });
     pi.registerFlag("ssh-config", {
@@ -874,6 +879,7 @@ export function createSshRemoteExtension(
         );
         const clientOptions: SshClientOptions = {
           target: intent.target,
+          port: intent.port,
           configFile: intent.configFile,
           executable: platform === "win32" ? "ssh.exe" : undefined,
           connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
@@ -957,6 +963,7 @@ export function createSshRemoteExtension(
         const session: SshSessionState = {
           version: SSH_SESSION_STATE_VERSION,
           target: intent.target,
+          port: intent.port,
           remotePlatform: selected.workspace.platform,
           remoteShell: selected.workspace.shell,
           remoteCwd: selected.workspace.cwd,
@@ -1323,6 +1330,9 @@ export function createSshRemoteExtension(
         runtime.client.fallbackReason
           ? `transport fallback: ${runtime.client.fallbackReason}`
           : undefined,
+        runtime.session.port !== undefined
+          ? `port: ${runtime.session.port}`
+          : undefined,
         `cwd: ${runtime.session.remoteCwd}`,
         `home: ${runtime.session.remoteHome}`,
         runtime.session.configFile
@@ -1364,6 +1374,7 @@ export function createSshRemoteExtension(
           target: stored.target,
           requestedCwd: stored.remoteCwd,
           configFile: stored.configFile,
+          port: stored.port,
           shellPreference: explicitShell ?? stored.remoteShell,
           storedState: stored,
           persistOnSuccess: false,
@@ -1394,6 +1405,7 @@ export function createSshRemoteExtension(
               target: inherited.target,
               requestedCwd: inherited.remoteCwd,
               configFile: inherited.configFile,
+              port: inherited.port,
               shellPreference: inherited.remoteShell,
               storedState: inherited,
               persistOnSuccess: false,
@@ -1761,12 +1773,15 @@ export function createSshRemoteExtension(
     };
 
     pi.registerCommand("ssh-connect", {
-      description: "Connect or switch the current session to an SSH workspace: /ssh-connect host[:path]",
+      description: "Connect or switch the current session to an SSH workspace: /ssh-connect <[user@]host[:port][:path]>",
       handler: async (args, ctx) => {
         await ctx.waitForIdle();
         const target = args.trim();
         if (!target) {
-          ctx.ui.notify("Usage: /ssh-connect <host[:path]>", "warning");
+          ctx.ui.notify(
+            "Usage: /ssh-connect <[user@]host[:port][:path]>",
+            "warning",
+          );
           return;
         }
         if (runtime.kind === "connecting") {
@@ -1901,7 +1916,7 @@ export function createSshRemoteExtension(
       pi.registerTool({
         name: "ssh_connect",
         label: "SSH Connect",
-        description: "Connect the current Pi session to an SSH workspace, replacing an active SSH target without requiring ssh_exit first. The target accepts host or host:path syntax. When AI password authentication is enabled, each password required by the target or its ProxyJump chain must be entered by the user in Pi's UI within 60 seconds; otherwise key-based login is required.",
+        description: "Connect the current Pi session to an SSH workspace, replacing an active SSH target without requiring ssh_exit first. The target accepts [user@]host, [user@]host:port, [user@]host:path, or [user@]host:port:path. When AI password authentication is enabled, each password required by the target or its ProxyJump chain must be entered by the user in Pi's UI within 60 seconds; otherwise key-based login is required.",
         promptSnippet: "Connect or switch the current session to an SSH workspace",
         promptGuidelines: [
           "Use ssh_connect when the user asks to enter an SSH workspace or switch directly from the active SSH target to another one; do not call ssh_exit before switching targets.",
@@ -1912,7 +1927,7 @@ export function createSshRemoteExtension(
         ],
         parameters: Type.Object({
           target: Type.String({
-            description: "SSH target as host, user@host, or host:path",
+            description: "SSH target as [user@]host, [user@]host:port, [user@]host:path, or [user@]host:port:path",
             minLength: 1,
           }),
         }),
@@ -2148,6 +2163,7 @@ export function createSshRemoteExtension(
           if (
             runtime.kind === "active"
             && runtime.session.target === stored.target
+            && runtime.session.port === stored.port
             && runtime.session.remotePlatform === stored.remotePlatform
             && runtime.session.remoteShell === stored.remoteShell
             && runtime.session.remoteCwd === stored.remoteCwd
@@ -2160,6 +2176,7 @@ export function createSshRemoteExtension(
             target: stored.target,
             requestedCwd: stored.remoteCwd,
             configFile: stored.configFile,
+            port: stored.port,
             shellPreference: stored.remoteShell,
             storedState: stored,
             persistOnSuccess: false,

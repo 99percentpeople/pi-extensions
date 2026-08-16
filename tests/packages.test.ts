@@ -165,7 +165,7 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(deepSeekAnchor.peerDependencies?.typebox, "*");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
-  assert.equal(sshRemote.version, "0.5.7");
+  assert.equal(sshRemote.version, "0.6.0");
   assertSourceExtensionPackage(sshRemote);
   assert.deepEqual(sshRemote.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",

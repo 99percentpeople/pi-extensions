@@ -9,6 +9,7 @@ export const SSH_LOCAL_SESSION_STATE_VERSION = 1 as const;
 export interface SshSessionState {
   version: typeof SSH_SESSION_STATE_VERSION;
   target: string;
+  port?: number;
   remotePlatform: RemotePlatform;
   remoteShell: RemoteShell;
   remoteCwd: string;
@@ -37,6 +38,16 @@ function isSafeOptionalString(value: unknown): value is string | undefined {
   return value === undefined || (typeof value === "string" && !/[\0\r\n]/.test(value));
 }
 
+function isSafeOptionalPort(value: unknown): value is number | undefined {
+  return value === undefined
+    || (
+      typeof value === "number"
+      && Number.isInteger(value)
+      && value >= 1
+      && value <= 65_535
+    );
+}
+
 function isValidTarget(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
@@ -55,6 +66,7 @@ function isValidWindowsPath(value: string): boolean {
 
 function commonFieldsAreValid(value: Record<string, unknown>): boolean {
   return isValidTarget(value.target)
+    && isSafeOptionalPort(value.port)
     && typeof value.remoteCwd === "string"
     && typeof value.remoteHome === "string"
     && isSafeOptionalString(value.requestedCwd)
@@ -103,6 +115,7 @@ export function normalizeSshSessionState(value: unknown): SshSessionState | unde
   return {
     version: SSH_SESSION_STATE_VERSION,
     target: value.target as string,
+    port: value.port as number | undefined,
     remotePlatform: value.remotePlatform,
     remoteShell: value.remoteShell,
     remoteCwd: value.remoteCwd as string,
@@ -144,6 +157,9 @@ export function findSshSessionState(entries: readonly unknown[]): SshSessionStat
   return environment?.mode === "remote" ? environment.session : undefined;
 }
 
-export function formatRemoteLocation(state: Pick<SshSessionState, "target" | "remoteCwd">): string {
-  return `${state.target}:${state.remoteCwd}`;
+export function formatRemoteLocation(
+  state: Pick<SshSessionState, "target" | "port" | "remoteCwd">,
+): string {
+  const port = state.port !== undefined ? `:${state.port}` : "";
+  return `${state.target}${port}:${state.remoteCwd}`;
 }

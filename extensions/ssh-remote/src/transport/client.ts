@@ -23,6 +23,8 @@ export type SshTransportKind = Exclude<SshTransportPreference, "auto">;
 
 export interface SshClientOptions {
   target: string;
+  /** Explicit destination port parsed from the unified SSH target syntax. */
+  port?: number;
   configFile?: string;
   executable?: string;
   connectTimeoutSeconds?: number;
@@ -137,6 +139,26 @@ function createTempFile(): { fd: number; path: string } {
   return { fd: openSync(path, "w+"), path };
 }
 
+/**
+ * Parse and validate an SSH destination port (parsed from the unified
+ * target syntax). Returns undefined for unset/empty values.
+ */
+export function parseSshPort(
+  value: unknown,
+  description = "SSH port",
+): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const normalized = typeof value === "string" ? value.trim() : String(value);
+  if (!/^\d+$/.test(normalized)) {
+    throw new Error(`${description} must be an integer from 1 to 65535`);
+  }
+  const port = Number(normalized);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`${description} must be an integer from 1 to 65535`);
+  }
+  return port;
+}
+
 export function buildSshArguments(
   options: SshClientOptions,
   allocatePty = false,
@@ -160,8 +182,11 @@ export function buildSshArguments(
     );
   }
 
+  const port = parseSshPort(options.port);
+
   const args: string[] = [];
   if (options.configFile) args.push("-F", options.configFile);
+  if (port !== undefined) args.push("-p", String(port));
   if (options.multiplex === true) {
     if (!options.controlPath) {
       throw new Error("OpenSSH multiplexing requires a control path");
@@ -229,9 +254,13 @@ export function buildSshControlMasterArguments(
     true,
   );
   const target = args.pop()!;
+  // `-M` alone already enables ControlMaster=yes. Passing both `-M` and
+  // `-o ControlMaster=yes` makes OpenSSH treat them like repeated `-M`
+  // flags, which requires interactive confirmation for every mux session.
+  // Without an askpass helper that permission is denied, each command falls
+  // back to a direct connection, and stderr gains the misleading
+  // `Master refused session request: Permission denied` line.
   args.push(
-    "-o",
-    "ControlMaster=yes",
     "-o",
     "ControlPersist=no",
     "-S",
@@ -749,8 +778,10 @@ export class OpenSshClient implements SshRemoteClient {
         && this.controlMasterReady
       ) {
         const executable = this.options.executable ?? "ssh";
+        const port = parseSshPort(this.options.port);
         const args: string[] = [];
         if (this.options.configFile) args.push("-F", this.options.configFile);
+        if (port !== undefined) args.push("-p", String(port));
         args.push(
           "-o",
           `BatchMode=${this.options.batchMode === false ? "no" : "yes"}`,

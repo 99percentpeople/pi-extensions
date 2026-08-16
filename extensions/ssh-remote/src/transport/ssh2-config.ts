@@ -13,7 +13,7 @@ import ssh2, {
   type MacAlgorithm,
   type ServerHostKeyAlgorithm,
 } from "ssh2";
-import type { SshClientOptions } from "./client.ts";
+import { parseSshPort, type SshClientOptions } from "./client.ts";
 import type { SshPasswordEndpoint } from "./password-resolver.ts";
 
 const { createAgent, utils } = ssh2;
@@ -831,6 +831,7 @@ export async function resolveSsh2Connection(
   };
   const target = await resolveSsh2Endpoint(context, {
     target: options.target,
+    port: parseSshPort(options.port),
     disableProxyJump: false,
     role: "target",
   });

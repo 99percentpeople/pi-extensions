@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   OpenSshClient,
+  parseSshPort,
   type SshClientOptions,
   type SshDisconnectListener,
   type SshDisposeOptions,
@@ -75,8 +76,10 @@ async function detectProxyJumpDefault(
     return false;
   }
   const executable = options.executable ?? (platform === "win32" ? "ssh.exe" : "ssh");
+  const port = parseSshPort(options.port);
   const args: string[] = [];
   if (options.configFile) args.push("-F", options.configFile);
+  if (port !== undefined) args.push("-p", String(port));
   args.push("-G", "-o", "BatchMode=yes", options.target);
   try {
     const result = await runLocalCommand(executable, args, 15_000);
@@ -94,10 +97,13 @@ async function detectProxyJumpDefault(
 /**
  * Secret key for an OpenSSH target, matching the ssh2 resolver's
  * `user@host:port` format so one entered password is reused across both
- * transports. Targets without an explicit user keep the raw target (the
- * effective user is only known to ssh -G).
+ * transports. Targets without an explicit user keep the raw target unless a
+ * port is known (the effective user is only known to ssh -G).
  */
-function opensshHostLabel(target: string): string {
+function opensshPasswordEndpoint(
+  target: string,
+  explicitPort?: number,
+): SshPasswordEndpoint {
   let user: string | undefined;
   let rest = target;
   const at = rest.lastIndexOf("@");
@@ -105,14 +111,29 @@ function opensshHostLabel(target: string): string {
     user = rest.slice(0, at);
     rest = rest.slice(at + 1);
   }
-  const colon = rest.lastIndexOf(":");
+
   let host = rest;
-  let port = 22;
-  if (colon !== -1 && /^\d+$/.test(rest.slice(colon + 1))) {
+  let inlinePort: number | undefined;
+  const colon = rest.lastIndexOf(":");
+  // A single trailing :digits is an inline port. Unbracketed IPv6 targets
+  // contain multiple colons and must not be split at the last one.
+  const colonCount = rest.split(":").length - 1;
+  if (colonCount === 1 && colon !== -1 && /^\d+$/.test(rest.slice(colon + 1))) {
     host = rest.slice(0, colon);
-    port = Number(rest.slice(colon + 1));
+    inlinePort = Number(rest.slice(colon + 1));
   }
-  return user ? `${user}@${host}:${port}` : target;
+  const port = explicitPort ?? inlinePort ?? 22;
+  const hostLabel = user
+    ? `${user}@${host}:${port}`
+    : explicitPort !== undefined || inlinePort !== undefined
+      ? `${host}:${port}`
+      : target;
+  return {
+    hostLabel,
+    username: user ?? "",
+    host,
+    port,
+  };
 }
 
 function boundedReason(error: unknown): string {
@@ -317,13 +338,10 @@ class SshpassRetryClient implements SshRemoteClient {
   }
 
   private endpoint(): SshPasswordEndpoint {
-    const label = opensshHostLabel(this.openSshOptionsValue.target);
-    return {
-      hostLabel: label,
-      username: label.includes("@") ? label.slice(0, label.lastIndexOf("@")) : "",
-      host: this.openSshOptionsValue.target,
-      port: 22,
-    };
+    return opensshPasswordEndpoint(
+      this.openSshOptionsValue.target,
+      this.openSshOptionsValue.port,
+    );
   }
 
   /** A cached password makes the sshpass retry start without prompting. */

@@ -24,6 +24,9 @@ on the local machine.
   failing closed when a device reboot or network loss is detected
 - Uses normal OpenSSH aliases and configuration, including multi-hop
   `ProxyJump`
+- Connects to non-standard ports directly in the target, for example
+  `deploy@devbox:2201:/srv/project`; explicit ports override the configured
+  `Port`
 - Detects Unix and Windows shells automatically, with an explicit shell option
   when needed
 - Restores branch-aware SSH state across resume, reload, fork, clone, and
@@ -88,7 +91,13 @@ resolution in `ssh2` mode, and for remote background jobs.
 # Unix workspace
 pi --ssh devbox:/srv/project
 
-# Windows workspace (quote the target in your shell)
+# Unix workspace on a non-standard SSH port
+pi --ssh deploy@devbox:2201:/srv/project
+
+# Windows workspace, port 2201 plus remote cwd (quote the target in your shell)
+pi --ssh 'winuser@winbox:2201:C:\Users\winuser\project'
+
+# Windows workspace on the configured/default port
 pi --ssh 'winuser@winbox:C:\Users\winuser\project'
 ```
 
@@ -102,7 +111,7 @@ Useful commands inside Pi:
 ```text
 /ssh-status                         Show the current local or SSH environment
 /ssh-cd /srv/another-project        Change the remote cwd without reconnecting
-/ssh-connect staging:/srv/project   Enter SSH or switch directly to another host
+/ssh-connect staging:2201:/srv      Enter SSH or switch directly to another host
 /ssh-reconnect                      Reconnect or apply a transport change
 /ssh-exit                           Return this conversation to its local workspace
 ```
@@ -140,25 +149,61 @@ A typical OpenSSH alias works with either transport:
 Host devbox
     HostName 192.0.2.20
     User deploy
+    Port 2201
     IdentityFile ~/.ssh/company
     ProxyJump bastion
 ```
 
 ```bash
+# Use the Port from the alias
 pi --ssh devbox:/srv/project
+
+# Override it for one command without editing the config
+pi --ssh devbox:22:/srv/project
 ```
 
 ## Targets and paths
 
-SSH Remote accepts rsync-style locations:
+SSH Remote accepts one unified target argument:
 
 ```text
-devbox
-deploy@devbox:/srv/project
-deploy@[2001:db8::10]:/srv/project
-winbox
-winuser@winbox:C:\Users\winuser\project
+[user@]host[:port][:path]
 ```
+
+| Example | Meaning |
+| --- | --- |
+| `devbox` | Host alias `devbox`, remote login directory |
+| `deploy@devbox:/srv/project` | User `deploy`, remote cwd `/srv/project` |
+| `deploy@devbox:2201` | User `deploy`, port `2201`, remote login directory |
+| `deploy@devbox:2201:/srv/project` | User `deploy`, port `2201`, cwd `/srv/project` |
+| `deploy@[2001:db8::10]:2201:/srv/project` | Bracketed IPv6, port `2201`, cwd `/srv/project` |
+| `winbox` | Host alias `winbox`, remote profile directory |
+| `winuser@winbox:C:\Users\winuser\project` | Windows path, configured/default port |
+| `winuser@winbox:2201:C:\Users\winuser\project` | Windows path plus port `2201` |
+
+### Ports
+
+A pure number immediately after the first colon is an SSH port
+(`1-65535`), matching OpenSSH's `host:port` destination form. A second colon
+may then introduce the remote path. An explicit port overrides any `Port`
+value from the OpenSSH configuration; omitting it keeps the configured or
+default port.
+
+A pure number that is not a valid port is rejected so a typo such as
+`devbox:22011` never becomes a remote path silently.
+
+| Write this | To get |
+| --- | --- |
+| `devbox:2201` | Connect on port 2201 |
+| `devbox:2201:/srv` | Connect on port 2201 with cwd `/srv` |
+| `devbox:~/2201` | Directory `2201` under the remote home |
+| `devbox:./2201` | Directory `2201` under the login directory |
+| `devbox:/srv` | Directory `/srv`, configured/default port |
+
+> **Breaking change:** a remote directory whose name is a number must now be
+> written with `./` (or `~/`) because `devbox:2201` now means port 2201.
+> Windows drive paths such as `winbox:C:\Users\winuser\project` are
+> unaffected.
 
 IPv6 literals must use brackets. With no path, the remote login working
 directory is used, normally the remote home directory. A relative startup path
@@ -169,6 +214,7 @@ is resolved from that directory.
 ```bash
 pi --ssh devbox:~/project
 pi --ssh devbox:/srv/project
+pi --ssh devbox:2201:/srv/project
 ```
 
 Unix paths use POSIX syntax. `~` and `~/path` resolve from the remote home.
@@ -180,6 +226,7 @@ Unix paths use POSIX syntax. `~` and `~/path` resolve from the remote home.
 pi --ssh 'winbox:C:\Users\developer\project'
 pi --ssh 'winbox:D:\source'
 pi --ssh 'winbox:\\server\share\project'
+pi --ssh 'winbox:2201:C:\Users\developer\project'
 ```
 
 Windows paths may be drive-qualified or UNC paths. Relative paths, `~`,
@@ -199,7 +246,7 @@ filesystem:
 
 | Flag | Values | Purpose |
 | --- | --- | --- |
-| `--ssh` | `host` or `host:path` | Start or resume in an SSH workspace |
+| `--ssh` | `[user@]host[:port][:path]` | Start or resume in an SSH workspace |
 | `--ssh-config` | local path | Use an alternate local OpenSSH config |
 | `--ssh-shell` | `auto`, `bash`, `zsh`, `pwsh`, `powershell` | Select the remote shell |
 | `--ssh-transport` | `auto`, `openssh`, `ssh2` | Override the saved transport preference |
@@ -208,7 +255,7 @@ Examples:
 
 ```bash
 pi --ssh devbox:/srv/project --ssh-transport openssh
-pi --ssh devbox:/srv/project --ssh-shell zsh
+pi --ssh devbox:2201:/srv/project --ssh-shell zsh
 pi --ssh devbox:/srv/project --ssh-config ~/.ssh/work.conf
 ```
 
@@ -258,8 +305,9 @@ failure; another transport would reject the same credentials.
 
 OpenSSH mode invokes the system `ssh` executable and leaves the destination
 alias unchanged. Without `--ssh-config`, the client reads its normal user and
-system configuration, including `~/.ssh/config`. This is the best choice for
-advanced OpenSSH behavior that `ssh2` cannot reproduce.
+system configuration, including `~/.ssh/config`. An explicit target port is
+passed as `-p <port>` and takes precedence over the configured `Port`. This is
+the best choice for advanced OpenSSH behavior that `ssh2` cannot reproduce.
 
 On Linux and macOS, SSH Remote creates a private ControlPath and owns a
 foreground `ssh -M -N` ControlMaster process for the workspace lifetime. Each
@@ -295,6 +343,10 @@ each foreground operation. It runs `ssh -G` locally to resolve:
 - keepalives and effective algorithm lists;
 - `ProxyJump` endpoints;
 - configured `known_hosts` files.
+
+An explicit target port is resolved with `ssh -G -p <port>`, so it overrides
+the configured `Port` and is used for known_hosts lookups and password cache
+keys.
 
 Single- and multi-hop `ProxyJump` are implemented with `direct-tcpip` channels.
 Each hop receives its own authenticated SSH connection, its own password cache
@@ -458,10 +510,10 @@ Known POSIX-control-script limits:
 
 | Command | Effect |
 | --- | --- |
-| `/ssh-connect <host[:path]>` | Enter SSH or switch directly from the active target |
+| `/ssh-connect <[user@]host[:port][:path]>` | Enter SSH or switch directly from the active target |
 | `/ssh-exit` | Return this conversation to its local workspace |
 | `/ssh-cd <remote-path>` | Change the persistent remote cwd without reconnecting |
-| `/ssh-status` | Live-check and show state, target, platform, shell, transport, cwd, and home |
+| `/ssh-status` | Live-check and show target, port, platform, shell, transport, cwd, and home |
 | `/ssh-reconnect` | Retry the stored target or apply a transport change |
 | `/ssh-forget-password [all]` | Clear session-scoped or all cached passwords |
 
@@ -500,6 +552,7 @@ Pi conversations and session files stay local. SSH Remote stores a hidden,
 branch-aware entry containing only:
 
 - target or alias;
+- optional explicit SSH port;
 - resolved remote platform and shell;
 - resolved remote cwd and home;
 - optional local OpenSSH config path.
@@ -511,8 +564,8 @@ memory.
 The selected local or SSH environment is restored after `/resume`, `pi -r`,
 `pi -c`, reload, fork, clone, and `/tree`. `/new` inherits the previous remote
 target. `/ssh-exit` writes an explicit local marker, so later resume stays local
-instead of finding an older SSH entry. Passing a conflicting target, config,
-cwd, or explicit shell while resuming is rejected to prevent an old
+instead of finding an older SSH entry. Passing a conflicting target, port,
+config, cwd, or explicit shell while resuming is rejected to prevent an old
 conversation from modifying another machine.
 
 Pi still groups sessions by its **local** cwd. Start remote projects from a
@@ -536,6 +589,7 @@ message when available:
 
 ```text
 SSH devbox:/srv/project (main) • Fix the build
+SSH deploy@devbox:2201:/srv/project (main) • Fix the build
 ```
 
 A user-assigned `/name` is never overwritten.
@@ -547,7 +601,7 @@ A user-assigned `/name` is never overwritten.
 
 | Tool | Purpose |
 | --- | --- |
-| `ssh_connect { target }` | Enter SSH or switch directly to another target |
+| `ssh_connect { target }` | Enter SSH or switch directly to another `[user@]host[:port][:path]` target |
 | `ssh_exit {}` | Return to the local workspace |
 | `ssh_cd { path }` | Change the active remote cwd |
 | `ssh_status {}` | Inspect the current environment |
