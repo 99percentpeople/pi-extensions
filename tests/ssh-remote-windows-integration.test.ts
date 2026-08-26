@@ -114,6 +114,25 @@ test("write/read round trip preserves unicode, CRLF, and binary content", opts, 
   assert.ok(binBack.equals(bin));
 });
 
+test("parallel writes complete without depending on remote stdin EOF", opts, async (t) => {
+  if (!requireHost(t)) return;
+  const payloads = Array.from({ length: 8 }, (_, index) =>
+    Buffer.from(`parallel-${index}-中文-${"x".repeat(4_096 + index)}`, "utf8")
+  );
+  const paths = payloads.map((_, index) =>
+    adapter.toToolPath(`${root}\\parallel-${index}.bin`, workspace)
+  );
+
+  await Promise.all(paths.map((path, index) =>
+    adapter.writeFile(path, payloads[index])
+  ));
+  const written = await Promise.all(paths.map((path) => adapter.readFile(path)));
+
+  for (const [index, bytes] of written.entries()) {
+    assert.ok(bytes.equals(payloads[index]), `parallel payload ${index} must match`);
+  }
+});
+
 test("fileExists and access report correct results", opts, async (t) => {
   if (!requireHost(t)) return;
   assert.equal(await adapter.fileExists(adapter.toToolPath(file1(), workspace)), true);
@@ -230,6 +249,43 @@ test("runShell streams unicode output without corruption", opts, async (t) => {
   );
   assert.equal(rc, 0);
   assert.ok(chunks.join("").includes("输出中文测试"));
+});
+
+test("runShell finishes when a detached descendant inherits its stdio", opts, async (t) => {
+  if (!requireHost(t)) return;
+  const output: Buffer[] = [];
+  const executable = workspace.shell === "pwsh" ? "pwsh.exe" : "powershell.exe";
+  const command = `
+$child = Start-Process -FilePath '${executable}' -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 20') -NoNewWindow -PassThru
+[Console]::Out.WriteLine("fixture-pid:$($child.Id)")
+`;
+  let childPid: number | undefined;
+  const startedAt = Date.now();
+
+  try {
+    const exitCode = await adapter.runShell(command, workspace.cwd, {
+      timeoutSeconds: 5,
+      onStdout: (data) => output.push(Buffer.from(data)),
+    });
+    const text = Buffer.concat(output).toString("utf8");
+    childPid = Number(/fixture-pid:(\d+)/.exec(text)?.[1]);
+    assert.equal(exitCode, 0);
+    assert.match(text, /fixture-pid:\d+/);
+    assert.ok(
+      Date.now() - startedAt < 2_000,
+      "remote completion must not wait for the inherited handles to close",
+    );
+  } finally {
+    const text = Buffer.concat(output).toString("utf8");
+    childPid ??= Number(/fixture-pid:(\d+)/.exec(text)?.[1]);
+    if (Number.isInteger(childPid) && childPid! > 0) {
+      await adapter.runShell(
+        `& taskkill.exe /PID ${childPid} /T /F 2>$null | Out-Null; exit 0`,
+        workspace.cwd,
+        { timeoutSeconds: 5 },
+      ).catch(() => undefined);
+    }
+  }
 });
 
 test("long commands use the gzip transport and still run", opts, async (t) => {

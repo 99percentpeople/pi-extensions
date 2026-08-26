@@ -16,6 +16,7 @@ import {
   type Ssh2ConfigResolverOptions,
 } from "./ssh2-config.ts";
 import type { SshPasswordEndpoint } from "./password-resolver.ts";
+import { SshCompletionFrameFilter } from "./completion.ts";
 
 const { Client } = ssh2;
 
@@ -444,6 +445,9 @@ export class Ssh2Client implements SshRemoteClient {
         && (!Number.isFinite(options.timeoutSeconds) || options.timeoutSeconds <= 0)) {
       throw new Error("SSH timeout must be a positive number of seconds");
     }
+    const completionFilter = options.completion
+      ? new SshCompletionFrameFilter(options.completion)
+      : undefined;
 
     const release = await this.acquireChannel(options.signal);
     let connection: RawSsh2Client;
@@ -465,14 +469,45 @@ export class Ssh2Client implements SshRemoteClient {
       let exitCode: number | null = null;
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       let forceCloseHandle: ReturnType<typeof setTimeout> | undefined;
+      let completionHandle: ReturnType<typeof setTimeout> | undefined;
       let timedOut = false;
       let settled = false;
       let terminationRequested = false;
       let terminationApplied = false;
+      let completionMatched = false;
+      let completionExitCode: number | null = null;
+
+      const emitStdout = (data: Buffer): void => {
+        if (data.length === 0) return;
+        if (options.captureOutput !== false) stdout.push(data);
+        options.onStdout?.(data);
+      };
+      const emitStderr = (data: Buffer): void => {
+        if (data.length === 0) return;
+        if (options.captureOutput !== false) stderr.push(data);
+        options.onStderr?.(data);
+      };
+      const processStderr = (data: Buffer): void => {
+        if (!completionFilter) {
+          emitStderr(data);
+          return;
+        }
+        const filtered = completionFilter.push(data);
+        emitStderr(filtered.data);
+        if (filtered.completion) {
+          requestCompletion(filtered.completion.exitCode);
+        }
+      };
+      const flushCompletion = (discardPartialFrame = false): void => {
+        if (completionFilter) {
+          emitStderr(completionFilter.flush(discardPartialFrame));
+        }
+      };
 
       const cleanup = () => {
         if (timeoutHandle) clearTimeout(timeoutHandle);
         if (forceCloseHandle) clearTimeout(forceCloseHandle);
+        if (completionHandle) clearTimeout(completionHandle);
         options.signal?.removeEventListener("abort", onAbort);
         connection.removeListener("close", onConnectionClose);
         if (stream) this.channels.delete(stream);
@@ -481,12 +516,48 @@ export class Ssh2Client implements SshRemoteClient {
       const finishReject = (error: Error) => {
         if (settled) return;
         settled = true;
+        flushCompletion(true);
         try {
           stream?.close();
         } catch {}
         cleanup();
         reject(error);
       };
+      const finishResolve = (resolvedExitCode: number | null) => {
+        if (settled) return;
+        flushCompletion();
+        settled = true;
+        cleanup();
+        if (options.signal?.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        if (timedOut) {
+          reject(new Error(`timeout:${options.timeoutSeconds}`));
+          return;
+        }
+        resolve({
+          stdout: Buffer.concat(stdout),
+          stderr: Buffer.concat(stderr),
+          exitCode: resolvedExitCode,
+        });
+      };
+      function requestCompletion(remoteExitCode: number | null): void {
+        if (settled || completionMatched || !options.completion) return;
+        completionMatched = true;
+        completionExitCode = remoteExitCode;
+        completionHandle = setTimeout(() => {
+          if (settled || options.signal?.aborted || timedOut) return;
+          try {
+            stream?.close();
+          } catch {}
+          try {
+            stream?.destroy();
+          } catch {}
+          finishResolve(completionExitCode ?? exitCode);
+        }, options.completion.graceMs);
+        completionHandle.unref?.();
+      }
       const cancellationError = (): Error => options.signal?.aborted
         ? new Error("aborted")
         : timedOut
@@ -569,35 +640,20 @@ export class Ssh2Client implements SshRemoteClient {
 
           channel.on("data", (chunk: Buffer | string) => {
             const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            if (options.captureOutput !== false) stdout.push(data);
-            options.onStdout?.(data);
+            emitStdout(data);
           });
           channel.stderr.on("data", (chunk: Buffer | string) => {
             const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            if (options.captureOutput !== false) stderr.push(data);
-            options.onStderr?.(data);
+            processStderr(data);
           });
           channel.on("exit", (code: number | null) => {
             exitCode = typeof code === "number" ? code : null;
           });
           channel.once("error", (streamError: Error) => finishReject(streamError));
           channel.once("close", () => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            if (options.signal?.aborted) {
-              reject(new Error("aborted"));
-              return;
-            }
-            if (timedOut) {
-              reject(new Error(`timeout:${options.timeoutSeconds}`));
-              return;
-            }
-            resolve({
-              stdout: Buffer.concat(stdout),
-              stderr: Buffer.concat(stderr),
-              exitCode,
-            });
+            finishResolve(
+              completionMatched ? completionExitCode ?? exitCode : exitCode,
+            );
           });
           channel.on("error", () => {});
           channel.end(options.input);

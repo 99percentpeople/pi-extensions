@@ -17,6 +17,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  SshCompletionFrameFilter,
+  type SshRunCompletion,
+} from "./completion.ts";
 
 export type SshTransportPreference = "auto" | "openssh" | "ssh2";
 export type SshTransportKind = Exclude<SshTransportPreference, "auto">;
@@ -50,6 +54,8 @@ export interface SshRunOptions {
   captureOutput?: boolean;
   onStdout?: (data: Buffer) => void;
   onStderr?: (data: Buffer) => void;
+  /** Internal remote-command completion frame used to bound inherited-stdio hangs. */
+  completion?: SshRunCompletion;
 }
 
 export interface SshRunResult {
@@ -501,6 +507,9 @@ export class OpenSshClient implements SshRemoteClient {
     ) {
       throw new Error("SSH timeout must be a positive number of seconds");
     }
+    const completionFilter = options.completion
+      ? new SshCompletionFrameFilter(options.completion)
+      : undefined;
 
     if (this.options.multiplex === true) {
       await this.ensureControlMaster();
@@ -615,10 +624,40 @@ export class OpenSshClient implements SshRemoteClient {
       const offsets = { out: 0, err: 0 };
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       let forceKillHandle: ReturnType<typeof setTimeout> | undefined;
+      let completionHandle: ReturnType<typeof setTimeout> | undefined;
       let pollHandle: ReturnType<typeof setInterval> | undefined;
       let timedOut = false;
       let settled = false;
       let terminationRequested = false;
+      let completionMatched = false;
+      let completionExitCode: number | null = null;
+
+      const emitStdout = (data: Buffer): void => {
+        if (data.length === 0) return;
+        if (options.captureOutput !== false) stdout.push(data);
+        options.onStdout?.(data);
+      };
+      const emitStderr = (data: Buffer): void => {
+        if (data.length === 0) return;
+        if (options.captureOutput !== false) stderr.push(data);
+        options.onStderr?.(data);
+      };
+      const processStderr = (data: Buffer): void => {
+        if (!completionFilter) {
+          emitStderr(data);
+          return;
+        }
+        const filtered = completionFilter.push(data);
+        emitStderr(filtered.data);
+        if (filtered.completion) {
+          requestCompletion(filtered.completion.exitCode);
+        }
+      };
+      const flushCompletion = (discardPartialFrame = false): void => {
+        if (completionFilter) {
+          emitStderr(completionFilter.flush(discardPartialFrame));
+        }
+      };
 
       const readTemp = (
         fd: number,
@@ -639,16 +678,14 @@ export class OpenSshClient implements SshRemoteClient {
           const { data, next } = readTemp(stdoutFd, offsets.out);
           offsets.out = next;
           if (data.length > 0) {
-            if (options.captureOutput !== false) stdout.push(data);
-            options.onStdout?.(data);
+            emitStdout(data);
           }
         }
         if (stderrFd !== undefined) {
           const { data, next } = readTemp(stderrFd, offsets.err);
           offsets.err = next;
           if (data.length > 0) {
-            if (options.captureOutput !== false) stderr.push(data);
-            options.onStderr?.(data);
+            processStderr(data);
           }
         }
       };
@@ -656,6 +693,7 @@ export class OpenSshClient implements SshRemoteClient {
       const cleanup = () => {
         if (timeoutHandle) clearTimeout(timeoutHandle);
         if (forceKillHandle) clearTimeout(forceKillHandle);
+        if (completionHandle) clearTimeout(completionHandle);
         if (pollHandle) clearInterval(pollHandle);
         options.signal?.removeEventListener("abort", onAbort);
         cleanupStdioFiles();
@@ -664,9 +702,63 @@ export class OpenSshClient implements SshRemoteClient {
       const finishReject = (error: Error) => {
         if (settled) return;
         settled = true;
+        flushCompletion(true);
         cleanup();
         reject(error);
       };
+      const finishResolve = (exitCode: number | null) => {
+        if (settled) return;
+        if (windowsClient) drainTemp();
+        flushCompletion();
+        settled = true;
+        cleanup();
+        if (options.signal?.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        if (timedOut) {
+          reject(new Error(`timeout:${options.timeoutSeconds}`));
+          return;
+        }
+        resolve({
+          stdout: Buffer.concat(stdout),
+          stderr: Buffer.concat(stderr),
+          exitCode,
+        });
+      };
+      const hardKill = () => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        if (process.platform === "win32" && child.pid) {
+          try {
+            const killer = spawn(
+              "taskkill",
+              ["/PID", String(child.pid), "/T", "/F"],
+              { stdio: "ignore", windowsHide: true },
+            );
+            killer.unref();
+          } catch {}
+        }
+      };
+      function requestCompletion(exitCode: number | null): void {
+        if (settled || completionMatched || !options.completion) return;
+        completionMatched = true;
+        completionExitCode = exitCode;
+        completionHandle = setTimeout(() => {
+          if (settled || options.signal?.aborted || timedOut) return;
+          terminationRequested = true;
+          try {
+            child.kill("SIGTERM");
+          } catch {}
+          forceKillHandle = setTimeout(() => {
+            hardKill();
+            finishResolve(completionExitCode);
+          }, 1_000);
+          forceKillHandle.unref?.();
+        }, options.completion.graceMs);
+        completionHandle.unref?.();
+      }
       const onAbort = () => {
         if (terminationRequested) return;
         terminationRequested = true;
@@ -674,19 +766,7 @@ export class OpenSshClient implements SshRemoteClient {
           child.kill("SIGTERM");
         } catch {}
         forceKillHandle = setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
-          if (process.platform === "win32" && child.pid) {
-            try {
-              const killer = spawn(
-                "taskkill",
-                ["/PID", String(child.pid), "/T", "/F"],
-                { stdio: "ignore", windowsHide: true },
-              );
-              killer.unref();
-            } catch {}
-          }
+          hardKill();
           finishReject(
             options.signal?.aborted
               ? new Error("aborted")
@@ -705,34 +785,18 @@ export class OpenSshClient implements SshRemoteClient {
 
       child.stdout?.on("data", (chunk: Buffer | string) => {
         const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        if (options.captureOutput !== false) stdout.push(data);
-        options.onStdout?.(data);
+        emitStdout(data);
       });
       child.stderr?.on("data", (chunk: Buffer | string) => {
         const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        if (options.captureOutput !== false) stderr.push(data);
-        options.onStderr?.(data);
+        processStderr(data);
       });
 
       child.once("error", (error) => finishReject(error));
       child.once("close", (exitCode) => {
-        if (settled) return;
-        settled = true;
-        if (windowsClient) drainTemp();
-        cleanup();
-        if (options.signal?.aborted) {
-          reject(new Error("aborted"));
-          return;
-        }
-        if (timedOut) {
-          reject(new Error(`timeout:${options.timeoutSeconds}`));
-          return;
-        }
-        resolve({
-          stdout: Buffer.concat(stdout),
-          stderr: Buffer.concat(stderr),
-          exitCode,
-        });
+        finishResolve(
+          completionMatched ? completionExitCode ?? exitCode : exitCode,
+        );
       });
 
       if (options.timeoutSeconds !== undefined) {

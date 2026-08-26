@@ -497,7 +497,12 @@ as binary stdin/stdout. Cancellable Windows shell calls also record the root
 PowerShell PID and start time. A Pi Esc cancellation or bash timeout uses a
 second SSH channel with `taskkill /T /F` to remove that validated remote process
 tree before closing the primary channel; a hard transport deadline prevents a
-PowerShell 5.1 or Windows OpenSSH close hang from wedging the tool call.
+PowerShell 5.1 or Windows OpenSSH close hang from wedging the tool call. Normal
+Windows shell completion also emits a private, operation-scoped frame that both
+transports remove from stderr. If a detached descendant inherits the remote
+stdout/stderr handles and keeps the SSH channel open, the matching OpenSSH
+process or ssh2 channel is finalized after a short output-drain grace period
+while the rest of a persistent connection remains available.
 
 Known POSIX-control-script limits:
 

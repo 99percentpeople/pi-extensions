@@ -117,6 +117,33 @@ import {
   shellQuote,
 } from "../extensions/ssh-remote/src/workspace/target.ts";
 
+interface TestSshCompletion {
+  startMarker: Buffer;
+  endMarker: Buffer;
+  graceMs: number;
+}
+
+function testSshCompletion(
+  token = "00112233445566778899aabbccddeeff",
+): TestSshCompletion {
+  return {
+    startMarker: Buffer.from(`\u001ePI_SSH_WINDOWS_DONE\u001f${token}\u001f`, "utf8"),
+    endMarker: Buffer.from("\u001e", "utf8"),
+    graceMs: 5,
+  };
+}
+
+function testSshCompletionFrame(
+  completion: TestSshCompletion,
+  exitCode: number | "?",
+): Buffer {
+  return Buffer.concat([
+    completion.startMarker,
+    Buffer.from(String(exitCode), "ascii"),
+    completion.endMarker,
+  ]);
+}
+
 function createSshRemoteExtension(
   dependencies: Parameters<typeof createSshRemoteExtensionBase>[0] = {},
 ): ReturnType<typeof createSshRemoteExtensionBase> {
@@ -755,6 +782,46 @@ test("OpenSSH timeout rejects even when the local ssh process never closes", asy
   );
   assert.ok(Date.now() - started < 2_500);
   assert.deepEqual(process.signals, ["SIGTERM", "SIGKILL"]);
+  await client.dispose();
+});
+
+test("OpenSSH completes after a remote Windows exit frame when descendants keep the channel open", async () => {
+  class LingeringProcess extends EventEmitter {
+    readonly stdin = new PassThrough();
+    readonly stdout = new PassThrough();
+    readonly stderr = new PassThrough();
+    readonly signals: string[] = [];
+    kill(signal?: string): boolean {
+      this.signals.push(signal ?? "SIGTERM");
+      queueMicrotask(() => this.emit("close", null));
+      return true;
+    }
+  }
+
+  const process = new LingeringProcess();
+  const client = new OpenSshClient(
+    { target: "winbox" },
+    () => process as unknown as ChildProcess,
+  );
+  const completion = testSshCompletion();
+  const running = client.run("completed powershell command", {
+    timeoutSeconds: 0.05,
+    completion,
+  } as SshRunOptions & { completion: TestSshCompletion });
+  queueMicrotask(() => {
+    process.stderr.write("remote stderr\n");
+    const frame = testSshCompletionFrame(completion, 0);
+    process.stderr.write(frame.subarray(0, 7));
+    process.stderr.write(frame.subarray(7, frame.length - 1));
+    process.stderr.write(frame.subarray(frame.length - 1));
+    // A remote descendant deliberately keeps the SSH channel open, so the
+    // local ssh process emits no close until the completion path terminates it.
+  });
+
+  const result = await running;
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stderr.toString("utf8"), "remote stderr\n");
+  assert.deepEqual(process.signals, ["SIGTERM"]);
   await client.dispose();
 });
 
@@ -1432,6 +1499,58 @@ test("Ssh2Client hard-aborts a channel that ignores SSH signals and close", asyn
   await assert.rejects(running, /aborted/);
   assert.deepEqual(raw.channels[0].signals, ["TERM", "KILL"]);
   assert.equal(raw.closed, true, "a stuck channel must invalidate its ssh2 connection");
+  await client.dispose();
+});
+
+test("Ssh2Client completes after a remote Windows exit frame when descendants keep the channel open", async () => {
+  const completion = testSshCompletion();
+  class LingeringChannel extends FakeSsh2Channel {
+    override end(): void {
+      queueMicrotask(() => {
+        this.stderr.write("remote stderr\n");
+        this.stderr.write(Buffer.concat([
+          testSshCompletionFrame(completion, "?"),
+          Buffer.from("ignored descendant output"),
+        ]));
+        this.emit("exit", 7);
+      });
+    }
+    override close(): void {}
+    destroy(): void {}
+  }
+  class LingeringClient extends FakeRawSsh2Client {
+    override exec(
+      _command: string,
+      callback: (error: Error | undefined, channel: LingeringChannel) => void,
+    ): void {
+      const channel = new LingeringChannel();
+      this.channels.push(channel);
+      callback(undefined, channel);
+    }
+  }
+
+  const raw = new LingeringClient();
+  const client = new Ssh2Client(
+    { target: "winbox" },
+    {
+      createClient: () => raw as any,
+      terminationGraceMs: 10,
+      resolveConnection: async () => ({
+        config: { host: "winbox", username: "deploy" },
+        hostLabel: "deploy@winbox:22",
+        warnings: [],
+        verification: {},
+      }),
+    },
+  );
+
+  const result = await client.run("completed powershell command", {
+    timeoutSeconds: 0.05,
+    completion,
+  } as SshRunOptions & { completion: TestSshCompletion });
+  assert.equal(result.exitCode, 7);
+  assert.equal(result.stderr.toString("utf8"), "remote stderr\n");
+  assert.equal(raw.closed, false, "one completed channel must not invalidate ssh2");
   await client.dispose();
 });
 
@@ -4022,6 +4141,125 @@ function createHangingWindowsExecutor() {
   };
 }
 
+test("Windows writeFile reads the declared UTF-8 byte length instead of waiting for EOF", async () => {
+  const calls: Array<{ command: string; options: SshRunOptions }> = [];
+  const run = async (
+    command: string,
+    options: SshRunOptions = {},
+  ): Promise<SshRunResult> => {
+    calls.push({ command, options });
+    return {
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+      exitCode: 0,
+    };
+  };
+  const adapter = new WindowsPowerShellAdapter(
+    { run, runChecked: run },
+    "powershell",
+    "win32",
+  );
+  const content = "ASCII + 中文 + 🙂";
+  const expected = Buffer.from(content, "utf8");
+
+  await adapter.writeFile(
+    encodeWindowsToolPath("C:\\Remote\\payload.bin", "win32"),
+    content,
+  );
+
+  assert.equal(calls.length, 1);
+  assert.ok(Buffer.isBuffer(calls[0].options.input));
+  assert.deepEqual(calls[0].options.input, expected);
+  const script = decodePowerShellInvocation(calls[0].command);
+  assert.match(
+    script,
+    new RegExp(String.raw`\$remaining = \[long\]${expected.length}\b`),
+  );
+  assert.match(script, /\$inputStream\.Read\(\$buffer, 0, \$count\)/);
+  assert.doesNotMatch(script, /\.CopyTo\(/);
+});
+
+test("Windows writeFile aborts the recorded remote process tree on Esc", async () => {
+  const { calls, executor } = createHangingWindowsExecutor();
+  const adapter = new WindowsPowerShellAdapter(executor, "powershell", "win32");
+  const controller = new AbortController();
+  const content = Buffer.from("complete remote payload");
+  const running = adapter.writeFile(
+    encodeWindowsToolPath("C:\\Remote\\locked.txt", "win32"),
+    content,
+    controller.signal,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+
+  await assert.rejects(running, /aborted/);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].options.input, content);
+  const primary = decodePowerShellInvocation(calls[0].command);
+  const cleanup = decodePowerShellInvocation(calls[1].command);
+  assert.match(primary, /rootStartedAt/);
+  assert.match(cleanup, /taskkill\.exe \/PID \$rootProcessId \/T \/F/);
+  const primaryToken = /pi-ssh-bg-[a-f0-9]+/.exec(primary)?.[0];
+  assert.ok(primaryToken);
+  assert.equal(cleanup.includes(primaryToken), true);
+  assert.equal(calls[1].options.signal, undefined);
+});
+
+test("Windows writeFile timeout cleans the recorded remote process tree", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { calls, executor } = createHangingWindowsExecutor();
+    const adapter = new WindowsPowerShellAdapter(executor, "powershell", "win32");
+    const running = adapter.writeFile(
+      encodeWindowsToolPath("C:\\Remote\\timed-out.txt", "win32"),
+      Buffer.from("payload"),
+    );
+    t.mock.timers.tick(120_000);
+
+    await assert.rejects(running, /timeout:120/);
+    assert.equal(calls.length, 2);
+    assert.match(
+      decodePowerShellInvocation(calls[1].command),
+      /taskkill\.exe \/PID \$rootProcessId \/T \/F/,
+    );
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("Windows runShell registers a private remote completion frame", async () => {
+  const calls: Array<{ command: string; options: SshRunOptions }> = [];
+  const run = async (
+    command: string,
+    options: SshRunOptions = {},
+  ): Promise<SshRunResult> => {
+    calls.push({ command, options });
+    return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
+  };
+  const adapter = new WindowsPowerShellAdapter(
+    { run, runChecked: run },
+    "powershell",
+    "win32",
+  );
+
+  await adapter.runShell("Write-Output ok", "C:\\Remote");
+
+  assert.equal(calls.length, 1);
+  const completion = (calls[0].options as SshRunOptions & {
+    completion?: TestSshCompletion;
+  }).completion;
+  assert.ok(completion);
+  assert.equal(completion.graceMs, 100);
+  const token = /PI_SSH_WINDOWS_DONE\u001f([a-f0-9]{32})\u001f/.exec(
+    completion.startMarker.toString("utf8"),
+  )?.[1];
+  assert.ok(token);
+  const script = decodePowerShellInvocation(calls[0].command);
+  assert.match(script, /\$commandCompleted = \$false/);
+  assert.match(script, /\$completionExitCode/);
+  assert.equal(script.includes(token), true);
+});
+
 test("Windows runShell aborts the recorded remote process tree on Esc", async () => {
   const { calls, executor } = createHangingWindowsExecutor();
   const adapter = new WindowsPowerShellAdapter(executor, "powershell", "win32");
@@ -4487,7 +4725,7 @@ test("remote adapter auto-detects Windows PowerShell and streams file content ov
   assert.equal(await adapter.fileExists(path), false);
   await adapter.writeFile(path, "secret file content");
   const writeCall = client.calls.at(-1);
-  assert.equal(writeCall?.options?.input, "secret file content");
+  assert.deepEqual(writeCall?.options?.input, Buffer.from("secret file content"));
   assert.doesNotMatch(writeCall?.command ?? "", /secret file content/);
 });
 
@@ -6512,7 +6750,10 @@ test("extension routes Windows workspaces through PowerShell without exposing lo
   );
   assert.equal(writeResult.content[0].text, "Successfully wrote 13 bytes to notes.txt");
   assert.doesNotMatch(writeResult.content[0].text, /__pi_ssh_remote_windows__/);
-  const writeCall = clients[0].calls.find((call) => call.options?.input === "windows value");
+  const writeCall = clients[0].calls.find((call) =>
+    Buffer.isBuffer(call.options?.input)
+      && call.options.input.equals(Buffer.from("windows value"))
+  );
   assert.ok(writeCall);
   assert.doesNotMatch(writeCall.command, /windows value/);
 

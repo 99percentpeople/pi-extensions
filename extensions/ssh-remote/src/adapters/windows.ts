@@ -8,7 +8,12 @@ import {
   win32,
 } from "node:path";
 import { controlDirectoryName } from "../background/control.ts";
-import type { SshExecutor, SshRunOptions, SshRunResult } from "../transport/client.ts";
+import type {
+  SshExecutor,
+  SshRunOptions,
+  SshRunResult,
+} from "../transport/client.ts";
+import type { SshRunCompletion } from "../transport/completion.ts";
 import type {
   RemoteAdapter,
   RemoteDirectoryEntry,
@@ -21,6 +26,9 @@ import type {
 
 const VIRTUAL_WINDOWS_ROOT = "/__pi_ssh_remote_windows__";
 const WINDOWS_LOCAL_WINDOWS_ROOT = "C:\\__pi_ssh_remote_windows__";
+const WINDOWS_FILE_TRANSFER_TIMEOUT_SECONDS = 120;
+const WINDOWS_SHELL_COMPLETION_GRACE_MS = 100;
+const WINDOWS_SHELL_COMPLETION_PREFIX = "PI_SSH_WINDOWS_DONE";
 const REMOTE_SESSION_ENV_KEYS = [
   "PI_SESSION_ID",
   "PI_PROVIDER",
@@ -254,6 +262,37 @@ export interface WindowsPowerShellCommandHooks {
   finally?: string;
 }
 
+function applyWindowsPowerShellCommandHooks(
+  body: string,
+  hooks?: WindowsPowerShellCommandHooks,
+): string {
+  return hooks?.finally !== undefined
+    ? `${hooks.before ?? ""}\ntry {\n${body}\n} finally {\n${hooks.finally}\n}`
+    : `${hooks?.before ?? ""}\n${body}`;
+}
+
+function buildWindowsShellCompletion(token: string): SshRunCompletion {
+  return {
+    startMarker: Buffer.from(
+      `\u001e${WINDOWS_SHELL_COMPLETION_PREFIX}\u001f${token}\u001f`,
+      "utf8",
+    ),
+    endMarker: Buffer.from("\u001e", "utf8"),
+    graceMs: WINDOWS_SHELL_COMPLETION_GRACE_MS,
+  };
+}
+
+function buildWindowsShellCompletionScript(token: string): string {
+  return `
+$completionExitCode = $(if ($commandCompleted) { [string]$commandExitCode } else { '?' })
+$completionFrame = ([char]30 + '${WINDOWS_SHELL_COMPLETION_PREFIX}' + [char]31 + '${token}' + [char]31 + $completionExitCode + [char]30)
+$completionBytes = [Text.Encoding]::UTF8.GetBytes($completionFrame)
+$completionStream = [Console]::OpenStandardError()
+$completionStream.Write($completionBytes, 0, $completionBytes.Length)
+$completionStream.Flush()
+`;
+}
+
 /** Record a PowerShell root PID and start time for out-of-band tree cleanup. */
 export function buildWindowsProcessControlHooks(
   token: string,
@@ -315,13 +354,17 @@ export function buildWindowsPowerShellCommand(
   env?: NodeJS.ProcessEnv,
   interactive = false,
   hooks?: WindowsPowerShellCommandHooks,
+  completionToken?: string,
 ): string {
   const assignments: string[] = [];
   for (const key of REMOTE_SESSION_ENV_KEYS) {
     const value = env?.[key];
     if (typeof value === "string") assignments.push(`$env:${key} = ${utf8BytesExpression(value)}`);
   }
-  const commandBody = `
+  if (completionToken !== undefined && !/^[a-f0-9]{32}$/.test(completionToken)) {
+    throw new Error("Invalid Windows shell completion token");
+  }
+  const commandBody = completionToken === undefined ? `
 Set-Location -LiteralPath (${utf8BytesExpression(cwd)})
 ${assignments.join("\n")}
 $global:LASTEXITCODE = 0
@@ -330,10 +373,31 @@ $command = ${utf8BytesExpression(command)}
 if ($null -ne $global:LASTEXITCODE -and $global:LASTEXITCODE -ne 0) {
   exit $global:LASTEXITCODE
 }
+` : `
+$commandExitCode = 0
+$commandCompleted = $false
+try {
+  Set-Location -LiteralPath (${utf8BytesExpression(cwd)})
+  ${assignments.join("\n")}
+  $global:LASTEXITCODE = 0
+  $command = ${utf8BytesExpression(command)}
+  & ([ScriptBlock]::Create($command))
+  if ($null -ne $global:LASTEXITCODE -and $global:LASTEXITCODE -ne 0) {
+    $commandExitCode = [int]$global:LASTEXITCODE
+  }
+  $commandCompleted = $true
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  $commandExitCode = 1
+  $commandCompleted = $true
+}
+if ($commandCompleted) { exit $commandExitCode }
 `;
-  const body = hooks?.finally !== undefined
-    ? `${hooks.before ?? ""}\ntry {\n${commandBody}\n} finally {\n${hooks.finally}\n}`
-    : `${hooks?.before ?? ""}\n${commandBody}`;
+  const effectiveHooks = completionToken === undefined ? hooks : {
+    before: hooks?.before,
+    finally: `${hooks?.finally ?? ""}\n${buildWindowsShellCompletionScript(completionToken)}`,
+  };
+  const body = applyWindowsPowerShellCommandHooks(commandBody, effectiveHooks);
   return buildPowerShellInvocation(shell, wrappedPowerShellScript(body), !interactive);
 }
 
@@ -429,8 +493,103 @@ ${writeFrameScript("PI_SSH_WINDOWS_CWD", ["$cwdPath"])}
     return resolveWindowsRemotePath(expanded, workspace.home, workspace.cwd);
   }
 
-  private async runScript(script: string, options: SshRunOptions = {}) {
-    return this.executor.runChecked(buildPowerShellInvocation(this.shell, wrappedPowerShellScript(script)), options);
+  private async runControlledPowerShell(
+    buildCommand: (hooks?: WindowsPowerShellCommandHooks) => string,
+    options: SshRunOptions,
+    checked: boolean,
+  ): Promise<SshRunResult> {
+    const { signal, timeoutSeconds, ...runOptions } = options;
+    if (signal?.aborted) throw new Error("aborted");
+    if (
+      timeoutSeconds !== undefined
+      && (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)
+    ) {
+      throw new Error("SSH timeout must be a positive number of seconds");
+    }
+
+    const controlled = signal !== undefined || timeoutSeconds !== undefined;
+    if (!controlled) {
+      return checked
+        ? this.executor.runChecked(buildCommand(), runOptions)
+        : this.executor.run(buildCommand(), runOptions);
+    }
+
+    // Windows OpenSSH does not reliably deliver SSH TERM/KILL requests to a
+    // PowerShell process tree. Record the root PID for cancellable operations,
+    // then clean it through a second channel before aborting the primary one.
+    const token = randomBytes(16).toString("hex");
+    const transportController = new AbortController();
+    const command = buildCommand(buildWindowsProcessControlHooks(token));
+    let stopReason: "aborted" | "timeout" | undefined;
+    let stopPromise: Promise<void> | undefined;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+    const requestStop = (reason: "aborted" | "timeout"): void => {
+      if (stopReason) return;
+      stopReason = reason;
+      stopPromise = this.executor.run(
+        buildWindowsProcessTreeKillCommand(this.shell, token),
+        { timeoutSeconds: 4, captureOutput: false },
+      ).then((result) => {
+        if (result.exitCode !== 0 && result.exitCode !== 77) {
+          throw new Error(`Remote Windows process-tree cleanup failed (${result.exitCode ?? "signal"})`);
+        }
+      }).catch(() => {
+        // The primary transport is still aborted below. Its hard cancellation
+        // deadline prevents an unresponsive cleanup channel from wedging Pi.
+      }).finally(() => {
+        transportController.abort();
+      });
+      void stopPromise;
+    };
+    const onAbort = (): void => requestStop("aborted");
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    if (timeoutSeconds !== undefined) {
+      timeoutHandle = setTimeout(() => requestStop("timeout"), timeoutSeconds * 1_000);
+      timeoutHandle.unref?.();
+    }
+
+    let result: SshRunResult | undefined;
+    let runError: unknown;
+    try {
+      result = checked
+        ? await this.executor.runChecked(command, {
+            ...runOptions,
+            signal: transportController.signal,
+          })
+        : await this.executor.run(command, {
+            ...runOptions,
+            signal: transportController.signal,
+          });
+    } catch (error) {
+      runError = error;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      signal?.removeEventListener("abort", onAbort);
+      if (stopPromise) await stopPromise;
+    }
+
+    if (stopReason === "aborted") throw new Error("aborted");
+    if (stopReason === "timeout") throw new Error(`timeout:${timeoutSeconds}`);
+    if (runError) throw runError;
+    if (!result) throw new Error("SSH command ended without a result");
+    return result;
+  }
+
+  private runScript(
+    script: string,
+    options: SshRunOptions = {},
+  ): Promise<SshRunResult> {
+    return this.runControlledPowerShell(
+      (hooks) => buildPowerShellInvocation(
+        this.shell,
+        wrappedPowerShellScript(applyWindowsPowerShellCommandHooks(script, hooks)),
+      ),
+      options,
+      true,
+    );
   }
 
   async readFile(path: string, signal?: AbortSignal): Promise<Buffer> {
@@ -441,7 +600,10 @@ $bytes = [IO.File]::ReadAllBytes($path)
 $stdout = [Console]::OpenStandardOutput()
 $stdout.Write($bytes, 0, $bytes.Length)
 `;
-    return (await this.runScript(script, { signal })).stdout;
+    return (await this.runScript(script, {
+      signal,
+      timeoutSeconds: WINDOWS_FILE_TRANSFER_TIMEOUT_SECONDS,
+    })).stdout;
   }
 
   async fileExists(path: string, signal?: AbortSignal): Promise<boolean> {
@@ -484,13 +646,30 @@ $path = ${utf8BytesExpression(nativePath)}
     signal?: AbortSignal,
   ): Promise<void> {
     const nativePath = this.fromToolPath(path);
+    const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
     const script = `
 $path = ${utf8BytesExpression(nativePath)}
+$remaining = [long]${bytes.length}
 $inputStream = [Console]::OpenStandardInput()
 $outputStream = [IO.File]::Open($path, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-try { $inputStream.CopyTo($outputStream) } finally { $outputStream.Dispose() }
+try {
+  $buffer = New-Object byte[] 65536
+  while ($remaining -gt 0) {
+    $count = [int][Math]::Min([long]$buffer.Length, $remaining)
+    $read = $inputStream.Read($buffer, 0, $count)
+    if ($read -le 0) { throw "stdin closed before the declared file payload was received" }
+    $outputStream.Write($buffer, 0, $read)
+    $remaining -= $read
+  }
+} finally {
+  $outputStream.Dispose()
+}
 `;
-    await this.runScript(script, { input: content, signal });
+    await this.runScript(script, {
+      input: bytes,
+      signal,
+      timeoutSeconds: WINDOWS_FILE_TRANSFER_TIMEOUT_SECONDS,
+    });
   }
 
   async listDirectory(
@@ -673,88 +852,24 @@ while ($files.Count -gt 0 -and $count -lt ${options.limit}) {
     cwd: string,
     options: SshRunOptions & { env?: NodeJS.ProcessEnv } = {},
   ): Promise<number | null> {
-    const { env, signal, timeoutSeconds, ...runOptions } = options;
-    if (signal?.aborted) throw new Error("aborted");
-    if (
-      timeoutSeconds !== undefined
-      && (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)
-    ) {
-      throw new Error("SSH timeout must be a positive number of seconds");
-    }
-
-    // Windows OpenSSH does not reliably deliver SSH TERM/KILL requests to a
-    // PowerShell process tree. Record the root PID for cancellable tool calls,
-    // then use a second channel and taskkill /T /F before closing the primary
-    // transport. This also removes nested programs such as ssh.exe children.
-    const controlled = signal !== undefined || timeoutSeconds !== undefined;
-    if (!controlled) {
-      const result = await this.executor.run(this.buildShellCommand(command, cwd, env), runOptions);
-      if (result.exitCode === 255) {
-        throw new Error("SSH transport failed (ssh exited with code 255)");
-      }
-      return result.exitCode;
-    }
-
-    const token = randomBytes(16).toString("hex");
-    const transportController = new AbortController();
-    const shellCommand = buildWindowsPowerShellCommand(
-      this.shell,
-      command,
-      cwd,
-      env,
-      false,
-      buildWindowsProcessControlHooks(token),
-    );
-    let stopReason: "aborted" | "timeout" | undefined;
-    let stopPromise: Promise<void> | undefined;
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-
-    const requestStop = (reason: "aborted" | "timeout"): void => {
-      if (stopReason) return;
-      stopReason = reason;
-      stopPromise = this.executor.run(
-        buildWindowsProcessTreeKillCommand(this.shell, token),
-        { timeoutSeconds: 4, captureOutput: false },
-      ).then((result) => {
-        if (result.exitCode !== 0 && result.exitCode !== 77) {
-          throw new Error(`Remote Windows process-tree cleanup failed (${result.exitCode ?? "signal"})`);
-        }
-      }).catch(() => {
-        // The primary transport is still aborted below. Its hard cancellation
-        // deadline prevents an unresponsive cleanup channel from wedging Pi.
-      }).finally(() => {
-        transportController.abort();
-      });
-      void stopPromise;
-    };
-    const onAbort = (): void => requestStop("aborted");
-
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) onAbort();
-    if (timeoutSeconds !== undefined) {
-      timeoutHandle = setTimeout(() => requestStop("timeout"), timeoutSeconds * 1_000);
-      timeoutHandle.unref?.();
-    }
-
-    let result: SshRunResult | undefined;
-    let runError: unknown;
-    try {
-      result = await this.executor.run(shellCommand, {
+    const { env, ...runOptions } = options;
+    const completionToken = randomBytes(16).toString("hex");
+    const result = await this.runControlledPowerShell(
+      (hooks) => buildWindowsPowerShellCommand(
+        this.shell,
+        command,
+        cwd,
+        env,
+        false,
+        hooks,
+        completionToken,
+      ),
+      {
         ...runOptions,
-        signal: transportController.signal,
-      });
-    } catch (error) {
-      runError = error;
-    } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      signal?.removeEventListener("abort", onAbort);
-      if (stopPromise) await stopPromise;
-    }
-
-    if (stopReason === "aborted") throw new Error("aborted");
-    if (stopReason === "timeout") throw new Error(`timeout:${timeoutSeconds}`);
-    if (runError) throw runError;
-    if (!result) throw new Error("SSH command ended without a result");
+        completion: buildWindowsShellCompletion(completionToken),
+      },
+      false,
+    );
     if (result.exitCode === 255) {
       throw new Error("SSH transport failed (ssh exited with code 255)");
     }
