@@ -81,7 +81,8 @@ Additional behavior:
   the folded view and complete reasoning blocks. Its expansion hint appears
   only when content is actually hidden: by a `collapse` strategy, or because a
   thinking block exceeds the configured fold threshold. The chosen state
-  persists across later turns until `Ctrl+T` is pressed again.
+  persists across later turns until `Ctrl+T` is pressed again. On Pi 0.85+,
+  clicking a thinking block in fullscreen mode toggles the same global state.
 - `Ctrl+O` keeps its native Pi behavior and only expands tools and other
   expandable UI content.
 
@@ -206,7 +207,11 @@ component, then wraps that display-only child so `render(width)` is evaluated
 before its output is folded. The patch prevents duplicates across reloads and
 restores the original method during session shutdown.
 
-The package is tested against Pi 0.83.0. If the public component API is missing,
-the extension disables itself and reports a warning. If Pi changes only the
+The package is tested against Pi 0.83.0 and 0.85.1. It supports both direct
+thinking `Markdown` children and the `MouseRegion` wrappers introduced in 0.85,
+and preserves the native `isStreaming` argument for Markdown transformers.
+Shutdown restores native content and mouse handlers on existing components.
+If the public component API is missing, the extension disables itself and reports
+a warning. If Pi changes only the
 internal child layout, an affected message safely falls back to complete native
 rendering instead of exposing markers or modifying source content.

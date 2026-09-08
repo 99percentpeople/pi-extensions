@@ -12,7 +12,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown } from "@earendil-works/pi-tui";
+import { Markdown, type Component } from "@earendil-works/pi-tui";
 import thinkingFoldExtension, {
   BUILT_IN_MODEL_BEHAVIORS,
   createThinkingCursorLabel,
@@ -640,6 +640,154 @@ test("completed preview keeps a truncated tail", () => {
     patch.setExpanded(true);
     patch.completeMessage(source, 2_000);
     assert.equal(patch.expanded, true);
+  } finally {
+    patch.dispose();
+  }
+});
+
+test("Pi 0.85 mouse-wrapped thinking folds and shares the keyboard expansion state", () => {
+  // Exercise the new layout even when CI installs Pi 0.83.
+  class MouseRegionFixture implements Component {
+    constructor(public child: Component) {}
+    render(width: number) { return this.child.render(width); }
+    invalidate() { this.child.invalidate(); }
+    handleMouse(_event: { type: string; button?: string }): { handled: true } | undefined {
+      throw new Error("native visibility toggle must not fight thinking-fold");
+    }
+  }
+  type Internals = {
+    contentContainer: { children: Component[] };
+    thinkingVisibilityOverrides: Map<number, boolean>;
+  };
+  const prototype = AssistantMessageComponent.prototype;
+  const original = prototype.updateContent;
+  prototype.updateContent = function (message) {
+    original.call(this, message);
+    const children = (this as unknown as Internals).contentContainer.children;
+    for (let index = 0; index < children.length; index++) {
+      const child = children[index];
+      if (child instanceof Markdown &&
+          (child as unknown as { defaultTextStyle?: { italic?: boolean } }).defaultTextStyle?.italic) {
+        children[index] = new MouseRegionFixture(child);
+      }
+    }
+  };
+  const patch = installThinkingFoldPatch(options);
+  const source = assistant("one\ntwo\nthree\nfour", "openai-completions", "answer");
+  try {
+    patch.beginMessage(source, 1_000);
+    const component = new AssistantMessageComponent(source, true);
+    const internals = component as unknown as Internals;
+    const overrides = new Map([[0, true]]);
+    internals.thinkingVisibilityOverrides = overrides;
+    patch.tick(2_000);
+    assert.equal(internals.thinkingVisibilityOverrides, overrides);
+    const folded = renderAssistantLines(component).join("\n");
+    assert.match(folded, /Thinking 1\.0s/);
+    assert.doesNotMatch(folded, /\bone\b|thinking-fold:/);
+    assert.match(folded, /four/);
+    const click = () => {
+      const region = internals.contentContainer.children.find(
+        (child) => typeof (child as MouseRegionFixture).handleMouse === "function",
+      ) as MouseRegionFixture;
+      assert.ok(region);
+      assert.equal(region.handleMouse({ type: "move" }), undefined);
+      assert.deepEqual(region.handleMouse({ type: "click", button: "left" }), { handled: true });
+    };
+    click();
+    assert.equal(patch.expanded, true);
+    assert.match(renderAssistantLines(component).join("\n"), /one/);
+    click();
+    assert.equal(patch.expanded, false);
+    component.invalidate();
+    assert.equal(renderAssistantLines(component).join("\n"), folded);
+    patch.completeMessage(source, 3_000);
+    assert.match(renderAssistantLines(component).join("\n"), /Thought for 2\.0s/);
+    assert.equal(thinkingText(source), "one\ntwo\nthree\nfour");
+  } finally {
+    patch.dispose();
+    prototype.updateContent = original;
+  }
+});
+
+test("streaming flag survives native updates, timer ticks, toggles, and invalidation", () => {
+  const prototype = AssistantMessageComponent.prototype;
+  const original = prototype.updateContent;
+  const flags: Array<boolean | undefined> = [];
+  prototype.updateContent = function (message, isStreaming?: boolean) {
+    flags.push(isStreaming);
+    (original as (message: AssistantMessage, isStreaming?: boolean) => void).call(this, message, isStreaming);
+  };
+  const patch = installThinkingFoldPatch(options);
+  try {
+    const source = assistant("one\ntwo\nthree\nfour");
+    const component = new AssistantMessageComponent(source);
+    const update = component.updateContent as (message: AssistantMessage, isStreaming?: boolean) => void;
+    update.call(component, source, true);
+    patch.tick();
+    patch.toggle();
+    component.invalidate();
+    assert.deepEqual(flags.slice(-4), [true, true, true, true]);
+    update.call(component, source, false);
+    patch.toggle();
+    component.invalidate();
+    assert.deepEqual(flags.slice(-3), [false, false, false]);
+  } finally {
+    patch.dispose();
+    prototype.updateContent = original;
+  }
+});
+
+test("disposing restores native content instead of retaining markers and mouse callbacks", () => {
+  const source = assistant("one\ntwo\nthree\nfour");
+  const native = renderAssistantLines(new AssistantMessageComponent(source));
+  const patch = installThinkingFoldPatch(options);
+  let component: AssistantMessageComponent;
+  try {
+    component = new AssistantMessageComponent(source);
+    assert.notDeepEqual(renderAssistantLines(component), native);
+  } finally {
+    patch.dispose();
+  }
+  assert.deepEqual(renderAssistantLines(component!), native);
+  component!.invalidate();
+  assert.deepEqual(renderAssistantLines(component!), native);
+});
+
+test("Pi markdown transformers receive the streaming flag and original thinking text", (t) => {
+  if (!("markdownTransformers" in new AssistantMessageComponent())) {
+    t.skip("This Pi version predates markdown transformers");
+    return;
+  }
+  type TransformContext = { messageType: string; isStreaming: boolean; availableWidth: number };
+  type Transformer = (markdown: string, context: TransformContext) => string;
+  const NativeComponent = AssistantMessageComponent as unknown as new (
+    message: AssistantMessage | undefined, hide: boolean, theme: ReturnType<typeof getMarkdownTheme>,
+    label: string, pad: number, transformers: Transformer[],
+  ) => AssistantMessageComponent;
+  const seen: Array<{ markdown: string; context: TransformContext }> = [];
+  const patch = installThinkingFoldPatch(options);
+  try {
+    const source = assistant("one\ntwo\nthree\nfour");
+    const component = new NativeComponent(undefined, false, getMarkdownTheme(), "Thinking...", 1, [
+      (markdown, context) => {
+        seen.push({ markdown, context });
+        return markdown.replace("four", "transformed tail");
+      },
+    ]);
+    const update = component.updateContent as (message: AssistantMessage, isStreaming?: boolean) => void;
+    update.call(component, source, true);
+    assert.match(renderAssistantLines(component).join("\n"), /transformed tail/);
+    const thinking = seen.find((item) => item.markdown === thinkingText(source));
+    assert.equal(thinking?.context.messageType, "assistant-thinking");
+    assert.equal(thinking?.context.isStreaming, true);
+    assert.equal(thinking?.context.availableWidth, 78);
+    assert.ok(seen.every((item) => !item.markdown.includes("thinking-fold:")));
+    seen.length = 0;
+    update.call(component, source, false);
+    component.render(40);
+    assert.ok(seen.length > 0);
+    assert.ok(seen.every((item) => item.context.isStreaming === false));
   } finally {
     patch.dispose();
   }

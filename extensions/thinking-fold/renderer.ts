@@ -50,11 +50,29 @@ export const DEFAULT_THINKING_FOLD_OPTIONS: ThinkingFoldOptions = {
 interface ComponentState {
   fullMessage?: AssistantMessage;
   renderedMessage?: AssistantMessage;
+  isStreaming?: boolean;
 }
 
 interface AssistantMessageInternals {
   contentContainer?: { children?: Component[] };
   hideThinkingBlock?: boolean;
+  thinkingVisibilityOverrides?: Map<number, boolean>;
+}
+
+// Pi 0.85 wraps thinking Markdown in MouseRegion. Keep this structural so
+// older Pi versions do not need to export MouseRegion or its event types.
+interface ThinkingMouseRegion extends Component {
+  child: Component;
+  handleMouse(event: { type: string; button?: string }): { handled: true } | undefined;
+}
+
+function getThinkingMouseRegion(component: Component): ThinkingMouseRegion | undefined {
+  const region = component as Partial<ThinkingMouseRegion>;
+  return region.child &&
+    (region.child instanceof Markdown || region.child instanceof RenderedThinkingSection) &&
+    typeof region.handleMouse === "function"
+    ? region as ThinkingMouseRegion
+    : undefined;
 }
 
 interface MarkdownInternals {
@@ -71,7 +89,7 @@ interface PatchRecord {
   expanded: boolean;
   now: number;
   options: ThinkingFoldOptions;
-  originalUpdate: AssistantMessageComponent["updateContent"];
+  originalUpdate: (this: AssistantMessageComponent, message: AssistantMessage, isStreaming?: boolean) => void;
   states: WeakMap<AssistantMessageComponent, ComponentState>;
   components: Set<WeakRef<AssistantMessageComponent>>;
   knownComponents: WeakSet<AssistantMessageComponent>;
@@ -462,14 +480,18 @@ function replaceMarkedThinkingSections(
   for (let index = 0; index < children.length; index++) {
     const child = children[index];
     if (!child) continue;
-    const markdown = getMarkdownInternals(child);
+    const region = getThinkingMouseRegion(child);
+    const nativeMarkdown = region?.child ?? child;
+    const markdown = getMarkdownInternals(nativeMarkdown);
     const section = markdown?.text ? pending.get(markdown.text) : undefined;
     if (!section) continue;
 
-    const content = cloneNativeMarkdown(child, section.text);
-    const label = section.showLabel ? cloneNativeMarkdown(child, "") : undefined;
+    const content = cloneNativeMarkdown(nativeMarkdown, section.text);
+    const label = section.showLabel ? cloneNativeMarkdown(nativeMarkdown, "") : undefined;
     if (!content || (section.showLabel && !label)) return false;
-    children[index] = new RenderedThinkingSection(content, label, context);
+    const replacement = new RenderedThinkingSection(content, label, context);
+    if (region) region.child = replacement;
+    else children[index] = replacement;
     pending.delete(section.marker);
   }
   return pending.size === 0;
@@ -575,11 +597,14 @@ function rebuild(
 
   const internals = component as unknown as AssistantMessageInternals;
   const nativeHidden = internals.hideThinkingBlock;
+  const nativeOverrides = internals.thinkingVisibilityOverrides;
   internals.hideThinkingBlock = false;
+  // Native per-run hiding must not prevent marker discovery or Ctrl+T expansion.
+  if (nativeOverrides) internals.thinkingVisibilityOverrides = new Map();
   try {
     if (record.expanded || !message.content.some((block) => block.type === "thinking")) {
       state.renderedMessage = message;
-      record.originalUpdate.call(component, message);
+      record.originalUpdate.call(component, message, state.isStreaming);
       return;
     }
 
@@ -589,7 +614,7 @@ function rebuild(
     const marked = createMarkedThinkingMessage(message, behavior);
     if (!marked) {
       state.renderedMessage = message;
-      record.originalUpdate.call(component, message);
+      record.originalUpdate.call(component, message, state.isStreaming);
       return;
     }
 
@@ -602,7 +627,7 @@ function rebuild(
         : createStreamingThinkingLabel(record.options, timing, record.now, canExpand);
 
     state.renderedMessage = marked.message;
-    record.originalUpdate.call(component, marked.message);
+    record.originalUpdate.call(component, marked.message, state.isStreaming);
     const replaced = replaceMarkedThinkingSections(
       component,
       marked,
@@ -615,10 +640,22 @@ function rebuild(
       // Pi changed its internal child layout. Never leak markers or damage the
       // message: fall back to the complete native rendering for this component.
       state.renderedMessage = message;
-      record.originalUpdate.call(component, message);
+      record.originalUpdate.call(component, message, state.isStreaming);
     }
   } finally {
     internals.hideThinkingBlock = nativeHidden;
+    if (nativeOverrides) internals.thinkingVisibilityOverrides = nativeOverrides;
+    // Mouse clicks and Ctrl+T share one persistent display preference rather
+    // than letting native per-run overrides fight the folded representation.
+    for (const child of internals.contentContainer?.children ?? []) {
+      const region = getThinkingMouseRegion(child);
+      if (!region) continue;
+      region.handleMouse = (event) => {
+        if (event.type !== "click" || event.button !== "left") return undefined;
+        record.setExpanded(!record.expanded);
+        return { handled: true };
+      };
+    }
   }
 }
 
@@ -698,8 +735,9 @@ function createPatchRecord(options: Partial<ThinkingFoldOptions>): PatchRecord {
     },
   };
 
-  prototype.updateContent = function (message: AssistantMessage): void {
+  prototype.updateContent = function (message: AssistantMessage, isStreaming?: boolean): void {
     const state = record.states.get(this) ?? {};
+    if (isStreaming !== undefined) state.isStreaming = isStreaming;
 
     // Container.invalidate() passes Pi's last display-only marker clone back
     // through updateContent(). Never mistake that clone for session source data.
@@ -766,6 +804,12 @@ export function installThinkingFoldPatch(
 
       prototype.updateContent = record.originalUpdate;
       setPatchRecord(undefined);
+      // Drop display clones and mouse callbacks that close over this record.
+      forEachLiveComponent(record, (component, state) => {
+        if (state.fullMessage) {
+          record.originalUpdate.call(component, state.fullMessage, state.isStreaming);
+        }
+      });
     },
   };
 }
