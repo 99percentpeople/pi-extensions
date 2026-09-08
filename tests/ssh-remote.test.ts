@@ -5998,6 +5998,74 @@ test("manual ssh-connect password prompts have no timeout and stay disconnected 
   );
 });
 
+for (const remotePlatform of ["unix", "windows"] as const) {
+  for (const localPlatform of ["linux", "win32"] as const) {
+    test(`remote bash maps the ${localPlatform} session cwd to ${remotePlatform} before and after ssh-cd`, async () => {
+      const localCwd = localPlatform === "win32" ? "C:\\local\\workspace" : "/local/workspace";
+      const remoteCwd = remotePlatform === "windows" ? "D:\\project" : "/srv/project";
+      const nextCwd = remotePlatform === "windows" ? "D:\\project\\src" : "/srv/project/src";
+      const harness = createExtensionHarness({ flag: `devbox:${remoteCwd}`, cwd: localCwd });
+      const shellCalls: Array<{ command: string; cwd: string }> = [];
+      const mappingCalls: Array<{ cwd: string; anchor: string }> = [];
+      const controller = new AbortController();
+      createSshRemoteExtension({
+        platform: localPlatform,
+        createClient: (options) => new FakeSshClient(options),
+        selectRemote: async (client) => {
+          const adapter = remotePlatform === "windows"
+            ? new WindowsPowerShellAdapter(client, "pwsh", localPlatform)
+            : new UnixBashAdapter(client, "linux", "bash");
+          const workspace: RemoteWorkspace = {
+            platform: remotePlatform,
+            shell: adapter.shell,
+            home: remotePlatform === "windows" ? "C:\\Users\\deploy" : "/home/deploy",
+            cwd: remoteCwd,
+          };
+          adapter.inspectWorkspace = async () => ({ ...workspace, cwd: nextCwd });
+          const mapCwd = adapter.mapCwd.bind(adapter);
+          adapter.mapCwd = (cwd, anchor, activeWorkspace) => {
+            mappingCalls.push({ cwd, anchor });
+            return mapCwd(cwd, anchor, activeWorkspace);
+          };
+          adapter.runShell = async (command, cwd, options) => {
+            if (command === "git -c color.ui=false branch --show-current") return 0;
+            shellCalls.push({ command, cwd });
+            assert.equal(options?.signal, controller.signal);
+            assert.equal(options?.timeoutSeconds, 10);
+            assert.equal(options?.env?.PI_SESSION_ID, "session-id");
+            options?.onStdout?.(Buffer.from(`${cwd}\n`));
+            return 0;
+          };
+          return { adapter, workspace };
+        },
+      })(harness.pi);
+      try {
+        await harness.emit("session_start", { reason: "startup" });
+        const command = remotePlatform === "windows" ? "Get-Location" : "pwd";
+        const execute = () => harness.tools.get("bash").execute(
+          "remote-cwd", { command, timeout: 10 }, controller.signal, undefined, harness.ctx,
+        );
+        const first = await execute();
+        assert.equal(first.content[0].text, `${remoteCwd}\n`);
+        await harness.commands.get("ssh-cd").handler("src", harness.ctx);
+        const second = await execute();
+        assert.equal(second.content[0].text, `${nextCwd}\n`);
+        assert.deepEqual(shellCalls, [
+          { command, cwd: remoteCwd },
+          { command, cwd: nextCwd },
+        ]);
+        assert.deepEqual(mappingCalls, [
+          { cwd: localCwd, anchor: localCwd },
+          { cwd: localCwd, anchor: localCwd },
+        ]);
+        assert.equal(harness.ctx.cwd, localCwd, "remote execution must not mutate the session anchor");
+      } finally {
+        await harness.emit("session_shutdown", { reason: "quit" });
+      }
+    });
+  }
+}
+
 test("ssh-cd updates the virtual remote cwd and persists it without reconnecting", async () => {
   const clients: FakeSshClient[] = [];
   const harness = createExtensionHarness({ flag: "devbox:/srv/project" });

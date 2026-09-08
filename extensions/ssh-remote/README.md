@@ -757,6 +757,10 @@ Use compatible versions of both packages.
 
 ## Compatibility and limitations
 
+- Use SSH Remote 0.6.2 or newer with Pi 0.85.x. This fixes model-facing `bash`
+  calls passing Pi's local session cwd to the remote shell. The cwd is mapped
+  to the active remote workspace, including after `ssh-cd`, on both older and
+  newer Pi versions.
 - `ssh2` implements the documented compatibility subset only. Use explicit
   OpenSSH for certificates, hardware keys, arbitrary routing, GSSAPI, or
   keyboard-interactive authentication.

@@ -1744,8 +1744,12 @@ export function createSshRemoteExtension(
             ctx,
           );
         }
-        return createBashToolDefinition(active.workspace.cwd, {
-          operations: createRemoteBashOperations(active.adapter),
+        // Use the local anchor on both older Pi (constructor cwd) and Pi >= 0.85
+        // (ctx.cwd), then translate it exactly once at the remote boundary.
+        return createBashToolDefinition(ctx.cwd, {
+          operations: createRemoteBashOperations(active.adapter, (cwd) =>
+            active.adapter.mapCwd(cwd, ctx.cwd, active.workspace),
+          ),
         }).execute(id, params, signal, onUpdate, ctx);
       },
     };
