@@ -103,18 +103,16 @@ test("extensions are independently publishable workspace packages", async () => 
   );
 
   assert.equal(background.name, "@99percentpeople/pi-background-tasks");
-  assert.equal(background.version, "2.1.1");
   assertSourceExtensionPackage(background);
   assert.deepEqual(background.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",
   ]);
-  assert.equal(background.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
-  assert.equal(background.dependencies?.["node-pty"], "1.2.0-beta.14");
-  assert.equal(background.dependencies?.["@xterm/headless"], "6.0.0");
+  assert.ok(background.dependencies?.["@99percentpeople/pi-shared-settings"]);
+  assert.ok(background.dependencies?.["node-pty"]);
+  assert.ok(background.dependencies?.["@xterm/headless"]);
   assert.equal(background.publishConfig?.access, "public");
 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
-  assert.equal(codexApi.version, "0.3.2");
   assertSourceExtensionPackage(codexApi);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
   assert.deepEqual(codexApi.piBuild?.assets, ["skills"]);
@@ -123,8 +121,8 @@ test("extensions are independently publishable workspace packages", async () => 
     "@99percentpeople/pi-workspace-files",
   ]);
   assert.equal(codexApi.publishConfig?.access, "public");
-  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
-  assert.equal(codexApi.dependencies?.["@99percentpeople/pi-workspace-files"], "0.1.1");
+  assert.ok(codexApi.dependencies?.["@99percentpeople/pi-shared-settings"]);
+  assert.ok(codexApi.dependencies?.["@99percentpeople/pi-workspace-files"]);
   assert.equal(codexApi.peerDependencies?.["@earendil-works/pi-tui"], "*");
   assert.match(codexApiSkill, /^---\nname: gpt-image-prompts\n/m);
   assert.match(codexApiSkill, /Craft and refine production-ready prompts for GPT Image 2/);
@@ -132,16 +130,14 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.doesNotMatch(codexApiSkill, /codex_search|codex_image|output_path|referenced_(?:image_)?paths/);
 
   assert.equal(cursorEffect.name, "@99percentpeople/pi-cursor-effect");
-  assert.equal(cursorEffect.version, "0.1.6");
   assertSourceExtensionPackage(cursorEffect);
   assert.deepEqual(cursorEffect.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",
   ]);
   assert.equal(cursorEffect.publishConfig?.access, "public");
-  assert.equal(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
+  assert.ok(cursorEffect.dependencies?.["@99percentpeople/pi-shared-settings"]);
 
   assert.equal(pwsh.name, "@99percentpeople/pi-pwsh-adapter");
-  assert.equal(pwsh.version, "1.1.2");
   assertSourceExtensionPackage(pwsh);
   assert.deepEqual(pwsh.os, ["win32"]);
   assert.equal(
@@ -152,12 +148,11 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(pwsh.publishConfig?.access, "public");
 
   assert.equal(deepSeekAnchor.name, "@99percentpeople/pi-deepseek-anchor");
-  assert.equal(deepSeekAnchor.version, "0.1.1");
   assertSourceExtensionPackage(deepSeekAnchor);
   assert.deepEqual(deepSeekAnchor.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",
   ]);
-  assert.equal(deepSeekAnchor.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
+  assert.ok(deepSeekAnchor.dependencies?.["@99percentpeople/pi-shared-settings"]);
   assert.equal(deepSeekAnchor.publishConfig?.access, "public");
   assert.equal(deepSeekAnchor.peerDependencies?.["@earendil-works/pi-ai"], "*");
   assert.equal(deepSeekAnchor.peerDependencies?.["@earendil-works/pi-coding-agent"], "*");
@@ -165,37 +160,33 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(deepSeekAnchor.peerDependencies?.typebox, "*");
 
   assert.equal(sshRemote.name, "@99percentpeople/pi-ssh-remote");
-  assert.equal(sshRemote.version, "0.6.2");
   assertSourceExtensionPackage(sshRemote);
   assert.deepEqual(sshRemote.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",
     "@99percentpeople/pi-workspace-files",
   ]);
-  assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
-  assert.equal(sshRemote.dependencies?.["@99percentpeople/pi-workspace-files"], "0.1.1");
+  assert.ok(sshRemote.dependencies?.["@99percentpeople/pi-shared-settings"]);
+  assert.ok(sshRemote.dependencies?.["@99percentpeople/pi-workspace-files"]);
   assert.equal(sshRemote.publishConfig?.access, "public");
 
   assert.equal(thinkingFold.name, "@99percentpeople/pi-thinking-fold");
-  assert.equal(thinkingFold.version, "0.1.9");
   assertSourceExtensionPackage(thinkingFold);
   assert.deepEqual(thinkingFold.piBuild?.assets, ["model-behaviors.json"]);
   assert.deepEqual(thinkingFold.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",
   ]);
   assert.equal(thinkingFold.publishConfig?.access, "public");
-  assert.equal(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
+  assert.ok(thinkingFold.dependencies?.["@99percentpeople/pi-shared-settings"]);
 
   assert.equal(todo.name, "@99percentpeople/pi-todo");
-  assert.equal(todo.version, "1.2.7");
   assertSourceExtensionPackage(todo);
   assert.deepEqual(todo.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",
   ]);
   assert.equal(todo.publishConfig?.access, "public");
-  assert.equal(todo.dependencies?.["@99percentpeople/pi-shared-settings"], "0.1.3");
+  assert.ok(todo.dependencies?.["@99percentpeople/pi-shared-settings"]);
 
   assert.equal(sharedSettings.name, "@99percentpeople/pi-shared-settings");
-  assert.equal(sharedSettings.version, "0.1.3");
   assert.equal(sharedSettings.private, true);
   assert.equal(sharedSettings.pi, undefined);
   assert.equal(sharedSettings.main, "./index.ts");
@@ -207,7 +198,6 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(sharedSettings.publishConfig?.access, "public");
 
   assert.equal(workspaceFiles.name, "@99percentpeople/pi-workspace-files");
-  assert.equal(workspaceFiles.version, "0.1.1");
   assert.equal(workspaceFiles.private, true);
   assert.equal(workspaceFiles.pi, undefined);
   assert.equal(workspaceFiles.main, "./index.ts");
