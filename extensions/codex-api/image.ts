@@ -18,7 +18,6 @@ import {
   textOutput,
 } from "./render.ts";
 
-const IMAGE_MODEL = "gpt-image-2";
 const MAX_REFERENCE_IMAGES = 5;
 const MIN_IMAGE_PIXELS = 655_360;
 const MAX_IMAGE_PIXELS = 8_294_400;
@@ -78,17 +77,17 @@ export function normalizeCodexImageSize(value?: string): string {
   const height = Number(match[2]);
   const pixels = width * height;
   if (width % 16 !== 0 || height % 16 !== 0) {
-    throw new Error("GPT Image 2 width and height must both be divisible by 16");
+    throw new Error("Codex image width and height must both be divisible by 16");
   }
   if (width > MAX_IMAGE_EDGE || height > MAX_IMAGE_EDGE) {
-    throw new Error(`GPT Image 2 width and height must not exceed ${MAX_IMAGE_EDGE}px`);
+    throw new Error(`Codex image width and height must not exceed ${MAX_IMAGE_EDGE}px`);
   }
   if (Math.max(width, height) / Math.min(width, height) > 3) {
-    throw new Error("GPT Image 2 aspect ratio must be between 1:3 and 3:1");
+    throw new Error("Codex image aspect ratio must be between 1:3 and 3:1");
   }
   if (pixels < MIN_IMAGE_PIXELS || pixels > MAX_IMAGE_PIXELS) {
     throw new Error(
-      `GPT Image 2 size must contain between ${MIN_IMAGE_PIXELS.toLocaleString("en-US")} and ${MAX_IMAGE_PIXELS.toLocaleString("en-US")} pixels`,
+      `Codex image size must contain between ${MIN_IMAGE_PIXELS.toLocaleString("en-US")} and ${MAX_IMAGE_PIXELS.toLocaleString("en-US")} pixels`,
     );
   }
   return `${width}x${height}`;
@@ -192,7 +191,7 @@ export function registerCodexImageTool(
     name: "codex_image",
     label: "Codex Image",
     description:
-      "Generate a PNG with the Codex subscription image API, or edit with up to five local or recent conversation images. Uses the active openai-codex OAuth subscription and gpt-image-2; no API key is required.",
+      "Generate a PNG with the Codex subscription image API, or edit with up to five local or recent conversation images. Uses the active openai-codex OAuth subscription and the image model selected in /99settings (default gpt-image-2.5-flare); no API key is required.",
     promptSnippet: "Generate or edit raster images through the active Codex subscription",
     promptGuidelines: [
       "Use codex_image for requested raster images, illustrations, mockups, textures, or edits when the active model uses openai-codex OAuth, or Other providers is enabled in /99settings and Codex OAuth is logged in.",
@@ -218,7 +217,7 @@ export function registerCodexImageTool(
       size: Type.Optional(Type.String({
         minLength: 1,
         pattern: "^(auto|[1-9][0-9]*x[1-9][0-9]*)$",
-        description: "Exact GPT Image 2 output size as WIDTHxHEIGHT only when required. Edges must be divisible by 16 and at most 3840px, aspect ratio 1:3 to 3:1, total 655360 to 8294400 pixels. May be ignored by the backend; control the aspect ratio with composition words in the prompt (see the gpt-image-prompts skill).",
+        description: "Exact Codex image output size as WIDTHxHEIGHT only when required. Edges must be divisible by 16 and at most 3840px, aspect ratio 1:3 to 3:1, total 655360 to 8294400 pixels. May be ignored by the backend; control the aspect ratio with composition words in the prompt (see the gpt-image-prompts skill).",
       })),
       quality: Type.Optional(ImageQualitySchema),
       output_path: Type.Optional(Type.String({
@@ -282,7 +281,7 @@ export function registerCodexImageTool(
       const request = {
         prompt: params.prompt,
         background: "auto",
-        model: IMAGE_MODEL,
+        model: config.imageModel ?? DEFAULT_CODEX_API_CONFIG.imageModel,
         quality,
         size,
       };

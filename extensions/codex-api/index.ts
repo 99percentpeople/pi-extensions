@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCodexAskTool } from "./ask.ts";
+import { registerCodexCitationRendering } from "./citations.ts";
 import {
   loadCodexApiConfig,
   saveCodexApiConfig,
@@ -35,6 +36,7 @@ const CODEX_TOOL_FEATURES: readonly CodexToolFeature<CodexApiConfig>[] = [
 ];
 
 export default function (pi: ExtensionAPI) {
+  registerCodexCitationRendering(pi);
   let config = loadCodexApiConfig();
   let usageHandle: CodexUsageHandle | undefined;
 

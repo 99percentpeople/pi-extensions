@@ -1,4 +1,9 @@
 import assert from "node:assert/strict";
+import {
+  collectCodexCitationSources,
+  formatCodexCitations,
+  registerCodexCitationRendering,
+} from "../extensions/codex-api/citations.ts";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,12 +12,13 @@ import { test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import {
   initTheme,
+  getMarkdownTheme,
   type ExtensionAPI,
   type ExtensionContext,
   type Theme,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { Component } from "@earendil-works/pi-tui";
+import { Markdown, type Component } from "@earendil-works/pi-tui";
 import {
   collectWorkspaceFile,
   WORKSPACE_FILES_REQUEST_CHANNEL,
@@ -170,6 +176,103 @@ function otherProviderContext(cwd: string): ExtensionContext {
     },
   } as unknown as ExtensionContext;
 }
+
+test("Codex citations index search sources without trusting arbitrary messages or URLs", () => {
+  const sources = new Map<string, string | null>();
+  const result = {
+    toolName: "codex_search",
+    content: [{ type: "text", text: "Official page (https://example.com/page)\nciteturn1view0 metadata\nL0: cite2†Link" }],
+    details: { results: [
+      { ref_id: "turn0search0", url: "https://docs.example/guide" },
+      { ref_id: "turn0search1", url: "javascript:alert(1)" },
+      { ref_id: "turn0search2", url: "https://user:password@example.com/" },
+      { ref_id: "turn0search3", url: "https://example.com/\u001b]8;;bad" },
+    ] },
+  };
+  collectCodexCitationSources(sources, { ...result, toolName: "read" });
+  collectCodexCitationSources(sources, { ...result, isError: true });
+  assert.equal(sources.size, 0);
+  collectCodexCitationSources(sources, result);
+  assert.deepEqual([...sources], [
+    ["turn0search0", "https://docs.example/guide"],
+    ["turn1view0", "https://example.com/page"],
+  ]);
+  collectCodexCitationSources(sources, result);
+  assert.equal(sources.get("turn1view0"), "https://example.com/page");
+  collectCodexCitationSources(sources, {
+    toolName: "codex_search", details: { results: [{ refId: "turn1view0", url: "https://example.org/different" }] },
+  });
+  collectCodexCitationSources(sources, result);
+  assert.equal(sources.get("turn1view0"), null);
+});
+
+test("Codex citation formatting handles multiple refs, streaming, code and unsafe targets", () => {
+  const marker = "citeturn1view0";
+  const sources = new Map<string, string | null>([["turn1view0", "https://example.com/page"]]);
+  const link = "[example.com](<https://example.com/page>)";
+  assert.equal(formatCodexCitations(`已发布。${marker}`, sources), `已发布。${link}`);
+  assert.equal(formatCodexCitations("citeturn1view0turn2search0turn1view0", sources),
+    `${link} \\[turn2search0\\]`);
+  for (const prefix of ["", "c", "ci", "cit", "cite", "citeturn1vie"]) {
+    assert.equal(formatCodexCitations(`Text ${prefix}`, sources, true), "Text ");
+    assert.equal(formatCodexCitations(prefix, sources), prefix);
+  }
+  for (const code of [
+    `\`${marker}\``, `\`\`${marker}\`\``, `\`unfinished ${marker}`,
+    `\`\`\`text\n${marker}\n\`\`\`\n`, `~~~\n${marker}\n~~~\n`, `    ${marker}\n`,
+  ]) assert.equal(formatCodexCitations(code, sources, true), code);
+  assert.equal(formatCodexCitations(`\`\`\`\n${marker}\n\`\`\`\n${marker}`, sources),
+    `\`\`\`\n${marker}\n\`\`\`\n${link}`);
+  assert.equal(formatCodexCitations("cite2†Terms imageturn1image0", sources),
+    "cite2†Terms imageturn1image0");
+  assert.equal(formatCodexCitations(marker, new Map([["turn1view0", "javascript:alert(1)"]])),
+    "\\[turn1view0\\]");
+  assert.equal(formatCodexCitations(marker, new Map([["turn1view0", "https://example.com/a(b)"]])),
+    "[example.com](<https://example.com/a%28b%29>)");
+  assert.equal(formatCodexCitations(link, sources), link);
+});
+
+test("Codex citations render through Pi Markdown at narrow and wide widths", () => {
+  initTheme("dark", false);
+  const text = formatCodexCitations("已发布。citeturn1view0", new Map([
+    ["turn1view0", "https://example.com/page"],
+  ]));
+  for (const width of [20, 80]) {
+    const rendered = stripVTControlCharacters(new Markdown(text, 0, 0, getMarkdownTheme()).render(width).join("\n"));
+    assert.match(rendered, /example.com/);
+    assert.doesNotMatch(rendered, /|||turn1view0/);
+  }
+});
+
+test("Codex citation renderer rebuilds branch sources and degrades safely on older Pi", () => {
+  assert.doesNotThrow(() => registerCodexCitationRendering({} as ExtensionAPI));
+  const handlers = new Map<string, (event: any, ctx: any) => void>();
+  let transform!: (text: string, context: any) => string;
+  registerCodexCitationRendering({
+    registerMarkdownTransformer: (fn: typeof transform) => { transform = fn; },
+    on: (name: string, fn: (event: any, ctx: any) => void) => { handlers.set(name, fn); },
+  } as unknown as ExtensionAPI);
+  const marker = "citeturn1view0";
+  const result = { role: "toolResult", toolName: "codex_search",
+    details: { results: [{ ref_id: "turn1view0", url: "https://example.com/page" }] } };
+  let branch: unknown[] = [{ type: "message", message: result }];
+  const ctx = { sessionManager: { getBranch: () => branch } };
+  const assistant = { messageType: "assistant", isStreaming: false };
+  handlers.get("session_start")!({}, ctx);
+  assert.match(transform(marker, assistant), /https:\/\/example.com\/page/);
+  assert.equal(transform(marker, { messageType: "user" }), marker);
+  assert.match(transform(marker, { messageType: "assistant-thinking" }), /example.com/);
+  branch = [];
+  handlers.get("session_tree")!({}, ctx);
+  assert.equal(transform(marker, assistant), "\\[turn1view0\\]");
+  handlers.get("tool_result")!(result, ctx);
+  assert.match(transform(marker, assistant), /example.com/);
+  handlers.get("before_agent_start")!({}, ctx);
+  assert.equal(transform(marker, assistant), "\\[turn1view0\\]");
+  handlers.get("tool_result")!(result, ctx);
+  handlers.get("session_shutdown")!({}, ctx);
+  assert.equal(transform(marker, assistant), "\\[turn1view0\\]");
+});
 
 test("Codex client resolves OAuth account, roots, headers, and API errors", async () => {
   assert.equal(extractCodexAccountId(jwt()), "acct-123");
@@ -645,9 +748,10 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
     return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from("png-data").toString("base64") }] }));
   };
+  let imageModel = DEFAULT_CODEX_API_CONFIG.imageModel;
   const tool = toolRegistry((pi) => registerCodexImageTool(
     pi,
-    () => ({ ...DEFAULT_CODEX_API_CONFIG, imageQuality: "medium" }),
+    () => ({ ...DEFAULT_CODEX_API_CONFIG, imageModel, imageQuality: "medium" }),
   ));
   const imageProperties = (tool.parameters as any).properties;
   assert.deepEqual(Object.keys(imageProperties), [
@@ -690,7 +794,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
       ctx,
     );
     assert.equal(calls[0].url, "https://chatgpt.com/backend-api/codex/images/generations");
-    assert.equal(calls[0].body.model, "gpt-image-2");
+    assert.equal(calls[0].body.model, "gpt-image-2.5-flare");
     assert.equal(calls[0].body.background, "auto");
     assert.equal(calls[0].body.quality, "medium");
     assert.equal(calls[0].body.size, "auto");
@@ -785,6 +889,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     ));
     assert.match(partialImage, /Waiting for Codex image generation/);
 
+    imageModel = "gpt-image-2.5-sunburst";
     const editedPath = join(temporary, "edited.png");
     const editedUpdates: any[] = [];
     await tool.execute(
@@ -801,6 +906,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
       ctx,
     );
     assert.equal(calls[1].url, "https://chatgpt.com/backend-api/codex/images/edits");
+    assert.equal(calls[1].body.model, "gpt-image-2.5-sunburst");
     assert.deepEqual(
       editedUpdates.map((update) => update.details.phase),
       ["preparing", "authenticating", "reading-references", "generating", "saving"],
@@ -809,6 +915,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
     assert.equal(calls[1].body.size, "1536x1024");
     assert.equal(calls[1].body.quality, "high");
 
+    imageModel = "gpt-image-2";
     const recentPath = join(temporary, "recent-edit.png");
     const recentCtx = context(temporary) as any;
     recentCtx.sessionManager.buildContextEntries = () => [{
@@ -834,6 +941,7 @@ test("codex_image generates, edits, saves PNGs, and returns image content", asyn
       recentCtx,
     );
     assert.equal(calls[2].url, "https://chatgpt.com/backend-api/codex/images/edits");
+    assert.equal(calls[2].body.model, "gpt-image-2");
     assert.match(calls[2].body.images[0].image_url, /^data:image\/jpeg;base64,/);
 
     const recentCall = tool.renderCall!(
@@ -2981,6 +3089,11 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     live: "Live",
   });
   assert.equal(normalizeCodexApiConfig({ searchMode: "auto" }).searchMode, "auto");
+  assert.equal(normalizeCodexApiConfig({}).imageModel, "gpt-image-2.5-flare");
+  assert.equal(normalizeCodexApiConfig({ imageModel: "gpt-image-2.5" }).imageModel, "gpt-image-2.5-flare");
+  for (const imageModel of ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"]) {
+    assert.equal(normalizeCodexApiConfig({ imageModel }).imageModel, imageModel);
+  }
   assert.equal(resolveSearchMode("auto"), "indexed");
   assert.equal(resolveSearchMode("auto", "live"), "live");
   assert.equal(resolveSearchMode("auto", "cached"), "cached");
@@ -3007,6 +3120,7 @@ test("Codex API config normalizes, saves, and reloads", async () => {
     allowOtherProviders: true,
     searchMode: "live",
     searchContextSize: "high",
+    imageModel: "gpt-image-2.5-flare",
     imageQuality: "high",
     usageStatus: false,
     usagePollInterval: 5,
@@ -3035,6 +3149,7 @@ test("Codex API config normalizes, saves, and reloads", async () => {
       allowOtherProviders: true,
       searchMode: "indexed",
       searchContextSize: "low",
+      imageModel: "gpt-image-2.5-sunburst",
       imageQuality: "low",
       usageStatus: true,
     }, path);
@@ -3047,6 +3162,7 @@ test("Codex API config normalizes, saves, and reloads", async () => {
       allowOtherProviders: true,
       searchMode: "indexed",
       searchContextSize: "low",
+      imageModel: "gpt-image-2.5-sunburst",
       imageQuality: "low",
       usageStatus: true,
       usagePollInterval: 5,

@@ -5,6 +5,7 @@ import {
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   CODEX_API_SETTINGS_NAMESPACE,
+  CODEX_IMAGE_MODELS,
   type CodexApiConfig,
   type CodexImageQuality,
   type CodexResponseVerbosity,
@@ -175,9 +176,16 @@ export function registerCodexApiSettings(
           values: Object.values(CONTEXT_SIZE_LABELS),
         },
         {
+          id: "imageModel",
+          label: "Image model",
+          description: "Flare for speed, Sunburst for precise edits, or GPT Image 2 for compatibility; availability depends on Codex rollout",
+          currentValue: config.imageModel,
+          values: [...CODEX_IMAGE_MODELS],
+        },
+        {
           id: "imageQuality",
           label: "Image quality",
-          description: "Default GPT Image 2 quality; explicit per-image requests may override it",
+          description: "Default GPT Image quality; explicit per-image requests may override it",
           currentValue: IMAGE_QUALITY_LABELS[config.imageQuality],
           values: Object.values(IMAGE_QUALITY_LABELS),
         },
@@ -215,6 +223,9 @@ export function registerCodexApiSettings(
           searchContextSize:
             keyForLabel(CONTEXT_SIZE_LABELS, value) ?? config.searchContextSize,
         }, ctx);
+      } else if (id === "imageModel") {
+        const imageModel = CODEX_IMAGE_MODELS.find((model) => model === value);
+        if (imageModel) controller.updateConfig({ ...config, imageModel }, ctx);
       } else if (id === "imageQuality") {
         controller.updateConfig({
           ...config,

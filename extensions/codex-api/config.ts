@@ -6,6 +6,8 @@ import {
 
 export type CodexSearchMode = "auto" | "cached" | "indexed" | "live";
 export type CodexSearchContextSize = "low" | "medium" | "high";
+export const CODEX_IMAGE_MODELS = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"] as const;
+export type CodexImageModel = typeof CODEX_IMAGE_MODELS[number];
 export type CodexImageQuality = "auto" | "low" | "medium" | "high";
 export type CodexResponseVerbosity = "auto" | "low" | "medium" | "high";
 
@@ -18,6 +20,7 @@ export interface CodexApiConfig {
   allowOtherProviders: boolean;
   searchMode: CodexSearchMode;
   searchContextSize: CodexSearchContextSize;
+  imageModel: CodexImageModel;
   imageQuality: CodexImageQuality;
   usageStatus: boolean;
   /** Minutes between background status refreshes; 0 disables polling. */
@@ -35,6 +38,7 @@ export const DEFAULT_CODEX_API_CONFIG: CodexApiConfig = {
   allowOtherProviders: false,
   searchMode: "auto",
   searchContextSize: "medium",
+  imageModel: "gpt-image-2.5-flare",
   imageQuality: "auto",
   usageStatus: true,
   usagePollInterval: 5,
@@ -78,6 +82,7 @@ export function normalizeCodexApiConfig(value: unknown): CodexApiConfig {
       ["low", "medium", "high"],
       DEFAULT_CODEX_API_CONFIG.searchContextSize,
     ),
+    imageModel: oneOf(input.imageModel, CODEX_IMAGE_MODELS, DEFAULT_CODEX_API_CONFIG.imageModel),
     imageQuality: oneOf(
       input.imageQuality,
       ["auto", "low", "medium", "high"],

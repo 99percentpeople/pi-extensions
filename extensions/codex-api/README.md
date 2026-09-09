@@ -17,7 +17,7 @@ monitoring — **no OpenAI API key required**.
   default or override normal Codex replies and `codex_ask` with Low, Medium,
   or High detail.
 - **Image generation & editing** — `codex_image` creates or edits images via
-  your Codex subscription's `gpt-image-2`, and works from **any model**:
+  your Codex subscription (default `gpt-image-2.5-flare`), and works from **any model**:
   even with a third-party provider active (DeepSeek, Google, …), it reuses Pi's
   logged-in `openai-codex` OAuth account (enable **Other providers** in
   `/99settings`).
@@ -97,6 +97,24 @@ Current Codex backend limitations are surfaced as actionable result hints:
 When a batched lookup silently omits one item, the extension compares returned
 reference indexes with the request and reports the missing item's applicable
 hint instead of presenting the batch as fully successful.
+
+## Inline citations in assistant replies
+
+On Pi versions exposing `registerMarkdownTransformer`, the extension formats
+Codex citation markers such as `citeturn1view0` into domain-labelled Markdown
+links. URLs come only from `codex_search` results on the active session branch.
+Multiple references are supported; missing or conflicting reference IDs display
+as `[turn1view0]` without inventing a URL. Terminal hyperlink support determines
+whether links are clickable.
+
+Formatting is display-only: assistant text and thinking are transformed, while
+user messages, code examples, stored messages, and model context stay unchanged.
+Incomplete trailing citations are hidden during streaming. Source mappings are
+rebuilt on session load and tree navigation. Older Pi versions without the hook
+keep the original rendering; no private rendering prototypes are patched.
+This affects Pi's Markdown UI, not external Telegram/Feishu renderers or raw JSON
+exports. Other marker families (image cards, navigation widgets, etc.) are not
+handled by this citation formatter.
 
 ## Quick start
 
@@ -211,13 +229,32 @@ Configure under **Codex API** in `/99settings`:
 - **Other providers** lets any model (DeepSeek, Google, …) use the logged-in
   Codex subscription.
 - **Search mode** and **Search context** configure search when its feature is on.
-- **Image quality** sets the GPT Image 2 default when its feature is on.
+- **Image model** selects `gpt-image-2.5-flare` (default, fast generation),
+  `gpt-image-2.5-sunburst` (precise editing), or `gpt-image-2` (compatibility).
+  Existing settings without `imageModel` default to Flare. Changes apply on the next call.
+- **Image quality** sets the GPT Image default when its feature is on.
 - **Usage poll** controls the monitor refresh interval when its feature is on.
 
 Settings live in `~/.pi/agent/99extensions.json` under the `codex-api`
 namespace. Existing configurations migrate with Search, Image, and Ask Codex
 enabled, so upgrading does not remove tools unless you explicitly switch them
 off.
+
+### Images 2.5 availability
+
+OpenAI [announced Images 2.5 on September 8, 2026](https://openai.com/index/introducing-chatgpt-images-2-5/).
+The model IDs are `gpt-image-2.5-flare` and `gpt-image-2.5-sunburst`, not
+`gpt-image-2.5`. This extension sends the selected ID to the existing Codex
+subscription generation/edit endpoints, not the public paid Images API.
+The new IDs have mock request coverage but have not been live-verified here;
+account availability depends on the Codex rollout. If the backend rejects a
+new model, select `gpt-image-2` in **Image model**. There is no silent fallback
+or automatic retry that could generate a second image.
+
+The existing conservative size limits, five-reference limit, and
+`auto`/`low`/`medium`/`high` quality choices are retained for the subscription
+backend; additional public API options are not assumed to be supported.
+The bundled prompting skill and demo were originally written for GPT Image 2.
 
 ## How it works
 
