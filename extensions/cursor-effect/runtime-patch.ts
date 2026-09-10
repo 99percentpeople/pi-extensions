@@ -51,10 +51,12 @@ interface PatchState {
   originalStop: (this: RuntimeLoader) => void;
   patchedStop: (this: RuntimeLoader) => void;
   labelTimers: Map<RuntimeLoader, LabelTimerState>;
+  metrics?: (kind: string) => string;
 }
 
 export interface CursorEffectPatchHandle {
   setTheme(theme: Pick<Theme, "fg" | "bold">): void;
+  setMetrics(suffix: (kind: string) => string): void;
   setResolvedTheme(resolved: ResolvedCursorTheme): void;
   setLabelEffect(effect: ResolvedLabelEffect): void;
   setLabelConfig(config: CustomCursorEffects["label"]): void;
@@ -100,6 +102,7 @@ function createHandle(state: PatchState): CursorEffectPatchHandle {
   let disposed = false;
   return {
     setTheme: (theme) => { state.theme = theme; },
+    setMetrics: (suffix) => { state.metrics = suffix; },
     setResolvedTheme: (resolved) => {
       state.indicator = structuredClone(resolved.indicator);
       state.labelEffect = structuredClone(resolved.label);
@@ -164,16 +167,13 @@ export function installCursorEffectPatch(
 
   const ensureLabelTimer = (loader: RuntimeLoader) => {
     const effect = patchState.labelEffect;
-    if (
-      !isMainStatus(loader)
-      || !patchState.theme
-      || effect.style === "none"
-      || loader.message.includes("\u001b")
-    ) {
+    const hasMetrics = isMainStatus(loader) && Boolean(patchState.metrics?.(loader.kind!));
+    const hasEffect = effect.style !== "none" && !loader.message.includes("\u001b");
+    if (!isMainStatus(loader) || !patchState.theme || (!hasEffect && !hasMetrics)) {
       clearLabelTimer(loader);
       return;
     }
-    const intervalMs = labelFrameInterval(effect);
+    const intervalMs = Math.min(hasEffect ? labelFrameInterval(effect) : Infinity, hasMetrics ? 250 : Infinity);
     if (loaderRefreshInterval() <= intervalMs) {
       clearLabelTimer(loader);
       return;
@@ -197,15 +197,25 @@ export function installCursorEffectPatch(
   };
 
   const patchedUpdate = function (this: RuntimeLoader): void {
+    const renderNative = () => {
+      const message = this.message;
+      // Pi 0.85 uses "Working". Normalize only its plain working label, and
+      // keep the source message intact for other extensions and patch disposal.
+      if (this.kind === "working") {
+        this.message = message.replace(/^Working(?= \([^\n]* to interrupt\)$|$)/, "Working...");
+      }
+      try {
+        originalUpdate.call(this);
+      } finally {
+        this.message = message;
+      }
+    };
     const effect = patchState.labelEffect;
-    if (
-      !isMainStatus(this)
-      || !patchState.theme
-      || effect.style === "none"
-      || this.message.includes("\u001b")
-    ) {
+    const suffix = isMainStatus(this) ? patchState.metrics?.(this.kind!) ?? "" : "";
+    const hasEffect = effect.style !== "none" && !this.message.includes("\u001b");
+    if (!isMainStatus(this) || !patchState.theme || (!hasEffect && !suffix)) {
       clearLabelTimer(this);
-      originalUpdate.call(this);
+      renderNative();
       return;
     }
     ensureLabelTimer(this);
@@ -219,14 +229,17 @@ export function installCursorEffectPatch(
       state.label = this.message;
     }
     const originalColor = this.messageColorFn;
-    this.messageColorFn = (text) => renderLabelEffect(
-      text,
-      cursorEffectFrame(state!.startedAt, now, labelFrameInterval(effect)),
-      effect,
-      patchState.theme!,
-    );
+    this.messageColorFn = (text) => {
+      const label = hasEffect ? renderLabelEffect(
+        text,
+        cursorEffectFrame(state!.startedAt, now, labelFrameInterval(effect)),
+        effect,
+        patchState.theme!,
+      ) : originalColor(text);
+      return label + (suffix ? patchState.theme!.fg("dim", ` ${suffix}`) : "");
+    };
     try {
-      originalUpdate.call(this);
+      renderNative();
     } finally {
       this.messageColorFn = originalColor;
     }

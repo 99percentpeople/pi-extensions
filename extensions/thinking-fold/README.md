@@ -81,7 +81,9 @@ Additional behavior:
   the folded view and complete reasoning blocks. Its expansion hint appears
   only when content is actually hidden: by a `collapse` strategy, or because a
   thinking block exceeds the configured fold threshold. The chosen state
-  persists across later turns until `Ctrl+T` is pressed again. On Pi 0.85+,
+  persists across later turns until `Ctrl+T` is pressed again. Toggling requests
+  an immediate TUI redraw, including after the conversation has finished or a
+  completed session has been restored. On Pi 0.85+,
   clicking a thinking block in fullscreen mode toggles the same global state.
 - `Ctrl+O` keeps its native Pi behavior and only expands tools and other
   expandable UI content.

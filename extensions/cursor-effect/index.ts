@@ -11,9 +11,11 @@ import {
   type CursorEffectPatchHandle,
 } from "./runtime-patch.ts";
 import { registerCursorEffectSettings } from "./settings.ts";
+import { registerCursorMetrics } from "./metrics.ts";
 
 export default function (pi: ExtensionAPI) {
   let config = loadCursorEffectConfig();
+  const metrics = registerCursorMetrics(pi, () => config.metrics);
   let patch: CursorEffectPatchHandle | undefined;
   let activeContext: {
     theme: Pick<Theme, "fg" | "bold">;
@@ -44,6 +46,7 @@ export default function (pi: ExtensionAPI) {
 
   try {
     patch = installCursorEffectPatch();
+    patch.setMetrics(metrics.suffix);
   } catch (error) {
     patchError = error instanceof Error ? error.message : String(error);
   }
@@ -77,6 +80,8 @@ export default function (pi: ExtensionAPI) {
 export {
   CURSOR_EFFECT_SETTINGS_NAMESPACE,
   DEFAULT_CURSOR_EFFECT_CONFIG,
+  DEFAULT_CURSOR_METRICS,
+  type CursorMetricsConfig,
   DEFAULT_CUSTOM_CURSOR_EFFECTS,
   getCursorEffectConfigPath,
   loadCursorEffectConfig,

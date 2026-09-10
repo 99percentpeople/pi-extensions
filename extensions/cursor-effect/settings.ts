@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   CURSOR_EFFECT_SETTINGS_NAMESPACE,
   type CursorEffectConfig,
+  type CursorMetricsConfig,
   type CursorEffectTheme,
   type EffectDirection,
   type EffectPause,
@@ -74,6 +75,11 @@ const PAUSE_LABELS: Record<EffectPause, string> = {
   short: "Short",
   long: "Long",
 };
+
+export function metricsSettingsSummary(metrics: CursorMetricsConfig): string {
+  const values = Object.values(metrics);
+  return `${values.filter(Boolean).length}/${values.length} On`;
+}
 
 function keyForLabel<T extends string>(labels: Record<T, string>, label: string): T | undefined {
   return (Object.entries(labels) as Array<[T, string]>).find(([, value]) => value === label)?.[0];
@@ -213,6 +219,28 @@ export function registerCursorEffectSettings(
     },
   };
 
+  const metricLabels: Record<keyof CursorMetricsConfig, { label: string; description: string }> = {
+    elapsed: { label: "Elapsed time", description: "Total busy time including tools and automatic retries" },
+    outputTokens: { label: "Output tokens", description: "Estimated while streaming; provider usage after each response" },
+    liveSpeed: { label: "Live speed", description: "Estimated speed while working; provider-based average in the completion notification" },
+    completionSummary: { label: "Completion notification", description: "Notify once with enabled metrics when the task settles" },
+  };
+  const metricsPanel: ExtensionSettingsPanel = {
+    title: "Runtime Metrics",
+    currentValue: () => metricsSettingsSummary(controller.getConfig().metrics),
+    settings: () => (Object.entries(metricLabels) as Array<[keyof CursorMetricsConfig, { label: string; description: string }]>).map(([id, item]) => ({
+      id,
+      ...item,
+      currentValue: controller.getConfig().metrics[id] ? "On" : "Off",
+      values: ["On", "Off"],
+    })),
+    onChange: (id, value, ctx) => {
+      if (!Object.hasOwn(metricLabels, id) || (value !== "On" && value !== "Off")) return;
+      const config = controller.getConfig();
+      controller.updateConfig({ ...config, metrics: { ...config.metrics, [id]: value === "On" } }, ctx);
+    },
+  };
+
   registerExtensionSettings(pi, {
     namespace: CURSOR_EFFECT_SETTINGS_NAMESPACE,
     title: "Cursor Effect",
@@ -225,6 +253,13 @@ export function registerCursorEffectSettings(
           description: "Apply a complete cursor theme",
           currentValue: CURSOR_THEMES[config.theme],
           values: Object.values(CURSOR_THEMES),
+        },
+        {
+          id: "metrics",
+          label: "Runtime metrics",
+          description: "Elapsed time, output tokens, speed and completion summary (all themes)",
+          currentValue: metricsSettingsSummary(config.metrics),
+          submenu: metricsPanel,
         },
         ...(config.theme === "custom" ? [
           {

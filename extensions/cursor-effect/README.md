@@ -5,7 +5,9 @@ visual effects on Pi's **main session status cursors**.
 
 Pick a preset (`Claude Code` or `Codex`) for an authentic busy-row look, or
 build your own: spinner glyph, animated label effects (wave, shimmer, scan,
-rainbow), speed, color, and direction — all from `/99settings`.
+rainbow), speed, color, and direction — all from `/99settings`. Runtime metrics
+add task elapsed time, output tokens, estimated live throughput, and a final
+summary independently of the selected theme.
 
 ## Demo
 
@@ -28,7 +30,8 @@ This package changes Pi's main `working`, `retry`, `compaction`, and
 ```
 
 It does **not** change assistant Items, reasoning content, tool/bash loaders,
-widgets, message bodies, model events, or session data. Other extensions, such
+widgets, message bodies, model events, or session data. Metrics observe model
+lifecycle events and optionally send a completion summary via `ctx.ui.notify()`. Other extensions, such
 as `thinking-fold`, provide their status labels as plain text and remain fully
 functional without this package.
 
@@ -79,6 +82,70 @@ provide crest width controls; all non-Rainbow effects support Accent, Thinking,
 and Monochrome palettes. Loader and Label clocks are independent, and label
 segmentation preserves emoji and combining-character graphemes.
 
+## Runtime metrics
+
+All four switches are enabled by default and available under
+`/99settings → Cursor Effect → Runtime metrics` in **every** theme:
+
+| Setting | Display |
+| --- | --- |
+| Elapsed time | Total busy interval, including tools, automatic retries and compaction |
+| Output tokens | Completed provider-reported output plus an estimate for the streaming response |
+| Live speed | `≈48.2 tok/s` while working; `Avg 46.1 tok/s` using provider-reported output in the completion notification |
+| Completion notification | Notify once with enabled metrics when the task settles; no persistent footer status |
+
+Completion notifications follow the elapsed-time, output-token and live-speed
+switches. There is no separate average-speed switch; legacy `averageSpeed` values
+are ignored. Disabling all three metrics suppresses the notification.
+The default working label is displayed as `Working...`; custom labels are unchanged.
+
+Illustrative output:
+
+```text
+⠦ Responding... 18s ≈860 out ≈47.8 tok/s
+⠦ Working... 32s 1,024 out ≈47.8 tok/s
+
+Done 42s 1,280 out Avg 46.1 tok/s
+```
+
+**Timing and accuracy:** elapsed time uses a monotonic local clock and stops at
+`agent_settled`, not the earlier `agent_end`. Speed measures client-observed
+model-call throughput from `turn_start` to assistant `message_end`, including
+request preparation and first-output waiting, but excluding subsequent tool
+execution, retry backoff, compaction and user idle time. It is not a server-side
+decode-speed measurement. Final speed divides summed output by summed measured
+model-call durations, rather than averaging individual rates.
+
+During tool execution or the next call's first-output wait, live speed retains
+the last displayed value; it is not a measurement of that waiting interval.
+A new task resets the retained value, and speed stays absent until its first
+valid sample.
+
+Live estimates count streamed text, visible thinking and tool-call JSON using
+approximately four ASCII characters or one non-ASCII code point per token.
+They are **not tokenizer-exact** and cannot measure hidden reasoning; every
+estimated count/rate has an `≈` prefix. Final counts use `usage.output`, whose
+reasoning/tool-token coverage depends on the provider, so final and live rates
+can differ. No model calls or network requests are added for measurement.
+Missing usage for a response with visible output (or an error/abort) produces
+`out —` / `Avg — tok/s` rather than a fabricated total. Rates for spans shorter
+than 500ms are withheld. Errors and cancellation are labelled in the summary.
+
+Retry, compaction and branch-summary rows show only elapsed task time while a
+task is active; their internal model usage is not included. Standalone manual
+compaction/branch summarization is not measured. Background tasks surviving the
+agent's completion are not part of its elapsed time.
+
+Metrics are appended only during rendering: existing labels from `thinking-fold`
+remain untouched, and the suffix uses dim styling rather than the label animation.
+A 250ms refresh keeps metrics moving even with both animations disabled. Timers
+are stopped with their loaders and cleaned up on session shutdown/reload. Pi's
+native wrapping/clipping also applies to metrics, including editor-border status
+placement and narrow terminals. Completion summaries use Pi's notification UI,
+independently of custom footers. The existing `completionSummary` config key is
+preserved for compatibility. There is no history persistence or
+reconstruction of timings after reload.
+
 ## Install
 
 ```bash
@@ -98,11 +165,12 @@ Restart Pi or run `/reload` after installation.
 
 ## Settings
 
-Run `/99settings`. Presets keep the section to one row:
+Run `/99settings`. All themes expose runtime metrics:
 
 ```text
 Cursor Effect
-Theme  Claude Code
+Theme            Claude Code
+Runtime metrics  4/4 On
 ```
 
 Selecting `Custom` dynamically reveals the two detailed submenus:
@@ -110,6 +178,7 @@ Selecting `Custom` dynamically reveals the two detailed submenus:
 ```text
 Cursor Effect
 Theme          Custom
+Runtime metrics 4/4 On
 Loader effect  Pi default
 Label effect   Wave
 ```
@@ -127,6 +196,12 @@ under the `cursor-effect` namespace:
 {
   "cursor-effect": {
     "theme": "default",
+    "metrics": {
+      "elapsed": true,
+      "outputTokens": true,
+      "liveSpeed": true,
+      "completionSummary": true
+    },
     "custom": {
       "loader": {
         "style": "pi-default",
@@ -156,7 +231,7 @@ owns the independent Label timer and prevents it from outliving a status row.
 Tool, bash, and extension loaders do not have those kinds and remain unchanged.
 The patch checks the expected methods at startup, avoids duplicates, and restores
 the original prototype during session shutdown. Pre-styled ANSI labels are left
-unchanged.
+unchanged; enabled metrics can still be appended after them.
 
 Streaming label changes preserve the current Label effect phase instead of
 restarting it for every partial summary or status message. Loader animation

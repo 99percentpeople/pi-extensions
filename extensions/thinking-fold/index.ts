@@ -23,6 +23,7 @@ import {
 
 const ITEM_TIMER_INTERVAL_MS = 1000;
 const MIN_SUMMARY_CURSOR_MS = 1000;
+const RENDER_BRIDGE_WIDGET = "thinking-fold-render-bridge";
 
 export function endsThinkingPhase(type: AssistantMessageEvent["type"]): boolean {
   return (
@@ -67,6 +68,7 @@ export default function (pi: ExtensionAPI) {
   let config = loadThinkingFoldConfig();
   let patch: ThinkingFoldPatchHandle | undefined;
   let removeInputListener: (() => void) | undefined;
+  let requestRender: (() => void) | undefined;
   let itemTimer: ReturnType<typeof setInterval> | undefined;
   let summaryHoldTimer: ReturnType<typeof setTimeout> | undefined;
   let thinkingStartedAt: number | undefined;
@@ -112,6 +114,7 @@ export default function (pi: ExtensionAPI) {
     if (elapsedSecond === lastItemTimerSecond) return;
     lastItemTimerSecond = elapsedSecond;
     patch.tick(now);
+    requestRender?.();
   };
 
   const startItemTimer = (ctx: ExtensionContext) => {
@@ -138,6 +141,7 @@ export default function (pi: ExtensionAPI) {
   const applyConfig = (next: ThinkingFoldConfig, ctx: ExtensionContext) => {
     config = next;
     patch?.updateOptions(configToRenderOptions(config));
+    requestRender?.();
     try {
       saveThinkingFoldConfig(config);
     } catch (error) {
@@ -204,6 +208,18 @@ export default function (pi: ExtensionAPI) {
     }
     if (!patch || ctx.mode !== "tui") return;
 
+    // Terminal input consumed by an extension does not schedule a TUI render.
+    // Capture Pi's live TUI through a zero-row widget factory without replacing
+    // another extension's editor/footer or adding visible UI.
+    ctx.ui.setWidget(RENDER_BRIDGE_WIDGET, (tui) => {
+      requestRender = () => tui.requestRender();
+      return {
+        render: () => [],
+        invalidate() {},
+        dispose() { requestRender = undefined; },
+      };
+    }, { placement: "belowEditor" });
+
     const toggleKey = keyText("app.thinking.toggle") || "ctrl+t";
     patch.updateOptions({ ...configToRenderOptions(config), toggleKey });
     restoreTimings(ctx, patch);
@@ -213,6 +229,7 @@ export default function (pi: ExtensionAPI) {
       if (!patch || !getKeybindings().matches(data, "app.thinking.toggle")) return;
 
       patch.toggle();
+      requestRender?.();
       return { consume: true };
     });
   });
@@ -309,6 +326,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    clearSummaryHold();
     stopItemTimer();
     removeInputListener?.();
     removeInputListener = undefined;
@@ -317,6 +335,11 @@ export default function (pi: ExtensionAPI) {
     }
     patch?.dispose();
     patch = undefined;
+    if (requestRender) {
+      requestRender();
+      ctx.ui.setWidget(RENDER_BRIDGE_WIDGET, undefined);
+    }
+    requestRender = undefined;
   });
 }
 

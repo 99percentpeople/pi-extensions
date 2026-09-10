@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
-import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { Loader, type TUI } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Loader, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { CursorMetrics, estimateOutputTokens, registerCursorMetrics } from "../extensions/cursor-effect/metrics.ts";
+import { metricsSettingsSummary } from "../extensions/cursor-effect/settings.ts";
 import {
   createClaudeLoaderFrames,
   createLoaderIndicator,
@@ -118,6 +120,259 @@ function customLabel(
 ) {
   return { ...DEFAULT_CUSTOM_CURSOR_EFFECTS.label, ...overrides, style };
 }
+
+test("runtime metrics use monotonic task time and exclude tools and retry waits from throughput", () => {
+  let now = 0;
+  const metrics = new CursorMetrics(() => now);
+  const config = DEFAULT_CURSOR_EFFECT_CONFIG.metrics;
+  assert.equal(metrics.text(config), "");
+  metrics.start();
+  metrics.startResponse();
+  now = 2000;
+  metrics.addDelta("a".repeat(80));
+  assert.equal(metrics.text(config), "2s ≈20 out ≈10.0 tok/s");
+  metrics.endResponse(100, "toolUse");
+  now = 12000; // Ten seconds of tool execution.
+  assert.equal(metrics.text(config), "12s 100 out ≈10.0 tok/s");
+  metrics.start(); // Continuation/retry must not reset the task clock.
+  metrics.startResponse();
+  now = 15000;
+  metrics.endResponse(200, "stop");
+  metrics.endResponse(200, "stop"); // Ignore duplicate finalization.
+  metrics.finish();
+  now = 30000;
+  assert.equal(metrics.text(config), "Done 15s 300 out Avg 60.0 tok/s");
+  metrics.start();
+  assert.equal(metrics.text(config), "0s 0 out");
+  metrics.reset();
+  assert.equal(metrics.text(config), "");
+});
+
+test("live speed holds the latest display between calls and resets for a new task", () => {
+  let now = 0;
+  const metrics = new CursorMetrics(() => now);
+  const config = DEFAULT_CURSOR_EFFECT_CONFIG.metrics;
+  metrics.start();
+  metrics.startResponse();
+  now = 2000;
+  assert.doesNotMatch(metrics.text(config), /tok\/s/);
+  metrics.addDelta("abcd");
+  assert.match(metrics.text(config), /≈0\.5 tok\/s/);
+  metrics.endResponse(10, "toolUse");
+  now = 2500;
+  assert.match(metrics.text(config), /≈0\.5 tok\/s/);
+  metrics.startResponse();
+  now = 3500;
+  assert.match(metrics.text(config), /≈0\.5 tok\/s/);
+  metrics.addDelta("abcdefgh");
+  assert.match(metrics.text(config), /≈2\.0 tok\/s/);
+  metrics.endResponse(20, "toolUse");
+  metrics.startResponse();
+  metrics.addDelta("abcd");
+  now += 100;
+  assert.match(metrics.text(config), /≈2\.0 tok\/s/);
+  assert.doesNotMatch(metrics.text({ ...config, liveSpeed: false }), /tok\/s/);
+  metrics.endResponse(1, "stop");
+  metrics.finish();
+  metrics.start();
+  metrics.startResponse();
+  assert.doesNotMatch(metrics.text(config), /tok\/s/);
+});
+
+test("runtime metrics label estimates and do not invent usage for cancelled or incomplete responses", () => {
+  let now = 0;
+  const metrics = new CursorMetrics(() => now);
+  const config = DEFAULT_CURSOR_EFFECT_CONFIG.metrics;
+  assert.equal(estimateOutputTokens("abcd中文"), 3);
+  for (const stop of ["aborted", "error", "stop"]) {
+    metrics.start();
+    metrics.startResponse();
+    metrics.addDelta("not authoritative usage");
+    now += 1000;
+    metrics.endResponse(0, stop);
+    metrics.finish();
+    assert.match(metrics.text(config), /out — Avg — tok\/s/);
+    assert.match(metrics.text(config), new RegExp(`^${stop === "aborted" ? "Cancelled" : stop === "error" ? "Error" : "Done"}`));
+  }
+  metrics.start();
+  metrics.startResponse();
+  metrics.addDelta("text");
+  metrics.endResponse(Number.NaN, "stop");
+  metrics.finish();
+  assert.match(metrics.text(config), /Avg —/);
+  metrics.start();
+  metrics.startResponse();
+  metrics.addDelta("fast");
+  metrics.endResponse(1, "stop");
+  metrics.finish();
+  assert.match(metrics.text(config), /Avg —/); // No division by zero or extreme sub-500ms rates.
+  metrics.start();
+  metrics.startResponse();
+  metrics.finish();
+  assert.match(metrics.text(config), /out —/);
+});
+
+test("metrics settings summarize enabled switches", () => {
+  const config = DEFAULT_CURSOR_EFFECT_CONFIG.metrics;
+  assert.equal(metricsSettingsSummary(config), "4/4 On");
+  assert.equal(metricsSettingsSummary({ ...config, elapsed: false }), "3/4 On");
+  assert.equal(metricsSettingsSummary({ elapsed: false, outputTokens: false, liveSpeed: false,
+    completionSummary: false }), "0/4 On");
+});
+
+test("metric switches are independent and non-working rows show only task time", () => {
+  let now = 0;
+  const metrics = new CursorMetrics(() => now);
+  const config = DEFAULT_CURSOR_EFFECT_CONFIG.metrics;
+  const off = { elapsed: false, outputTokens: false, liveSpeed: false, completionSummary: false };
+  metrics.start();
+  metrics.startResponse();
+  metrics.addDelta("test");
+  now = 65000;
+  assert.equal(metrics.text(off), "");
+  assert.equal(metrics.text({ ...off, elapsed: true }), "1m 5s");
+  assert.equal(metrics.text({ ...off, outputTokens: true }), "≈1 out");
+  for (const kind of ["retry", "compaction", "branchSummary"]) {
+    assert.equal(metrics.text(config, kind), "1m 5s");
+  }
+  const normalized = normalizeCursorEffectConfig({ metrics: { elapsed: false, liveSpeed: "false", unknown: true } });
+  assert.equal(normalized.metrics.elapsed, false);
+  assert.equal(normalized.metrics.liveSpeed, true);
+  assert.equal(Object.hasOwn(normalized.metrics, "unknown"), false);
+});
+
+test("completion metrics follow the same switches as working metrics and ignore legacy averageSpeed", () => {
+  let now = 0;
+  const metrics = new CursorMetrics(() => now);
+  metrics.start();
+  metrics.startResponse();
+  now = 2_000;
+  metrics.endResponse(100, "stop");
+  metrics.finish();
+  const off = { elapsed: false, outputTokens: false, liveSpeed: false, completionSummary: true };
+  assert.equal(metrics.text(off), "");
+  assert.equal(metrics.text({ ...off, elapsed: true }), "Done 2s");
+  assert.equal(metrics.text({ ...off, outputTokens: true }), "Done 100 out");
+  assert.equal(metrics.text({ ...off, liveSpeed: true }), "Done Avg 50.0 tok/s");
+  for (const liveSpeed of [true, false]) {
+    const config = normalizeCursorEffectConfig({ metrics: { ...off, liveSpeed, averageSpeed: !liveSpeed } });
+    assert.equal(Object.hasOwn(config.metrics, "averageSpeed"), false);
+    assert.equal(metrics.text(config.metrics), liveSpeed ? "Done Avg 50.0 tok/s" : "");
+  }
+});
+
+test("metrics event wiring settles once, preserves raw events, clears on tree/reload and honors summary toggle", () => {
+  const handlers = new Map<string, (event: any, ctx?: any) => void>();
+  const notifications: string[] = [];
+  let config = { ...DEFAULT_CURSOR_EFFECT_CONFIG.metrics };
+  const controller = registerCursorMetrics({
+    on: (name: string, handler: (event: any, ctx?: any) => void) => { handlers.set(name, handler); },
+  } as unknown as ExtensionAPI, () => config);
+  const ctx = { hasUI: true, ui: {
+    notify: (text: string, level: string) => { assert.equal(level, "info"); notifications.push(text); },
+    setStatus: () => assert.fail("metrics must not occupy the status bar"),
+  } };
+  handlers.get("session_start")!({}, ctx);
+  handlers.get("agent_start")!({}, ctx);
+  handlers.get("turn_start")!({});
+  for (const type of ["text_delta", "thinking_delta", "toolcall_delta"]) {
+    handlers.get("message_update")!({ assistantMessageEvent: { type, delta: "abcd" } });
+  }
+  assert.match(controller.suffix("working"), /≈3 out/);
+  handlers.get("message_update")!({ assistantMessageEvent: { type: "text_end", content: "abcd" } });
+  assert.match(controller.suffix("working"), /≈3 out/);
+  handlers.get("message_end")!({ message: { role: "toolResult" } });
+  const message = { role: "assistant", usage: { output: 20 }, stopReason: "stop" };
+  handlers.get("message_end")!({ message });
+  assert.deepEqual(message, { role: "assistant", usage: { output: 20 }, stopReason: "stop" });
+  assert.equal(handlers.has("agent_end"), false);
+  handlers.get("agent_settled")!({}, ctx);
+  assert.equal(controller.suffix("working"), "");
+  assert.match(notifications[0], /Done.*20 out/);
+  handlers.get("agent_settled")!({}, ctx);
+  assert.equal(notifications.length, 1, "duplicate settle must not notify twice");
+  config = { ...config, completionSummary: false };
+  handlers.get("agent_start")!({}, ctx);
+  handlers.get("agent_settled")!({}, ctx);
+  assert.equal(notifications.length, 1);
+  config = { ...config, completionSummary: true };
+  handlers.get("agent_start")!({}, ctx);
+  handlers.get("agent_settled")!({}, { hasUI: false });
+  assert.equal(notifications.length, 1, "non-UI mode must not notify");
+  handlers.get("agent_start")!({}, ctx);
+  handlers.get("session_tree")!({});
+  handlers.get("agent_settled")!({}, ctx);
+  assert.equal(notifications.length, 1);
+  handlers.get("agent_start")!({}, ctx);
+  handlers.get("session_shutdown")!({});
+  handlers.get("agent_settled")!({}, ctx);
+  assert.equal(controller.suffix("working"), "");
+  assert.equal(notifications.length, 1);
+});
+
+test("plain working labels get an ellipsis without changing source or custom labels", () => {
+  const handle = installCursorEffectPatch({ style: "none" });
+  handle.setTheme(theme);
+  handle.setResolvedTheme({ indicator: { frames: [] }, label: { style: "none" } });
+  const working = new WorkingLoader("Working");
+  const retry = new StatusLoader("retry", "Working");
+  const tool = new Loader(ui, (text) => text, muted, "Working", { frames: [] });
+  try {
+    assert.match(stripVTControlCharacters(rendered(working)), /Working\.\.\./);
+    assert.equal((working as unknown as { message: string }).message, "Working");
+    assert.doesNotMatch(stripVTControlCharacters(rendered(retry)), /Working\.\.\./);
+    assert.doesNotMatch(stripVTControlCharacters(rendered(tool)), /Working\.\.\./);
+    handle.setMetrics(() => "2s");
+    handle.setLabelEffect({ style: "none" });
+    working.setMessage("Working");
+    assert.match(stripVTControlCharacters(rendered(working)), /Working\.\.\. 2s/);
+    working.setMessage("Working (esc to interrupt)");
+    assert.match(stripVTControlCharacters(rendered(working)), /Working\.\.\. \(esc to interrupt\) 2s/);
+    assert.equal((working as unknown as { message: string }).message, "Working (esc to interrupt)");
+    for (const label of ["Working...", "Working on tests", "Thinking..."]) {
+      working.setMessage(label);
+      assert.ok(stripVTControlCharacters(rendered(working)).includes(`${label} 2s`));
+      assert.doesNotMatch(stripVTControlCharacters(rendered(working)), /\.{4}/);
+    }
+  } finally {
+    working.stop();
+    retry.stop();
+    tool.stop();
+    handle.dispose();
+  }
+});
+
+test("metrics append without taking over labels and refresh with both animations disabled", async () => {
+  const handle = installCursorEffectPatch({ style: "none" });
+  handle.setTheme(theme);
+  handle.setResolvedTheme({ indicator: { frames: [] }, label: { style: "none" } });
+  let suffix = "1s ≈10 tok/s";
+  handle.setMetrics(() => suffix);
+  const loader = new WorkingLoader("Thinking...");
+  const other = new Loader(ui, (text) => text, muted, "Tool loader", { frames: [] });
+  try {
+    assert.match(stripVTControlCharacters(rendered(loader)), /Thinking\.\.\. 1s ≈10 tok\/s/);
+    assert.doesNotMatch(rendered(other), /tok\/s/);
+    assert.equal((loader as unknown as { message: string }).message, "Thinking...");
+    suffix = "2s ≈12 tok/s";
+    await delay(300);
+    assert.match(stripVTControlCharacters(rendered(loader)), /2s ≈12 tok\/s/);
+    loader.setMessage("New thinking-fold label");
+    assert.match(stripVTControlCharacters(rendered(loader)), /New thinking-fold label 2s/);
+    loader.setMessage("\u001b[31mPrestyled\u001b[0m");
+    assert.match(stripVTControlCharacters(rendered(loader)), /Prestyled 2s/);
+    for (const width of [12, 40, 120]) {
+      for (const line of loader.render(width)) assert.ok(visibleWidth(line) <= width);
+    }
+    suffix = "";
+    await delay(300);
+    assert.doesNotMatch(rendered(loader), /tok\/s/);
+  } finally {
+    loader.stop();
+    other.stop();
+    handle.dispose();
+  }
+});
 
 test("label effects preserve text, animate, and handle grapheme clusters", () => {
   const label = "Thinking 👨‍👩‍👧‍👦 e\u0301";
@@ -374,6 +629,7 @@ test("cursor-effect config migrates, normalizes, saves, and reloads", async () =
     assert.equal(legacy.custom.label.pause, "none");
 
     const config = {
+      ...structuredClone(DEFAULT_CURSOR_EFFECT_CONFIG),
       theme: "custom" as const,
       custom: {
         loader: { style: "orbit" as const, speed: "fast" as const, color: "text" as const },

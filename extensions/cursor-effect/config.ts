@@ -37,9 +37,24 @@ export interface CustomCursorEffects {
   };
 }
 
+export interface CursorMetricsConfig {
+  elapsed: boolean;
+  outputTokens: boolean;
+  liveSpeed: boolean;
+  completionSummary: boolean;
+}
+
+export const DEFAULT_CURSOR_METRICS: CursorMetricsConfig = {
+  elapsed: true,
+  outputTokens: true,
+  liveSpeed: true,
+  completionSummary: true,
+};
+
 export interface CursorEffectConfig {
   theme: CursorEffectTheme;
   custom: CustomCursorEffects;
+  metrics: CursorMetricsConfig;
 }
 
 export const DEFAULT_CUSTOM_CURSOR_EFFECTS: CustomCursorEffects = {
@@ -61,6 +76,7 @@ export const DEFAULT_CUSTOM_CURSOR_EFFECTS: CustomCursorEffects = {
 export const DEFAULT_CURSOR_EFFECT_CONFIG: CursorEffectConfig = {
   theme: "default",
   custom: structuredClone(DEFAULT_CUSTOM_CURSOR_EFFECTS),
+  metrics: { ...DEFAULT_CURSOR_METRICS },
 };
 
 export const CURSOR_EFFECT_SETTINGS_NAMESPACE = "cursor-effect";
@@ -118,6 +134,7 @@ export function normalizeCursorEffectConfig(value: unknown): CursorEffectConfig 
   const input = value as {
     theme?: unknown;
     custom?: unknown;
+    metrics?: unknown;
     style?: unknown;
     loader?: unknown;
     label?: unknown;
@@ -130,6 +147,11 @@ export function normalizeCursorEffectConfig(value: unknown): CursorEffectConfig 
       hasLegacyEffects ? "custom" : "default",
     ),
     custom: normalizeCustomCursorEffects(input.custom ?? input),
+    metrics: Object.fromEntries(Object.entries(DEFAULT_CURSOR_METRICS).map(([key, fallback]) => {
+      const value = input.metrics && typeof input.metrics === "object"
+        ? (input.metrics as Record<string, unknown>)[key] : undefined;
+      return [key, typeof value === "boolean" ? value : fallback];
+    })) as unknown as CursorMetricsConfig,
   };
 }
 

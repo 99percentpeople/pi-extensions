@@ -30,7 +30,7 @@ capabilities you need.
 | --- | --- | --- |
 | [Background Tasks](extensions/background-tasks/README.md) | [![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Pipe and PTY background tasks with attach, logs, waits, input, signals, and local or SSH-backed execution |
 | [Codex API](extensions/codex-api/README.md) | [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth text/vision delegation, image generation, search, Fast mode, and subscription usage |
-| [Cursor Effect](extensions/cursor-effect/README.md) | [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Configurable effects for Pi's working, retry, compaction, and branch-summary cursors |
+| [Cursor Effect](extensions/cursor-effect/README.md) | [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Configurable status cursor effects, elapsed time, output tokens, and throughput metrics |
 | [PowerShell Adapter](extensions/pwsh-adapter/README.md) | [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 or Windows PowerShell 5.1 for Pi's shell and background tasks on Windows |
 | [DeepSeek Anchor](extensions/deepseek-anchor/README.md) | [![deepseek-anchor](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-deepseek-anchor?label=deepseek-anchor)](https://www.npmjs.com/package/@99percentpeople/pi-deepseek-anchor) | Simulate DSH minimal mode's first request to induce a stronger DeepSeek V4 Pro agent trajectory |
 | [SSH Remote](extensions/ssh-remote/README.md) | [![ssh-remote](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-ssh-remote?label=ssh-remote)](https://www.npmjs.com/package/@99percentpeople/pi-ssh-remote) | Remote Unix or Windows workspaces through reusable OpenSSH or `ssh2` transports |
@@ -275,7 +275,8 @@ directory.
 Style Pi's main working, retry, compaction, and branch-summary cursors without
 changing tool loaders, widgets, messages, or model events. Built-in themes
 include Default, Claude Code, and Codex; Custom mode exposes independent loader
-and label controls.
+and label controls. Every theme supports task elapsed time, output-token counts,
+approximate live throughput, and a completion summary with average throughput.
 
 [Read the Cursor Effect documentation →](extensions/cursor-effect/README.md)
 
@@ -319,7 +320,7 @@ Configurable extensions share one atomically written file:
 | --- | --- |
 | `background-tasks` | Collapsed task count and output previews |
 | `codex-api` | Tool switches, Answer detail, Fast mode, usage monitoring, provider access, search, and image quality |
-| `cursor-effect` | Themes and custom loader/label effects |
+| `cursor-effect` | Themes, custom loader/label effects, and runtime metrics |
 | `deepseek-anchor` | Profile, mode, anchor scope, and bootstrap tools |
 | `ssh-remote` | Transport, password behavior, and AI controls |
 | `thinking-fold` | Fold threshold and streaming/completed display behavior |

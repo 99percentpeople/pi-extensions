@@ -12,7 +12,10 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, type Component } from "@earendil-works/pi-tui";
+import {
+  Markdown, getKeybindings, setKeybindings, KeybindingsManager,
+  type Component, type TUI,
+} from "@earendil-works/pi-tui";
 import thinkingFoldExtension, {
   BUILT_IN_MODEL_BEHAVIORS,
   createThinkingCursorLabel,
@@ -268,6 +271,90 @@ test("trace and summary models without visible reasoning use the normal respondi
     workingMessages.filter((message): message is string => message !== undefined).join("\n"),
     /reasoning details unavailable/,
   );
+});
+
+test("Ctrl+T redraws completed messages while idle and releases the render bridge on shutdown", async () => {
+  const previousKeys = getKeybindings();
+  setKeybindings(new KeybindingsManager({
+    "app.thinking.toggle": { defaultKeys: "ctrl+t" },
+  }));
+  const handlers = new Map<string, Array<(event: any, ctx: ExtensionContext) => unknown>>();
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: any, ctx: ExtensionContext) => unknown) {
+      handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+    },
+  } as unknown as ExtensionAPI;
+  let input: ((data: string) => { consume?: boolean } | undefined) | undefined;
+  let bridge: (Component & { dispose?(): void }) | undefined;
+  let component: AssistantMessageComponent | undefined;
+  let frame = "";
+  let renders = 0;
+  const tui = {
+    requestRender() {
+      renders++;
+      if (component) frame = renderAssistantLines(component).join("\n");
+    },
+  } as unknown as TUI;
+  const source = assistant("first reasoning line\nlast reasoning line");
+  const ctx = {
+    mode: "tui", hasUI: true,
+    sessionManager: {
+      getEntries: () => [{ type: "message", message: source, timestamp: new Date(2_000).toISOString() }],
+    },
+    ui: {
+      setWorkingMessage() {},
+      setWidget(_key: string, factory: ((tui: TUI) => Component) | undefined, options?: { placement: string }) {
+        bridge?.dispose?.();
+        bridge = factory?.(tui);
+        if (factory) assert.equal(options?.placement, "belowEditor");
+      },
+      onTerminalInput(handler: typeof input) {
+        input = handler;
+        return () => { input = undefined; };
+      },
+    },
+  } as unknown as ExtensionContext;
+  const emit = async (name: string, event = {}) => {
+    for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
+  };
+  thinkingFoldExtension(pi);
+  try {
+    await emit("session_start");
+    assert.deepEqual(bridge?.render(80), [], "render bridge must not add visible rows");
+    component = new AssistantMessageComponent(source);
+    tui.requestRender();
+    assert.match(frame, /Thought for 1\.0s/);
+    assert.doesNotMatch(frame, /first reasoning line/);
+    const before = renders;
+    assert.equal(input?.("x"), undefined);
+    assert.equal(renders, before);
+    assert.deepEqual(input?.("\x14"), { consume: true });
+    assert.equal(renders, before + 1);
+    assert.match(frame, /first reasoning line/);
+    assert.deepEqual(input?.("\x14"), { consume: true });
+    assert.equal(renders, before + 2);
+    assert.doesNotMatch(frame, /first reasoning line/);
+    // Also cover an actually completed turn without any streaming/loader timer.
+    await emit("message_start", { message: source });
+    await emit("message_update", {
+      message: source,
+      assistantMessageEvent: { type: "thinking_end" },
+    });
+    await emit("message_end", { message: source });
+    await emit("agent_end");
+    const idleRenders = renders;
+    input?.("\x14");
+    assert.equal(renders, idleRenders + 1);
+    assert.match(frame, /first reasoning line/);
+    input?.("\x14");
+    assert.doesNotMatch(frame, /first reasoning line/);
+  } finally {
+    await emit("session_shutdown");
+    setKeybindings(previousKeys);
+  }
+  assert.equal(input, undefined);
+  assert.equal(bridge, undefined);
 });
 
 test("trace Item shows a timed header while the cursor keeps a Thinking... label", () => {
