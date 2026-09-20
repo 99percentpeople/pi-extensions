@@ -174,13 +174,19 @@ of 2, 3, 5, 8, 10, or 20 calls.
 
 ## Rendering
 
-The task list is rendered in a read-only widget above Pi's input box. It follows
-Pi's standard tool-output expansion state (`Ctrl+O` by default):
+The task list is rendered in a read-only widget above Pi's input box. In native
+Pi TUI mode, it follows Pi's standard tool-output expansion state (`Ctrl+O` by
+default):
 
 - collapsed: overall progress and a configurable number of tasks (three by
   default);
 - expanded: the complete todo list with status glyphs, task names, and resolved
   prerequisites.
+
+In RPC mode, the extension sends a plain-text widget compatible with clients
+such as FrostPi. It shows the same collapsed task window and reports how many
+additional tasks are hidden because RPC widgets do not expose Pi's
+expand/collapse control.
 
 While the model is streaming a `todo` call, the tool row updates in place and
 shows each task name and its compact dependency references as they are written

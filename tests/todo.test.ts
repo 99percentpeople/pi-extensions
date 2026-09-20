@@ -417,6 +417,7 @@ interface RegisteredTool {
 function createHarness(
   initialBranch: unknown[] = [],
   config: TodoConfig = DEFAULT_TODO_CONFIG,
+  mode: "tui" | "rpc" = "tui",
 ) {
   const tools = new Map<string, RegisteredTool>();
   const commands = new Map<string, unknown>();
@@ -441,7 +442,7 @@ function createHarness(
 
   const ctx = {
     cwd: process.cwd(),
-    mode: "tui",
+    mode,
     hasUI: true,
     sessionManager: { getBranch: () => branch },
     hasPendingMessages: () => pendingMessages,
@@ -1272,4 +1273,28 @@ test("todo rejects completed work whose dependency is still pending", () => {
     }),
     TodoValidationError,
   );
+});
+
+test("todo extension emits a plain-text widget for RPC clients", async () => {
+  const { tools, handlers, widgets, ctx } = createHarness(
+    [],
+    { ...DEFAULT_TODO_CONFIG, collapsedTaskLimit: 2 },
+    "rpc",
+  );
+  const tool = tools.get("todo");
+  assert.ok(tool);
+
+  await handlers.get("session_start")?.({}, ctx);
+  await tool.execute("todo-rpc", { tasks: initialPlan, baseRevision: 0 }, undefined, undefined, ctx);
+
+  const widget = widgets.get("pi-todo-widget");
+  assert.ok(Array.isArray(widget), "RPC widgets must use string arrays");
+  const text = widget.join("\n");
+  assert.match(text, /Todo 0\/3 completed · rev 1 · 1 more/);
+  assert.match(text, /◐ Inspect the existing extension #1/);
+  assert.match(text, /○ Design the snapshot protocol #2 ← #1/);
+  assert.doesNotMatch(text, /Verify the implementation/);
+
+  await tool.execute("todo-rpc-clear", { tasks: [], baseRevision: 1 }, undefined, undefined, ctx);
+  assert.equal(widgets.has("pi-todo-widget"), false);
 });
