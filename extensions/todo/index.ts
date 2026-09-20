@@ -270,6 +270,40 @@ function renderExpandHint(expanded: boolean, theme: Theme): string {
     + theme.fg("dim", ")");
 }
 
+function renderTodoWidgetForRpc(
+  state: TodoState,
+  collapsedTaskLimit: number,
+  showDependencyNumbers: boolean,
+): string[] {
+  const tasks = getTodoTasks(state);
+  if (tasks.length === 0) return [];
+  const completed = tasks.filter((task) => task.status === "completed").length;
+  const displayTasks = toDisplayTasks(tasks);
+  const displayed = getCollapsedTodoTasks(displayTasks, collapsedTaskLimit);
+  const hiddenCount = tasks.length - displayed.length;
+  const lines = [
+    `Todo ${completed}/${tasks.length} completed · rev ${state.revision}`
+      + (hiddenCount > 0 ? ` · ${hiddenCount} more` : ""),
+  ];
+
+  for (const task of displayed) {
+    const glyph = task.status === "completed"
+      ? "✓"
+      : task.status === "in_progress"
+        ? "◐"
+        : "○";
+    const number = showDependencyNumbers && task.displayNumber !== undefined
+      ? ` #${task.displayNumber}`
+      : "";
+    const dependencies = showDependencyNumbers && task.dependencyNumbers?.length
+      ? ` ← ${task.dependencyNumbers.map((dependency) => `#${dependency}`).join(", ")}`
+      : "";
+    lines.push(`${glyph} ${task.subject}${number}${dependencies}`);
+  }
+
+  return lines;
+}
+
 function renderTodoWidget(
   state: TodoState,
   width: number,
@@ -330,11 +364,26 @@ export default function todoExtension(
 
   const updateWidget = (ctx?: ExtensionContext): void => {
     if (ctx) uiContext = ctx;
-    if (!uiContext?.hasUI || uiContext.mode !== "tui") return;
+    if (!uiContext?.hasUI) return;
     if (getTodoTasks(state).length === 0) {
       clearWidget();
       return;
     }
+    if (uiContext.mode === "rpc") {
+      uiContext.ui.setWidget(
+        WIDGET_KEY,
+        renderTodoWidgetForRpc(
+          state,
+          config.collapsedTaskLimit,
+          config.showDependencyNumbers,
+        ),
+        { placement: "aboveEditor" },
+      );
+      widgetRegistered = true;
+      widgetTui = undefined;
+      return;
+    }
+    if (uiContext.mode !== "tui") return;
     if (!widgetRegistered) {
       uiContext.ui.setWidget(
         WIDGET_KEY,
