@@ -124,7 +124,7 @@ function formatTodoReminder(details: TodoState): string {
 
 function renderTaskLine(
   task: TodoDisplayTask,
-  theme: Theme,
+  theme: Theme | undefined,
   showDependencyNumbers: boolean,
 ): string {
   const number =
@@ -134,15 +134,24 @@ function renderTaskLine(
   const dependencies = showDependencyNumbers && task.dependencyNumbers?.length
     ? ` ← ${task.dependencyNumbers.map((dependency) => `#${dependency}`).join(", ")}`
     : "";
-  const relationship =
-    number || dependencies ? theme.fg("dim", number + dependencies) : "";
-  if (!task.status) return theme.fg("text", task.subject) + relationship;
+  const relationshipText = number + dependencies;
+  const relationship = theme && relationshipText
+    ? theme.fg("dim", relationshipText)
+    : relationshipText;
+
+  if (!task.status) {
+    return (theme ? theme.fg("text", task.subject) : task.subject) + relationship;
+  }
+
   const glyph =
     task.status === "completed"
       ? "✓"
       : task.status === "in_progress"
         ? "◐"
         : "○";
+
+  if (!theme) return `${glyph} ${task.subject}${relationship}`;
+
   const color =
     task.status === "completed"
       ? "success"
@@ -286,20 +295,9 @@ function renderTodoWidgetForRpc(
       + (hiddenCount > 0 ? ` · ${hiddenCount} more` : ""),
   ];
 
-  for (const task of displayed) {
-    const glyph = task.status === "completed"
-      ? "✓"
-      : task.status === "in_progress"
-        ? "◐"
-        : "○";
-    const number = showDependencyNumbers && task.displayNumber !== undefined
-      ? ` #${task.displayNumber}`
-      : "";
-    const dependencies = showDependencyNumbers && task.dependencyNumbers?.length
-      ? ` ← ${task.dependencyNumbers.map((dependency) => `#${dependency}`).join(", ")}`
-      : "";
-    lines.push(`${glyph} ${task.subject}${number}${dependencies}`);
-  }
+  lines.push(...displayed.map((task) =>
+    renderTaskLine(task, undefined, showDependencyNumbers)
+  ));
 
   return lines;
 }
