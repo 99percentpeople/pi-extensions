@@ -4,20 +4,6 @@ Turn your ChatGPT subscription into Pi superpowers — multilingual text and
 vision delegation, image generation, web search, Fast mode, and usage
 monitoring — **no OpenAI API key required**.
 
-## 0.4.1 reliability fixes
-
-- Usage poll/countdown callbacks tolerate invalidated Pi contexts. Session
-  generations and timer identities prevent late OAuth, HTTP, watcher, or tool
-  completions from restarting a closed session or replacing its successor's status.
-- Concurrent account checks follow the current context. Reset-card confirmation
-  is discarded after a context/account change, and credentials are rechecked
-  before consumption even when the auth-file watcher has not run yet.
-- Cancelled and timed-out API requests preserve their original abort reason;
-  authenticated API requests reject redirects rather than following unchecked
-  destinations. Network failures are still not retried automatically.
-- Image output paths are checked again immediately before saving to catch files
-  created while generation was in flight.
-
 ## Highlights
 
 - **Ask Codex from any model** — `codex_ask` sends a standalone multilingual
