@@ -510,6 +510,7 @@ interface ResolvedActiveClient {
   accountId: string;
   client: CodexApiClient;
   revision: number;
+  lifecycleRevision: number;
 }
 
 interface PendingRedeem {
@@ -560,25 +561,65 @@ export function registerCodexUsageAndFast(
   const pendingRedeemByAccount = new Map<string, PendingRedeem>();
   let activeAccountId: string | undefined;
   let credentialRevision = 0;
+  let lifecycleRevision = 0;
+  let sessionClosed = false;
+  const contextRevisions = new WeakMap<ExtensionContext, number>();
   let latestContext: ExtensionContext | undefined;
-  let accountCheck: Promise<void> | undefined;
+  let accountCheck: { ctx: ExtensionContext; lifecycleRevision: number; promise: Promise<void> } | undefined;
   let accountObserverActive = false;
   let authWatcher: FSWatcher | undefined;
   let authWatchDebounce: ReturnType<typeof setTimeout> | undefined;
   let pollDelay: ReturnType<typeof setTimeout> | undefined;
   let countdownInterval: ReturnType<typeof setInterval> | undefined;
 
-  const codexOAuthLoginAvailable = (ctx: ExtensionContext): boolean =>
+  // Timers are not the only owners of a context: tool completions and pending
+  // OAuth/HTTP requests can outlive shutdown too. Never re-adopt an old ctx.
+  const adoptContext = (ctx: ExtensionContext): boolean => {
+    if (sessionClosed) return false;
+    const revision = contextRevisions.get(ctx);
+    if (revision !== undefined && revision !== lifecycleRevision) return false;
+    // A tool may finish with a ctx this monitor has never seen. Consult Pi's
+    // guarded getters before adopting it, not after replacing latestContext.
+    if (!contextAccessible(ctx)) {
+      if (latestContext === ctx) stopCountdown();
+      return false;
+    }
+    contextRevisions.set(ctx, lifecycleRevision);
+    latestContext = ctx;
+    return true;
+  };
+
+  const isCurrentContext = (ctx: ExtensionContext, revision: number): boolean =>
+    !sessionClosed && lifecycleRevision === revision && latestContext === ctx && contextAccessible(ctx);
+
+  // Pi guards context getters after session replacement/reload. Background
+  // status checks must treat an inert context as unavailable, not as an error.
+  const safeEvaluate = <T>(evaluate: () => T, fallback: T): T => {
+    try {
+      return evaluate();
+    } catch {
+      return fallback;
+    }
+  };
+
+  const contextAccessible = (ctx: ExtensionContext): boolean => safeEvaluate(() => {
+    void ctx.model;
+    void ctx.modelRegistry;
+    void ctx.ui;
+    return true;
+  }, false);
+
+  const codexOAuthLoginAvailable = (ctx: ExtensionContext): boolean => safeEvaluate(() =>
     (ctx.model?.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(ctx.model))
     || (ctx.modelRegistry.getAll?.() ?? []).some((candidate) =>
       candidate.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(candidate)
-    );
+    ), false);
 
-  const usageEnabled = (ctx: ExtensionContext): boolean => {
+  const usageEnabled = (ctx: ExtensionContext): boolean => safeEvaluate(() => {
     const config = controller.getConfig();
     return config.usageStatus
       && (ctx.model?.provider === "openai-codex" || config.allowOtherProviders);
-  };
+  }, false);
 
   const usageFetchSignal = (): AbortSignal =>
     AbortSignal.timeout(options.usageFetchTimeoutMs ?? USAGE_FETCH_TIMEOUT_MS);
@@ -588,9 +629,14 @@ export function registerCodexUsageAndFast(
     value: string | undefined,
     color: ThemeColor = "muted",
   ): void => {
-    ctx.ui.setStatus(STATUS_KEY, value && ctx.ui.theme
-      ? ctx.ui.theme.fg(color, value)
-      : value);
+    try {
+      const ui = ctx.ui;
+      ui.setStatus(STATUS_KEY, value && ui.theme
+        ? ui.theme.fg(color, value)
+        : value);
+    } catch {
+      // The UI may already be invalidated, including during shutdown cleanup.
+    }
   };
 
   const stopCountdown = (): void => {
@@ -637,21 +683,30 @@ export function registerCodexUsageAndFast(
       return;
     }
     if (countdownInterval) return;
-    countdownInterval = setInterval(() => {
-      const active = latestContext;
-      if (!active) {
+    const interval = setInterval(() => {
+      // A cancelled callback must not update a replacement session's status.
+      if (countdownInterval !== interval) return;
+      try {
+        const active = latestContext;
+        if (!active) {
+          stopCountdown();
+          return;
+        }
+        // Recompute from the absolute reset timestamp. This intentionally does
+        // not fetch; a normal refresh replaces the snapshot and re-syncs it.
+        refreshStatus(active);
+      } catch {
+        // Timers run outside Pi's event-handler error boundary. A later usage
+        // refresh can restart this local ticker with a live context.
         stopCountdown();
-        return;
       }
-      // Recompute from the absolute reset timestamp. This intentionally does
-      // not fetch; a normal refresh replaces the snapshot and re-syncs it.
-      refreshStatus(active);
     }, USAGE_COUNTDOWN_INTERVAL_MS);
+    countdownInterval = interval;
     countdownInterval.unref?.();
   };
 
   function refreshStatus(ctx: ExtensionContext): void {
-    latestContext = ctx;
+    if (!adoptContext(ctx)) return;
     if (controller.getConfig().usageStatus) startPolling(ctx);
     else stopPolling();
     if (clearIfCodexOAuthUnavailable(ctx)) return;
@@ -665,7 +720,7 @@ export function registerCodexUsageAndFast(
   }
 
   const showSyncingStatus = (ctx: ExtensionContext): void => {
-    latestContext = ctx;
+    if (!adoptContext(ctx)) return;
     if (clearIfCodexOAuthUnavailable(ctx)) return;
     stopCountdown();
     setStatus(ctx, usageEnabled(ctx) ? "Codex syncing…" : undefined);
@@ -677,7 +732,7 @@ export function registerCodexUsageAndFast(
    * token is rejected outright (the snapshot would be stale anyway).
    */
   const showErrorStatus = (ctx: ExtensionContext, error: unknown): void => {
-    latestContext = ctx;
+    if (!adoptContext(ctx)) return;
     if (clearIfCodexOAuthUnavailable(ctx)) return;
     if (!usageEnabled(ctx)) {
       stopCountdown();
@@ -729,11 +784,16 @@ export function registerCodexUsageAndFast(
     ctx: ExtensionContext,
     config: CodexApiConfig,
   ): Promise<ResolvedActiveClient> => {
+    const invocationLifecycle = lifecycleRevision;
+    if (!adoptContext(ctx)) throw new Error("Codex usage session is no longer active");
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const revision = credentialRevision;
       const client = await createCodexApiClient(ctx, {
         allowOtherProviders: config.allowOtherProviders,
       });
+      if (!isCurrentContext(ctx, invocationLifecycle)) {
+        throw new Error("Codex usage context changed while resolving credentials");
+      }
       if (revision !== credentialRevision) continue;
       const accountChanged = activateAccount(client.accountId, ctx);
       return {
@@ -741,6 +801,7 @@ export function registerCodexUsageAndFast(
         accountId: client.accountId,
         client,
         revision: credentialRevision,
+        lifecycleRevision: invocationLifecycle,
       };
     }
     throw new Error("Codex account changed while resolving subscription usage; retry the refresh");
@@ -749,7 +810,7 @@ export function registerCodexUsageAndFast(
   const isCurrentResolution = (
     ctx: ExtensionContext,
     resolved: ResolvedActiveClient,
-  ): boolean => latestContext === ctx
+  ): boolean => isCurrentContext(ctx, resolved.lifecycleRevision)
     && activeAccountId === resolved.accountId
     && credentialRevision === resolved.revision;
 
@@ -758,6 +819,7 @@ export function registerCodexUsageAndFast(
     resolved: ResolvedActiveClient,
     force = false,
   ): Promise<void> => {
+    if (!isCurrentResolution(ctx, resolved)) return;
     const state = accountState(resolved.accountId);
     const now = Date.now();
     if (
@@ -779,6 +841,8 @@ export function registerCodexUsageAndFast(
           USAGE_PATH,
           usageFetchSignal(),
         );
+        if (lifecycleRevision !== resolved.lifecycleRevision
+          || credentialRevision !== resolved.revision || activeAccountId !== resolved.accountId) return;
         const parsed = parseCodexUsagePayload(payload);
         if (parsed.length === 0) throw new Error("Codex usage API returned no usage data");
         state.snapshots = parsed;
@@ -799,7 +863,8 @@ export function registerCodexUsageAndFast(
   };
 
   const refreshUsage = async (ctx: ExtensionContext, force = false): Promise<void> => {
-    latestContext = ctx;
+    if (!adoptContext(ctx)) return;
+    const invocationLifecycle = lifecycleRevision;
     const invocationRevision = credentialRevision;
     const config = controller.getConfig();
     if (ctx.model?.provider !== "openai-codex" && !config.allowOtherProviders) {
@@ -820,14 +885,13 @@ export function registerCodexUsageAndFast(
       // failure always replaces syncing with a terminal status.
       const isCurrent = resolved
         ? isCurrentResolution(ctx, resolved)
-        : latestContext === ctx && credentialRevision === invocationRevision;
+        : isCurrentContext(ctx, invocationLifecycle) && credentialRevision === invocationRevision;
       if (isCurrent) showErrorStatus(ctx, error);
       throw error;
     }
   };
 
   const refreshInBackground = (ctx: ExtensionContext, force = false) => {
-    latestContext = ctx;
     // refreshUsage reports the terminal status itself on failure.
     void refreshUsage(ctx, force).catch(() => {});
   };
@@ -845,37 +909,48 @@ export function registerCodexUsageAndFast(
    * takes effect without restarting anything.
    */
   const scheduleNextPoll = (): void => {
-    if (pollDelay) return;
+    if (pollDelay || !latestContext || sessionClosed) return;
     const config = controller.getConfig();
     if (!config.usageStatus) return;
     const intervalMinutes = Math.round(config.usagePollInterval);
     if (intervalMinutes <= 0) return;
-    pollDelay = setTimeout(() => {
+    const timer = setTimeout(() => {
+      // Ignore work queued before stopPolling(), including after a new timer
+      // has been installed for a replacement session.
+      if (pollDelay !== timer) return;
       pollDelay = undefined;
-      const active = latestContext;
-      if (active) {
-        // Reconcile auth before polling so logout cannot revive an expired
-        // status through a credential-resolution failure.
-        const oauthAvailable = !clearIfCodexOAuthUnavailable(active);
-        const state = currentState();
-        if (oauthAvailable && usageEnabled(active)) {
-          const intervalMs = intervalMinutes * 60_000;
-          if (!state || state.snapshots.length === 0 || Date.now() - state.lastFetchAt >= intervalMs) {
-            void refreshUsage(active).catch(() => {});
+      try {
+        const active = latestContext;
+        if (active) {
+          // Reconcile auth before polling so logout cannot revive an expired
+          // status through a credential-resolution failure.
+          const oauthAvailable = !clearIfCodexOAuthUnavailable(active);
+          const state = currentState();
+          if (oauthAvailable && usageEnabled(active)) {
+            const intervalMs = intervalMinutes * 60_000;
+            if (!state || state.snapshots.length === 0 || Date.now() - state.lastFetchAt >= intervalMs) {
+              void refreshUsage(active).catch(() => {});
+            }
           }
         }
+      } catch {
+        // A synchronous background failure must never become uncaughtException.
+      } finally {
+        // Keep polling through a transient failure, but do not let rescheduling
+        // itself escape the timer boundary. A live event can restart it later.
+        safeEvaluate(scheduleNextPoll, undefined);
       }
-      scheduleNextPoll();
     }, intervalMinutes * 60_000);
+    pollDelay = timer;
     pollDelay.unref?.();
   };
 
   const startPolling = (ctx: ExtensionContext): void => {
-    latestContext = ctx;
+    if (!adoptContext(ctx)) return;
     scheduleNextPoll();
   };
 
-  const codexOAuthAvailable = (ctx: ExtensionContext, config: CodexApiConfig): boolean => {
+  const codexOAuthAvailable = (ctx: ExtensionContext, config: CodexApiConfig): boolean => safeEvaluate(() => {
     const model = ctx.model?.provider === "openai-codex"
       ? ctx.model
       : config.allowOtherProviders
@@ -884,14 +959,17 @@ export function registerCodexUsageAndFast(
           )
         : undefined;
     return !!model && ctx.modelRegistry.isUsingOAuth(model);
-  };
+  }, false);
 
   const checkCurrentAccount = (
     ctx: ExtensionContext,
     forceUsage = false,
   ): Promise<void> => {
-    latestContext = ctx;
-    if (accountCheck) return accountCheck;
+    if (!adoptContext(ctx)) return Promise.resolve();
+    const invocationLifecycle = lifecycleRevision;
+    if (accountCheck?.ctx === ctx && accountCheck.lifecycleRevision === invocationLifecycle) {
+      return accountCheck.promise;
+    }
     const operation = (async () => {
       const config = controller.getConfig();
       const usageAvailable = codexOAuthAvailable(ctx, config);
@@ -900,28 +978,20 @@ export function registerCodexUsageAndFast(
         else setStatus(ctx, undefined);
         return;
       }
-      let client: CodexApiClient;
+      let resolved: ResolvedActiveClient;
       try {
         // Command visibility follows login state, not the active model or the
         // cross-provider tool setting. The latter still controls execution.
-        client = await createCodexApiClient(ctx, {
-          allowOtherProviders: true,
-        });
+        resolved = await resolveActiveClient(ctx, { ...config, allowOtherProviders: true });
       } catch (error) {
         // Credential-resolution failures are terminal too. Suppress a stale
         // completion after a context switch or session shutdown.
-        if (latestContext === ctx) showErrorStatus(ctx, error);
+        if (isCurrentContext(ctx, invocationLifecycle)) showErrorStatus(ctx, error);
         return;
       }
-      if (!accountObserverActive || latestContext !== ctx) return;
+      if (!accountObserverActive || !isCurrentResolution(ctx, resolved)) return;
       registerCodexCommands(ctx);
-      const accountChanged = activateAccount(client.accountId, ctx);
-      const resolved: ResolvedActiveClient = {
-        accountChanged,
-        accountId: client.accountId,
-        client,
-        revision: credentialRevision,
-      };
+      const { accountChanged } = resolved;
       if (
         usageAvailable
         && config.usageStatus
@@ -939,32 +1009,36 @@ export function registerCodexUsageAndFast(
       }
     })();
     const pending = operation.finally(() => {
-      if (accountCheck === pending) accountCheck = undefined;
+      if (accountCheck?.promise === pending) accountCheck = undefined;
     });
-    accountCheck = pending;
+    accountCheck = { ctx, lifecycleRevision: invocationLifecycle, promise: pending };
     return pending;
   };
 
   const startAccountObserver = (ctx: ExtensionContext): void => {
-    latestContext = ctx;
+    if (!adoptContext(ctx)) return;
     accountObserverActive = true;
     if (authWatcher) return;
     const authPath = options.authPath ?? join(getAgentDir(), "auth.json");
     const authFilename = basename(authPath);
     try {
       const watcher = watch(dirname(authPath), { persistent: false }, (_event, filename) => {
+        if (!accountObserverActive || authWatcher !== watcher) return;
         if (filename !== null && filename.toString() !== authFilename) return;
         if (authWatchDebounce) clearTimeout(authWatchDebounce);
-        authWatchDebounce = setTimeout(() => {
+        const invocationLifecycle = lifecycleRevision;
+        const debounce = setTimeout(() => {
+          if (authWatchDebounce !== debounce) return;
           authWatchDebounce = undefined;
           const activeContext = latestContext;
-          if (!activeContext) return;
+          if (!activeContext || !isCurrentContext(activeContext, invocationLifecycle)) return;
           void (async () => {
             await activeContext.modelRegistry.refresh();
-            if (latestContext !== activeContext) return;
+            if (!isCurrentContext(activeContext, invocationLifecycle)) return;
             await checkCurrentAccount(activeContext);
           })().catch(() => {});
         }, AUTH_WATCH_DEBOUNCE_MS);
+        authWatchDebounce = debounce;
         authWatchDebounce.unref?.();
       });
       watcher.on("error", () => {
@@ -982,20 +1056,22 @@ export function registerCodexUsageAndFast(
     snapshots: CodexRateLimitSnapshot[],
   ): Promise<void> => {
     const resolved = await resolveActiveClient(ctx, controller.getConfig());
+    if (!isCurrentResolution(ctx, resolved)) return;
     const state = accountState(resolved.accountId);
     state.snapshots = snapshots;
     state.lastFetchAt = Date.now();
-    if (activeAccountId === resolved.accountId && credentialRevision === resolved.revision) {
-      refreshStatus(ctx);
-    }
+    refreshStatus(ctx);
   };
 
   const codexUsageCommand: Parameters<ExtensionAPI["registerCommand"]>[1] = {
     description: "Refresh and show Codex subscription usage, plan, and rate limit redeems",
     handler: async (_args, ctx) => {
+      if (!adoptContext(ctx)) return;
+      const invocationLifecycle = lifecycleRevision;
       try {
         await refreshUsage(ctx, true);
       } catch (error) {
+        if (!isCurrentContext(ctx, invocationLifecycle)) return;
         const message = error instanceof Error ? error.message : String(error);
         const snapshots = currentState()?.snapshots ?? [];
         if (snapshots.length === 0) {
@@ -1004,17 +1080,21 @@ export function registerCodexUsageAndFast(
         }
         ctx.ui.notify(`Failed to refresh Codex usage; showing the latest snapshot: ${message}`, "warning");
       }
+      if (!isCurrentContext(ctx, invocationLifecycle)) return;
       try {
         const resolved = await resolveActiveClient(ctx, controller.getConfig());
+        if (!isCurrentResolution(ctx, resolved)) return;
         const state = accountState(resolved.accountId);
         const payload = await resolved.client.get<unknown>(
           REDEEM_CREDITS_PATH,
           usageFetchSignal(),
         );
+        if (!isCurrentResolution(ctx, resolved)) return;
         state.redeemCredits = parseCodexRedeemCredits(payload);
       } catch {
         // Redeem details are best-effort; the base usage message still shows.
       }
+      if (!isCurrentContext(ctx, invocationLifecycle)) return;
       const state = currentState();
       const message = formatCodexUsage(state?.snapshots ?? [], Date.now(), {
         account: state?.account,
@@ -1029,6 +1109,8 @@ export function registerCodexUsageAndFast(
   const codexRedeemCommand: Parameters<ExtensionAPI["registerCommand"]>[1] = {
     description: "Preview and redeem an earned Codex rate limit reset credit (confirmation required)",
     handler: async (_args, ctx) => {
+      if (!adoptContext(ctx)) return;
+      const invocationLifecycle = lifecycleRevision;
       const config = controller.getConfig();
       if (ctx.model?.provider !== "openai-codex" && !config.allowOtherProviders) {
         ctx.ui.notify(
@@ -1042,16 +1124,19 @@ export function registerCodexUsageAndFast(
       try {
         resolved = await resolveActiveClient(ctx, config);
       } catch (error) {
+        if (!isCurrentContext(ctx, invocationLifecycle)) return;
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`Failed to resolve the Codex subscription: ${message}`, "error");
         return;
       }
+      if (!isCurrentResolution(ctx, resolved)) return;
       const state = accountState(resolved.accountId);
       try {
         const payload = await resolved.client.get<unknown>(
           REDEEM_CREDITS_PATH,
           usageFetchSignal(),
         );
+        if (!isCurrentResolution(ctx, resolved)) return;
         const redeemCredits = parseCodexRedeemCredits(payload);
         state.redeemCredits = redeemCredits;
         const now = Date.now();
@@ -1078,6 +1163,7 @@ export function registerCodexUsageAndFast(
             const choice = await ctx.ui.select("Select a reset credit to redeem", options, {
               timeout: REDEEM_DIALOG_TIMEOUT_MS,
             });
+            if (!isCurrentResolution(ctx, resolved)) return;
             if (choice === undefined) {
               pendingRedeemByAccount.delete(resolved.accountId);
               ctx.ui.notify("Redeem cancelled — no reset credit was consumed.", "info");
@@ -1094,6 +1180,7 @@ export function registerCodexUsageAndFast(
             confirmOptions,
             { timeout: REDEEM_DIALOG_TIMEOUT_MS },
           );
+          if (!isCurrentResolution(ctx, resolved)) return;
           if (choice !== confirmOptions[1]) {
             pendingRedeemByAccount.delete(resolved.accountId);
             ctx.ui.notify("Redeem cancelled — no reset credit was consumed.", "info");
@@ -1101,20 +1188,34 @@ export function registerCodexUsageAndFast(
           }
         }
 
+        // The auth file watcher may not have fired during the dialog yet.
+        // Re-resolve credentials before an irreversible request, and never use
+        // a confirmation obtained for a different account or session.
+        if (!isCurrentResolution(ctx, resolved)) return;
+        const confirmed = await resolveActiveClient(ctx, config);
+        if (!isCurrentResolution(ctx, resolved)) {
+          if (isCurrentContext(ctx, invocationLifecycle)) {
+            ctx.ui.notify("Codex account changed during confirmation. Run /codex-redeem again.", "warning");
+          }
+          return;
+        }
+        resolved = confirmed;
+
         // Reuse an in-flight redeem_request_id while it is still valid, so a
         // retry after a network failure cannot consume a second credit.
         const targetId = selected?.id;
+        const confirmedAt = Date.now();
         const existing = pendingRedeemByAccount.get(resolved.accountId);
-        const pending = existing && existing.expiresAt > now && existing.creditId === targetId
+        const pending = existing && existing.expiresAt > confirmedAt && existing.creditId === targetId
           ? existing
           : {
               redeemRequestId: crypto.randomUUID(),
               creditId: targetId,
-              expiresAt: now + REDEEM_CONFIRM_WINDOW_MS,
+              expiresAt: confirmedAt + REDEEM_CONFIRM_WINDOW_MS,
             };
         pendingRedeemByAccount.set(resolved.accountId, pending);
 
-        if (!ctx.hasUI && (!existing || existing.expiresAt <= now || existing.creditId !== targetId)) {
+        if (!ctx.hasUI && (!existing || existing.expiresAt <= confirmedAt || existing.creditId !== targetId)) {
           // No dialog UI: preview now and require a second run within the window.
           ctx.ui.notify(
             `${redeemCredits.availableCount} rate limit reset redeem available: ${credit?.title ?? "Full reset"}${expiryOf(credit)}. `
@@ -1129,18 +1230,21 @@ export function registerCodexUsageAndFast(
             redeem_request_id: pending.redeemRequestId,
             credit_id: pending.creditId,
           }, usageFetchSignal());
+          if (!isCurrentResolution(ctx, resolved)) return;
           pendingRedeemByAccount.delete(resolved.accountId);
           try {
             await refreshUsage(ctx, true);
           } catch {
             // The redeem succeeded; usage refresh is best-effort.
           }
+          if (!isCurrentResolution(ctx, resolved)) return;
           const status = formatCodexStatus(currentState()?.snapshots ?? [], config.fastMode);
           ctx.ui.notify(
             `✓ Rate limit reset redeemed — usage reset.${status ? `\n${status}` : ""}`,
             "info",
           );
         } catch (error) {
+          if (!isCurrentResolution(ctx, resolved)) return;
           // Keep the redeem_request_id so a retry stays idempotent.
           pending.expiresAt = Date.now() + REDEEM_RETRY_WINDOW_MS;
           pendingRedeemByAccount.set(resolved.accountId, pending);
@@ -1152,6 +1256,7 @@ export function registerCodexUsageAndFast(
           );
         }
       } catch (error) {
+        if (!isCurrentResolution(ctx, resolved)) return;
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`Failed to redeem a rate limit reset: ${message}`, "error");
       }
@@ -1161,12 +1266,12 @@ export function registerCodexUsageAndFast(
   let commandsRegistered = false;
   const registerCodexCommands = (ctx?: ExtensionContext): void => {
     if (commandsRegistered) return;
-    commandsRegistered = true;
     pi.registerCommand("codex-usage", codexUsageCommand);
     pi.registerCommand("codex-redeem", codexRedeemCommand);
+    commandsRegistered = true;
 
-    // Refresh interactive autocomplete when login happens after startup.
-    ctx?.ui.addAutocompleteProvider?.((current) => current);
+    // Autocomplete is best-effort; an unavailable UI must not block usage sync.
+    safeEvaluate(() => ctx?.ui.addAutocompleteProvider?.((current) => current), undefined);
   };
 
   if (options.registerCommandsImmediately) registerCodexCommands();
@@ -1182,23 +1287,33 @@ export function registerCodexUsageAndFast(
     if (ctx.model?.provider !== "openai-codex" || !controller.getConfig().usageStatus) return;
     const parsed = parseCodexRateLimits(event.headers);
     if (parsed.length > 0) {
-      void storeHeaderSnapshots(ctx, parsed).catch(() => refreshInBackground(ctx));
+      const invocationLifecycle = lifecycleRevision;
+      void storeHeaderSnapshots(ctx, parsed).catch(() => {
+        if (isCurrentContext(ctx, invocationLifecycle)) refreshInBackground(ctx);
+      });
       return;
     }
     refreshInBackground(ctx);
   });
 
   pi.on("model_select", async (_event, ctx) => {
+    const invocationLifecycle = lifecycleRevision;
     startAccountObserver(ctx);
     await checkCurrentAccount(ctx, true).catch(() => {});
-    startPolling(ctx);
+    if (isCurrentContext(ctx, invocationLifecycle)) startPolling(ctx);
   });
   pi.on("session_start", async (_event, ctx) => {
+    sessionClosed = false;
+    lifecycleRevision += 1;
+    contextRevisions.set(ctx, lifecycleRevision);
+    const invocationLifecycle = lifecycleRevision;
     startAccountObserver(ctx);
     await checkCurrentAccount(ctx, true).catch(() => {});
-    startPolling(ctx);
+    if (isCurrentContext(ctx, invocationLifecycle)) startPolling(ctx);
   });
   pi.on("session_shutdown", (_event, ctx) => {
+    sessionClosed = true;
+    lifecycleRevision += 1;
     stopPolling();
     stopCountdown();
     credentialRevision += 1;

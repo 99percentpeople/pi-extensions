@@ -292,6 +292,9 @@ export function registerCodexImageTool(
       const data = firstImage(response);
       update("saving");
       await files.mkdir(files.dirname(savedPath), { signal });
+      // Generation can take a long time. Do not overwrite an asset created
+      // since the initial preflight check while the request was in flight.
+      await assertDoesNotExist(files, savedPath, signal);
       await files.writeFile(
         savedPath,
         Buffer.from(data, "base64"),

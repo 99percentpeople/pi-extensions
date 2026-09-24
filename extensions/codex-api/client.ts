@@ -143,6 +143,7 @@ export class CodexApiClient {
     body: unknown,
     signal?: AbortSignal,
   ): Promise<T> {
+    signal?.throwIfAborted();
     const headers = new Headers(this.headers);
     headers.set("authorization", `Bearer ${this.accessToken}`);
     headers.set("chatgpt-account-id", this.accountId);
@@ -158,11 +159,17 @@ export class CodexApiClient {
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal,
+        // The destination check must also cover redirects; never forward an
+        // authenticated request or its body to an unchecked endpoint.
+        redirect: "error",
       });
     } catch (error) {
+      signal?.throwIfAborted();
       throw transportError(method, endpoint, error);
     }
+    signal?.throwIfAborted();
     const parsed = await responseBody(response);
+    signal?.throwIfAborted();
     if (!response.ok) {
       throw new CodexApiError(
         response.status,
