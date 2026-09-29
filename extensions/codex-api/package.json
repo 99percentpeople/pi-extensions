@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-codex-api",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "Expose Codex subscription text, vision, image, search, Fast, and usage APIs to Pi",
   "type": "module",

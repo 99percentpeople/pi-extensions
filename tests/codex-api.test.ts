@@ -2069,6 +2069,29 @@ test("Codex usage shows limit reached instead of a percentage", () => {
   assert.equal(formatCodexStatus(normal, false, now), "Codex weekly 35% 5d 3h");
   assert.match(formatCodexUsage(normal, now), /weekly \[\u2588{7}\u2591{13}\] 35% left/);
 
+  // limit_reached applies to the whole snapshot. If only one window is
+  // exhausted, other windows must keep showing their own remaining quota.
+  const partiallyReached = parseCodexUsagePayload({
+    rate_limit: {
+      allowed: false,
+      limit_reached: true,
+      primary_window: {
+        used_percent: 100,
+        limit_window_seconds: 5 * 60 * 60,
+        reset_at: now / 1000 + 4 * 60 * 60,
+      },
+      secondary_window: {
+        used_percent: 16,
+        limit_window_seconds: 7 * 24 * 60 * 60,
+        reset_at: now / 1000 + 4 * 24 * 60 * 60,
+      },
+    },
+  });
+  const partiallyReachedText = formatCodexUsage(partiallyReached, now);
+  assert.match(partiallyReachedText, /5h\s+\[░░░░░░░░░░░░░░░░░░░░\] limit reached resets in 4h/);
+  assert.match(partiallyReachedText, /weekly \[█████████████████░░░\] 84% left resets in 4d/);
+  assert.equal(formatCodexStatus(partiallyReached, false, now), "Codex 5h limit reached 4h");
+
   // Header fallback: the reached-type header marks the snapshot.
   const headerSnapshots = parseCodexRateLimits({
     "X-Codex-Primary-Used-Percent": "100",

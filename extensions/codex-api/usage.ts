@@ -362,11 +362,19 @@ function usageBar(remaining: number): string {
   return `[${"█".repeat(filled)}${"░".repeat(USAGE_BAR_WIDTH - filled)}]`;
 }
 
+function windowReached(window: CodexRateLimitWindow, limitReached: boolean): boolean {
+  // limit_reached is snapshot-wide: one exhausted window (typically 5h)
+  // can set it while another window (typically weekly) still has quota.
+  // Only collapse the specific window whose own usage is exhausted.
+  return limitReached && remainingPercent(window) <= 0;
+}
+
 function windowText(item: LabeledWindow, labelWidth: number, now: number, limitReached: boolean): string {
   const reset = resetText(item.window.resetsAt, now);
   const remaining = remainingPercent(item.window);
-  const state = limitReached ? "limit reached" : `${percent(remaining)}% left`;
-  return `${item.label.padEnd(labelWidth)} ${usageBar(limitReached ? 0 : remaining)} ${state}${reset ? ` resets in ${reset}` : ""}`;
+  const reached = windowReached(item.window, limitReached);
+  const state = reached ? "limit reached" : `${percent(remaining)}% left`;
+  return `${item.label.padEnd(labelWidth)} ${usageBar(reached ? 0 : remaining)} ${state}${reset ? ` resets in ${reset}` : ""}`;
 }
 
 function creditsText(credits: CodexCreditsSnapshot): string {
@@ -465,7 +473,9 @@ export function formatCodexStatus(
   if (!shortest) return undefined;
   const remaining = remainingPercent(shortest.window);
   const reset = resetText(shortest.window.resetsAt, now);
-  const usage = snapshot.limitReached === true ? "limit reached" : `${percent(remaining)}%`;
+  const usage = windowReached(shortest.window, snapshot.limitReached === true)
+    ? "limit reached"
+    : `${percent(remaining)}%`;
   return `Codex ${shortest.label} ${usage}${reset ? ` ${reset}` : ""}${fastMode ? " Fast" : ""}`;
 }
 
