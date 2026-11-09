@@ -4,17 +4,23 @@ Turn your ChatGPT subscription into Pi superpowers — multilingual text and
 vision delegation, image generation, web search, Fast mode, and usage
 monitoring — **no OpenAI API key required**.
 
+[简体中文](README.zh-CN.md)
+
+> **Pi 1.5 compatibility:** text/vision delegation supports the newer `openai`
+> ChatGPT OAuth login. Search, images, quota, and reset cards still require a
+> **separate `openai-codex` legacy OAuth login**; the tokens are not interchangeable.
+
 ## Highlights
 
 - **Ask Codex from any model** — `codex_ask` sends a standalone multilingual
-  text or vision request to a live Codex subscription model. Use it for an
+  text or vision request through `openai` ChatGPT OAuth or legacy Codex OAuth. Use it for an
   explicit Codex second opinion, translation, rewrite, review, or screenshot
   analysis while DeepSeek, Google, Claude, or another provider remains active.
 - **Tool manager** — one `/99settings` submenu independently switches Search,
   Image, and Ask Codex On or Off. Disabled model tools disappear from the
   active prompt immediately.
-- **Answer detail** — `/99settings` can leave Codex verbosity at the model
-  default or override normal Codex replies and `codex_ask` with Low, Medium,
+- **Answer detail** — `/99settings` can leave subscription verbosity at the provider
+  default or override normal ChatGPT OAuth replies and `codex_ask` with Low, Medium,
   or High detail.
 - **Image generation & editing** — `codex_image` creates or edits images via
   your Codex subscription (default `gpt-image-2.5-flare`), and works from **any model**:
@@ -24,8 +30,9 @@ monitoring — **no OpenAI API key required**.
 - **First-party search** — `codex_search` runs web and image queries, page
   navigation, PDF screenshots, finance, weather, sports, and time lookups, and
   renders clean result cards instead of raw citations.
-- **Fast mode** — optional priority service tier for snappier responses.
-- **Usage at a glance** — the status bar shows remaining Codex quota and
+- **Fast mode** — requests the priority service tier on both subscription text
+  transports, subject to model/account support; API-key traffic is not modified.
+- **Usage at a glance** — the status bar shows remaining legacy Codex quota and
   reset time; `/codex-usage` shows your plan, masked account, limits, credits,
   and earned rate-limit reset cards.
 - **Reset cards** — when you run out of messages, `/codex-redeem` redeems an
@@ -45,6 +52,29 @@ Image generation with `gpt-image-2` (saved PNG + description):
 
 ![codex image demo](https://raw.githubusercontent.com/99percentpeople/pi-extensions/master/promo/demo/codex-image.gif)
 
+## Authentication and compatibility
+
+Recommended and regression-tested SDK: **Pi 1.5.0**. Pi introduced the newer
+`openai` ChatGPT OAuth login in 0.99.0. The legacy delegation path retains its
+Pi 0.84.1 minimum; the peer range preserves that path, not newer OAuth on old Pi.
+
+| Feature | Required login | Request destination |
+| --- | --- | --- |
+| `codex_ask` text/vision | `/login openai` → **Sign in with ChatGPT** | OpenAI Responses API (`api.openai.com/v1`) through Pi |
+| Legacy `codex_ask` | `/login openai-codex` | ChatGPT Codex backend through Pi |
+| Search, image generation/editing, usage, reset cards | `/login openai-codex` | ChatGPT backend (`chatgpt.com/backend-api`) |
+
+New Pi labels `openai-codex` **OpenAI Codex (legacy)**. An OpenAI API key is not a
+subscription login. The extension does not move newer `openai` tokens to the
+legacy backend, reuse legacy tokens for public API calls, or silently fall back
+to API-key billing. Availability still depends on your account and workspace.
+
+An active subscription model can use the tools without **Other providers**.
+To invoke them while a third-party or API-key model is active, enable **Other
+providers** in `/99settings`; this does not remove each tool's OAuth requirement.
+If only newer `openai` OAuth is configured, `codex_ask` works, legacy commands
+and quota status stay hidden, and search/image calls explain the missing legacy login.
+
 ## Ask Codex
 
 `codex_ask` is deliberately opt-in. The active model should call it only when
@@ -55,16 +85,29 @@ Each call is standalone. Pi does **not** copy the surrounding conversation or
 workspace into the request automatically, so the tool prompt must contain the
 necessary context, target language, and output format. Optional controls include:
 
-- an exact `openai-codex` model ID from Pi's existing model list (otherwise the
-  current official ChatGPT Codex default is resolved from its live model catalog);
+- an exact OAuth model ID from Pi's model list; use `openai/<id>` or
+  `openai-codex/<id>` to disambiguate providers; omit it to reuse the active
+  `openai` ChatGPT model, Pi's saved OpenAI default, or the legacy catalog
+  default (see below);
 - reasoning effort and per-call answer detail;
 - up to five workspace images or recent conversation images for vision;
-- an explicit output-token cap when the default 8,192 tokens is unsuitable.
+- a requested output-token cap (default 8,192), **best effort only**: Pi omits
+  unsupported fields for ChatGPT sign-in, so the backend may ignore this cap.
+
+With the newer login, no legacy model-catalog request is made. When another
+provider is active, Pi's saved default is used only if `defaultProvider` is
+`openai` and that model has OAuth. If no OpenAI default is saved and no legacy
+login is available, select an OpenAI model with `/model` or specify `model`;
+the extension does not pick an arbitrary model. If legacy OAuth is selected
+and `model` is omitted, the existing live Codex catalog default is retained.
+Explicitly requested unavailable models fail rather than switching providers.
 
 Text calls reuse Pi's model-provider implementation and record their nested LLM
 usage on the tool result. One-off delegated requests use a fresh routing session
 and disable prompt-cache retention. With SSH Remote active, workspace image
-inputs are read through the remote binary file adapter.
+inputs are read through the remote binary file adapter. Fast mode and answer
+detail apply to both text transports; reasoning availability follows the selected
+model. Recorded token usage is not a quota snapshot or evidence of API-key billing.
 
 ## Search output
 
@@ -122,15 +165,17 @@ handled by this citation formatter.
 pi install npm:@99percentpeople/pi-codex-api
 ```
 
-Requirements:
+1. Use Pi **1.5.0** (or a compatible newer version).
+2. For text/vision, run `/login openai`, choose **Sign in with ChatGPT**, then
+   select an `openai` model with `/model`. Ask for an explicit Codex second opinion.
+3. For search, images, quota, or reset cards, also sign in with
+   `/login openai-codex` (**OpenAI Codex (legacy)**).
+4. If a third-party model remains active, enable **Other providers** in
+   `/99settings`. For newer OAuth delegation, save an OpenAI default in Pi
+   or specify an exact `openai/<model-id>`.
 
-- Pi 0.84.1 or newer for `codex_ask`
-- Pi logged in with `/login` for `openai-codex`
-- An active `openai-codex` model, or **Other providers** enabled in
-  `/99settings` to use the subscription from any model
-
-That's it — just ask *"generate an image of a neon ramen shop"* or *"search
-the web for today's Rust releases"* and the model calls the tools for you.
+With the legacy login available, ask *"generate an image of a neon ramen shop"*
+or *"search the web for today's Rust releases"* and the model can call those tools.
 
 When `@99percentpeople/pi-ssh-remote` is active, `codex_image.output_path` and
 `referenced_paths` resolve through `@99percentpeople/pi-workspace-files`
@@ -140,8 +185,9 @@ read directly from it, without creating local staging files.
 
 ## Commands
 
-The commands below are registered only after Pi confirms an `openai-codex`
-OAuth login. Sessions that start without Codex login do not show them; login
+The commands below describe **legacy Codex** usage and reset cards, not the
+newer public Responses API's quota. They are registered only after Pi confirms
+an `openai-codex` OAuth login. A newer `openai` OAuth login alone does not show them; login
 and model/auth changes are detected during the session. Pi currently has no
 command-unregister API, so after logging out in the same running session use
 `/reload` (or open another session) to remove commands registered earlier.
@@ -220,14 +266,17 @@ Configure under **Codex API** in `/99settings`:
   can each be switched **On** or **Off**. Disabled tools are removed from the active model
   prompt immediately; stale or concurrently queued calls are rejected before
   they reach Codex.
-- **Fast mode** remains a direct On/Off setting for the priority service tier.
-- **Usage monitor** remains a direct On/Off setting. Turning it off stops
-  background status refreshes, while explicit `/codex-usage` and
-  `/codex-redeem` commands remain available.
-- **Answer detail** selects model default, Low, Medium, or High verbosity for
-  normal Codex replies and `codex_ask` unless a call overrides it.
-- **Other providers** lets any model (DeepSeek, Google, …) use the logged-in
-  Codex subscription.
+- **Fast mode** requests the priority service tier for normal ChatGPT OAuth
+  replies and `codex_ask`, on both supported text transports.
+- **Usage monitor** controls only legacy Codex background status refreshes.
+  Turning it off leaves explicit `/codex-usage` and `/codex-redeem` available
+  when legacy OAuth is configured. Normal newer OpenAI replies do not trigger
+  legacy quota refreshes or parse their response headers as Codex quota.
+- **Answer detail** selects provider default, Low, Medium, or High verbosity for
+  normal subscription replies and `codex_ask` unless a call overrides it.
+- **Other providers** permits calls from non-subscription active models
+  (DeepSeek, Google, API-key OpenAI, …). Each feature still requires its own
+  subscription OAuth login; the default **ChatGPT only** does not permit API-key traffic.
 - **Search mode** and **Search context** configure search when its feature is on.
 - **Image model** selects `gpt-image-2.5-flare` (default, fast generation),
   `gpt-image-2.5-sunburst` (precise editing), or `gpt-image-2` (compatibility).
@@ -246,10 +295,11 @@ OpenAI [announced Images 2.5 on September 8, 2026](https://openai.com/index/intr
 The model IDs are `gpt-image-2.5-flare` and `gpt-image-2.5-sunburst`, not
 `gpt-image-2.5`. This extension sends the selected ID to the existing Codex
 subscription generation/edit endpoints, not the public paid Images API.
-The new IDs have mock request coverage but have not been live-verified here;
-account availability depends on the Codex rollout. If the backend rejects a
-new model, select `gpt-image-2` in **Image model**. There is no silent fallback
-or automatic retry that could generate a second image.
+Both new IDs have mock request coverage. A single `gpt-image-2.5-sunburst`
+generation passed a legacy OAuth live smoke test on **2026-11-09**; Flare and
+image editing remain unverified live. Account availability depends on the Codex
+rollout. If the backend rejects a new model, select `gpt-image-2` in **Image model**.
+There is no silent fallback or automatic retry that could generate a second image.
 
 The existing conservative size limits, five-reference limit, and
 `auto`/`low`/`medium`/`high` quality choices are retained for the subscription
@@ -258,21 +308,50 @@ The bundled prompting skill and demo were originally written for GPT Image 2.
 
 ## How it works
 
-- Reuses Pi's existing `openai-codex` OAuth — no API key, no MCP server, no
-  separate search provider
-- Tokens are fetched per call from Pi's model registry, never stored in
-  settings or tool results
-- `codex_ask` uses Pi 0.84+'s authenticated model completion API so OAuth,
-  provider overrides, and request transport stay inside Pi's model registry
-- Text, image, and search requests go to OpenAI's Codex backend and follow your
-  ChatGPT workspace's policies
+- Reuses Pi's subscription OAuth logins — no API key, MCP server, or separate
+  search provider; newer OpenAI and legacy Codex credentials stay isolated
+- Tokens are resolved per call inside Pi, never stored in settings or tool results
+- `codex_ask` uses Pi's authenticated model completion API so provider overrides,
+  token refresh, and transport remain inside the model registry. OAuth is checked
+  again before completion; newer HTTP delegation also refuses actual `sk-` API
+  keys even if the registry's OAuth snapshot became stale
+- Legacy backend requests honor resolved base URLs only on the exact HTTPS
+  `chatgpt.com` origin and reject URL credentials and redirects. Nullable optional
+  headers delete defaults rather than sending `"null"`; mandatory authentication
+  headers are always rebuilt from the selected legacy credentials
 - The extension also ships the **`gpt-image-prompts`** skill for crafting
   production-grade image prompts — invoke it with `/skill:gpt-image-prompts`
 
-## Development
+## Validation and development
+
+The Pi 1.5 adaptation has mock coverage for both login families, provider/model
+selection, API-key rejection (including a real-registry stale-auth case),
+nullable headers, usage isolation, and text/vision requests through Pi's real
+Responses adapter with HTTP mocked.
+
+**Live smoke test, 2026-11-09:** existing legacy OAuth successfully handled
+standalone text, vision input, web search and opening a returned reference,
+a structured time lookup, WHAM usage and reset-card reads, and one PNG generation
+with `gpt-image-2.5-sunburst`. The PNG signature and dimensions were checked, and
+the vision call correctly described the generated image. Ordinary OpenAI API-key
+authentication was also confirmed to be refused before subscription delegation.
+
+The newer `openai` ChatGPT OAuth path remains mock-covered only; it was not
+live-tested without that login. Flare generation, image editing, other search
+families, priority tier, and reset-card redemption were not live-tested in this
+smoke run. No login/settings were changed and no reset card was consumed.
+These results are account-scoped, not a guarantee of availability for every account.
 
 ```bash
-bun run build:packages
-bun run --cwd extensions/codex-api build
-pi install ./extensions/codex-api
+bun install
+bun run lint
+node --import tsx --test tests/codex-api.test.ts tests/codex-api-oauth.test.ts
+bun run check:privacy
+bun run check
+bun run pack:codex-api
+pi -e ./extensions/codex-api/index.ts
 ```
+
+Development SDK versions are pinned to Pi 1.5.0. Pi-provided runtime packages
+remain external in `dist/codex-api/index.min.js`; the npm staging package also
+contains its linked source map, both READMEs, license, and prompting skill.

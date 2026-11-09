@@ -191,10 +191,10 @@ export function registerCodexImageTool(
     name: "codex_image",
     label: "Codex Image",
     description:
-      "Generate a PNG with the Codex subscription image API, or edit with up to five local or recent conversation images. Uses the active openai-codex OAuth subscription and the image model selected in /99settings (default gpt-image-2.5-flare); no API key is required.",
+      "Generate or edit a PNG with up to five reference images. Requires a separate legacy openai-codex OAuth login; openai ChatGPT sign-in alone is insufficient. Uses the /99settings image model (default gpt-image-2.5-flare), never API-key billing.",
     promptSnippet: "Generate or edit raster images through the active Codex subscription",
     promptGuidelines: [
-      "Use codex_image for requested raster images, illustrations, mockups, textures, or edits when the active model uses openai-codex OAuth, or Other providers is enabled in /99settings and Codex OAuth is logged in.",
+      "Use codex_image for requested raster images or edits with legacy openai-codex OAuth. Other active providers need Other providers enabled unless using openai ChatGPT OAuth; its token is not used for images.",
       "Load the gpt-image-prompts skill before generating or editing an image; it covers prompt structure, composition, aspect-ratio control, exact text, and edit patterns.",
       "For a new image, omit both reference fields. For an edit, use referenced_paths for workspace files or num_last_images_to_include for recent attached/generated conversation images; never provide both.",
       "Omit size and quality unless the user explicitly requests a draft or quality level; the size and aspect_ratio parameters may be ignored by the backend — control the aspect ratio with composition words in the prompt (see the skill).",

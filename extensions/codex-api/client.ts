@@ -1,6 +1,9 @@
+import type { ProviderHeaders } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { codexToolsAllowed } from "./auth.ts";
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+const CODEX_ORIGIN = "https://chatgpt.com";
 const CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
 
 export type CodexFetch = typeof fetch;
@@ -10,7 +13,7 @@ export interface CodexApiClientOptions {
   accountId: string;
   modelId?: string;
   baseUrl?: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   fetch?: CodexFetch;
 }
 
@@ -34,9 +37,14 @@ export class CodexOAuthError extends Error {
   }
 }
 
-function headerValue(headers: Record<string, string> | undefined, name: string): string | undefined {
-  const normalized = name.toLowerCase();
-  return Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === normalized)?.[1];
+function headerValue(headers: ProviderHeaders | undefined, name: string): string | undefined {
+  let value: string | undefined;
+  for (const [key, item] of Object.entries(headers ?? {})) {
+    if (key.toLowerCase() === name.toLowerCase()) {
+      value = typeof item === "string" && item.trim() ? item : undefined;
+    }
+  }
+  return value;
 }
 
 export function extractCodexAccountId(accessToken: string): string {
@@ -116,7 +124,7 @@ export class CodexApiClient {
   /** ChatGPT account identity used only for in-memory account-scoped state. */
   readonly accountId: string;
   private readonly accessToken: string;
-  private readonly headers: Record<string, string>;
+  private readonly headers: ProviderHeaders;
   private readonly fetchImpl: CodexFetch;
 
   constructor(options: CodexApiClientOptions) {
@@ -131,7 +139,8 @@ export class CodexApiClient {
   private endpoint(path: string): string {
     const root = new URL(`${this.rootUrl}/`);
     const endpoint = new URL(path.replace(/^\/+/, ""), root);
-    if (endpoint.protocol !== "https:" || endpoint.hostname !== "chatgpt.com" || endpoint.origin !== root.origin) {
+    if (endpoint.origin !== CODEX_ORIGIN || endpoint.origin !== root.origin
+      || endpoint.username || endpoint.password) {
       throw new Error(`Refusing to send Codex OAuth credentials to non-ChatGPT endpoint: ${endpoint.origin}`);
     }
     return endpoint.toString();
@@ -144,12 +153,16 @@ export class CodexApiClient {
     signal?: AbortSignal,
   ): Promise<T> {
     signal?.throwIfAborted();
-    const headers = new Headers(this.headers);
+    const headers = new Headers({ originator: "pi", accept: "application/json" });
+    if (body !== undefined) headers.set("content-type", "application/json");
+    // ProviderHeaders uses null to suppress a default header, never the literal "null".
+    for (const [name, value] of Object.entries(this.headers)) {
+      if (value === null) headers.delete(name);
+      else headers.set(name, value);
+    }
+    // Authentication is mandatory and always belongs to the selected legacy account.
     headers.set("authorization", `Bearer ${this.accessToken}`);
     headers.set("chatgpt-account-id", this.accountId);
-    headers.set("originator", "pi");
-    headers.set("accept", "application/json");
-    if (body !== undefined) headers.set("content-type", "application/json");
 
     const endpoint = this.endpoint(path);
     let response: Response;
@@ -190,14 +203,16 @@ export class CodexApiClient {
 }
 
 export interface CodexApiClientContextOptions {
-  /** Allow a non-Codex active model to use separately stored Codex OAuth. */
+  /** Allow a non-subscription active model to use separately stored legacy Codex OAuth. */
   allowOtherProviders?: boolean;
 }
 
 function codexOAuthUnavailable(message?: string): CodexOAuthError {
   return new CodexOAuthError(
     `Codex subscription OAuth is unavailable${message ? `: ${message}` : ""}. `
-      + "Run /login and sign in to openai-codex, then retry.",
+      + "Run /login openai-codex (OpenAI Codex (legacy)), then retry. "
+      + "Search, images, usage, and reset credits require this separate legacy login; "
+      + "/login openai supports codex_ask but does not authorize these ChatGPT backend endpoints.",
   );
 }
 
@@ -206,12 +221,13 @@ function resolveCodexAuthModel(
   allowOtherProviders: boolean,
 ) {
   if (ctx.model?.provider === "openai-codex") return ctx.model;
-  if (!allowOtherProviders) {
+  if (!codexToolsAllowed(ctx, allowOtherProviders)) {
     throw new Error(
-      "Codex API tools require an active openai-codex model. "
+      "Codex backend tools require an active openai-codex model or an openai ChatGPT OAuth model. "
         + "Enable Other providers in /99settings to use them from another model.",
     );
   }
+  // Never resolve an `openai` token here: its resource/audience is the public Responses API.
   const model = ctx.modelRegistry.getAll().find((candidate) =>
     candidate.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(candidate)
   );
@@ -236,9 +252,9 @@ export async function createCodexApiClient(
   if (!resolved.apiKey) throw codexOAuthUnavailable();
   const accountId = headerValue(resolved.headers, "chatgpt-account-id")
     ?? extractCodexAccountId(resolved.apiKey);
-  const baseUrl = model.baseUrl ?? DEFAULT_CODEX_BASE_URL;
+  const baseUrl = resolved.baseUrl ?? model.baseUrl ?? DEFAULT_CODEX_BASE_URL;
   const endpoint = new URL(resolveCodexApiRoot(baseUrl));
-  if (endpoint.protocol !== "https:" || endpoint.hostname !== "chatgpt.com") {
+  if (endpoint.origin !== CODEX_ORIGIN || endpoint.username || endpoint.password) {
     throw new Error(`Refusing to send Codex OAuth credentials to non-ChatGPT endpoint: ${endpoint.origin}`);
   }
   return new CodexApiClient({

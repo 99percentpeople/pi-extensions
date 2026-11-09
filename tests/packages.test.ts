@@ -115,7 +115,12 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(codexApi.name, "@99percentpeople/pi-codex-api");
   assertSourceExtensionPackage(codexApi);
   assert.deepEqual(codexApi.pi?.skills, ["./skills"]);
-  assert.deepEqual(codexApi.piBuild?.assets, ["skills"]);
+  assert.deepEqual(codexApi.piBuild?.assets, ["skills", "README.zh-CN.md"]);
+  assert.ok(root.scripts?.test?.includes("tests/codex-api-oauth.test.ts"));
+  for (const name of ["pi-ai", "pi-coding-agent", "pi-tui"]) {
+    assert.equal(root.devDependencies?.[`@earendil-works/${name}`], "1.5.0");
+    assert.equal(codexApi.peerDependencies?.[`@earendil-works/${name}`], ">=0.84.1");
+  }
   assert.deepEqual(codexApi.piBuild?.bundlePackages, [
     "@99percentpeople/pi-shared-settings",
     "@99percentpeople/pi-workspace-files",
@@ -123,7 +128,6 @@ test("extensions are independently publishable workspace packages", async () => 
   assert.equal(codexApi.publishConfig?.access, "public");
   assert.ok(codexApi.dependencies?.["@99percentpeople/pi-shared-settings"]);
   assert.ok(codexApi.dependencies?.["@99percentpeople/pi-workspace-files"]);
-  assert.equal(codexApi.peerDependencies?.["@earendil-works/pi-tui"], "*");
   assert.match(codexApiSkill, /^---\nname: gpt-image-prompts\n/m);
   assert.match(codexApiSkill, /Craft and refine production-ready prompts for GPT Image 2/);
   assert.match(codexApiSkill, /prompt-writing skill only/);
@@ -302,6 +306,8 @@ test("root dist contains complete minified publish staging packages", async () =
     new URL("../dist/shared-settings/", import.meta.url),
   );
   assert.deepEqual(codexStage.pi?.skills, ["./skills"]);
+  assert.ok((codexStage.files as string[]).includes("README.zh-CN.md"));
+  assert.equal(codexStage.peerDependencies?.["@earendil-works/pi-coding-agent"], ">=0.84.1");
   assert.ok(
     (codexStage.files as string[]).includes("skills/gpt-image-prompts/SKILL.md"),
   );

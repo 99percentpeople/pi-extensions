@@ -587,10 +587,11 @@ export function registerBackgroundTaskTools(
       tail: Type.Optional(
         Type.Number({ description: "Read last N lines (default: 100)" }),
       ),
+      // Pi 1.5's published StringEnum uses pi-schema; retain TypeBox inference too.
       stream: Type.Optional(
-        StringEnum(["stdout", "stderr", "both", "terminal"] as const, {
+        Type.Unsafe<"stdout" | "stderr" | "both" | "terminal">(StringEnum(["stdout", "stderr", "both", "terminal"] as const, {
           description: "Which stream (default: 'both'); use terminal for explicit PTY output",
-        }),
+        })),
       ),
       from_line: Type.Optional(
         Type.Number({
@@ -812,7 +813,7 @@ export function registerBackgroundTaskTools(
     parameters: Type.Object({
       id: Type.String({ description: "Task ID or unique name (case-insensitive)" }),
       input: Type.Optional(Type.String({ description: "Exact text; terminal keys must use <...> tokens, for example y<Enter>, <A-f>, or <C-d>", minLength: 1, maxLength: MAX_INPUT_BYTES })),
-      signal: Type.Optional(StringEnum([...BACKGROUND_SEND_SIGNALS], { description: "Named signal validated against the task's local or adapter execution environment" })),
+      signal: Type.Optional(Type.Unsafe<BackgroundSignal>(StringEnum([...BACKGROUND_SEND_SIGNALS], { description: "Named signal validated against the task's local or adapter execution environment" }))),
     }),
 
     executionMode: "parallel",

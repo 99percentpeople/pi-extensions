@@ -29,7 +29,7 @@ capabilities you need.
 | Extension | npm | What it adds |
 | --- | --- | --- |
 | [Background Tasks](extensions/background-tasks/README.md) | [![background-tasks](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-background-tasks?label=background-tasks)](https://www.npmjs.com/package/@99percentpeople/pi-background-tasks) | Pipe and PTY background tasks with attach, logs, waits, input, signals, and local or SSH-backed execution |
-| [Codex API](extensions/codex-api/README.md) | [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Codex OAuth text/vision delegation, image generation, search, Fast mode, and subscription usage |
+| [Codex API](extensions/codex-api/README.md) | [![codex-api](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-codex-api?label=codex-api)](https://www.npmjs.com/package/@99percentpeople/pi-codex-api) | Modern/legacy ChatGPT OAuth delegation, legacy image/search/usage, and Fast mode |
 | [Cursor Effect](extensions/cursor-effect/README.md) | [![cursor-effect](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-cursor-effect?label=cursor-effect)](https://www.npmjs.com/package/@99percentpeople/pi-cursor-effect) | Configurable status cursor effects, elapsed time, output tokens, and throughput metrics |
 | [PowerShell Adapter](extensions/pwsh-adapter/README.md) | [![pwsh-adapter](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-pwsh-adapter?label=pwsh-adapter)](https://www.npmjs.com/package/@99percentpeople/pi-pwsh-adapter) | PowerShell 7 or Windows PowerShell 5.1 for Pi's shell and background tasks on Windows |
 | [DeepSeek Anchor](extensions/deepseek-anchor/README.md) | [![deepseek-anchor](https://img.shields.io/npm/v/%4099percentpeople%2Fpi-deepseek-anchor?label=deepseek-anchor)](https://www.npmjs.com/package/@99percentpeople/pi-deepseek-anchor) | Simulate DSH minimal mode's first request to induce a stronger DeepSeek V4 Pro agent trajectory |
@@ -260,15 +260,25 @@ Use a ChatGPT Codex subscription from Pi without an API key.
 | `/codex-usage` | Show quota, plan information, and reset cards |
 | `/codex-redeem` | Confirm and redeem an available reset card |
 
-The usage commands appear only after Pi confirms an `openai-codex` OAuth login.
-`codex_ask` requires Pi 0.84.1 or newer and uses Pi's model registry rather than
-a duplicate model catalog. Use the **Tools** submenu in `/99settings` to toggle
-Search, Image, and Ask Codex. Fast mode, Usage monitor, and Answer detail remain
-direct Codex API settings. When SSH Remote is active, generated files and image
-references use the remote binary workspace provider instead of a local staging
-directory.
+Regression-tested against **Pi 1.5.0**. `codex_ask` supports the newer
+`/login openai` → **Sign in with ChatGPT** (introduced in Pi 0.99.0), while
+retaining legacy `openai-codex` delegation on Pi 0.84.1+. It uses Pi's model
+registry and never falls back to API-key billing. Newer OAuth reuses the active
+OpenAI model or Pi's saved OpenAI default; legacy calls retain their live catalog default.
 
-[Read the Codex API documentation →](extensions/codex-api/README.md)
+**Search, images, quota, and reset cards still require a separate
+`/login openai-codex` legacy OAuth login.** A newer `openai` token is not sent to
+those endpoints, and legacy commands/status stay hidden without legacy auth.
+Use **Other providers** to delegate while a third-party or API-key model is active;
+each feature still needs its own subscription credentials.
+
+The **Tools** submenu in `/99settings` toggles Search, Image, and Ask Codex.
+Fast mode and Answer detail cover both subscription text transports, not normal
+API-key traffic. When SSH Remote is active, generated files and image references
+use the remote binary workspace provider instead of a local staging directory.
+
+[Read the Codex API documentation →](extensions/codex-api/README.md) ·
+[中文文档 →](extensions/codex-api/README.zh-CN.md)
 
 ### Cursor Effect
 
@@ -388,7 +398,10 @@ reads/writes, directory creation, existence checks, and cancellation.
 ## Development
 
 The repository is a private Bun 1.3.14 workspace containing independently
-published source packages.
+published source packages. The three Pi development SDKs are pinned to **1.5.0**;
+Pi/runtime packages remain external in published bundles. TypeBox tools wrap
+Pi's published `StringEnum` with `Type.Unsafe<T>` where needed to retain static
+parameter inference across the newer pi-schema and Pi's extension view.
 
 ### Install, build, and test
 

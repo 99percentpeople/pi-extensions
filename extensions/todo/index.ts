@@ -71,11 +71,12 @@ const TodoTaskSchema = Type.Object({
       maxLength: 2_000,
     }),
   ),
+  // Pi 1.5's published StringEnum uses pi-schema; retain TypeBox inference too.
   status: Type.Optional(
-    StringEnum(["pending", "in_progress", "completed"] as const, {
+    Type.Unsafe<TodoStatus>(StringEnum(["pending", "in_progress", "completed"] as const, {
       description:
         "Current task status; required for a new key, omitted to preserve an existing value",
-    }),
+    })),
   ),
   dependsOn: Type.Optional(
     Type.Array(Type.String(), {

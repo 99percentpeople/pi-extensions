@@ -2,7 +2,6 @@ import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   formatSize,
-  keyHint,
   truncateHead,
   type ExtensionAPI,
   type ExtensionContext,
@@ -537,10 +536,10 @@ export function registerCodexSearchTool(
     name: "codex_search",
     label: "Codex Search",
     description:
-      "Search web/images, navigate references, capture PDF pages, and query finance, weather, sports, or time through the Codex subscription. Search before opening; direct URLs are best effort.",
+      "Search web/images, navigate references, capture PDF pages, and query finance, weather, sports, or time. Requires a separate legacy openai-codex OAuth login; openai ChatGPT sign-in alone is insufficient. Search before opening.",
     promptSnippet: "Search and navigate web sources or query current structured data through Codex",
     promptGuidelines: [
-      "Use codex_search with Codex OAuth models, or when Other providers is enabled and Codex OAuth is logged in.",
+      "codex_search requires legacy openai-codex OAuth; other active providers need Other providers enabled unless using openai ChatGPT OAuth.",
       "For web research, search first and open only strong ref_ids; use image_query only for images. With short output, batch at most three queries; a fourth needs medium or long.",
       "Direct URLs are best effort; do not retry blocked URLs. Navigate at most three pages per call; open/click/find may return full documents despite response_length or lineno, so split large batches.",
       "Use finance, weather, sports, and time for structured data, separately from page navigation. Weather: duration=1 for current conditions; after no data, retry once, then search. Crypto: BTC/ETH, not BTC-USD. market does not resolve unsupported exchanges. NHL standings: search nhl.com instead.",
@@ -691,7 +690,7 @@ export function registerCodexSearchTool(
         output,
         details.results,
       );
-      const expandHint = keyHint("app.tools.expand", "to expand");
+      const expandHint = context.keyHint?.("app.tools.expand", "to expand") ?? "expand tools to view";
       const displayLines = formatCodexSearchDisplay(display, expanded, expandHint);
       if (display.kind === "lookups") {
         displayLines.push(...(details.hints ?? []).map((hint) => ({

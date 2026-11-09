@@ -18,9 +18,10 @@ const TRUNCATED_MESSAGE = "<response clipped><NOTE>To save on context only part 
 const DEFAULT_MAX_OUTPUT_CHARS = 16_000;
 
 export const strReplaceEditorSchema = Type.Object({
-  command: StringEnum(["view", "create", "str_replace", "insert"] as const, {
+  // Pi 1.5's published StringEnum uses pi-schema; retain TypeBox inference too.
+  command: Type.Unsafe<"view" | "create" | "str_replace" | "insert">(StringEnum(["view", "create", "str_replace", "insert"] as const, {
     description: "The commands to run. Allowed options are: `view`, `create`, `str_replace`, `insert`.",
-  }),
+  })),
   path: Type.String({
     description: "Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.",
   }),

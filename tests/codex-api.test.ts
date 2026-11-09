@@ -132,6 +132,8 @@ function renderContext(expanded: boolean, overrides: Record<string, unknown> = {
     expanded,
     showImages: true,
     isError: false,
+    keyHint: (_key: string, description: string) => `configured-key ${description}`,
+    keyText: () => "configured-key",
     ...overrides,
   };
 }
@@ -759,8 +761,15 @@ test("codex_ask delegates standalone text and vision requests with explicit cont
     ));
     assert.match(longCollapsed, /^\n?Preview starts here/);
     assert.match(longCollapsed, /…\nCodex answered with gpt-5\.6-sol · 488 chars/);
-    assert.match(longCollapsed, /to expand/);
+    assert.match(longCollapsed, /configured-key to expand/);
     assert.ok(Array.from(longCollapsed.split("\n")[0]).length <= 320);
+    const olderPiCollapsed = render(tool.renderResult!(
+      longResult,
+      { expanded: false, isPartial: false },
+      plainTheme,
+      renderContext(false, { keyHint: undefined }),
+    ));
+    assert.match(olderPiCollapsed, /expand tools to view/);
 
     const expanded = render(tool.renderResult!(
       result,
@@ -1315,7 +1324,14 @@ test("codex_search sends official commands and subscription search settings", as
     assert.match(collapsedResult, /source1\.example/);
     assert.match(collapsedResult, /Clean first snippet/);
     assert.match(collapsedResult, /3\. Source 3/);
-    assert.match(collapsedResult, /2 more results \( ?to expand\)/);
+    assert.match(collapsedResult, /2 more results \(configured-key to expand\)/);
+    const olderPiCollapsed = render(tool.renderResult!(
+      result,
+      { expanded: false, isPartial: false },
+      plainTheme,
+      renderContext(false, { args, keyHint: undefined }),
+    ));
+    assert.match(olderPiCollapsed, /2 more results \(expand tools to view\)/);
     assert.doesNotMatch(collapsedResult, /4\. Source 4|turn0search|wordlim|Search result line|Completed/);
     const hintGuardTheme = {
       ...plainTheme,
@@ -1334,7 +1350,7 @@ test("codex_search sends official commands and subscription search settings", as
       hintGuardTheme,
       renderContext(false, { args }),
     )));
-    assert.match(guardedCollapsedResult, /2 more results \( ?to expand\)/);
+    assert.match(guardedCollapsedResult, /2 more results \(configured-key to expand\)/);
     const expandedResult = render(tool.renderResult!(
       result,
       { expanded: true, isPartial: false },

@@ -71,17 +71,17 @@ const CODEX_FEATURES: readonly CodexFeatureDefinition[] = [
   {
     id: "searchEnabled",
     label: "Search",
-    description: "Expose codex_search to the model and allow search or lookup calls",
+    description: "Expose codex_search; search and lookups require a separate legacy openai-codex OAuth login",
   },
   {
     id: "imageEnabled",
     label: "Image",
-    description: "Expose codex_image to the model and allow image generation or editing",
+    description: "Expose codex_image; generation and editing require a separate legacy openai-codex OAuth login",
   },
   {
     id: "askEnabled",
     label: "Ask Codex",
-    description: "Expose codex_ask for explicit standalone text or vision delegation",
+    description: "Expose codex_ask for standalone text or vision through openai ChatGPT OAuth or legacy Codex OAuth",
   },
 ];
 
@@ -143,23 +143,23 @@ export function registerCodexApiSettings(
         {
           id: "usageStatus",
           label: "Usage monitor",
-          description: "Show and refresh subscription usage in the background; manual usage commands remain available",
+          description: "Show legacy Codex usage only; requires openai-codex OAuth, not the newer openai ChatGPT login",
           currentValue: config.usageStatus ? "On" : "Off",
           values: ["Off", "On"],
         },
         {
           id: "responseVerbosity",
           label: "Answer detail",
-          description: "Override Codex response verbosity for normal replies and codex_ask",
+          description: "Override ChatGPT subscription verbosity for normal replies and codex_ask",
           currentValue: RESPONSE_VERBOSITY_LABELS[config.responseVerbosity],
           values: Object.values(RESPONSE_VERBOSITY_LABELS),
         },
         {
           id: "allowOtherProviders",
           label: "Other providers",
-          description: "Allow non-Codex models to use Codex tools with your logged-in ChatGPT subscription",
-          currentValue: config.allowOtherProviders ? "Allow" : "Codex only",
-          values: ["Codex only", "Allow"],
+          description: "Allow third-party or API-key active models to call subscription tools; each tool still requires its own OAuth login",
+          currentValue: config.allowOtherProviders ? "Allow" : "ChatGPT only",
+          values: ["ChatGPT only", "Allow"],
         },
         {
           id: "searchMode",

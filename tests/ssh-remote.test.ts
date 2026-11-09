@@ -3339,9 +3339,10 @@ test("extension writes and edits protected Unix paths without exposing its logic
     undefined,
     harness.ctx,
   );
-  assert.equal(
+  // Pi 1.5 omits byte counts in the built-in write confirmation.
+  assert.match(
     writeResult.content[0].text,
-    "Successfully wrote 13 bytes to /root/tool-test.txt",
+    /^Successfully wrote (?:13 bytes )?to \/root\/tool-test\.txt$/,
   );
 
   const editResult = await harness.tools.get("edit").execute(
@@ -6816,7 +6817,7 @@ test("extension routes Windows workspaces through PowerShell without exposing lo
     undefined,
     harness.ctx,
   );
-  assert.equal(writeResult.content[0].text, "Successfully wrote 13 bytes to notes.txt");
+  assert.match(writeResult.content[0].text, /^Successfully wrote (?:13 bytes )?to notes\.txt$/);
   assert.doesNotMatch(writeResult.content[0].text, /__pi_ssh_remote_windows__/);
   const writeCall = clients[0].calls.find((call) =>
     Buffer.isBuffer(call.options?.input)

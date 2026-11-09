@@ -12,7 +12,14 @@ import {
   createCodexApiClient,
   type CodexApiClient,
 } from "./client.ts";
+import { codexToolsAllowed, isChatGPTSubscriptionModel } from "./auth.ts";
 import type { CodexApiConfig } from "./config.ts";
+import { applyCodexProviderPayload } from "./payload.ts";
+export {
+  applyCodexProviderPayload,
+  applyFastModePayload,
+  applyResponseVerbosityPayload,
+} from "./payload.ts";
 
 const USAGE_PATH = "../wham/usage";
 const REDEEM_CREDITS_PATH = "../wham/rate-limit-reset-credits";
@@ -479,32 +486,6 @@ export function formatCodexStatus(
   return `Codex ${shortest.label} ${usage}${reset ? ` ${reset}` : ""}${fastMode ? " Fast" : ""}`;
 }
 
-export function applyFastModePayload(payload: unknown, enabled: boolean): unknown {
-  if (!enabled || !payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-  return { ...(payload as Record<string, unknown>), service_tier: "priority" };
-}
-
-export function applyResponseVerbosityPayload(
-  payload: unknown,
-  verbosity: CodexApiConfig["responseVerbosity"],
-): unknown {
-  if (verbosity === "auto" || !payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return payload;
-  }
-  const record = payload as Record<string, unknown>;
-  const text = record.text && typeof record.text === "object" && !Array.isArray(record.text)
-    ? record.text as Record<string, unknown>
-    : {};
-  return { ...record, text: { ...text, verbosity } };
-}
-
-export function applyCodexProviderPayload(payload: unknown, config: CodexApiConfig): unknown {
-  return applyResponseVerbosityPayload(
-    applyFastModePayload(payload, config.fastMode),
-    config.responseVerbosity,
-  );
-}
-
 interface UsageController {
   getConfig(): CodexApiConfig;
   updateConfig(config: CodexApiConfig, ctx: ExtensionContext): void;
@@ -627,8 +608,7 @@ export function registerCodexUsageAndFast(
 
   const usageEnabled = (ctx: ExtensionContext): boolean => safeEvaluate(() => {
     const config = controller.getConfig();
-    return config.usageStatus
-      && (ctx.model?.provider === "openai-codex" || config.allowOtherProviders);
+    return config.usageStatus && codexToolsAllowed(ctx, config.allowOtherProviders);
   }, false);
 
   const usageFetchSignal = (): AbortSignal =>
@@ -877,9 +857,9 @@ export function registerCodexUsageAndFast(
     const invocationLifecycle = lifecycleRevision;
     const invocationRevision = credentialRevision;
     const config = controller.getConfig();
-    if (ctx.model?.provider !== "openai-codex" && !config.allowOtherProviders) {
+    if (!codexToolsAllowed(ctx, config.allowOtherProviders)) {
       const error = new Error(
-        "An active openai-codex model is required to refresh subscription usage. "
+        "An active ChatGPT OAuth model is required to refresh legacy Codex subscription usage. "
           + "Enable Other providers in /99settings to use the logged-in Codex subscription from another model.",
       );
       showErrorStatus(ctx, error);
@@ -960,16 +940,8 @@ export function registerCodexUsageAndFast(
     scheduleNextPoll();
   };
 
-  const codexOAuthAvailable = (ctx: ExtensionContext, config: CodexApiConfig): boolean => safeEvaluate(() => {
-    const model = ctx.model?.provider === "openai-codex"
-      ? ctx.model
-      : config.allowOtherProviders
-        ? ctx.modelRegistry.getAll().find((candidate) =>
-            candidate.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(candidate)
-          )
-        : undefined;
-    return !!model && ctx.modelRegistry.isUsingOAuth(model);
-  }, false);
+  const codexOAuthAvailable = (ctx: ExtensionContext, config: CodexApiConfig): boolean => safeEvaluate(() =>
+    codexToolsAllowed(ctx, config.allowOtherProviders) && codexOAuthLoginAvailable(ctx), false);
 
   const checkCurrentAccount = (
     ctx: ExtensionContext,
@@ -1074,7 +1046,7 @@ export function registerCodexUsageAndFast(
   };
 
   const codexUsageCommand: Parameters<ExtensionAPI["registerCommand"]>[1] = {
-    description: "Refresh and show Codex subscription usage, plan, and rate limit redeems",
+    description: "Refresh and show legacy Codex subscription usage, plan, and rate limit redeems",
     handler: async (_args, ctx) => {
       if (!adoptContext(ctx)) return;
       const invocationLifecycle = lifecycleRevision;
@@ -1122,9 +1094,9 @@ export function registerCodexUsageAndFast(
       if (!adoptContext(ctx)) return;
       const invocationLifecycle = lifecycleRevision;
       const config = controller.getConfig();
-      if (ctx.model?.provider !== "openai-codex" && !config.allowOtherProviders) {
+      if (!codexToolsAllowed(ctx, config.allowOtherProviders)) {
         ctx.ui.notify(
-          "An active openai-codex model is required to redeem a rate limit reset. "
+          "An active ChatGPT OAuth model is required to redeem a legacy Codex rate limit reset. "
             + "Enable Other providers in /99settings to use the logged-in Codex subscription from another model.",
           "error",
         );
@@ -1287,9 +1259,10 @@ export function registerCodexUsageAndFast(
   if (options.registerCommandsImmediately) registerCodexCommands();
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (ctx.model?.provider !== "openai-codex") return;
+    if (!isChatGPTSubscriptionModel(ctx)) return;
     const config = controller.getConfig();
-    if (config.usageStatus) refreshInBackground(ctx);
+    if (ctx.model?.provider === "openai-codex" && config.usageStatus) refreshInBackground(ctx);
+    // Fast/detail work on both subscription transports, never on paid API-key requests.
     return applyCodexProviderPayload(event.payload, config);
   });
 
