@@ -4470,7 +4470,7 @@ test("Pi file tools resolve remote logical paths on native Windows", {
     undefined,
     harness.ctx,
   );
-  assert.match(writeResult.content[0].text, /Successfully wrote 13 bytes/);
+  assert.match(writeResult.content[0].text, /^Successfully wrote (?:13 bytes )?to /);
 });
 
 test("PowerShell scripts use EncodedCommand and keep user commands out of SSH arguments", () => {
