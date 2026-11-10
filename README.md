@@ -128,7 +128,10 @@ Open the shared settings menu:
 /99settings
 ```
 
-Only installed extensions that expose settings appear in the menu.
+Only installed extensions that expose settings appear in the menu. Type to
+search the current menu by plugin name, setting label, or description, just like
+Pi's `/settings`. Submenus have their own search; returning restores the parent
+query and selection. Use ↑/↓ to navigate, Enter to change, and Esc to go back.
 
 ## Compatibility
 

@@ -121,13 +121,15 @@ Run the shared `/99settings` menu. It lists installed `@99percentpeople`
 plugins that expose three independent display controls:
 
 - **Fold after lines** (1–20): maximum terminal-visible lines retained by a
-  `preview` display;
-- **While thinking**: `auto` (hide summaries, preview traces), `preview`
-  (latest lines), or `collapse` (timer only);
-- **After thinking**: `auto` (hide every model), `collapse` (timer only),
-  `preview` (latest lines), or `full` (all reasoning text).
+  **Preview** display;
+- **While thinking**: **Auto** (hide summaries, preview traces), **Preview**
+  (latest lines), or **Collapse** (timer only);
+- **After thinking**: **Auto** (hide every model), **Collapse** (timer only),
+  **Preview** (latest lines), or **Full** (all reasoning text).
 
-Both behavior settings default to `auto`.
+Both behavior settings default to **Auto**. Menu values use capitalized display
+labels; the settings file retains lowercase values (`auto`, `preview`,
+`collapse`, `full`) for compatibility.
 
 Settings persist globally in:
 

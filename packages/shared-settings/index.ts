@@ -128,7 +128,7 @@ async function showSettingsMenu(ctx: ExtensionContext, registry: SharedSettingsR
     return;
   }
 
-  await ctx.ui.custom((tui, theme, _keybindings, done) => {
+  await ctx.ui.custom((tui, theme, keybindings, done) => {
     const createPanel = (
       panel: ExtensionSettingsPanel,
       close: (value?: string) => void,
@@ -158,6 +158,7 @@ async function showSettingsMenu(ctx: ExtensionContext, registry: SharedSettingsR
           list.replaceRows(buildRows(), id);
         },
         () => close(panel.currentValue?.()),
+        keybindings,
       );
       return list;
     };
@@ -206,11 +207,18 @@ async function showSettingsMenu(ctx: ExtensionContext, registry: SharedSettingsR
         settingsList.replaceRows(buildRootRows(), id);
       },
       () => done(undefined),
+      keybindings,
     );
     container.addChild(settingsList);
     container.addChild(border);
 
     return {
+      get focused() {
+        return settingsList.focused;
+      },
+      set focused(value: boolean) {
+        settingsList.focused = value;
+      },
       render: (width: number) => container.render(width),
       invalidate: () => container.invalidate(),
       handleInput: (data: string) => {

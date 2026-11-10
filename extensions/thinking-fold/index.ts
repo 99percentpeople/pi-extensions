@@ -25,6 +25,18 @@ const ITEM_TIMER_INTERVAL_MS = 1000;
 const MIN_SUMMARY_CURSOR_MS = 1000;
 const RENDER_BRIDGE_WIDGET = "thinking-fold-render-bridge";
 
+const STREAMING_BEHAVIOR_LABELS: Record<ThinkingFoldConfig["streamingBehavior"], string> = {
+  auto: "Auto",
+  preview: "Preview",
+  collapse: "Collapse",
+};
+const COMPLETED_BEHAVIOR_LABELS: Record<ThinkingFoldConfig["completedBehavior"], string> = {
+  auto: "Auto",
+  collapse: "Collapse",
+  preview: "Preview",
+  full: "Full",
+};
+
 export function endsThinkingPhase(type: AssistantMessageEvent["type"]): boolean {
   return (
     type === "thinking_end" ||
@@ -171,30 +183,32 @@ export default function (pi: ExtensionAPI) {
         id: "streamingBehavior",
         label: "While thinking",
         description: "Auto hides summaries and previews traces while they stream",
-        currentValue: config.streamingBehavior,
-        values: ["auto", "preview", "collapse"],
+        currentValue: STREAMING_BEHAVIOR_LABELS[config.streamingBehavior],
+        values: Object.values(STREAMING_BEHAVIOR_LABELS),
       },
       {
         id: "completedBehavior",
         label: "After thinking",
         description: "Auto hides completed content for every model",
-        currentValue: config.completedBehavior,
-        values: ["auto", "collapse", "preview", "full"],
+        currentValue: COMPLETED_BEHAVIOR_LABELS[config.completedBehavior],
+        values: Object.values(COMPLETED_BEHAVIOR_LABELS),
       },
     ],
     onChange: (id, value, ctx) => {
+      // UI labels are sentence-cased; renderer options and saved values stay lowercase.
+      const behavior = value.toLowerCase();
       if (id === "foldThreshold") {
         applyConfig({ ...config, foldThreshold: Number(value) }, ctx);
       } else if (
         id === "streamingBehavior" &&
-        (value === "auto" || value === "preview" || value === "collapse")
+        (behavior === "auto" || behavior === "preview" || behavior === "collapse")
       ) {
-        applyConfig({ ...config, streamingBehavior: value }, ctx);
+        applyConfig({ ...config, streamingBehavior: behavior }, ctx);
       } else if (
         id === "completedBehavior" &&
-        (value === "auto" || value === "collapse" || value === "preview" || value === "full")
+        (behavior === "auto" || behavior === "collapse" || behavior === "preview" || behavior === "full")
       ) {
-        applyConfig({ ...config, completedBehavior: value }, ctx);
+        applyConfig({ ...config, completedBehavior: behavior }, ctx);
       }
     },
   });

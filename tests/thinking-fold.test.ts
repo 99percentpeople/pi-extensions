@@ -16,6 +16,7 @@ import {
   Markdown, getKeybindings, setKeybindings, KeybindingsManager,
   type Component, type TUI,
 } from "@earendil-works/pi-tui";
+import type { ExtensionSettingsSection } from "../packages/shared-settings/index.ts";
 import thinkingFoldExtension, {
   BUILT_IN_MODEL_BEHAVIORS,
   createThinkingCursorLabel,
@@ -35,6 +36,7 @@ import thinkingFoldExtension, {
   saveThinkingFoldConfig,
   type ThinkingDisplayState,
   type ThinkingFoldOptions,
+  type ThinkingFoldConfig,
 } from "../extensions/thinking-fold/index.ts";
 
 function assistant(
@@ -893,6 +895,74 @@ test("patch acquisition is idempotent", () => {
   assert.equal(AssistantMessageComponent.prototype.updateContent, patchedUpdate);
   second.dispose();
   assert.equal(AssistantMessageComponent.prototype.updateContent, originalUpdate);
+});
+
+test("settings capitalize display labels while keeping persisted behavior values lowercase", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-thinking-fold-settings-"));
+  const path = join(directory, "99extensions.json");
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const shutdownHandlers: Array<(event: unknown, ctx: ExtensionContext) => unknown> = [];
+  const pi = {
+    registerCommand() {},
+    on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+      if (name === "session_shutdown") shutdownHandlers.push(handler);
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    mode: "print",
+    hasUI: false,
+    ui: { notify: (message: string) => assert.fail(message) },
+  } as unknown as ExtensionContext;
+  process.env.PI_CODING_AGENT_DIR = directory;
+  try {
+    const existing: ThinkingFoldConfig = {
+      foldThreshold: 8,
+      streamingBehavior: "preview",
+      completedBehavior: "full",
+    };
+    saveThinkingFoldConfig(existing, path);
+    thinkingFoldExtension(pi);
+    const registry = (globalThis as unknown as Record<symbol, {
+      sections: Map<string, ExtensionSettingsSection>;
+    }>)[Symbol.for("@99percentpeople/pi-shared-settings/registry-v1")];
+    const section = registry.sections.get("thinking-fold");
+    assert.ok(section?.onChange);
+    const settings = section.settings();
+    assert.deepEqual(settings.map((setting) => setting.label), ["Fold after lines", "While thinking", "After thinking"]);
+    assert.deepEqual(settings.map((setting) => setting.currentValue), ["8", "Preview", "Full"]);
+    assert.deepEqual(settings[1]!.values, ["Auto", "Preview", "Collapse"]);
+    assert.deepEqual(settings[2]!.values, ["Auto", "Collapse", "Preview", "Full"]);
+    assert.deepEqual(loadThinkingFoldConfig(path), existing, "loading old settings does not alter their values");
+
+    for (const id of ["streamingBehavior", "completedBehavior"] as const) {
+      const setting = settings.find((candidate) => candidate.id === id)!;
+      for (const label of setting.values!) {
+        assert.match(label, /^[A-Z]/);
+        section.onChange(id, label, ctx);
+        assert.equal(loadThinkingFoldConfig(path)[id], label.toLowerCase());
+        const saved = JSON.parse(await readFile(path, "utf8"));
+        assert.equal(saved["thinking-fold"][id], label.toLowerCase());
+        assert.equal(section.settings().find((candidate) => candidate.id === id)?.currentValue, label);
+      }
+    }
+    const beforeInvalid = await readFile(path, "utf8");
+    section.onChange("streamingBehavior", "Full", ctx);
+    section.onChange("completedBehavior", "Unknown", ctx);
+    assert.equal(await readFile(path, "utf8"), beforeInvalid, "invalid choices must not overwrite settings");
+    section.onChange("streamingBehavior", "preview", ctx);
+    assert.equal(section.settings()[1]!.currentValue, "Preview", "legacy lowercase inputs still work");
+    section.onChange("foldThreshold", "10", ctx);
+    assert.equal(loadThinkingFoldConfig(path).foldThreshold, 10);
+    assert.equal(section.settings()[0]!.currentValue, "10");
+  } finally {
+    try {
+      for (const handler of shutdownHandlers) await handler({}, ctx);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 test("global config normalizes, saves, and reloads", async () => {
