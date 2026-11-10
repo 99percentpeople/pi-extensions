@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-deepseek-anchor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Simulate DSH minimal mode's first request to induce a stronger DeepSeek V4 Pro agent trajectory",
   "type": "module",
@@ -45,7 +45,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.3"
+    "@99percentpeople/pi-shared-settings": "0.1.4"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

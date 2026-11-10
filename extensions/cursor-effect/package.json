@@ -1,6 +1,6 @@
 {
   "name": "@99percentpeople/pi-cursor-effect",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "description": "Apply selectable visual effects to Pi's main working cursor status",
   "type": "module",
@@ -41,7 +41,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@99percentpeople/pi-shared-settings": "0.1.3"
+    "@99percentpeople/pi-shared-settings": "0.1.4"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
