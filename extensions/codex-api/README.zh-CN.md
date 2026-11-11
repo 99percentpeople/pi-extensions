@@ -44,7 +44,8 @@ Pi 0.84.1 的最低要求。peer 范围保留旧路径兼容性，不代表旧 P
 
 1. `/login openai`，选择 **Sign in with ChatGPT**。
 2. `/model` 选择一个 `openai` 模型。
-3. 明确要求“请问 Codex”“让 Codex 给第二意见”，或将具体翻译、改写、分析任务委托给 Codex。
+3. 在 `/99settings → Codex API → Tools → Ask Codex` 中开启工具。
+4. 明确要求“请问 Codex”“让 Codex 给第二意见”，或将具体翻译、改写、分析任务委托给 Codex。
 
 如果当前仍使用 DeepSeek、Google、Claude 或 API-key 模型，在 `/99settings` 中开启
 **Other providers**。同时将 OpenAI 模型保存为 Pi 默认模型，或在调用中指定
@@ -63,6 +64,9 @@ Pi 0.84.1 的最低要求。peer 范围保留旧路径兼容性，不代表旧 P
 从其他模型调用时，该设置只放开“当前模型”限制，不会替代各功能自己的 OAuth 要求。
 
 ## Ask Codex
+
+`codex_ask` 默认关闭，需要在 `/99settings → Codex API → Tools → Ask Codex` 中开启。
+已有明确的开关设置会保留；旧配置缺少 `askEnabled` 时默认关闭。
 
 `codex_ask` 是显式委托工具，不应因“Codex 可用”就自动调用，也不应递归委托日常工作。
 每次请求独立，不自动复制 Pi 的对话或工作区；`prompt` 必须包含必要上下文、目标语言和输出格式。
@@ -95,6 +99,18 @@ SSH Remote 激活时，工作区视觉输入经远端二进制文件适配器读
 ## 搜索与引用
 
 `codex_search` 将网页/图片搜索结果渲染为来源卡片，将页面和结构化查询分别整理显示。
+纯搜索会合并原文与不完整的元数据，保留部分失败和未知响应说明；短分隔符或仅换行
+分隔时也能解析引用链接。模型输出移除 wordlim 标记和多余空行，保留完整摘要、日期
+及所有来源引用编号，包括同一 URL 对应的多个编号。
+搜索与 open/click/find/screenshot、time/weather 等混合调用时，同时保留来源卡片、
+文档正文和查询卡片；折叠时仅在末尾显示一个汇总展开提示。来源引用编号和文档行号可继续
+用于页面导航，未识别的结果说明也会保留。
+模型侧按类型处理混合结果：来源和 lookup 继续压缩，只有文档块保留原文及导航元数据。
+文档正文仅存一份，历史重载时重建卡片；全部模型输出仍受 2,000 行或 50 KB 上限约束。
+
+工具参数 `search_mode` 只接受 `cached`、`indexed`、`live`；`auto` 仅用于用户设置。
+省略参数时遵循设置，Auto 默认使用 `indexed`。固定设置优先于单次调用参数，但查询不支持
+该模式时会切换到 `indexed`，并在结果中说明；例如 Cached 天气查询和 Live 体育查询。
 
 - 先搜索，再打开返回的 reference ID；直接 URL 可能被后端安全检查拒绝。
 - 页面导航每批最多三页。`response_length` 和 `open.lineno` 不保证缩短完整页面正文。
@@ -147,12 +163,12 @@ SSH Remote 激活时，`output_path` 和 `referenced_paths` 直接通过远端�
 
 | 设置 | 行为 |
 | --- | --- |
-| Tools | Search、Image、Ask Codex 独立开关，默认都开启 |
+| Tools | Search、Image、Ask Codex 独立开关；Search、Image 默认开启，Ask Codex 默认关闭 |
 | Fast mode | 默认关闭；向两种订阅文字路径请求 `service_tier: "priority"`，是否支持由模型/账户决定 |
 | Answer detail | 默认跟随 provider；可选 Low、Medium、High，作用于普通订阅回复和委托调用 |
 | Usage monitor | 默认开启，只管理 legacy Codex 后台额度状态；关闭不影响已注册的手动命令 |
 | Other providers | 默认 **ChatGPT only**；选 Allow 才能从非订阅当前模型调用，仍需相应 OAuth |
-| Search mode | Auto、Cached、Indexed、Live；固定模式优先于逐次请求的模式 |
+| Search mode | Auto、Cached、Indexed、Live；固定模式优先，不支持该模式的查询切换到 Indexed 并提示 |
 | Search context | 搜索上下文大小，默认 Medium |
 | Image model | 默认 `gpt-image-2.5-flare`，下一次调用生效 |
 | Image quality | 默认 Auto |

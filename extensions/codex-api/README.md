@@ -77,7 +77,8 @@ and quota status stay hidden, and search/image calls explain the missing legacy 
 
 ## Ask Codex
 
-`codex_ask` is deliberately opt-in. The active model should call it only when
+`codex_ask` is disabled by default. Enable **Codex API → Tools → Ask Codex** in
+`/99settings` before using it. It is deliberately opt-in. The active model should call it only when
 someone explicitly asks to consult Codex or requests a Codex second opinion;
 it must not recursively delegate routine work just because Codex is available.
 
@@ -113,20 +114,37 @@ model. Recorded token usage is not a quota snapshot or evidence of API-key billi
 
 `codex_search` keeps each result family readable:
 
-- Web and image searches render compact source cards.
+- Web and image searches merge raw results with partial metadata into compact
+  source cards. Partial failures and unrecognized response blocks stay visible.
+  Citation links also resolve across short or missing separator lines.
+- Pure search model output removes word-limit annotations and redundant blank
+  lines while retaining full excerpts, dates and every source reference ID,
+  including multiple IDs for the same URL.
+- Mixed calls retain source cards, document bodies from `open`/`click`/`find`/
+  `screenshot`, and structured lookup cards. One combined expand hint summarizes
+  all hidden content. Source reference IDs and document line numbers remain
+  available for subsequent navigation; unfamiliar result text is preserved.
 - `open`, `click`, and `find` render grouped document previews; collapsed output
   shows at most three documents, while expanded output keeps every result.
 - Weather forecasts, finance quotes, sports standings/schedules, and time
   lookups render structured cards. Weather alert details are reduced to their
   actionable summaries instead of injecting the provider's full object dump.
-- Structured lookup text is compacted before it reaches the model. Other search
-  output is bounded to 2,000 lines or 50 KB and tells the model to open fewer
+- Mixed model output compacts sources and lookups independently while retaining
+  raw document blocks with their navigation metadata. Document bodies are stored
+  once and rebuilt into cards when replaying history. All model search output
+  is bounded to 2,000 lines or 50 KB and tells the model to open fewer
   references if truncation occurs.
 
 For page workflows, search first and open returned reference IDs. Direct URLs
 are best effort because Codex's browsing backend can reject otherwise valid
 URLs. Keep page-navigation batches to three pages or fewer; `response_length`
 and `open.lineno` do not reliably shorten page bodies.
+
+The tool's optional `search_mode` accepts `cached`, `indexed`, or `live`.
+`auto` is a user setting only: omit the argument to follow settings (Auto defaults
+to `indexed`). Fixed settings take priority over the argument. If a lookup cannot
+use that mode, the request switches to `indexed` and reports the change in its
+result; for example, cached weather or live sports queries use `indexed`.
 
 Current Codex backend limitations are surfaced as actionable result hints:
 
@@ -167,7 +185,8 @@ pi install npm:@99percentpeople/pi-codex-api
 
 1. Use Pi **1.5.0** (or a compatible newer version).
 2. For text/vision, run `/login openai`, choose **Sign in with ChatGPT**, then
-   select an `openai` model with `/model`. Ask for an explicit Codex second opinion.
+   select an `openai` model with `/model`. Enable **Codex API → Tools → Ask Codex**
+   in `/99settings`, then ask for an explicit Codex second opinion.
 3. For search, images, quota, or reset cards, also sign in with
    `/login openai-codex` (**OpenAI Codex (legacy)**).
 4. If a third-party model remains active, enable **Other providers** in
@@ -285,9 +304,9 @@ Configure under **Codex API** in `/99settings`:
 - **Usage poll** controls the monitor refresh interval when its feature is on.
 
 Settings live in `~/.pi/agent/99extensions.json` under the `codex-api`
-namespace. Existing configurations migrate with Search, Image, and Ask Codex
-enabled, so upgrading does not remove tools unless you explicitly switch them
-off.
+namespace. Search and Image default to enabled; Ask Codex defaults to disabled.
+Existing explicit tool settings are preserved; configurations without an
+`askEnabled` setting also default to disabled.
 
 ### Images 2.5 availability
 

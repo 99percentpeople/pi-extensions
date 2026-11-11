@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import {
   collectCodexCitationSources,
   formatCodexCitations,
   registerCodexCitationRendering,
 } from "../extensions/codex-api/citations.ts";
+import { compactCodexSearchSources } from "../extensions/codex-api/search-display.ts";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -548,6 +550,7 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
   const initiallyDisabled = {
     ...DEFAULT_CODEX_API_CONFIG,
     searchEnabled: false,
+    askEnabled: true,
   };
   disableUnavailableCodexTools(pi, initiallyDisabled, toolFeatures);
   assert.deepEqual(activeTools, ["read", "codex_ask"]);
@@ -585,20 +588,20 @@ test("Codex tool manager toggles tools and blocks disabled calls", async () => {
     updateConfig: (next) => { config = next; },
   });
   assert.equal(panel.title, "Codex Tools");
-  assert.equal(codexFeatureSummary(config), "3/3 On");
+  assert.equal(codexFeatureSummary(config), "2/3 On");
   assert.deepEqual(
     panel.settings().map((setting) => [setting.label, setting.currentValue]),
     [
       ["Search", "On"],
       ["Image", "On"],
-      ["Ask Codex", "On"],
+      ["Ask Codex", "Off"],
     ],
   );
   panel.onChange?.("searchEnabled", "Off", context(process.cwd()));
   panel.onChange?.("fastMode", "On", context(process.cwd()));
   assert.equal(config.searchEnabled, false);
   assert.equal(config.fastMode, false, "non-tool settings are ignored by the tool submenu");
-  assert.equal(panel.currentValue?.(), "2/3 On");
+  assert.equal(panel.currentValue?.(), "1/3 On");
 
   const disabledSearch = toolRegistry((toolPi) => registerCodexSearchTool(
     toolPi,
@@ -656,6 +659,7 @@ test("codex_ask delegates standalone text and vision requests with explicit cont
     pi,
     () => ({
       ...DEFAULT_CODEX_API_CONFIG,
+      askEnabled: true,
       allowOtherProviders: true,
       fastMode: true,
       responseVerbosity: "medium",
@@ -781,7 +785,7 @@ test("codex_ask delegates standalone text and vision requests with explicit cont
 
     const disabled = otherProviderContext(temporary);
     await assert.rejects(
-      () => toolRegistry((pi) => registerCodexAskTool(pi)).execute(
+      () => toolRegistry((pi) => registerCodexAskTool(pi, () => ({ ...DEFAULT_CODEX_API_CONFIG, askEnabled: true }))).execute(
         "disabled-ask",
         { prompt: "Ask Codex" },
         undefined,
@@ -1332,7 +1336,8 @@ test("codex_search sends official commands and subscription search settings", as
       renderContext(false, { args, keyHint: undefined }),
     ));
     assert.match(olderPiCollapsed, /2 more results \(expand tools to view\)/);
-    assert.doesNotMatch(collapsedResult, /4\. Source 4|turn0search|wordlim|Search result line|Completed/);
+    assert.doesNotMatch(collapsedResult, /4\. Source 4|wordlim|Completed/);
+    assert.match(collapsedResult, /Search result line 10 \[turn0search0\]/, "unrecognized raw text is preserved alongside metadata cards");
     const hintGuardTheme = {
       ...plainTheme,
       fg: (_color: string, text: string) => {
@@ -1361,7 +1366,8 @@ test("codex_search sends official commands and subscription search settings", as
     assert.match(expandedResult, /https:\/\/source1\.example\/article/);
     assert.match(expandedResult, /5\. Source 5/);
     assert.match(expandedResult, /https:\/\/source5\.example\/article/);
-    assert.doesNotMatch(expandedResult, /turn0search|wordlim|Search result line|more results/);
+    assert.doesNotMatch(expandedResult, /wordlim|more results/);
+    assert.match(expandedResult, /Search result line 10 \[turn0search0\]/);
     const partialResult = render(tool.renderResult!(
       updates[1],
       { expanded: false, isPartial: true },
@@ -1371,6 +1377,155 @@ test("codex_search sends official commands and subscription search settings", as
     assert.match(partialResult, /Waiting for Codex search/);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("all Codex tools expose provider-compatible string enums, including image and ask", () => {
+  const tools = [
+    toolRegistry((pi) => registerCodexSearchTool(pi, () => DEFAULT_CODEX_API_CONFIG)),
+    toolRegistry((pi) => registerCodexImageTool(pi)),
+    toolRegistry((pi) => registerCodexAskTool(pi)),
+  ];
+  const inspect = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    assert.equal("anyOf" in value, false, "Codex string enums must not use anyOf");
+    assert.equal("const" in value, false, "Codex string enums must not use const");
+    for (const child of Object.values(value)) inspect(child);
+  };
+  for (const tool of tools) inspect(JSON.parse(JSON.stringify(tool.parameters)));
+  for (const [tool, field, values] of [
+    [tools[1], "quality", ["auto", "low", "medium", "high"]],
+    [tools[2], "reasoning", ["off", "minimal", "low", "medium", "high", "xhigh", "max"]],
+    [tools[2], "verbosity", ["auto", "low", "medium", "high"]],
+  ] as const) {
+    for (const parameters of [tool.parameters, JSON.parse(JSON.stringify(tool.parameters))]) {
+      const validate = (args: Record<string, unknown>) => validateToolArguments(
+        { ...tool, parameters }, { id: "codex-enum", name: tool.name, arguments: args },
+      );
+      for (const value of values) {
+        const args = { prompt: "Example request", [field]: value };
+        assert.deepEqual(validate(args), args);
+      }
+      assert.throws(() => validate({ prompt: "Example request", [field]: "invalid" }), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(error.message.includes(`expected one of ${JSON.stringify(values)}`));
+        return true;
+      });
+      assert.deepEqual(validate({ prompt: "Example request" }), { prompt: "Example request" });
+    }
+  }
+});
+
+test("codex_search validates every enum through Pi and lists all choices on errors", () => {
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => DEFAULT_CODEX_API_CONFIG));
+  // Exercise both the registered schema and plain JSON as seen by providers.
+  for (const parameters of [tool.parameters, JSON.parse(JSON.stringify(tool.parameters))]) {
+    const validate = (args: Record<string, unknown>) => validateToolArguments(
+      { ...tool, parameters }, { id: "search-validation", name: tool.name, arguments: args },
+    );
+    const cases = [
+      { values: ["cached", "indexed", "live"], args: (value: string) => ({ search_query: [{ q: "example" }], search_mode: value }) },
+      { values: ["short", "medium", "long"], args: (value: string) => ({ search_query: [{ q: "example" }], response_length: value }) },
+      { values: ["equity", "fund", "crypto", "index"], args: (value: string) => ({ finance: [{ ticker: "TEST", type: value }] }) },
+      { values: ["schedule", "standings"], args: (value: string) => ({ sports: [{ fn: value, league: "nba" }] }) },
+      { values: ["nba", "wnba", "nfl", "nhl", "mlb", "epl", "ncaamb", "ncaawb", "ipl"], args: (value: string) => ({ sports: [{ fn: "schedule", league: value }] }) },
+    ];
+    for (const { values, args } of cases) {
+      for (const value of values) assert.deepEqual(validate(args(value)), args(value));
+      assert.throws(() => validate(args("invalid")), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(error.message.includes(`expected one of ${JSON.stringify(values)}`));
+        return true;
+      });
+    }
+    assert.throws(() => validate(cases[0].args("auto")), /expected one of \["cached","indexed","live"\]/);
+    assert.deepEqual(validate({ search_query: [{ q: "example" }] }), { search_query: [{ q: "example" }] });
+  }
+});
+
+test("codex_search validates mode routing and reports cached weather / live sports switching to indexed", async (t) => {
+  let config = { ...DEFAULT_CODEX_API_CONFIG };
+  let request: any;
+  let response: Record<string, unknown> = { output: "Search result" };
+  const network = t.mock.method(globalThis, "fetch", async (_input: unknown, init: RequestInit | undefined) => {
+    request = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify(response));
+  });
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => config));
+  const execute = async (args: Record<string, unknown>) => {
+    const checked = validateToolArguments(tool, { id: "search-mode", name: tool.name, arguments: args });
+    return tool.execute("search-mode", checked, undefined, undefined, context("/local/workspace"));
+  };
+  for (const configured of ["auto", "cached", "indexed", "live"] as const) {
+    config = { ...DEFAULT_CODEX_API_CONFIG, searchMode: configured };
+    for (const requested of [undefined, "cached", "indexed", "live"] as const) {
+      const result = await execute({ search_query: [{ q: "example" }], ...(requested ? { search_mode: requested } : {}) });
+      const expected = configured === "auto" ? requested ?? "indexed" : configured;
+      assert.equal((result.details as any).mode, expected);
+      assert.equal(request.settings.external_web_access, expected === "cached" ? false : expected === "live" ? true : "indexed");
+      assert.equal(request.commands.search_mode, undefined);
+      assert.equal((result.details as any).hints, undefined);
+    }
+  }
+  const beforeInvalid = network.mock.callCount();
+  await assert.rejects(() => execute({ search_query: [{ q: "example" }], search_mode: "auto" }), /expected one of/);
+  assert.equal(network.mock.callCount(), beforeInvalid, "invalid modes fail before HTTP");
+
+  for (const [mode, args, payload] of [
+    ["cached", { weather: [{ location: "London, UK" }] }, { output: "Weather summary", results: [] }],
+    ["live", { sports: [{ fn: "schedule", league: "nba" }] }, { output: "Sports summary", results: [] }],
+    ["cached", { search_query: [{ q: "example weather" }], weather: [{ location: "London, UK" }] }, {
+      output: "Weather source", results: [{ type: "text_result", title: "Example", url: "https://example.com/weather", ref_id: "turn0search0" }],
+    }],
+  ] as const) {
+    config = { ...DEFAULT_CODEX_API_CONFIG, searchMode: mode };
+    response = payload;
+    const result = await execute(args);
+    assert.equal((result.details as any).mode, "indexed");
+    assert.equal(request.settings.external_web_access, "indexed");
+    const hint = `Search mode changed from ${mode} to indexed because the requested lookup commands do not all support ${mode}.`;
+    assert.equal((result.details as any).hints[0], hint);
+    assert.ok(result.content.some((item) => item.type === "text" && item.text.includes(hint)));
+    for (const expanded of [false, true]) {
+      const rendered = render(tool.renderResult!(result, { expanded, isPartial: false }, plainTheme, renderContext(expanded, { args })));
+      assert.equal(rendered.split(hint).length - 1, 1, "mode change appears once in both compact and expanded results");
+    }
+  }
+});
+
+test("codex_search renders structured hints once outside truncated bodies and terminal wrapping", () => {
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => DEFAULT_CODEX_API_CONFIG));
+  const hint = "Search mode changed from cached to indexed because the requested lookup commands do not all support cached.";
+  const extraHint = "Tip: Retry the lookup once if data is unavailable.";
+  const body = Array.from({ length: 12 }, (_, index) => `Body line ${index + 1}`).join("\n");
+  const hints = [hint, extraHint];
+  const result = {
+    content: [{ type: "text" as const, text: `${body}\n\n${hints.join("\n")}` }],
+    details: { phase: "completed", mode: "indexed", hints },
+  };
+  // Include serialized session replay, duplicate hint entries, and older results
+  // whose hints are only in details rather than appended to content.
+  const duplicateHints = [hint, hint, extraHint];
+  for (const saved of [
+    result,
+    JSON.parse(JSON.stringify(result)),
+    { ...result, content: [{ type: "text" as const, text: body }] },
+    { content: [{ type: "text" as const, text: `${body}\n\n${duplicateHints.join("\n")}` }], details: { ...result.details, hints: duplicateHints } },
+  ]) {
+    for (const expanded of [false, true]) {
+      const component = tool.renderResult!(saved, { expanded, isPartial: false }, plainTheme, renderContext(expanded, { args: { search_query: [{ q: "example" }] } }));
+      for (const width of [32, 120]) {
+        const output = stripVTControlCharacters(component.render(width).join("\n"));
+        const flat = output.replace(/\s/g, "");
+        for (const expected of hints) assert.equal(flat.split(expected.replace(/\s/g, "")).length - 1, 1);
+        if (!expanded) {
+          assert.match(output, /2 more lines/, "only body lines count towards the collapsed preview");
+          assert.doesNotMatch(output, /Body line 12/);
+        } else {
+          assert.match(output, /Body line 12/);
+        }
+      }
+    }
   }
 });
 
@@ -1453,6 +1608,9 @@ test("codex_search compacts lookup output, hints blocked URLs, and truncates lar
       context(process.cwd()),
     );
     const blockedText = blockedResult.content[0].type === "text" ? blockedResult.content[0].text : "";
+    assert.match(blockedText, /^Unable to open page\n/);
+    assert.doesNotMatch(blockedText, /Internal Error \(\)/);
+    assert.match(blockedText, /https:\/\/example\.com\/path\?q=1 is not safe to open \(non-retryable error\)/);
     assert.match(blockedText, /Codex rejected this direct URL/);
     assert.match(blockedText, /search.*returned reference ID/i);
     assert.match(blockedText, /do not repeatedly retry/i);
@@ -1603,6 +1761,128 @@ test("codex_search explains lookup outages, invalid symbols, unsupported leagues
   }
 });
 
+test("pure search merges partial metadata with raw sources and keeps failure notes visible", () => {
+  const args = { search_query: [{ q: "first" }, { q: "second" }] };
+  const blocks = Array.from({ length: 4 }, (_, i) => [
+    `Result ${i + 1} (https://source${i + 1}.example/page)`,
+    `citeturn40search${i} [wordlim: 200] Published: today; Crawled: today;`,
+    "Short excerpt.",
+    `Second paragraph for result ${i + 1}, with useful context.`,
+  ].join("\n"));
+  for (const metadata of [
+    undefined, [],
+    [{ title: "Result 1", url: "https://source1.example/page", ref_id: "turn40search0" }],
+    [{ ref_id: "turn40search0" }],
+    [{ url: "https://source1.example/page" }],
+  ]) {
+    for (const separator of ["\n----------------------------------------\n", "------------------------", "\n"]) {
+      const raw = blocks.join(separator);
+      const display = createCodexSearchDisplay(args, raw, metadata);
+      assert.equal(display.kind, "sources");
+      if (display.kind !== "sources") throw new Error("Expected sources");
+      assert.equal(display.sources.length, 4);
+      assert.equal(display.sources[0].title, "Result 1");
+      assert.equal(display.sources[0].refId, "turn40search0");
+      assert.equal(display.sources[0].url, "https://source1.example/page");
+      assert.match(display.sources[0].snippet!, /Short excerpt\./);
+      assert.match(display.sources[0].snippet!, /Second paragraph/);
+      const citations = new Map<string, string | null>();
+      collectCodexCitationSources(citations, { toolName: "codex_search", content: [{ type: "text", text: raw }], details: { results: metadata } });
+      assert.equal(citations.size, 4, "citation parsing uses the same boundaries as source cards");
+      assert.equal(citations.get("turn40search3"), "https://source4.example/page");
+      for (const note of [
+        "Found no tool response. This likely means the arguments you provided were not valid.",
+        "Provider returned an unfamiliar response for the second query.",
+      ]) {
+        const withNote = createCodexSearchDisplay(args, [note, raw].join("\n----------------------------------------\n"), metadata);
+        for (const expanded of [false, true]) {
+          const lines = formatCodexSearchDisplay(withNote, expanded, "expand");
+          assert.ok(lines.some((line) => line.text.includes(note)));
+          assert.equal(lines.filter((line) => line.expandHint).length, expanded ? 0 : 1);
+        }
+      }
+    }
+  }
+});
+
+test("pure search compacts framing without dropping paragraphs, dates or duplicate URL reference IDs", async (t) => {
+  let payload: Record<string, unknown> = {};
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(payload)));
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => DEFAULT_CODEX_API_CONFIG));
+  const sources = Array.from({ length: 4 }, (_, i) => [
+    `Result ${i + 1} (https://source${i + 1}.example/page)`,
+    `citeturn41search${i} [wordlim: 200] Published: Nov 10, 2026; Crawled: today;`,
+    "",
+    "Short excerpt.",
+    `Full second paragraph ${i + 1} that must remain available to the model.`,
+  ].join("\n"));
+  const alias = "Same page, second query (https://source1.example/page)\nciteturn41search4 [wordlim: 100]\nAdditional evidence from the second query.";
+  const metadata = [{ title: "Result 1", url: "https://source1.example/page", ref_id: "turn41search0" }];
+  for (const search_mode of ["cached", "indexed", "live"]) {
+    for (const note of ["", "Found no tool response for the second query."]) {
+      const raw = [...sources, alias, ...(note ? [note] : [])].join("\n----------------------------------------\n");
+      payload = { output: raw, results: metadata };
+      const args = { search_mode, search_query: [{ q: "example" }, { q: "second query" }] };
+      const checked = validateToolArguments(tool, { id: "pure-search", name: tool.name, arguments: args });
+      const result = await tool.execute("pure-search", checked, undefined, undefined, context("/local/workspace"));
+      const modelText = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+      assert.doesNotMatch(modelText, /wordlim/);
+      assert.match(modelText, /Published: Nov 10, 2026/);
+      assert.match(modelText, /Short excerpt/);
+      assert.match(modelText, /Full second paragraph 4/);
+      assert.match(modelText, /Additional evidence from the second query/);
+      assert.match(modelText, /turn41search4/);
+      if (note) assert.ok(modelText.includes(note));
+      assert.ok(modelText.length < raw.length);
+      for (const saved of [result, JSON.parse(JSON.stringify(result)), {
+        content: [{ type: "text" as const, text: raw }], details: { mode: search_mode, phase: "completed", results: metadata },
+      }]) {
+        const citations = new Map<string, string | null>();
+        collectCodexCitationSources(citations, { ...saved, toolName: "codex_search" });
+        assert.equal(citations.size, 5);
+        assert.equal(citations.get("turn41search4"), "https://source1.example/page");
+        for (const expanded of [false, true]) {
+          const output = render(tool.renderResult!(saved, { expanded, isPartial: false }, plainTheme, renderContext(expanded, { args })));
+          assert.match(output, /1\. Result 1/);
+          assert.match(output, /Short excerpt/);
+          if (note) assert.ok(output.includes(note));
+          if (expanded) assert.match(output, /4\. Result 4/);
+          else assert.equal(output.split("configured-key to expand").length - 1, 1);
+        }
+      }
+    }
+  }
+});
+
+test("compact search sources keep indentation, nested lists and blank lines", () => {
+  const raw = [
+    "Widget Docs (https://example.com/docs)",
+    "\uE200cite\uE202turn50search0\uE201 [wordlim: 200] Crawled: today;",
+    "",
+    "Install steps:",
+    "",
+    "    curl -fsSL https://example.com/install | bash",
+    "    bun add widget",
+    "",
+    "  * parent bullet",
+    "    * nested bullet",
+    "",
+    "```js",
+    "const x = 1;",
+    "```",
+  ].join("\n");
+  const [block] = compactCodexSearchSources(raw, []);
+  assert.ok(block, "the raw block stays available to the model");
+  assert.doesNotMatch(block, /wordlim/);
+  assert.match(block, /\uE200cite\uE202turn50search0\uE201 Crawled: today;/, "one space remains after the citation marker");
+  assert.doesNotMatch(block, /\uE201 {2}Crawled/, "removed chrome leaves no double space");
+  assert.match(block, /Install steps:\n\n {4}curl -fsSL/, "blank line and indented code survive");
+  assert.match(block, /\n {2}\* parent bullet\n/, "parent bullet keeps its indent");
+  assert.match(block, /\n {4}\* nested bullet\n/, "nested list keeps its indent");
+  assert.match(block, /```js\nconst x = 1;\n```/, "fenced code stays intact");
+  assert.doesNotMatch(block, /\n{3,}/, "runs of blank lines collapse to one");
+});
+
 test("Codex search display normalizes raw sources and document views", () => {
   const rawSources = [
     "First result (https://one.example/article)",
@@ -1744,11 +2024,11 @@ test("Codex search display normalizes raw sources and document views", () => {
   const collapsedMultiDocument = multiDocumentLines.map((line) => line.text).join("\n");
   assert.match(collapsedMultiDocument, /^1\. First page\n   one\.example/);
   assert.match(collapsedMultiDocument, /\n2\. Second page\n   two\.example/);
-  assert.match(collapsedMultiDocument, /\n3\. Internal Error\n   Unable to resolve open call/);
+  assert.match(collapsedMultiDocument, /\n3\. Unable to open page\n   Unable to resolve open call/);
   assert.doesNotMatch(collapsedMultiDocument, /\n\n/);
   assert.match(collapsedMultiDocument, /4 more lines across 3 results \(ctrl\+o to expand\)$/);
   assert.equal(multiDocumentLines.filter((line) => line.expandHint).length, 1);
-  assert.equal(multiDocumentLines.find((line) => line.text.includes("Internal Error"))?.role, "error");
+  assert.equal(multiDocumentLines.find((line) => line.text.includes("Unable to open page"))?.role, "error");
   assert.doesNotMatch(
     collapsedMultiDocument,
     /https:\/\/|First line 6|Second line 6|\[Input\]|cite|wordlim|L\d+:/,
@@ -1793,6 +2073,344 @@ test("Codex search display normalizes raw sources and document views", () => {
     formatCodexSearchDisplay(dataDisplay, false).map((line) => line.text),
     ["Weather: Sunny", "Temperature: 24 C"],
   );
+});
+
+test("mixed search with cached time or indexed weather retains both card families and citations", async (t) => {
+  let payload: Record<string, unknown> = {};
+  let request: any;
+  t.mock.method(globalThis, "fetch", async (_input: unknown, init: RequestInit | undefined) => {
+    request = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify(payload));
+  });
+  const sources = Array.from({ length: 4 }, (_, index) => [
+    `Source ${index + 1} (https://source${index + 1}.example/page)`,
+    `citeturn15search${index} [wordlim: 200] Published: today; Crawled: today;`,
+    `Search snippet ${index + 1} with useful details.`,
+  ].join("\n"));
+  const cases = [
+    { mode: "cached", lookup: { time: [{ utc_offset: "+08:00" }] }, raw: "citeturn15time0 The time in UTC+08:00 is Nov 11, 2026, 4:37:11 PM", expected: "Time · UTC+08:00", type: "time" },
+    { mode: "cached", lookup: { time: [{ utc_offset: "+08:00" }] }, raw: "cite The time in UTC+08:00 is Nov 11, 2026, 4:37:11 PM", expected: "Time · UTC+08:00", type: "time" },
+    { mode: "indexed", lookup: { weather: [{ location: "London, UK" }] }, raw: "citeturn15forecast0 Weather for London, UK:\nCurrent Conditions: Sunny, 60°F (16°C)\nDaily Forecast:\nWednesday, November 11: Sunny, High: 60°F (16°C), Low: 50°F (10°C)", expected: "Weather · London, UK", type: "weather" },
+  ] as const;
+  for (const sample of cases) {
+    const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => ({ ...DEFAULT_CODEX_API_CONFIG, searchMode: sample.mode })));
+    const args = { search_query: [{ q: "example information" }], ...sample.lookup };
+    for (const separator of ["\n----------------------------------------\n", "\n", "------------------------", "----------------------------------------", "\n------------------------\n"]) {
+      for (const lookupFirst of [false, true]) {
+        payload = {
+          output: (lookupFirst ? [sample.raw, ...sources] : [...sources, sample.raw]).join(separator),
+          // Metadata may be incomplete and may include lookup entries: merge raw sources too.
+          results: [{ title: "Source 1", url: "https://source1.example/page", ref_id: "turn15search0" }, { ref_id: sample.type === "time" ? "turn15time0" : "turn15forecast0" }],
+        };
+        const checked = validateToolArguments(tool, { id: "mixed-search", name: tool.name, arguments: args });
+        const result = await tool.execute("mixed-search", checked, undefined, undefined, context("/local/workspace"));
+        const details = result.details as any;
+        assert.equal(details.mode, sample.mode);
+        assert.equal(request.settings.external_web_access, sample.mode === "cached" ? false : "indexed");
+        assert.equal(details.display.kind, "mixed");
+        assert.equal(details.display.sources.length, 4);
+        assert.equal(details.display.lookups.length, 1, "search source blocks must not become lookup cards");
+        assert.equal(details.display.lookups[0].type, sample.type);
+        assert.equal(details.hints, undefined, "successful mixed lookups must not report missing results");
+        const modelText = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+        assert.ok(modelText.includes(sample.expected));
+        assert.match(modelText, /turn15search3/);
+        assert.doesNotMatch(modelText, /turn15time0|turn15forecast0|The time in UTC|Weather for London/);
+        for (const saved of [result, JSON.parse(JSON.stringify(result))]) {
+          const citations = new Map<string, string | null>();
+          collectCodexCitationSources(citations, { ...saved, toolName: "codex_search" });
+          assert.equal(citations.get("turn15search3"), "https://source4.example/page");
+          for (const expanded of [false, true]) {
+            const output = render(tool.renderResult!(saved, { expanded, isPartial: false }, plainTheme, renderContext(expanded, { args })));
+            assert.match(output, /1\. Source 1/);
+            assert.match(output, /3\. Source 3/);
+            assert.ok(output.includes(sample.expected));
+            assert.doesNotMatch(output, /cite|turn15|The time in UTC|Weather for London/);
+            if (expanded) assert.match(output, /4\. Source 4/);
+            else assert.match(output, /1 more results/);
+          }
+        }
+      }
+    }
+  }
+  const missing = createCodexSearchDisplay(
+    { search_query: [{ q: "example" }], time: [{ utc_offset: "+08:00" }] }, sources[0],
+  );
+  assert.equal(missing.kind, "mixed");
+  if (missing.kind === "mixed") assert.equal(missing.lookups.length, 0, "a search hit does not count as a returned time");
+  const unknown = createCodexSearchDisplay(
+    { search_query: [{ q: "example" }], time: [{ utc_offset: "+08:00" }] },
+    [sources[0], "Provider returned an unfamiliar lookup response."].join("\n----------------------------------------\n"),
+  );
+  assert.ok(formatCodexSearchDisplay(unknown, true).some((line) => line.text.includes("unfamiliar lookup response")));
+});
+
+test("mixed search with open/click/find/screenshot preserves document bodies and one expand prompt", async (t) => {
+  let payload: Record<string, unknown> = {};
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify(payload)));
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => DEFAULT_CODEX_API_CONFIG));
+  const sources = Array.from({ length: 4 }, (_, index) => [
+    `Search ${index + 1} (https://source${index + 1}.example/page)`,
+    `citeturn20search${index}`,
+    `Search snippet ${index + 1} for a documentation example.`,
+  ].join("\n"));
+  const commands = [
+    { open: [{ ref_id: "turn20search0" }] },
+    { click: [{ ref_id: "turn20view0", id: 1 }] },
+    { find: [{ ref_id: "turn20view0", pattern: "example" }] },
+    { screenshot: [{ ref_id: "turn20view0", pageno: 2 }] },
+  ];
+  for (const command of commands) {
+    const operation = Object.keys(command)[0];
+    const document = [
+      "Opened documentation (https://source1.example/page)",
+      `citeturn21view0 Source: ${operation}; Total lines: 30`,
+      "L13: # Opened documentation",
+      ...Array.from({ length: 15 }, (_, index) => `L${index + 14}: Document line ${index + 14}`),
+    ].join("\n");
+    const args = { search_query: [{ q: "documentation" }], ...command };
+    for (const separator of ["\n----------------------------------------\n", "------------------------", "\n"]) {
+      for (const documentFirst of [false, true]) {
+        payload = {
+          output: (documentFirst ? [document, ...sources] : [...sources, document]).join(separator),
+          results: [
+            { title: "Search 1", url: "https://source1.example/page", ref_id: "turn20search0" },
+            { title: "Opened documentation", url: "https://source1.example/page", ref_id: "turn21view0" },
+          ],
+        };
+        const display = createCodexSearchDisplay(args, String(payload.output), payload.results as unknown[]);
+        assert.equal(display.kind, "mixed");
+        if (display.kind !== "mixed") throw new Error("Expected mixed documents");
+        assert.equal(display.sources.length, 4, "opened pages must not become an extra source card");
+        assert.equal(display.documents?.length, 1);
+        assert.match(display.documents![0].body, /Document line 14/);
+        assert.match(display.documents![0].body, /Document line 28/);
+        assert.equal(display.documents![0].source?.refId, "turn21view0");
+        if (operation === "screenshot") assert.equal(display.documents![0].source?.title, "PDF screenshot · page 3");
+        const collapsed = formatCodexSearchDisplay(display, false, "ctrl+o to expand");
+        assert.equal(collapsed.filter((line) => line.hiddenSummary).length, 1);
+        assert.equal(collapsed.filter((line) => line.expandHint).length, 1);
+        assert.match(collapsed.at(-1)!.text, /Search: 1 more results; Pages: 5 more lines/);
+        const checked = validateToolArguments(tool, { id: "mixed-documents", name: tool.name, arguments: args });
+        const result = await tool.execute("mixed-documents", checked, undefined, undefined, context("/local/workspace"));
+        const modelText = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+        assert.match(modelText, /L28: Document line 28/, "model output retains document line numbers");
+        assert.equal((result.details as any).display.documents, undefined, "do not duplicate document bodies into stored details");
+        assert.equal((result.details as any).documentsFromContent, true);
+        const citationSources = new Map<string, string | null>();
+        collectCodexCitationSources(citationSources, { ...result, toolName: "codex_search" });
+        assert.equal(citationSources.get("turn20search3"), "https://source4.example/page", "raw source references survive mixed document output without metadata");
+        assert.equal(citationSources.get("turn21view0"), "https://source1.example/page");
+        for (const saved of [result, JSON.parse(JSON.stringify(result))]) {
+          for (const expanded of [false, true]) {
+            const output = render(tool.renderResult!(saved, { expanded, isPartial: false }, plainTheme, renderContext(expanded, { args })));
+            assert.match(output, /1\. Search 1/);
+            assert.match(output, /Document line 14/);
+            if (expanded) {
+              assert.match(output, /Document line 28/);
+              assert.match(output, /4\. Search 4/);
+              assert.doesNotMatch(output, /to expand|more lines|more results/);
+            } else {
+              assert.doesNotMatch(output, /Document line 28/);
+              assert.equal(output.split("configured-key to expand").length - 1, 1);
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+test("mixed documents compact other families independently and replay without duplicating page bodies", async (t) => {
+  let raw = "";
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ output: raw })));
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => DEFAULT_CODEX_API_CONFIG));
+  const source = [
+    "Example search (https://search.example/page)",
+    "citeturn30search0 [wordlim: 200] Published: today; Crawled: today;",
+    "Useful search snippet.",
+  ].join("\n");
+  const cases = [
+    {
+      search_mode: "cached", time: [{ utc_offset: "+08:00" }],
+      raw: "citeturn30time0 The time in UTC+08:00 is Nov 11, 2026, 4:37:11 PM",
+      title: "Time · UTC+08:00",
+    },
+    {
+      search_mode: "indexed", weather: [{ location: "London, UK" }],
+      raw: [
+        "citeturn30forecast0 Weather for London, UK:",
+        "Current Conditions: Sunny, 60°F (16°C)",
+        "Severe weather alerts:",
+        `[SevereWeather(name='London', summary='Wind Warning in effect.', details='${"Verbose provider detail. ".repeat(100)}')]`,
+      ].join("\n"),
+      title: "Weather · London, UK",
+    },
+  ];
+  for (const command of [
+    { open: [{ ref_id: "turn30search0" }] },
+    { click: [{ ref_id: "turn30view0", id: 2 }] },
+    { find: [{ ref_id: "turn30view0", pattern: "Navigation" }] },
+    { screenshot: [{ ref_id: "turn30view0", pageno: 1 }] },
+  ]) {
+    const document = [
+      "Navigation page (https://docs.example/page)",
+      `citeturn31view0 [wordlim: 200] Content type: text/html; Source: ${Object.keys(command)[0]}; Total lines: 50`,
+      "L13: # Navigation page",
+      "L14: Follow 【2†Next page】 for details.",
+      ...Array.from({ length: 15 }, (_, i) => `L${i + 15}: Retained document line ${i + 15}`),
+    ].join("\n");
+    for (const sample of cases) {
+      for (const withSearch of [false, true]) {
+        const { raw: lookupRaw, title, ...lookupArgs } = sample;
+        const args = { ...command, ...lookupArgs, ...(withSearch ? { search_query: [{ q: "example" }] } : {}) };
+        raw = [document, lookupRaw, ...(withSearch ? [source] : []), "Unfamiliar provider note."].join("\n----------------------------------------\n");
+        const checked = validateToolArguments(tool, { id: "compact-mixed", name: tool.name, arguments: args });
+        const result = await tool.execute("compact-mixed", checked, undefined, undefined, context("/local/workspace"));
+        const modelText = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+        assert.ok(modelText.includes(document), "document navigation metadata and body survive verbatim");
+        assert.ok(modelText.includes(title), "lookups are compacted even when documents are present");
+        assert.match(modelText, /Unfamiliar provider note/);
+        assert.doesNotMatch(modelText, /Weather for|The time in UTC|Verbose provider detail|SevereWeather|Published:|Crawled:/);
+        if (withSearch) assert.match(modelText, /turn30search0.*\nUseful search snippet/);
+        if (sample.weather) {
+          assert.match(modelText, /Wind Warning in effect/);
+          assert.ok(modelText.length < raw.length / 2, "verbose weather objects no longer bypass compaction");
+        }
+        assert.doesNotMatch(JSON.stringify(result.details), /Retained document line|Total lines: 50/);
+        for (const saved of [result, JSON.parse(JSON.stringify(result))]) {
+          const citations = new Map<string, string | null>();
+          collectCodexCitationSources(citations, { ...saved, toolName: "codex_search" });
+          assert.equal(citations.get("turn31view0"), "https://docs.example/page");
+          if (withSearch) assert.equal(citations.get("turn30search0"), "https://search.example/page");
+          for (const expanded of [false, true]) {
+            const output = render(tool.renderResult!(saved, { expanded, isPartial: false }, plainTheme, renderContext(expanded, { args })));
+            assert.ok(output.includes(title));
+            assert.match(output, /Next page/);
+            assert.match(output, /Unfamiliar provider note/);
+            if (withSearch) assert.match(output, /Example search/);
+            assert.equal(output.split("configured-key to expand").length - 1, expanded ? 0 : 1);
+            if (expanded) assert.match(output, /Retained document line 29/);
+            else assert.doesNotMatch(output, /Retained document line 29/);
+          }
+        }
+        // Older saved results contain raw mixed output and no cached display.
+        const legacy = { content: [{ type: "text" as const, text: raw }], details: { mode: sample.search_mode, phase: "completed" } };
+        const legacyOutput = render(tool.renderResult!(legacy, { expanded: true, isPartial: false }, plainTheme, renderContext(true, { args })));
+        assert.ok(legacyOutput.includes(title));
+        assert.match(legacyOutput, /Retained document line 29/);
+      }
+    }
+  }
+});
+
+test("mixed sources, documents, lookups and fallback text share one omission summary", () => {
+  const display = {
+    kind: "mixed" as const,
+    sources: Array.from({ length: 4 }, (_, index) => ({ title: `Source ${index}` })),
+    documents: Array.from({ length: 4 }, (_, index) => ({ source: { title: `Document ${index}` }, body: Array.from({ length: 8 }, (_, line) => `Page ${index} line ${line}`).join("\n") })),
+    lookups: [{ type: "weather" as const, title: "Weather", sections: [{ lines: Array.from({ length: 5 }, (_, index) => `Forecast ${index}`) }] }],
+    body: Array.from({ length: 12 }, (_, index) => `Extra ${index}`).join("\n"),
+  };
+  for (const keyHint of [undefined, "ctrl+o to expand"]) {
+    const collapsed = formatCodexSearchDisplay(display, false, keyHint);
+    assert.equal(collapsed.filter((line) => line.hiddenSummary).length, 1);
+    assert.match(collapsed.at(-1)!.text, /Search:.*Pages:.*Lookups:.*Other:/);
+    const expanded = formatCodexSearchDisplay(display, true, keyHint);
+    assert.equal(expanded.filter((line) => line.hiddenSummary).length, 0);
+    const text = expanded.map((line) => line.text).join("\n");
+    assert.match(text, /Source 3/);
+    assert.match(text, /Page 3 line 7/);
+    assert.match(text, /Forecast 4/);
+    assert.match(text, /Extra 11/);
+  }
+});
+
+test("short glued separators split weather and search without corrupting ordinary dashed content", () => {
+  const dashes = "------------------------";
+  const url = `https://example.com/bun${dashes}release`;
+  const output = [
+    "citeturn15forecast0 Weather for London, UK:",
+    `Current Conditions: Clear, 34°F (1°C)${dashes}Bun v1.4.4 (${url})`,
+    "citeturn15search0",
+    `Release notes contain before${dashes}after as literal text.`,
+  ].join("\n");
+  const display = createCodexSearchDisplay({
+    weather: [{ location: "London, UK" }], search_query: [{ q: "Bun release" }],
+  }, output);
+  assert.equal(display.kind, "mixed");
+  if (display.kind !== "mixed") throw new Error("Expected mixed cards");
+  assert.equal(display.sources.length, 1);
+  assert.equal(display.sources[0].title, "Bun v1.4.4");
+  assert.equal(display.sources[0].url, url);
+  assert.ok(display.sources[0].snippet?.includes(`before${dashes}after`));
+  assert.equal(display.lookups.length, 1);
+  assert.equal(display.lookups[0].summary, "Clear, 34°F (1°C)");
+  for (const expanded of [false, true]) {
+    const rendered = formatCodexSearchDisplay(display, expanded).map((line) => line.text).join("\n");
+    assert.match(rendered, /^1\. Bun v1\.4\.4/);
+    assert.match(rendered, /Weather · London, UK\n   Clear, 34°F \(1°C\)/);
+    assert.doesNotMatch(rendered, /1°C\)-+Bun/);
+  }
+});
+
+test("cached time without reference IDs renders cards and matches mixed results by UTC offset", () => {
+  const cached = "cite The time in UTC+08:00 is Nov 11, 2026, 4:37:11 PM";
+  const timestamp = "Nov 11, 2026, 4:37:11 PM";
+  for (const marker of ["cite", "citeturn0time0", ""]) {
+    const display = createCodexSearchDisplay(
+      { time: [{ utc_offset: "+08:00" }] }, `${marker} The time in UTC+08:00 is ${timestamp}`,
+    );
+    assert.equal(display.kind, "lookups");
+    if (display.kind !== "lookups") throw new Error("Expected time card");
+    assert.deepEqual(display.lookups, [{ type: "time", title: "Time · UTC+08:00", summary: timestamp, sections: [], requestIndex: 0 }]);
+    for (const expanded of [false, true]) {
+      assert.equal(formatCodexSearchDisplay(display, expanded).map((line) => line.text).join("\n"), `Time · UTC+08:00\n   ${timestamp}`);
+    }
+  }
+  const mixed = createCodexSearchDisplay({
+    sports: [{ fn: "schedule", league: "nba" }],
+    time: [{ utc_offset: "-05:00" }, { utc_offset: "+08:00" }],
+  }, [
+    "citeturn0sports0 Example game schedule",
+    cached,
+    "cite The time in UTC-05:00 is Nov 11, 2026, 3:37:11 AM",
+  ].join("\n----------------------------------------\n"));
+  assert.equal(mixed.kind, "lookups");
+  if (mixed.kind !== "lookups") throw new Error("Expected mixed cards");
+  assert.deepEqual(mixed.lookups.map(({ type, requestIndex }) => ({ type, requestIndex })), [
+    { type: "sports", requestIndex: 0 }, { type: "time", requestIndex: 1 }, { type: "time", requestIndex: 0 },
+  ]);
+  const unrelated = createCodexSearchDisplay({ time: [{ utc_offset: "-05:00" }] }, cached);
+  assert.equal(unrelated.kind, "data", "do not associate an unexpected UTC offset with a requested time");
+  assert.doesNotMatch(formatCodexSearchDisplay(unrelated, false).map((line) => line.text).join("\n"), /|cite|/);
+});
+
+test("cached time tool results preserve the mode and detect partially returned offsets", async (t) => {
+  const response = "cite The time in UTC+08:00 is Nov 11, 2026, 4:37:11 PM";
+  let body: any;
+  t.mock.method(globalThis, "fetch", async (_input: unknown, init: RequestInit | undefined) => {
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ output: response }));
+  });
+  const tool = toolRegistry((pi) => registerCodexSearchTool(pi, () => ({ ...DEFAULT_CODEX_API_CONFIG, searchMode: "cached" })));
+  for (const offsets of [["+08:00"], ["-05:00", "+08:00"]]) {
+    const args = { time: offsets.map((utc_offset) => ({ utc_offset })) };
+    const checked = validateToolArguments(tool, { id: "cached-time", name: tool.name, arguments: args });
+    const result = await tool.execute("cached-time", checked, undefined, undefined, context("/local/workspace"));
+    assert.equal(body.settings.external_web_access, false);
+    assert.equal((result.details as any).mode, "cached");
+    assert.equal((result.details as any).display.kind, "lookups");
+    assert.equal((result.details as any).display.lookups[0].requestIndex, offsets.indexOf("+08:00"));
+    const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+    assert.match(text, /Time · UTC\+08:00\n   Nov 11, 2026, 4:37:11 PM/);
+    assert.doesNotMatch(text, /cite|||Search mode changed/);
+    if (offsets.length === 1) assert.equal((result.details as any).hints, undefined);
+    else {
+      assert.equal((result.details as any).hints.length, 1);
+      assert.match(text, /Codex returned no time data/);
+    }
+  }
 });
 
 test("Codex search display formats weather, finance, sports, and time lookups", () => {
@@ -3160,7 +3778,7 @@ test("Codex usage watches auth.json for account switches and ignores stale reque
 test("Codex API config normalizes, saves, and reloads", async () => {
   assert.equal(DEFAULT_CODEX_API_CONFIG.searchMode, "auto");
   assert.equal(DEFAULT_CODEX_API_CONFIG.responseVerbosity, "auto");
-  assert.equal(DEFAULT_CODEX_API_CONFIG.askEnabled, true);
+  assert.equal(DEFAULT_CODEX_API_CONFIG.askEnabled, false);
   assert.deepEqual(RESPONSE_VERBOSITY_LABELS, {
     auto: "Model default",
     low: "Low",

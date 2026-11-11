@@ -389,7 +389,7 @@ test("modern codex_ask uses Pi's saved OpenAI default, attaches vision input, an
     completion = { model, context, options };
     return answer(model);
   };
-  const config = { ...DEFAULT_CODEX_API_CONFIG, allowOtherProviders: true, fastMode: true, responseVerbosity: "medium" as const };
+  const config = { ...DEFAULT_CODEX_API_CONFIG, askEnabled: true, allowOtherProviders: true, fastMode: true, responseVerbosity: "medium" as const };
   const tool = captureTool(
     (pi) => registerCodexAskTool(pi, () => config, () => { usageRefreshes += 1; }),
     { defaultProvider: "openai", defaultModel: native.id },
@@ -423,7 +423,7 @@ test("modern codex_ask rejects unsupported reasoning, text-only vision, and abor
   const ctx = fixture();
   let completions = 0;
   ctx.modelRegistry.complete = async () => { completions += 1; return answer(ctx.model, { stopReason: "aborted" }); };
-  const tool = captureTool((pi) => registerCodexAskTool(pi));
+  const tool = captureTool((pi) => registerCodexAskTool(pi, () => ({ ...DEFAULT_CODEX_API_CONFIG, askEnabled: true })));
   await assert.rejects(
     () => tool.execute("unsupported", { prompt: "test", reasoning: "xhigh" }, undefined, undefined, ctx),
     /does not support xhigh reasoning/,
@@ -595,7 +595,7 @@ test("Pi 1.5 real registry and Responses adapter send modern OAuth only to the p
     role: "user", content: [{ type: "image", mimeType: "image/png", data: "dGVzdA==" }],
   } }];
   const tool = captureTool((pi) => registerCodexAskTool(pi, () => ({
-    ...DEFAULT_CODEX_API_CONFIG, fastMode: true,
+    ...DEFAULT_CODEX_API_CONFIG, askEnabled: true, fastMode: true,
   })));
   const result = await tool.execute("sdk-test", {
     prompt: "Review the attached test image.", num_last_images_to_include: 1, reasoning: "high", verbosity: "high",

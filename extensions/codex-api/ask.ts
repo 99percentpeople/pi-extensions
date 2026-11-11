@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { stringEnum } from "./schema.ts";
 import {
   DEFAULT_CODEX_API_CONFIG,
   type CodexApiConfig,
@@ -50,26 +51,15 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
-const ReasoningSchema = Type.Union([
-  Type.Literal("off"),
-  Type.Literal("minimal"),
-  Type.Literal("low"),
-  Type.Literal("medium"),
-  Type.Literal("high"),
-  Type.Literal("xhigh"),
-  Type.Literal("max"),
-], {
-  description: "Optional Codex reasoning effort. Omit to use the selected model's default",
-});
+const ReasoningSchema = stringEnum(
+  ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  "Optional Codex reasoning effort. Omit to use the selected model's default",
+);
 
-const VerbositySchema = Type.Union([
-  Type.Literal("auto"),
-  Type.Literal("low"),
-  Type.Literal("medium"),
-  Type.Literal("high"),
-], {
-  description: "Per-call answer detail override. Omit to use the /99settings default",
-});
+const VerbositySchema = stringEnum(
+  ["auto", "low", "medium", "high"],
+  "Per-call answer detail override. Omit to use the /99settings default",
+);
 
 export type CodexAskReasoning = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type CodexAskPhase = "selecting-model" | "reading-images" | "asking" | "completed";

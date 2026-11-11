@@ -6,6 +6,7 @@ import {
 } from "@99percentpeople/pi-workspace-files";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { stringEnum } from "./schema.ts";
 import { createCodexApiClient } from "./client.ts";
 import {
   DEFAULT_CODEX_API_CONFIG,
@@ -23,14 +24,10 @@ const MIN_IMAGE_PIXELS = 655_360;
 const MAX_IMAGE_PIXELS = 8_294_400;
 const MAX_IMAGE_EDGE = 3_840;
 
-const ImageQualitySchema = Type.Union([
-  Type.Literal("auto"),
-  Type.Literal("low"),
-  Type.Literal("medium"),
-  Type.Literal("high"),
-], {
-  description: "Per-call quality override. Omit to use the /99settings default; override only when the user explicitly asks for a draft or quality level",
-});
+const ImageQualitySchema = stringEnum(
+  ["auto", "low", "medium", "high"],
+  "Per-call quality override. Omit to use the /99settings default; override only when the user explicitly asks for a draft or quality level",
+);
 
 const IMAGE_MIME_TYPES: Record<string, string> = {
   ".gif": "image/gif",

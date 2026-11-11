@@ -164,7 +164,7 @@ export function registerCodexApiSettings(
         {
           id: "searchMode",
           label: "Search mode",
-          description: "Auto lets the AI choose per call; fixed modes cannot be overridden",
+          description: "Auto lets the AI choose per call; fixed modes take priority, but unsupported lookup modes switch to indexed with a result hint",
           currentValue: SEARCH_MODE_LABELS[config.searchMode],
           values: Object.values(SEARCH_MODE_LABELS),
         },

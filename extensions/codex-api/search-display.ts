@@ -30,6 +30,7 @@ export interface CodexSearchLookup {
 
 export type CodexSearchDisplay =
   | { kind: "sources"; sources: CodexSearchSource[] }
+  | { kind: "mixed"; sources: CodexSearchSource[]; lookups: CodexSearchLookup[]; documents?: CodexSearchDocument[]; body?: string }
   | {
       kind: "document";
       source?: CodexSearchSource;
@@ -53,14 +54,18 @@ export interface CodexSearchDisplayLine {
   text: string;
   /** Styled keyHint kept separate so renderers do not recolor it. */
   expandHint?: string;
+  /** Unformatted omission summary, for combining mixed-result expand prompts. */
+  hiddenSummary?: string;
 }
 
 const SOURCE_PREVIEW_COUNT = 3;
 const DOCUMENT_PREVIEW_LINES = 10;
 const MULTI_DOCUMENT_PREVIEW_COUNT = 3;
 const MULTI_DOCUMENT_PREVIEW_LINES = 5;
-const RESULT_SEPARATOR = /\s*-{40,}\s*/;
-const CITATION_MARKER = /cite[^]*/g;
+// Short backend separators may be glued to prose. Require a recognizable
+// result header after them so ordinary dashed text and URL paths stay intact.
+const RESULT_SEPARATOR = /\s*-{40,}\s*|\s*-{3,}\s*(?=(?:[^\r\n]+\(https?:\/\/[^\r\n]+\)[ \t]*\r?\n[ \t]*cite|cite(?:turn\d+)?(?:forecast|weather|finance|sports|time)\d+|cite[ \t]*The time in UTC))/;
+const CITATION_MARKER = /cite[^]*|cite/g;
 const WORD_LIMIT = /\[wordlim:\s*[^\]]+\]/gi;
 const SEARCH_METADATA = /^(?:(?:Published|Crawled):\s*[^;]+;\s*)+/i;
 const URL_DECODE_PASSES = 12;
@@ -145,9 +150,21 @@ function normalizeSource(value: unknown): CodexSearchSource | undefined {
   return { type, refId, title, domain, url, snippet };
 }
 
+/** Mixed batches may use separators or adjacent citation-led result blocks. */
+export function searchResultBlocks(output: string): string[] {
+  return output.split(RESULT_SEPARATOR).flatMap((block) => block.split(
+    /\r?\n(?=(?:[^\n]+\(https?:\/\/[^\n]+\)[ \t]*\r?\n[ \t]*cite|cite(?:turn\d+)?(?:forecast|weather|finance|sports|time)\d+|cite[ \t]*The time in UTC))/,
+  )).map((block) => block.trim()).filter(Boolean);
+}
+
+/** Extract navigation blocks without removing line numbers, link IDs or metadata. */
+export function codexSearchDocumentOutput(output: string): string {
+  return searchResultBlocks(output).filter(isDocumentResult).join("\n----------------------------------------\n");
+}
+
 function rawSourceBlocks(output: string, imageResults = false): CodexSearchSource[] {
   const sources: CodexSearchSource[] = [];
-  for (const block of output.split(RESULT_SEPARATOR)) {
+  for (const block of searchResultBlocks(output)) {
     const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
     if (lines.length === 0) continue;
     const heading = /^(.*?)\s+\((https?:\/\/[^\s)]+)\)\s*$/.exec(lines[0]);
@@ -167,8 +184,11 @@ function rawSourceBlocks(output: string, imageResults = false): CodexSearchSourc
         && line !== pageTitle
         && !/^Image:/i.test(line)
         && !/^\d+$/.test(line));
-    const snippet = candidates.find((line) => line.length >= 20);
-    sources.push({ title, url, domain: domainFor(url), snippet });
+    const snippet = imageResults
+      ? candidates.find((line) => line.length >= 20)
+      : candidates.join("\n") || undefined;
+    const refId = /^cite(turn\d+[a-z]+\d+)/i.exec(lines[1] ?? "")?.[1];
+    sources.push({ title, url, domain: domainFor(url), snippet, ...(refId ? { refId } : {}) });
   }
   return sources;
 }
@@ -211,6 +231,8 @@ function lookupIdentity(
   params: Record<string, unknown>,
   fallbackIndex: number,
 ): { type: CodexSearchLookupType; index: number } | undefined {
+  // A search source is not a lookup, even if its prose mentions a lookup ID.
+  if (rawSourceBlocks(block).length > 0) return undefined;
   const match = /(?:turn\d+)?(forecast|weather|finance|sports|time)(\d+)/i.exec(block);
   if (match) {
     const type = /^(?:forecast|weather)$/i.test(match[1])
@@ -218,6 +240,19 @@ function lookupIdentity(
       : match[1].toLowerCase() as CodexSearchLookupType;
     if (!hasItems(params[type])) return undefined;
     return { type, index: Number(match[2]) };
+  }
+  // Cached time results can omit reference IDs. Use their reported offset,
+  // not their position among mixed or partially returned lookup results.
+  const time = /^The time in UTC([+-]\d{2}:\d{2}) is .+$/i.exec(cleanInline(block));
+  if (time) {
+    const index = Array.isArray(params.time)
+      ? params.time.findIndex((item) => record(item)?.utc_offset === time[1])
+      : -1;
+    return index >= 0 ? { type: "time", index } : undefined;
+  }
+  // Positional fallback is safe only for batches containing lookup commands alone.
+  if (["search_query", "image_query", "open", "click", "find", "screenshot"].some((key) => hasItems(params[key]))) {
+    return undefined;
   }
   const type = requestedLookupType(params);
   return type ? { type, index: fallbackIndex } : undefined;
@@ -455,7 +490,24 @@ function uniqueSources(
   imageResults = false,
 ): CodexSearchSource[] {
   const candidates = (results ?? []).map(normalizeSource).filter((value): value is CodexSearchSource => value !== undefined);
-  const sources = candidates.length > 0 ? candidates : rawSourceBlocks(output, imageResults);
+  const sources = [...candidates];
+  for (const raw of rawSourceBlocks(output, imageResults)) {
+    const index = sources.findIndex((source) => raw.refId && source.refId === raw.refId);
+    const matchIndex = index >= 0 ? index : sources.findIndex((source) => raw.url && source.url === raw.url);
+    if (matchIndex < 0) sources.push(raw);
+    else {
+      const source = sources[matchIndex];
+      sources[matchIndex] = {
+        type: source.type ?? raw.type,
+        refId: source.refId ?? raw.refId,
+        url: source.url ?? raw.url,
+        domain: source.domain ?? raw.domain,
+        snippet: source.snippet ?? raw.snippet,
+        title: source.title === "Search result" || source.title === source.domain || source.title === source.url
+          ? raw.title : source.title,
+      };
+    }
+  }
   const seen = new Set<string>();
   return sources.filter((source) => {
     const key = source.url ?? source.refId ?? `${source.title}\n${source.snippet ?? ""}`;
@@ -465,22 +517,67 @@ function uniqueSources(
   });
 }
 
+/** Compact search blocks without using the UI's deduplicated, abbreviated snippets. */
+export function compactCodexSearchSources(output: string, sources: CodexSearchSource[]): string[] {
+  const seenRefs = new Set<string>();
+  const seenUrls = new Set<string>();
+  const blocks: string[] = [];
+  for (const block of searchResultBlocks(output)) {
+    const source = rawSourceBlocks(block)[0];
+    if (!source) continue;
+    if (source.refId) seenRefs.add(source.refId);
+    if (source.url) seenUrls.add(source.url);
+    // Keep all snippet lines and citation IDs, including aliases for the same URL.
+    // Publication/crawl dates carry useful evidence; only remove word-limit chrome.
+    // Indentation and single blank lines are structure, not chrome: trimming them
+    // flattens indented code blocks and nested lists, and deletes paragraph breaks.
+    const compacted = block.split("\n")
+      // Swallow the chrome's surrounding spacing so the metadata line keeps one space.
+      .map((line) => line.replace(/[ \t]*\[wordlim:[^\]]+\][ \t]*/gi, " ").replace(/[ \t]+$/, ""))
+      .join("\n")
+      .replace(/^[ \t]+$/gm, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    if (compacted) blocks.push(compacted);
+  }
+  for (const source of sources) {
+    if (source.refId ? seenRefs.has(source.refId) : source.url && seenUrls.has(source.url)) continue;
+    blocks.push([
+      source.url ? `${source.title} (${source.url})` : source.title,
+      source.refId && /^turn\d+[a-z]+\d+$/i.test(source.refId) ? `cite${source.refId}` : "",
+      source.snippet ?? "",
+    ].filter(Boolean).join("\n"));
+  }
+  return blocks;
+}
+
 function hasItems(value: unknown): boolean {
   return Array.isArray(value) && value.length > 0;
+}
+
+/** Replace only backend error headings followed by citation metadata, not page prose. */
+export function normalizeCodexOpenErrors(output: string): string {
+  return output.replace(
+    /(^|\n-{40,}[ \t]*\r?\n)([ \t]*)Internal Error[ \t]*\([ \t]*\)[ \t]*(?=\r?\n[ \t]*cite)/g,
+    "$1$2Unable to open page",
+  );
 }
 
 function documentSourceFromBlock(block: string): CodexSearchSource | undefined {
   const first = block.split("\n").map((line) => line.trim()).find(Boolean);
   if (!first) return undefined;
+  if (first === "Unable to open page") return { type: "error", title: first };
   const heading = /^(.*?)\s*\((https?:\/\/[^)]*)?\)\s*$/.exec(first);
   if (!heading) return undefined;
   const url = safeUrl(heading[2]);
+  const refId = /^cite(turn\d+[a-z]+\d+)/im.exec(block)?.[1];
   const parsedTitle = cleanInline(heading[1]);
   const title = parsedTitle || domainFor(url) || "Opened page";
   if (!parsedTitle && !url) return undefined;
   return {
     ...(/^Internal Error$/i.test(title) ? { type: "error" } : {}),
     title,
+    ...(refId ? { refId } : {}),
     ...(url ? { domain: domainFor(url), url } : {}),
   };
 }
@@ -491,15 +588,17 @@ function mergeDocumentSource(
   index: number,
 ): CodexSearchSource | undefined {
   if (!blockSource) return resultSources[index];
-  const matched = resultSources.find((source) =>
-    (blockSource.url !== undefined && source.url === blockSource.url)
-    || source.title === blockSource.title
-  );
+  const matched = (blockSource.refId ? resultSources.find((source) => source.refId === blockSource.refId) : undefined)
+    ?? resultSources.find((source) =>
+      (blockSource.url !== undefined && source.url === blockSource.url)
+      || source.title === blockSource.title
+    );
   if (!matched) return blockSource;
   return {
     ...blockSource,
     ...matched,
     type: blockSource.type ?? matched.type,
+    ...(blockSource.refId ? { refId: blockSource.refId } : {}),
     title: matched.title || blockSource.title,
     domain: matched.domain ?? blockSource.domain,
     url: matched.url ?? blockSource.url,
@@ -538,13 +637,73 @@ function searchDocuments(
   });
 }
 
+function isDocumentResult(block: string): boolean {
+  const header = block.split("\n").slice(0, 2).join("\n");
+  // Search snippets can contain numbered lines; an explicit search reference wins.
+  if (/citeturn\d+(?:search|image)\d+/.test(header)) return false;
+  return /citeturn\d+view\d+/.test(header)
+    || /Source:\s*(?:open|click|find|screenshot)\b/i.test(header)
+    || /^L\d+:/m.test(block)
+    || /^(?:Unable to open page|Internal Error)/i.test(block);
+}
+
 export function createCodexSearchDisplay(
   params: Record<string, unknown>,
   output: string,
   results?: unknown[],
 ): CodexSearchDisplay {
+  if (hasItems(params.open)) output = normalizeCodexOpenErrors(output);
+  const hasSearch = hasItems(params.search_query) || hasItems(params.image_query);
+  const hasLookup = ["weather", "finance", "sports", "time"].some((key) => hasItems(params[key]));
+  const hasDocument = ["open", "click", "find", "screenshot"].some((key) => hasItems(params[key]));
+  if (Number(hasSearch) + Number(hasLookup) + Number(hasDocument) > 1) {
+    const lookups: CodexSearchLookup[] = [];
+    const documents: CodexSearchDocument[] = [];
+    const remaining: string[] = [];
+    const documentResults = results?.filter((item) => {
+      const source = record(item);
+      return source && /^turn\d+view\d+$/.test(stringField(source, "ref_id", "refId") ?? "");
+    });
+    let screenshotIndex = 0;
+    for (const block of searchResultBlocks(output)) {
+      if (hasDocument && isDocumentResult(block)) {
+        const parsed = searchDocuments(block, documentResults);
+        const screenshots = Array.isArray(params.screenshot) ? params.screenshot : [];
+        const screenshotOnly = !["open", "click", "find"].some((key) => hasItems(params[key]));
+        if (screenshots.length > 0 && (screenshotOnly || /Source:\s*screenshot\b/i.test(block))) {
+          for (const document of parsed) {
+            const item = record(screenshots[screenshotIndex++]);
+            const page = typeof item?.pageno === "number" ? item.pageno + 1 : screenshotIndex;
+            document.source = { ...(document.source ?? { title: "PDF screenshot" }), title: `PDF screenshot · page ${page}` };
+          }
+        }
+        documents.push(...parsed);
+        continue;
+      }
+      const parsed = lookupResults(block, params);
+      if (parsed.length > 0) lookups.push(...parsed);
+      else remaining.push(block);
+    }
+    // Lookup result metadata can carry ref IDs too; do not turn it into source cards.
+    const searchResults = results?.filter((item) => {
+      const source = record(item);
+      const refId = source && stringField(source, "ref_id", "refId");
+      return !refId || !/^(?:turn\d+)?(?:forecast|weather|finance|sports|time|view)\d+$/i.test(refId);
+    });
+    const searchOutput = remaining.join("\n----------------------------------------\n");
+    const sources = uniqueSources(searchResults, searchOutput, hasItems(params.image_query));
+    const body = remaining.filter((block) => rawSourceBlocks(block).length === 0)
+      .map(cleanCodexSearchOutput).filter(Boolean).join("\n\n");
+    if (sources.length > 0 || lookups.length > 0 || documents.length > 0) {
+      return { kind: "mixed", sources, lookups,
+        ...(documents.length > 0 ? { documents } : {}), ...(body ? { body } : {}) };
+    }
+  }
   const sources = uniqueSources(results, output, hasItems(params.image_query));
-  if ((hasItems(params.search_query) || hasItems(params.image_query)) && sources.length > 0) {
+  if (hasSearch && sources.length > 0) {
+    const body = searchResultBlocks(output).filter((block) => rawSourceBlocks(block).length === 0)
+      .map(cleanCodexSearchOutput).filter(Boolean).join("\n\n");
+    if (body) return { kind: "mixed", sources, lookups: [], body };
     return { kind: "sources", sources };
   }
   if (hasItems(params.open) || hasItems(params.click) || hasItems(params.find) || hasItems(params.screenshot)) {
@@ -577,9 +736,10 @@ function sourceLines(source: CodexSearchSource, index: number, expanded: boolean
   const lines: CodexSearchDisplayLine[] = [{ role: "title", text: `${index + 1}. ${source.title}` }];
   if (location) lines.push({ role: "url", text: `   ${location}` });
   if (source.snippet) {
-    const snippet = !expanded && source.snippet.length > 110
-      ? `${source.snippet.slice(0, 109).trimEnd()}…`
-      : source.snippet;
+    const text = expanded ? source.snippet : source.snippet.replace(/\s+/g, " ");
+    const snippet = !expanded && text.length > 110
+      ? `${text.slice(0, 109).trimEnd()}…`
+      : text;
     lines.push({ role: "body", text: `   ${snippet}` });
   }
   return lines;
@@ -588,6 +748,7 @@ function sourceLines(source: CodexSearchSource, index: number, expanded: boolean
 function expandHintLine(text: string, expandHint?: string): CodexSearchDisplayLine {
   return {
     role: "hint",
+    hiddenSummary: text,
     text: expandHint ? `${text} (${expandHint})` : text,
     ...(expandHint ? { expandHint } : {}),
   };
@@ -717,6 +878,24 @@ export function formatCodexSearchDisplay(
   expanded: boolean,
   expandHint?: string,
 ): CodexSearchDisplayLine[] {
+  if (display.kind === "mixed") {
+    const groups = [
+      { label: "Search", lines: formatCodexSearchDisplay({ kind: "sources", sources: display.sources }, expanded) },
+      { label: "Pages", lines: documentLines(display.documents ?? [], expanded) },
+      { label: "Lookups", lines: lookupLines(display.lookups, expanded) },
+      { label: "Other", lines: display.body ? excerptLines(display.body, expanded) : [] },
+    ];
+    const lines: CodexSearchDisplayLine[] = [];
+    const summaries: string[] = [];
+    for (const group of groups) {
+      for (const line of group.lines) {
+        if (line.hiddenSummary) summaries.push(`${group.label}: ${line.hiddenSummary.replace(/^…\s*/, "")}`);
+        else lines.push(line);
+      }
+    }
+    if (summaries.length > 0) lines.push(expandHintLine(`… ${summaries.join("; ")}`, expandHint));
+    return lines;
+  }
   if (display.kind === "sources") {
     const shown = expanded ? display.sources : display.sources.slice(0, SOURCE_PREVIEW_COUNT);
     const lines: CodexSearchDisplayLine[] = [];

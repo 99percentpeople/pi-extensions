@@ -17,11 +17,16 @@ import {
 } from "./render.ts";
 import {
   createCodexSearchDisplay,
+  compactCodexSearchSources,
   formatCodexSearchDisplay,
+  normalizeCodexOpenErrors,
+  codexSearchDocumentOutput,
   type CodexSearchDisplay,
   type CodexSearchDisplayLine,
   type CodexSearchDisplayLineRole,
 } from "./search-display.ts";
+
+import { stringEnum } from "./schema.ts";
 
 const SearchQuery = Type.Object({
   q: Type.String({ minLength: 1, description: "Search query" }),
@@ -83,12 +88,7 @@ const SearchCommandsSchema = Type.Object({
       minLength: 1,
       description: "Provider ticker; crypto requires a bare symbol such as BTC or ETH, not BTC-USD",
     }),
-    type: Type.Union([
-      Type.Literal("equity"),
-      Type.Literal("fund"),
-      Type.Literal("crypto"),
-      Type.Literal("index"),
-    ]),
+    type: stringEnum(["equity", "fund", "crypto", "index"]),
     market: Type.Optional(Type.String({
       description: "Optional provider hint; it does not resolve unsupported international exchange listings",
     })),
@@ -105,18 +105,8 @@ const SearchCommandsSchema = Type.Object({
     // The Codex backend requires tool: "sports" on every sports item, but it
     // is an API-internal constant tied to the command name, so it is hidden
     // from the model entirely; execute() injects it before sending.
-    fn: Type.Union([Type.Literal("schedule"), Type.Literal("standings")]),
-    league: Type.Union([
-      Type.Literal("nba"),
-      Type.Literal("wnba"),
-      Type.Literal("nfl"),
-      Type.Literal("nhl"),
-      Type.Literal("mlb"),
-      Type.Literal("epl"),
-      Type.Literal("ncaamb"),
-      Type.Literal("ncaawb"),
-      Type.Literal("ipl"),
-    ]),
+    fn: stringEnum(["schedule", "standings"]),
+    league: stringEnum(["nba", "wnba", "nfl", "nhl", "mlb", "epl", "ncaamb", "ncaawb", "ipl"]),
     team: Type.Optional(Type.String()),
     opponent: Type.Optional(Type.String()),
     date_from: Type.Optional(Type.String()),
@@ -127,21 +117,12 @@ const SearchCommandsSchema = Type.Object({
   time: Type.Optional(Type.Array(Type.Object({
     utc_offset: Type.String({ pattern: "^[+-][0-9]{2}:[0-9]{2}$" }),
   }, { additionalProperties: false }), { minItems: 1 })),
-  response_length: Type.Optional(Type.Union([
-    Type.Literal("short"),
-    Type.Literal("medium"),
-    Type.Literal("long"),
-  ], {
-    description: "Search/lookup response size; does not reliably shorten opened page bodies",
-  })),
-  search_mode: Type.Optional(Type.Union([
-    Type.Literal("cached"),
-    Type.Literal("indexed"),
-    Type.Literal("live"),
-  ], {
-    description:
-      "Per-call mode requested when the user's Search mode is Auto; fixed user modes always win",
-  })),
+  response_length: Type.Optional(stringEnum(["short", "medium", "long"],
+    "Search/lookup response size; does not reliably shorten opened page bodies",
+  )),
+  search_mode: Type.Optional(stringEnum(["cached", "indexed", "live"],
+    "Optional per-call mode; omit to follow settings (Auto defaults to indexed). auto is a settings value, not a tool argument. Fixed settings override this argument; unsupported lookup modes switch to indexed with a result hint.",
+  )),
 }, { additionalProperties: false });
 
 export type CodexSearchPhase = "authenticating" | "searching" | "completed";
@@ -152,7 +133,9 @@ export interface CodexSearchDetails {
   results?: unknown[];
   /** Pre-parsed compact lookup cards; document bodies stay out of details. */
   display?: CodexSearchDisplay;
-  /** Actionable backend limitation messages shown after compact lookup cards. */
+  /** Rebuild mixed document cards from content rather than storing their bodies twice. */
+  documentsFromContent?: boolean;
+  /** Mode adjustments and backend limitations, included in model output and UI. */
   hints?: string[];
   mode: CodexEffectiveSearchMode;
   phase: CodexSearchPhase;
@@ -321,8 +304,8 @@ function failedLookupItems(
   commands: Record<string, unknown>,
   display: CodexSearchDisplay,
 ): FailedLookupItem[] {
-  const completeFailure = /Found no tool response/i.test(output) && display.kind !== "lookups";
-  const parsedLookups = display.kind === "lookups" ? display.lookups : [];
+  const parsedLookups = display.kind === "lookups" || display.kind === "mixed" ? display.lookups : [];
+  const completeFailure = /Found no tool response/i.test(output) && parsedLookups.length === 0;
   const failed: FailedLookupItem[] = [];
 
   for (const command of LOOKUP_COMMANDS) {
@@ -411,7 +394,26 @@ function externalWebAccess(mode: CodexEffectiveSearchMode): boolean | "indexed" 
   return false;
 }
 
-function compactLookupOutput(display: CodexSearchDisplay, fallback: string): string {
+function compactSearchOutput(display: CodexSearchDisplay, fallback: string): string {
+  if (display.kind === "sources"
+    || (display.kind === "mixed" && !display.lookups.length && !display.documents?.length)) {
+    return [...compactCodexSearchSources(fallback, display.sources),
+      display.kind === "mixed" ? display.body ?? "" : "",
+    ].filter(Boolean).join("\n----------------------------------------\n");
+  }
+  if (display.kind === "mixed") {
+    // Keep source URLs and backend IDs available for subsequent open/click calls.
+    const sourceBlocks = display.sources.map((source) => [
+      source.url ? `${source.title} (${source.url})` : source.title,
+      source.refId && /^turn\d+[a-z]+\d+$/i.test(source.refId) ? `cite${source.refId}` : "",
+      source.snippet ?? "",
+    ].filter(Boolean).join("\n"));
+    const lookupText = formatCodexSearchDisplay({ kind: "lookups", lookups: display.lookups }, true)
+      .map((line) => line.text).join("\n");
+    const documentText = display.documents?.length ? codexSearchDocumentOutput(fallback) : "";
+    return [...sourceBlocks, lookupText, documentText, display.body ?? ""].filter(Boolean)
+      .join("\n----------------------------------------\n");
+  }
   if (display.kind !== "lookups") return fallback;
   return formatCodexSearchDisplay(display, true)
     .map((line) => line.text)
@@ -608,21 +610,26 @@ export function registerCodexSearchTool(
         },
         max_output_tokens: 12_000,
       }, signal);
-      const rawOutput = typeof response.output === "string"
+      const responseOutput = typeof response.output === "string"
         ? response.output
         : JSON.stringify(response.output ?? response.results ?? {}, null, 2);
+      const rawOutput = argumentItems(commands.open).length > 0
+        ? normalizeCodexOpenErrors(responseOutput)
+        : responseOutput;
       const results = Array.isArray(response.results) ? response.results : undefined;
       const parsedDisplay = createCodexSearchDisplay(
         commands as Record<string, unknown>,
         rawOutput,
         results,
       );
-      const hints = failureHints(
-        rawOutput,
-        commands as Record<string, unknown>,
-        parsedDisplay,
-      );
-      const compactOutput = boundedSearchOutput(compactLookupOutput(parsedDisplay, rawOutput));
+      const preferredMode = resolveSearchMode(config.searchMode, requestedMode);
+      const hints = [
+        ...(effectiveMode !== preferredMode
+          ? [`Search mode changed from ${preferredMode} to ${effectiveMode} because the requested lookup commands do not all support ${preferredMode}.`]
+          : []),
+        ...failureHints(rawOutput, commands as Record<string, unknown>, parsedDisplay),
+      ];
+      const compactOutput = boundedSearchOutput(compactSearchOutput(parsedDisplay, rawOutput));
       const output = hints.length > 0
         ? `${compactOutput}\n\n${hints.join("\n")}`
         : compactOutput;
@@ -633,7 +640,11 @@ export function registerCodexSearchTool(
           mode: effectiveMode,
           phase: "completed",
           results,
-          ...(parsedDisplay.kind === "lookups" ? { display: parsedDisplay } : {}),
+          ...(parsedDisplay.kind === "lookups" ? { display: parsedDisplay }
+            : parsedDisplay.kind === "mixed" ? { display: {
+              kind: "mixed", sources: parsedDisplay.sources, lookups: parsedDisplay.lookups,
+              ...(parsedDisplay.body ? { body: boundedSearchOutput(parsedDisplay.body) } : {}),
+            }, ...(parsedDisplay.documents?.length ? { documentsFromContent: true } : {}) } : {}),
           ...(hints.length > 0 ? { hints } : {}),
         } satisfies CodexSearchDetails,
       };
@@ -685,19 +696,31 @@ export function registerCodexSearchTool(
         return text;
       }
       const text = reusableText(context);
-      const display = details.display ?? createCodexSearchDisplay(
+      // execute appends one known hint block for the model. Remove that exact
+      // suffix before parsing/truncation, then render structured hints separately.
+      // Older saved results without an appended block retain their full body.
+      const hints = details.hints ?? [];
+      const hintSuffix = hints.length > 0 ? `\n\n${hints.join("\n")}` : "";
+      const body = hintSuffix && output.endsWith(hintSuffix)
+        ? output.slice(0, -hintSuffix.length)
+        : output;
+      let display = details.display ?? createCodexSearchDisplay(
         context.args as Record<string, unknown>,
-        output,
+        body,
         details.results,
       );
+      if (details.documentsFromContent && display.kind === "mixed") {
+        const documentOutput = codexSearchDocumentOutput(body);
+        const parsed = documentOutput ? createCodexSearchDisplay(
+          context.args as Record<string, unknown>, documentOutput, details.results,
+        ) : undefined;
+        display = { ...display, documents: parsed?.kind === "mixed" || parsed?.kind === "document"
+          ? parsed.documents : undefined };
+      }
       const expandHint = context.keyHint?.("app.tools.expand", "to expand") ?? "expand tools to view";
       const displayLines = formatCodexSearchDisplay(display, expanded, expandHint);
-      if (display.kind === "lookups") {
-        displayLines.push(...(details.hints ?? []).map((hint) => ({
-          role: "warning" as const,
-          text: hint,
-        })));
-      }
+      displayLines.push(...[...new Set(hints)]
+        .map((hint) => ({ role: "warning" as const, text: hint })));
       const rendered = displayLines
         .map((line) => renderDisplayLine(line, theme))
         .join("\n");

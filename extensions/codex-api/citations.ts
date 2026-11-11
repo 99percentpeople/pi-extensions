@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { searchResultBlocks } from "./search-display.ts";
 
 const REF_ID = /^turn\d+[a-z]+\d+$/i;
 const MARKER = /cite([^\n]+)/g;
@@ -44,13 +45,21 @@ export function collectCodexCitationSources(sources: CodexCitationSources, value
         source.url ?? source.source_url ?? source.sourceUrl ?? source.page_url ?? source.pageUrl);
     }
   }
+  // Compacted results can keep source references in their display data.
+  const display = record(details?.display);
+  if ((display?.kind === "mixed" || display?.kind === "sources") && Array.isArray(display.sources)) {
+    for (const item of display.sources) {
+      const source = record(item);
+      if (source) addSource(sources, source.refId, source.url);
+    }
+  }
   if (!Array.isArray(result.content)) return;
   for (const item of result.content) {
     const content = record(item);
     if (content?.type !== "text" || typeof content.text !== "string") continue;
     // A page's own inline link markers are NOT source IDs. Only pair a result
     // header with its immediately following citation metadata line.
-    for (const block of content.text.split(/\n-{40,}\s*\n/)) {
+    for (const block of searchResultBlocks(content.text)) {
       const match = /^[^\n]*\((https?:\/\/[^\s]+)\)\r?\ncite(turn\d+[a-z]+\d+)/i.exec(block.trim());
       if (match) addSource(sources, match[2], match[1]);
     }

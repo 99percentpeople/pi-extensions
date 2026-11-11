@@ -34,7 +34,7 @@ export const DEFAULT_CODEX_API_CONFIG: CodexApiConfig = {
   responseVerbosity: "auto",
   searchEnabled: true,
   imageEnabled: true,
-  askEnabled: true,
+  askEnabled: false,
   allowOtherProviders: false,
   searchMode: "auto",
   searchContextSize: "medium",
