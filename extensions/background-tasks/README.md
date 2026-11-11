@@ -457,9 +457,45 @@ runtime, but `node-pty` is still installed as a package dependency.
 ## Shared settings
 
 Use the shared `/99settings` menu to configure the number of task rows shown in
-the collapsed widget and which pipe tasks include their latest output. Defaults
-preserve the compact summary-only widget and finished-task output previews.
-Operational commands such as `/bg-attach` and `/bg-kill` remain separate.
+the collapsed widget, which pipe tasks include their latest output, and completion
+notifications. Defaults preserve the compact summary-only widget, finished-task
+output previews, and silent task completion. Operational commands such as
+`/bg-attach` and `/bg-kill` remain separate.
+
+### Opt-in completion notifications
+
+Completion notifications default to **Off**: use `bg_wait` when a finite task's
+completion is needed. Enable **Completion notifications** in `/99settings`
+(`completionNotifications: true` in the `background-tasks` settings namespace)
+to notify the agent about still-unread completions at successful active turn
+boundaries. Notifications cannot wake an idle agent. A task finishing after the
+last boundary waits for the next explicit/user-started run.
+
+Only new, actual task finishes produce receipts, including failures and stops.
+Enabling does not backfill finished/restored tasks; disconnected transports are
+not completions. A terminal result returned by any background tool acknowledges
+that task, including `bg_status` lists and calls through nested tool runtimes
+such as codemode. Acknowledged receipts are canceled before delivery, avoiding
+a duplicate notice/extra AI turn after a result was consumed. Other file reads
+or replacement processes cannot establish acknowledgment or semantic supersession.
+
+Unread completions batch at a successful, tool-complete turn boundary using
+steering, not a deferred follow-up during arbitrary tool work. Delivery happens
+after tool-result acknowledgments, so results consumed in that turn do not also
+produce notices. Queued user messages take precedence; queues are never cleared
+or rewritten. Pending receipts protect task output from ordinary next-run
+cleanup, without aging out unseen failures. Disabling cancels pending receipts,
+restoring normal retention; re-enabling only observes subsequent finishes.
+Session changes and shutdown cancel receipts; shutdown-induced kills do not notify.
+
+Notification delivery uses no timers and starts no autonomous turns while idle,
+during user auth preflight, or during manual compaction (including early auth,
+later handlers, success, cancellation, and failure). Unread receipts/output wait
+for a real successful active `turn_end`. Abort and error boundaries do not deliver or
+restart the agent; a successful automatic retry can deliver at its boundary
+without another user prompt. This boundary-only behavior supports Pi 0.83
+without relying on its idle status during preflight/compaction or guessing that
+newer peers expose safer wake capabilities.
 
 ## License
 

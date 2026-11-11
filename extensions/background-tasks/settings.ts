@@ -57,11 +57,21 @@ export function registerBackgroundTasksSettings(
         description: "Choose which pipe-task rows include their latest output",
         currentValue: OUTPUT_PREVIEW_LABELS[config.outputPreview],
         values: Object.values(OUTPUT_PREVIEW_LABELS),
+      }, {
+        id: "completionNotifications",
+        label: "Completion notifications",
+        description: "Report unread task completions at active turn boundaries; never wake an idle agent",
+        currentValue: config.completionNotifications ? "On" : "Off",
+        values: ["Off", "On"],
       }];
     },
     onChange: (id, value, ctx) => {
       const config = controller.getConfig();
-      if (id === "collapsedTaskLimit") {
+      if (id === "completionNotifications") {
+        if (value === "On" || value === "Off") {
+          controller.updateConfig({ ...config, completionNotifications: value === "On" }, ctx);
+        }
+      } else if (id === "collapsedTaskLimit") {
         const collapsedTaskLimit = value === "Summary only" ? 0 : Number(value);
         if (
           !Number.isInteger(collapsedTaskLimit)

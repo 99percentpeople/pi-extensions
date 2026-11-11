@@ -18,9 +18,18 @@ import { pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import {
   initTheme,
+  createAgentSession,
+  DefaultResourceLoader,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import { CompletionNotifications } from "../extensions/background-tasks/notifications.ts";
+import { tasks as runtimeTasks } from "../extensions/background-tasks/runtime.ts";
 import type { IPty } from "node-pty";
 import backgroundTasks, {
   BACKGROUND_COLLAPSED_TASK_LIMIT_PRESETS,
@@ -264,7 +273,13 @@ function createHarness(
       on: (name: string, handler: (...args: any[]) => void) => eventBus.on(name, handler),
       emit: (name: string, payload: unknown) => eventBus.emit(name, payload),
     },
-    on: (name: string, handler: (...args: any[]) => Promise<void> | void) => lifecycle.set(name, handler),
+    on: (name: string, handler: (...args: any[]) => Promise<void> | void) => {
+      const previous = lifecycle.get(name);
+      lifecycle.set(name, async (...args: any[]) => {
+        await previous?.(...args);
+        await handler(...args);
+      });
+    },
     registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: any) => commands.set(name, command),
     appendEntry: (customType: string, data: unknown) => {
@@ -277,6 +292,8 @@ function createHarness(
 
   const ctx = {
     cwd: process.cwd(),
+    isIdle: () => false,
+    hasPendingMessages: () => false,
     hasUI: false,
     mode: "tui",
     isProjectTrusted: () => true,
@@ -456,6 +473,7 @@ test("background task settings normalize and persist widget display options", as
   }), {
     collapsedTaskLimit: 3,
     outputPreview: "all",
+    completionNotifications: false,
   });
   assert.deepEqual(normalizeBackgroundTasksConfig({
     collapsedTaskLimit: 11,
@@ -466,16 +484,18 @@ test("background task settings normalize and persist widget display options", as
   const path = join(directory, "99extensions.json");
   try {
     await writeFile(path, '{"unknown":{"keep":true}}\n', "utf8");
-    saveBackgroundTasksConfig({ collapsedTaskLimit: 1, outputPreview: "failures" }, path);
+    saveBackgroundTasksConfig({ collapsedTaskLimit: 1, outputPreview: "failures", completionNotifications: true }, path);
     assert.deepEqual(loadBackgroundTasksConfig(path), {
       collapsedTaskLimit: 1,
       outputPreview: "failures",
+      completionNotifications: true,
     });
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
       unknown: { keep: true },
       "background-tasks": {
         collapsedTaskLimit: 1,
         outputPreview: "failures",
+        completionNotifications: true,
       },
     });
   } finally {
@@ -649,7 +669,9 @@ test("adapter controls target remote tasks instead of local transport processes"
 });
 
 test("adapter controls survive a lost local transport and can finish a disconnected task", async () => {
-  const { tools, lifecycle, eventBus, children, ctx } = createHarness();
+  const { tools, lifecycle, eventBus, children, ctx, messages } = createHarness({
+    ...DEFAULT_BACKGROUND_TASKS_CONFIG, completionNotifications: true,
+  });
   const bgStart = tools.get("bg_start");
   const bgStatus = tools.get("bg_status");
   const bgSend = tools.get("bg_send");
@@ -713,6 +735,8 @@ test("adapter controls survive a lost local transport and can finish a disconnec
   );
   assert.equal(disconnected.details.status, "disconnected");
   assert.match(disconnected.content[0].text, /test transport unavailable/);
+  await lifecycle.get("turn_end")?.(notificationTurn(), ctx);
+  assert.equal(messages.length, 0, "lost transport is not an actual task finish");
   await lifecycle.get("before_agent_start")?.({}, ctx);
   const retainedDisconnected = await bgStatus.execute(
     "transport-loss-retained-status",
@@ -3183,4 +3207,676 @@ test("PTY tasks preserve terminal state and use terminal input semantics", async
   assert.match(killedLogs.content[0].text, /LAST SCREEN ROW/);
 
   await lifecycle.get("session_shutdown")?.({}, ctx);
+});
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function notificationTurn(stopReason = "toolUse") {
+  return { message: { role: "assistant", stopReason }, toolResults: [] };
+}
+
+function notificationSettings(harness: ReturnType<typeof createHarness>, enabled: boolean): void {
+  const registry = (globalThis as any)[Symbol.for("@99percentpeople/pi-shared-settings/registry-v1")];
+  const section = registry.sections.get("background-tasks");
+  const setting = section.settings().find((setting: any) => setting.id === "completionNotifications");
+  assert.match(setting.description, /active turn boundaries; never wake an idle agent/);
+  section.onChange("completionNotifications", enabled ? "On" : "Off", harness.ctx);
+}
+
+function createNotificationHarness(enabled = true) {
+  const h = createHarness({ ...DEFAULT_BACKGROUND_TASKS_CONFIG, completionNotifications: enabled });
+  return {
+    ...h, processes: h.children, tasks: runtimeTasks,
+    bgStart: h.tools.get("bg_start"), bgWait: h.tools.get("bg_wait"), bgStatus: h.tools.get("bg_status"),
+    bgLogs: h.tools.get("bg_logs"), bgSend: h.tools.get("bg_send"), bgKill: h.tools.get("bg_kill"),
+  };
+}
+
+test("completion notification config normalizes booleans without coercion", () => {
+  assert.equal(normalizeBackgroundTasksConfig({ completionNotifications: true }).completionNotifications, true);
+  for (const value of [undefined, null, "true", 1]) {
+    assert.equal(normalizeBackgroundTasksConfig({ completionNotifications: value }).completionNotifications, false);
+  }
+});
+
+test("unread success/failure batch only at tool-complete boundary; queued input wins", async (t) => {
+  const h = createNotificationHarness();
+  try {
+    const first = await h.bgStart.execute("first", { name: "first", command: "build" }, undefined, undefined, h.ctx);
+    const second = await h.bgStart.execute("second", { name: "second", command: "test" }, undefined, undefined, h.ctx);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    h.processes[0].emit("exit", 0, null);
+    h.processes[1].emit("exit", 3, null);
+    t.mock.timers.tick(500);
+    assert.equal(h.messages.length, 0, "busy task finish must not queue any message");
+    h.ctx.hasPendingMessages = () => true;
+    await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+    assert.equal(h.messages.length, 0);
+    await h.lifecycle.get("before_agent_start")?.({}, h.ctx);
+    await h.lifecycle.get("turn_start")?.({}, h.ctx);
+    assert.equal(h.tasks.size, 2, "unread results survive retention cleanup");
+    h.ctx.hasPendingMessages = () => false;
+    await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+    assert.equal(h.messages.length, 1);
+    assert.deepEqual(h.messages[0].message.details.taskIds, [first.details.id, second.details.id]);
+    assert.match(h.messages[0].message.content, /completed/);
+    assert.match(h.messages[0].message.content, /failed, exit=3/);
+    await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+    t.mock.timers.tick(500);
+    assert.equal(h.messages.length, 1);
+  } finally { t.mock.timers.reset(); await h.cleanup(); }
+});
+
+for (const reader of ["bgWait", "bgStatus", "bgLogs", "bgSend", "bgKill", "list"] as const) {
+  test(`terminal ${reader} result acknowledges receipt at execute seam (nested callers included)`, async (t) => {
+    const h = createNotificationHarness();
+    try {
+      const start = await h.bgStart.execute("start", { name: "read", command: "work" }, undefined, undefined, h.ctx);
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      h.processes[0].emit("exit", 0, null);
+      const args = reader === "list" ? {} : reader === "bgSend" ? { id: start.details.id, input: "x" } : { id: start.details.id };
+      const tool = reader === "list" ? h.bgStatus : h[reader];
+      const result = await tool.execute("nested-call", args, undefined, undefined, h.ctx);
+      assert.equal(reader === "list" ? result.details.tasks[0].status : result.details.status, "completed");
+      await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+      h.ctx.isIdle = () => true;
+      await h.lifecycle.get("agent_settled")?.({}, h.ctx);
+      t.mock.timers.tick(500);
+      assert.equal(h.messages.length, 0, "consumed completion must cause no notification/extra turn");
+    } finally { t.mock.timers.reset(); await h.cleanup(); }
+  });
+}
+
+test("stopped kill result acknowledges finish before tool returns", async (t) => {
+  const h = createNotificationHarness();
+  try {
+    const start = await h.bgStart.execute("start", { name: "stop", command: "serve" }, undefined, undefined, h.ctx);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const result = await h.bgKill.execute("kill", { id: start.details.id }, undefined, undefined, h.ctx);
+    assert.equal(result.details.status, "stopped");
+    await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+    assert.equal(h.messages.length, 0);
+  } finally { t.mock.timers.reset(); await h.cleanup(); }
+});
+
+test("idle completion waits for active boundary; disabling cancels and enabling never backfills", async (t) => {
+  const h = createNotificationHarness(false);
+  try {
+    await h.bgStart.execute("old", { name: "old", command: "work" }, undefined, undefined, h.ctx);
+    h.ctx.isIdle = () => true;
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    h.processes[0].emit("exit", 0, null);
+    notificationSettings(h, true);
+    t.mock.timers.tick(200);
+    assert.equal(h.messages.length, 0);
+    await h.bgStart.execute("cancel", { name: "cancel", command: "work" }, undefined, undefined, h.ctx);
+    h.processes[1].emit("exit", 0, null);
+    notificationSettings(h, false);
+    notificationSettings(h, true);
+    t.mock.timers.tick(200);
+    assert.equal(h.messages.length, 0);
+    await h.bgStart.execute("new", { name: "new", command: "work" }, undefined, undefined, h.ctx);
+    h.processes[2].emit("exit", 0, null);
+    t.mock.timers.tick(1000);
+    assert.equal(h.messages.length, 0, "idle completion must never wake the agent");
+    await h.lifecycle.get("before_agent_start")?.({}, h.ctx);
+    assert.equal(h.tasks.size, 1, "only unread completion survives normal cleanup");
+    h.ctx.isIdle = () => false;
+    await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.messages[0].message.details.taskIds.length, 1);
+    assert.match(h.messages[0].message.content, /"new"/);
+    t.mock.timers.tick(1000);
+    assert.equal(h.messages.length, 1);
+  } finally { t.mock.timers.reset(); await h.cleanup(); }
+});
+
+test("abort/error never deliver; successful retry boundary delivers without before_agent_start", async (t) => {
+  const h = createNotificationHarness();
+  try {
+    const abort = new AbortController();
+    h.ctx.signal = abort.signal;
+    await h.bgStart.execute("start", { name: "retry", command: "work" }, undefined, undefined, h.ctx);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    abort.abort();
+    h.processes[0].emit("exit", 1, null);
+    h.ctx.isIdle = () => true;
+    await h.lifecycle.get("turn_end")?.(notificationTurn("aborted"), h.ctx);
+    await h.lifecycle.get("agent_settled")?.({}, h.ctx);
+    t.mock.timers.tick(1000);
+    assert.equal(h.messages.length, 0);
+    h.ctx.signal = new AbortController().signal;
+    h.ctx.isIdle = () => false;
+    await h.lifecycle.get("turn_end")?.(notificationTurn("error"), h.ctx);
+    await h.lifecycle.get("turn_start")?.({}, h.ctx);
+    await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+    assert.equal(h.messages.length, 1);
+  } finally { t.mock.timers.reset(); await h.cleanup(); }
+});
+
+test("idle failures retain output until successful active boundary", async (t) => {
+  const h = createNotificationHarness();
+  try {
+    await h.bgStart.execute("start", { name: "compact", command: "work" }, undefined, undefined, h.ctx);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    h.processes[0].emit("exit", 2, null);
+    h.ctx.isIdle = () => true;
+    t.mock.timers.tick(1000);
+    assert.equal(h.messages.length, 0);
+    await h.lifecycle.get("before_agent_start")?.({}, h.ctx);
+    await h.lifecycle.get("turn_start")?.({}, h.ctx);
+    assert.equal(h.tasks.size, 1);
+    h.ctx.isIdle = () => false;
+    await h.lifecycle.get("turn_end")?.(notificationTurn(), h.ctx);
+    assert.equal(h.messages.length, 1);
+  } finally { t.mock.timers.reset(); await h.cleanup(); }
+});
+
+test("shutdown and session replacement cancel pending receipts, never replay snapshots", async (t) => {
+  const h = createNotificationHarness();
+  try {
+    await h.bgStart.execute("start", { name: "replace", command: "work" }, undefined, undefined, h.ctx);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    h.processes[0].emit("exit", 0, null);
+    await h.lifecycle.get("session_start")?.({}, h.ctx);
+    h.ctx.isIdle = () => true;
+    t.mock.timers.tick(1000);
+    assert.equal(h.messages.length, 0);
+    await h.bgStart.execute("shutdown", { name: "shutdown", command: "work" }, undefined, undefined, h.ctx);
+    await h.lifecycle.get("session_shutdown")?.({}, h.ctx);
+    h.processes[1].emit("exit", 0, null);
+    t.mock.timers.tick(1000);
+    assert.equal(h.messages.length, 0);
+  } finally { t.mock.timers.reset(); await h.cleanup(); }
+});
+
+/** Real peer host: scripted provider, actual awaited extension/tool/turn lifecycle. */
+async function createNotificationHost(extra?: (pi: any, tools: Map<string, any>, processes: FakeChildProcess[]) => void) {
+  const directory = await mkdtemp(join(tmpdir(), "pi-bg-host-"));
+  const processes: FakeChildProcess[] = [];
+  const tools = new Map<string, any>();
+  const messages: any[] = [];
+  let ctx: any;
+  let shutdown: any;
+  let starts = 0;
+  const errors: string[] = [];
+  const faux = fauxProvider({ tokensPerSecond: Infinity });
+  const runtime = await ModelRuntime.create({ authPath: join(directory, "auth.json"), modelsPath: null });
+  runtime.registerNativeProvider(faux.provider);
+  const settingsManager = SettingsManager.inMemory({
+    compaction: { enabled: false, keepRecentTokens: 1 },
+    retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 },
+  });
+  const loader = new DefaultResourceLoader({
+    cwd: directory, agentDir: directory, settingsManager,
+    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    extensionFactories: [(pi) => {
+      const sourcePi = {
+        ...pi,
+        registerTool(tool: any) { tools.set(tool.name, tool); pi.registerTool(tool); },
+        on(name: any, handler: any) {
+          if (name === "session_shutdown") shutdown = handler;
+          pi.on(name, handler);
+        },
+        sendMessage(message: any, options: any) {
+          messages.push({ message, options });
+          pi.sendMessage(message, options);
+        },
+      };
+      backgroundTasks(sourcePi, {
+        loadConfig: () => ({ completionNotifications: true }), saveConfig: () => {},
+        spawnProcess: () => { const child = new FakeChildProcess(90_000_000 + processes.length); processes.push(child); return child as never; },
+        killProcess: (pid, signal) => {
+          const child = processes.find((process) => process.pid === Math.abs(pid));
+          if (!child) throw new Error("ESRCH");
+          child.finish(null, signal);
+        },
+        canSignalProcessGroup: true,
+        readConsoleSnapshot: () => "", getConsoleLineCount: () => 1, disposeConsole: () => {},
+      });
+      pi.on("session_start", async (_event, context) => { ctx = context; });
+      pi.on("before_agent_start", async () => { starts++; });
+      extra?.(pi, tools, processes);
+    }],
+  });
+  try {
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const { session } = await createAgentSession({
+      cwd: directory, agentDir: directory, modelRuntime: runtime, model: faux.getModel(),
+      settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(directory), noTools: "builtin",
+    });
+    await session.bindExtensions({ onError: (error) => errors.push(error.message) });
+    return {
+      session, faux, processes, tools, messages, runtime, settingsManager, get ctx() { return ctx; }, get starts() { return starts; },
+      async close() {
+        try {
+          await session.abort();
+          await shutdown?.({}, ctx);
+          assert.deepEqual(errors, []);
+        } finally {
+          session.dispose();
+          await rm(directory, { recursive: true, force: true });
+        }
+      },
+    };
+  } catch (error) {
+    await shutdown?.({}, ctx);
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+for (const nested of [false, true]) {
+  test(`peer 0.83 host: consumed ${nested ? "nested definition/list" : "bg_wait"} result causes zero notice or extra AI request`, async () => {
+    const h = await createNotificationHost((pi, tools) => {
+      if (!nested) return;
+      pi.registerTool({
+        name: "nested_status", label: "Nested status", description: "Call tool definition as nested tool runtimes do", parameters: Type.Object({}),
+        execute: async (_id: string, _args: unknown, signal: AbortSignal, update: unknown, ctx: unknown) =>
+          tools.get("bg_status").execute("nested", {}, signal, update, ctx),
+      });
+    });
+    try {
+      h.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("bg_start", { name: "read", command: "work" }), { stopReason: "toolUse" }),
+        () => {
+          h.processes[0].emit("exit", 0, null);
+          return fauxAssistantMessage(fauxToolCall(nested ? "nested_status" : "bg_wait", nested ? {} : { id: "read" }), { stopReason: "toolUse" });
+        },
+        fauxAssistantMessage("done"),
+      ]);
+      await h.session.prompt("run then read result");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(h.faux.state.callCount, 3);
+      assert.equal(h.messages.length, 0);
+      assert.equal(h.session.isIdle, true);
+    } finally { await h.close(); }
+  });
+}
+
+test("peer 0.83 host: unread batch waits for unrelated tool completion, steers next request", async () => {
+  let toolActive = false;
+  const h = await createNotificationHost((pi, _tools, processes) => {
+    pi.registerTool({
+      name: "finish_tasks", label: "Finish", description: "Finish fake children during unrelated tool work", parameters: Type.Object({}),
+      async execute() {
+        toolActive = true;
+        processes[0].emit("exit", 0, null);
+        processes[1].emit("exit", 7, null);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        toolActive = false;
+        return { content: [{ type: "text", text: "done" }], details: {} };
+      },
+    });
+  });
+  try {
+    let sawBatch = false;
+    h.faux.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("bg_start", { name: "success", command: "build" }),
+        fauxToolCall("bg_start", { name: "failure", command: "test" }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("finish_tasks", {}), { stopReason: "toolUse" }),
+      (context) => {
+        assert.equal(toolActive, false);
+        sawBatch = context.messages.some((message: any) => JSON.stringify(message).includes("Unread background task completions"));
+        return fauxAssistantMessage("inspected completion batch");
+      },
+    ]);
+    await h.session.prompt("run work");
+    assert.equal(sawBatch, true);
+    assert.equal(h.messages.length, 1);
+    assert.deepEqual(h.messages[0].options, { deliverAs: "steer", triggerTurn: false });
+    assert.equal(h.faux.state.callCount, 3);
+  } finally { await h.close(); }
+});
+
+test("peer 0.83 host: successful automatic retry recovers without before_agent_start", async () => {
+  const h = await createNotificationHost();
+  try {
+    h.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("bg_start", { name: "retry", command: "work" }), { stopReason: "toolUse" }),
+      () => {
+        h.processes[0].emit("exit", 1, null);
+        return fauxAssistantMessage([], { stopReason: "error", errorMessage: "429 rate limit" });
+      },
+      fauxAssistantMessage("retry succeeded"),
+      fauxAssistantMessage("completion inspected"),
+    ]);
+    await h.session.prompt("run with automatic retry");
+    assert.equal(h.starts, 1);
+    assert.equal(h.faux.state.callCount, 4);
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.session.isIdle, true);
+  } finally { await h.close(); }
+});
+
+test("peer 0.83 host: abort cannot wake idle agent with retained unread completion", async () => {
+  const blocked = deferred<void>();
+  const h = await createNotificationHost();
+  try {
+    h.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("bg_start", { name: "abort", command: "work" }), { stopReason: "toolUse" }),
+      async (_context, options) => {
+        blocked.resolve();
+        await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return fauxAssistantMessage([], { stopReason: "aborted" });
+      },
+    ]);
+    const run = h.session.prompt("start work then abort");
+    await blocked.promise;
+    await h.session.abort();
+    await run;
+    h.processes[0].emit("exit", 2, null);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.faux.state.callCount, 2);
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.session.isIdle, true);
+  } finally { await h.close(); }
+});
+
+test("peer 0.83 host: manual compaction delayed later handler cannot race notification wake", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const h = await createNotificationHost((pi, _tools, processes) => {
+    pi.on("session_before_compact", async (event: any) => ({
+      compaction: {
+        summary: "compact test history", firstKeptEntryId: event.preparation.firstKeptEntryId,
+        tokensBefore: event.preparation.tokensBefore,
+      },
+    }));
+    pi.on("session_compact", async () => {
+      processes[0].emit("exit", 3, null);
+      entered.resolve();
+      await release.promise;
+    });
+  });
+  try {
+    h.faux.setResponses([fauxAssistantMessage("seed compaction history")]);
+    await h.session.prompt("seed history");
+    await h.tools.get("bg_start").execute("outside", { name: "compact", command: "work" }, undefined, undefined, h.ctx);
+    const compacting = h.session.compact();
+    await entered.promise;
+    assert.equal(h.session.isIdle, true, "peer reports idle before compaction handler returns/reconnect");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.faux.state.callCount, 1);
+    release.resolve();
+    await compacting;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.messages.length, 0, "compaction completion is not an active turn boundary");
+    h.faux.setResponses([fauxAssistantMessage("resumed"), fauxAssistantMessage("completion inspected")]);
+    await h.session.prompt("resume after compaction");
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.faux.state.callCount, 3);
+  } finally { release.resolve(); await h.close(); }
+});
+
+test("late old-generation result cannot acknowledge replacement session receipt", async (t) => {
+  const h = createNotificationHarness(false);
+  const sent: unknown[] = [];
+  const receipts = new CompletionNotifications({ sendMessage: (message: unknown) => sent.push(message) } as ExtensionAPI, true);
+  try {
+    const start = await h.bgStart.execute("start", { name: "generation", command: "work" }, undefined, undefined, h.ctx);
+    const task = runtimeTasks.get(start.details.id)!;
+    const oldGeneration = receipts.captureGeneration();
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    h.processes[0].emit("exit", 0, null);
+    receipts.finished(task);
+    receipts.reset(true);
+    receipts.finished(task);
+    receipts.acknowledge({ id: task.id, status: "completed" }, oldGeneration);
+    receipts.turnEnd(notificationTurn() as never, h.ctx);
+    assert.equal(sent.length, 1);
+    receipts.reset();
+    t.mock.timers.tick(1000);
+    assert.equal(sent.length, 1);
+  } finally { receipts.reset(); t.mock.timers.reset(); await h.cleanup(); }
+});
+
+test("peer 0.83 host: delayed before_agent_start stays idle without recursive notification wake", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const h = await createNotificationHost((pi, _tools, processes) => {
+    pi.on("before_agent_start", async () => {
+      processes[0].emit("exit", 0, null);
+      entered.resolve();
+      await release.promise;
+    });
+  });
+  try {
+    await h.tools.get("bg_start").execute("outside", { name: "preflight", command: "work" }, undefined, undefined, h.ctx);
+    h.faux.setResponses([fauxAssistantMessage("user run"), fauxAssistantMessage("notification inspected")]);
+    const prompt = h.session.prompt("start user run");
+    await entered.promise;
+    assert.equal(h.session.isIdle, true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.faux.state.callCount, 0);
+    release.resolve();
+    await prompt;
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.faux.state.callCount, 2);
+  } finally { release.resolve(); await h.close(); }
+});
+
+test("peer 0.83 host: completion after final boundary waits for user run and preserves output", async () => {
+  const h = await createNotificationHost();
+  try {
+    h.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("bg_start", { name: "idle", command: "work" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("task still running"),
+    ]);
+    await h.session.prompt("start background work");
+    h.processes[0].stdout.emit("data", Buffer.from("retained output\n"));
+    h.processes[0].finish(0, null);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.faux.state.callCount, 2, "no autonomous provider request after final boundary");
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.session.isIdle, true);
+    h.faux.setResponses([
+      fauxAssistantMessage("user resumed"),
+      fauxAssistantMessage(fauxToolCall("bg_logs", { id: "idle" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("output inspected"),
+    ]);
+    await h.session.prompt("resume and inspect background work");
+    assert.equal(h.starts, 2);
+    assert.equal(h.faux.state.callCount, 5);
+    assert.equal(h.messages.length, 1);
+    assert.ok(h.session.messages.some((message: any) =>
+      message.role === "toolResult" && JSON.stringify(message.content).includes("retained output")));
+  } finally { await h.close(); }
+});
+
+test("peer 0.83 host: cancelled manual compaction preserves receipt until user resumes", async () => {
+  const h = await createNotificationHost((pi, _tools, processes) => {
+    pi.on("session_before_compact", async () => {
+      processes[0].emit("exit", 4, null);
+      return { cancel: true };
+    });
+  });
+  try {
+    h.faux.setResponses([fauxAssistantMessage("seed compaction history")]);
+    await h.session.prompt("seed history");
+    await h.tools.get("bg_start").execute("outside", { name: "cancel-compact", command: "work" }, undefined, undefined, h.ctx);
+    await assert.rejects(h.session.compact(), /Compaction cancelled/);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.messages.length, 0);
+    h.faux.setResponses([fauxAssistantMessage("resumed"), fauxAssistantMessage("completion inspected")]);
+    await h.session.prompt("resume after cancelled compaction");
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.faux.state.callCount, 3);
+  } finally { await h.close(); }
+});
+
+async function waitForNotificationHostGate(promise: Promise<void>): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Notification host gate was not reached")), 2000);
+      }),
+    ]);
+  } finally { if (timeout !== undefined) clearTimeout(timeout); }
+}
+
+for (const outcome of ["success", "cancel", "failure"] as const) {
+  test(`peer 0.83 host: early manual-compaction auth cannot wake agent (${outcome})`, async () => {
+    const enteredAuth = deferred<void>();
+    const releaseAuth = deferred<void>();
+    let beforeCompactions = 0;
+    const h = await createNotificationHost((pi) => {
+      pi.on("session_before_compact", async (event: any) => {
+        beforeCompactions++;
+        if (outcome === "cancel") return { cancel: true };
+        return {
+          compaction: {
+            summary: "compact test history", firstKeptEntryId: event.preparation.firstKeptEntryId,
+            tokensBefore: event.preparation.tokensBefore,
+          },
+        };
+      });
+    });
+    const getAuth = h.runtime.getAuth.bind(h.runtime);
+    try {
+      h.faux.setResponses([fauxAssistantMessage("seed compaction history")]);
+      await h.session.prompt("seed history");
+      if (outcome === "failure") await h.session.compact();
+      const beforeAuth = beforeCompactions;
+      await h.tools.get("bg_start").execute("outside", { name: "early-compact", command: "work" }, undefined, undefined, h.ctx);
+      h.runtime.getAuth = async (model, options) => {
+        enteredAuth.resolve();
+        await releaseAuth.promise;
+        return getAuth(model, options);
+      };
+      // Observe completion/rejection immediately; the gate is intentionally held.
+      const compacting = h.session.compact().then(
+        () => undefined,
+        (error: Error) => error,
+      );
+      await waitForNotificationHostGate(enteredAuth.promise);
+      assert.equal(beforeCompactions, beforeAuth, "auth precedes session_before_compact");
+      assert.equal(h.session.isIdle, true, "peer reports idle with agent events disconnected");
+      assert.equal(h.ctx.signal, undefined);
+      h.processes[0].finish(5, null);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(h.messages.length, 0);
+      assert.equal(h.faux.state.callCount, 1, "no autonomous provider request during early compaction auth");
+      h.runtime.getAuth = getAuth;
+      releaseAuth.resolve();
+      const result = await compacting;
+      if (outcome === "success") assert.equal(result, undefined);
+      else assert.match(result?.message ?? "", outcome === "cancel" ? /Compaction cancelled/ : /Nothing to compact \(session too small\)/);
+      assert.equal(beforeCompactions, beforeAuth + (outcome === "failure" ? 0 : 1));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(h.messages.length, 0, "success/failure/cancel is not an active turn boundary");
+      assert.equal(h.faux.state.callCount, 1);
+      h.faux.setResponses([fauxAssistantMessage("user resumed"), fauxAssistantMessage("completion inspected")]);
+      await h.session.prompt("resume after manual compaction");
+      assert.equal(h.messages.length, 1);
+      assert.match(h.messages[0].message.content, /"early-compact".*failed/);
+      assert.equal(h.faux.state.callCount, 3);
+    } finally {
+      h.runtime.getAuth = getAuth;
+      releaseAuth.resolve();
+      await h.close();
+    }
+  });
+}
+
+test("peer 0.83 host: user prompt slow auth and pre-prompt compaction preserve input precedence", async () => {
+  const enteredCheck = deferred<void>();
+  const releaseCheck = deferred<void>();
+  const enteredCompactionAuth = deferred<void>();
+  const releaseCompactionAuth = deferred<void>();
+  let beforeCompactions = 0;
+  const h = await createNotificationHost((pi) => {
+    pi.on("session_before_compact", async (event: any) => {
+      beforeCompactions++;
+      assert.equal(event.reason, "threshold");
+      // Only the pre-prompt compaction is needed for this regression.
+      h.settingsManager.setCompactionEnabled(false);
+      return {
+        compaction: {
+          summary: "compact before user prompt", firstKeptEntryId: event.preparation.firstKeptEntryId,
+          tokensBefore: event.preparation.tokensBefore,
+        },
+      };
+    });
+  });
+  const hasConfiguredAuth = h.runtime.hasConfiguredAuth.bind(h.runtime);
+  const checkAuth = h.runtime.checkAuth.bind(h.runtime);
+  const getAuth = h.runtime.getAuth.bind(h.runtime);
+  try {
+    h.faux.setResponses([fauxAssistantMessage("seed history for pre-prompt compaction")]);
+    await h.session.prompt("seed history");
+    const first = await h.tools.get("bg_start").execute("auth", { name: "user-auth", command: "work" }, undefined, undefined, h.ctx);
+    const second = await h.tools.get("bg_start").execute("compact", { name: "user-compact", command: "work" }, undefined, undefined, h.ctx);
+    h.settingsManager.applyOverrides({
+      compaction: { enabled: true, reserveTokens: h.faux.getModel().contextWindow - 1, keepRecentTokens: 1 },
+    });
+    h.runtime.hasConfiguredAuth = () => false;
+    h.runtime.checkAuth = async (provider) => {
+      enteredCheck.resolve();
+      await releaseCheck.promise;
+      return checkAuth(provider);
+    };
+    h.runtime.getAuth = async (model, options) => {
+      enteredCompactionAuth.resolve();
+      await releaseCompactionAuth.promise;
+      return getAuth(model, options);
+    };
+    h.faux.setResponses([
+      (context) => {
+        assert.ok(context.messages.some((message: any) =>
+          message.role === "user" && JSON.stringify(message.content).includes("user owns this run")));
+        assert.equal(h.messages.length, 0, "user prompt must reach provider before notification delivery");
+        return fauxAssistantMessage("user prompt completed");
+      },
+      fauxAssistantMessage("completion batch inspected"),
+    ]);
+    const prompt = h.session.prompt("user owns this run");
+    await waitForNotificationHostGate(enteredCheck.promise);
+    assert.equal(h.starts, 1, "user auth precedes before_agent_start");
+    assert.equal(h.session.isIdle, true);
+    assert.equal(h.ctx.hasPendingMessages(), false, "admitted prompt is not a queued message");
+    h.processes[0].finish(0, null);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.faux.state.callCount, 1, "no autonomous provider request during user auth");
+    h.runtime.hasConfiguredAuth = hasConfiguredAuth;
+    h.runtime.checkAuth = checkAuth;
+    releaseCheck.resolve();
+    await waitForNotificationHostGate(enteredCompactionAuth.promise);
+    assert.equal(h.starts, 1, "pre-prompt compaction also precedes before_agent_start");
+    assert.equal(beforeCompactions, 0, "summarization auth precedes compaction extension hooks");
+    assert.equal(h.session.isIdle, true);
+    h.processes[1].finish(6, null);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.faux.state.callCount, 1, "no autonomous provider request during pre-prompt compaction auth");
+    h.runtime.getAuth = getAuth;
+    releaseCompactionAuth.resolve();
+    await prompt;
+    assert.equal(beforeCompactions, 1);
+    assert.equal(h.starts, 2);
+    assert.equal(h.messages.length, 1);
+    assert.deepEqual(h.messages[0].message.details.taskIds, [first.details.id, second.details.id]);
+    assert.deepEqual(h.messages[0].options, { deliverAs: "steer", triggerTurn: false });
+    assert.equal(h.faux.state.callCount, 3);
+    assert.equal(h.session.isIdle, true);
+  } finally {
+    h.runtime.hasConfiguredAuth = hasConfiguredAuth;
+    h.runtime.checkAuth = checkAuth;
+    h.runtime.getAuth = getAuth;
+    releaseCheck.resolve();
+    releaseCompactionAuth.resolve();
+    await h.close();
+  }
 });

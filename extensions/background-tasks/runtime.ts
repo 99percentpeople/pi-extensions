@@ -202,6 +202,13 @@ export const MAX_TERMINAL_COLS = 500;
 export const MIN_TERMINAL_ROWS = 5;
 export const MAX_TERMINAL_ROWS = 200;
 
+const taskFinishedListeners = new Set<(task: BgTask) => void>();
+
+export function onTaskFinished(listener: (task: BgTask) => void): () => void {
+  taskFinishedListeners.add(listener);
+  return () => { taskFinishedListeners.delete(listener); };
+}
+
 let tasksChangedHandler: (() => void) | undefined;
 
 export function setTasksChangedHandler(handler: (() => void) | undefined): void {
@@ -1044,6 +1051,7 @@ export function finishTask(
   runningTasks.delete(task);
   task.done.abort();
   task.attachment.taskExited?.();
+  for (const listener of taskFinishedListeners) listener(task);
   notifyTasksChanged();
   // Snapshot persistence does not change visible task state; avoid a second,
   // delayed widget render after the task has already transitioned to finished.

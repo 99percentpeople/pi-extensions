@@ -4,6 +4,7 @@ import {
   normalizeBackgroundTasksConfig,
   saveBackgroundTasksConfig,
 } from "./config.ts";
+import { CompletionNotifications } from "./notifications.ts";
 import { registerBackgroundTaskCommands } from "./commands.ts";
 import {
   ORDERED_TASK_TOOL_NAMES,
@@ -17,6 +18,7 @@ import {
   forceKillProcess,
   getTaskSnapshotAppender,
   isTaskControllable,
+  onTaskFinished,
   persistTaskReconciliation,
   registerOrderedToolCall,
   registerShellProvider,
@@ -62,6 +64,8 @@ export default function (
   setBackgroundTasksConfig(normalizeBackgroundTasksConfig(
     (dependencies.loadConfig ?? loadBackgroundTasksConfig)(),
   ));
+  const notifications = new CompletionNotifications(pi, getBackgroundTasksConfig().completionNotifications);
+  let unsubscribeFinished = onTaskFinished((task) => notifications.finished(task));
   const persistConfig = dependencies.saveConfig ?? saveBackgroundTasksConfig;
 
   registerBackgroundTasksSettings(pi, {
@@ -69,6 +73,7 @@ export default function (
     updateConfig: (next, ctx) => {
       const config = normalizeBackgroundTasksConfig(next);
       setBackgroundTasksConfig(config);
+      notifications.setEnabled(config.completionNotifications);
       try {
         persistConfig(config);
       } catch (error) {
@@ -97,6 +102,9 @@ export default function (
   pi.events.on("bg:register", registerShellProvider);
 
   pi.on("session_start", async (_event, ctx) => {
+    notifications.reset(true);
+    unsubscribeFinished();
+    unsubscribeFinished = onTaskFinished((task) => notifications.finished(task));
     enableSnapshotPersistence();
     setTasksChangedHandler(updateWidget);
     clearOrderedToolCalls();
@@ -107,6 +115,7 @@ export default function (
   });
 
   pi.on("session_tree", async (_event, ctx) => {
+    notifications.reset(true);
     setTasksChangedHandler(updateWidget);
     clearOrderedToolCalls();
     clearWidget();
@@ -132,8 +141,9 @@ export default function (
     if (event.toolName.startsWith("bg_")) { setWidgetContext(ctx); updateWidget(); }
   });
 
-  pi.on("turn_end", async () => {
+  pi.on("turn_end", async (event, ctx) => {
     clearOrderedToolCalls();
+    notifications.turnEnd(event, ctx);
   });
 
   pi.on("agent_settled", async () => {
@@ -142,7 +152,7 @@ export default function (
 
   pi.on("before_agent_start", async () => {
     await waitForSnapshotPersistence();
-    const reconciliation = await discardExpiredFinishedTasks();
+    const reconciliation = await discardExpiredFinishedTasks((task) => notifications.protects(task));
     if (reconciliation.removed.length > 0 || reconciliation.clearedRetention.length > 0) {
       updateWidget();
       await persistTaskReconciliation(reconciliation.removed, reconciliation.clearedRetention);
@@ -150,6 +160,8 @@ export default function (
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    notifications.reset();
+    unsubscribeFinished();
     clearOrderedToolCalls();
     await waitForSnapshotPersistence();
     if (getTaskSnapshotAppender() === snapshotAppender) setTaskSnapshotAppender(null);
@@ -191,6 +203,6 @@ export default function (
     setTasksChangedHandler(undefined);
   });
 
-  registerBackgroundTaskTools(pi, dependencies);
+  registerBackgroundTaskTools(pi, dependencies, notifications);
   registerBackgroundTaskCommands(pi);
 }

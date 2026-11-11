@@ -66,15 +66,29 @@ import type {
   BgTask,
   BgWaitRenderState,
 } from "./types.ts";
+import type { CompletionNotifications } from "./notifications.ts";
 import { setWidgetContext, updateWidget } from "./widget.ts";
 
 export function registerBackgroundTaskTools(
   pi: ExtensionAPI,
   dependencies: BackgroundTasksExtensionDependencies,
+  notifications: CompletionNotifications,
 ): void {
+  const registerTool: ExtensionAPI["registerTool"] = (definition) => {
+    const execute = definition.execute;
+    pi.registerTool({
+      ...definition,
+      async execute(...args) {
+        const generation = notifications.captureGeneration();
+        const result = await execute(...args);
+        notifications.acknowledge(result.details, generation);
+        return result;
+      },
+    });
+  };
   // ── bg_start ───────────────────────────────────────────────────────
 
-  pi.registerTool({
+  registerTool({
     name: "bg_start",
     label: "BG Start",
     description: "Start a task asynchronously only when background execution is genuinely needed: for concurrent work, later interaction, or an explicit user request. Its unique name can immediately reference ordered follow-up bg_* calls in the same assistant response.",
@@ -310,7 +324,7 @@ export function registerBackgroundTaskTools(
 
   // ── bg_wait ────────────────────────────────────────────────────────
 
-  pi.registerTool({
+  registerTool({
     name: "bg_wait",
     label: "BG Wait",
     description: "Wait for a finite task to finish or time out and include its latest pipe log line when available. Use bg_logs for full pipe output or PTY terminal output.",
@@ -440,7 +454,7 @@ export function registerBackgroundTaskTools(
 
   // ── bg_status ──────────────────────────────────────────────────────
 
-  pi.registerTool({
+  registerTool({
     name: "bg_status",
     label: "BG Status",
     description: "Inspect task status and metadata or list current tasks, including each task's latest pipe log line when available. This is not a polling or waiting tool and does not return full or PTY output.",
@@ -570,7 +584,7 @@ export function registerBackgroundTaskTools(
 
   // ── bg_logs ────────────────────────────────────────────────────────
 
-  pi.registerTool({
+  registerTool({
     name: "bg_logs",
     label: "BG Logs",
     description:
@@ -798,7 +812,7 @@ export function registerBackgroundTaskTools(
     ? task.control.terminatingSignals.includes(signal)
     : DEFAULT_TERMINATING_SIGNALS.has(signal);
 
-  pi.registerTool({
+  registerTool({
     name: "bg_send",
     label: "BG Send",
     description: "Send text and terminal keys to a running task, or signal a running/disconnected adapter-owned task.",
@@ -989,7 +1003,7 @@ export function registerBackgroundTaskTools(
 
   // ── bg_kill ────────────────────────────────────────────────────────
 
-  pi.registerTool({
+  registerTool({
     name: "bg_kill",
     label: "BG Kill",
     description: "Terminate a running or disconnected background task and report the result. Sends SIGTERM by default or SIGKILL with force=true; does not return process output.",

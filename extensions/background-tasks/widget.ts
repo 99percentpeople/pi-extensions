@@ -58,13 +58,15 @@ interface TaskReconciliation {
   clearedRetention: string[];
 }
 
-export async function discardExpiredFinishedTasks(): Promise<TaskReconciliation> {
+export async function discardExpiredFinishedTasks(
+  protect: (task: BgTask) => boolean = () => false,
+): Promise<TaskReconciliation> {
   const expired = Array.from(tasks.values()).filter(
-    (task) => isFinalTaskStatus(task.status) && !task.retainForNextAgentTurn,
+    (task) => isFinalTaskStatus(task.status) && !task.retainForNextAgentTurn && !protect(task),
   );
   const clearedRetention: string[] = [];
   for (const task of tasks.values()) {
-    if (!task.retainForNextAgentTurn) continue;
+    if (!task.retainForNextAgentTurn || protect(task)) continue;
     task.retainForNextAgentTurn = false;
     if (isFinalTaskStatus(task.status)) clearedRetention.push(task.id);
   }

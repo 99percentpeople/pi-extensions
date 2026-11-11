@@ -9,6 +9,7 @@ export type BackgroundOutputPreview = "off" | "failures" | "finished" | "all";
 export interface BackgroundTasksConfig {
   collapsedTaskLimit: number;
   outputPreview: BackgroundOutputPreview;
+  completionNotifications: boolean;
 }
 
 export const BACKGROUND_TASKS_SETTINGS_NAMESPACE = "background-tasks";
@@ -19,6 +20,7 @@ export const BACKGROUND_COLLAPSED_TASK_LIMIT_PRESETS = [0, 1, 3, 5] as const;
 export const DEFAULT_BACKGROUND_TASKS_CONFIG: BackgroundTasksConfig = {
   collapsedTaskLimit: 0,
   outputPreview: "finished",
+  completionNotifications: false,
 };
 
 function isCollapsedTaskLimit(value: unknown): value is number {
@@ -42,8 +44,12 @@ export function normalizeBackgroundTasksConfig(value: unknown): BackgroundTasksC
   const input = value as {
     collapsedTaskLimit?: unknown;
     outputPreview?: unknown;
+    completionNotifications?: unknown;
   };
   return {
+    completionNotifications: typeof input.completionNotifications === "boolean"
+      ? input.completionNotifications
+      : DEFAULT_BACKGROUND_TASKS_CONFIG.completionNotifications,
     collapsedTaskLimit: isCollapsedTaskLimit(input.collapsedTaskLimit)
       ? input.collapsedTaskLimit
       : DEFAULT_BACKGROUND_TASKS_CONFIG.collapsedTaskLimit,
